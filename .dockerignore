@@ -1,0 +1,8 @@
+vendor/
+tags
+.github/
+.bin/
+*.md
+mtg
+.gitignore
+run.sh

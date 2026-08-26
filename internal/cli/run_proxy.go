@@ -1,0 +1,462 @@
+package cli
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/mhsanaei/mtg-multi/antireplay"
+	"github.com/mhsanaei/mtg-multi/events"
+	"github.com/mhsanaei/mtg-multi/internal/config"
+	"github.com/mhsanaei/mtg-multi/internal/proxyprotocol"
+	"github.com/mhsanaei/mtg-multi/internal/utils"
+	"github.com/mhsanaei/mtg-multi/ipblocklist"
+	"github.com/mhsanaei/mtg-multi/ipblocklist/files"
+	"github.com/mhsanaei/mtg-multi/logger"
+	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/mhsanaei/mtg-multi/network/v2"
+	"github.com/mhsanaei/mtg-multi/stats"
+	"github.com/pires/go-proxyproto"
+	"github.com/rs/zerolog"
+	"github.com/yl2chen/cidranger"
+)
+
+func makeLogger(conf *config.Config) mtglib.Logger {
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
+	zerolog.TimestampFieldName = "timestamp"
+	zerolog.LevelFieldName = "level"
+
+	if conf.Debug.Get(false) {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	} else {
+		zerolog.SetGlobalLevel(zerolog.WarnLevel)
+	}
+
+	baseLogger := zerolog.New(os.Stdout).With().Timestamp().Logger()
+
+	return logger.NewZeroLogger(baseLogger)
+}
+
+func makeNetwork(conf *config.Config, version string) (mtglib.Network, error) {
+	resolver, err := network.GetDNS(conf.GetDNS())
+	if err != nil {
+		return nil, fmt.Errorf("cannot create DNS resolver: %w", err)
+	}
+
+	base := network.New(
+		resolver,
+		"",
+		conf.Network.Timeout.TCP.Get(0),
+		conf.Network.Timeout.HTTP.Get(0),
+		conf.Network.Timeout.Idle.Get(0),
+		net.KeepAliveConfig{
+			Enable:   !conf.Network.KeepAlive.Disabled.Get(false),
+			Idle:     conf.Network.KeepAlive.Idle.Get(0),
+			Interval: conf.Network.KeepAlive.Interval.Get(0),
+			Count:    int(conf.Network.KeepAlive.Count.Get(0)),
+		},
+		int(conf.Network.TCPNotSentLowat.Get(network.DefaultTCPNotSentLowat)),
+	)
+
+	proxyDialers := make([]mtglib.Network, len(conf.Network.Proxies))
+	for idx, v := range conf.Network.Proxies {
+		value, err := network.NewProxyNetwork(base, v.Get(nil))
+		if err != nil {
+			return nil, fmt.Errorf("cannot use %v for proxy url: %w", v.Get(nil), err)
+		}
+		proxyDialers[idx] = value
+	}
+
+	switch len(proxyDialers) {
+	case 0:
+		return base, nil
+	case 1:
+		return proxyDialers[0], nil
+	}
+
+	value, err := network.Join(proxyDialers...)
+	if err != nil {
+		panic(err)
+	}
+
+	return value, nil
+}
+
+func makeAntiReplayCache(conf *config.Config) mtglib.AntiReplayCache {
+	if !conf.Defense.AntiReplay.Enabled.Get(false) {
+		return antireplay.NewNoop()
+	}
+
+	return antireplay.NewStableBloomFilter(
+		conf.Defense.AntiReplay.MaxSize.Get(antireplay.DefaultStableBloomFilterMaxSize),
+		conf.Defense.AntiReplay.ErrorRate.Get(antireplay.DefaultStableBloomFilterErrorRate),
+	)
+}
+
+func makeIPBlocklist(conf config.ListConfig,
+	logger mtglib.Logger,
+	ntw mtglib.Network,
+	updateCallback ipblocklist.FireholUpdateCallback,
+) (mtglib.IPBlocklist, error) {
+	if !conf.Enabled.Get(false) {
+		return ipblocklist.NewNoop(), nil
+	}
+
+	remoteURLs := []string{}
+	localFiles := []string{}
+
+	for _, v := range conf.URLs {
+		if v.IsRemote() {
+			remoteURLs = append(remoteURLs, v.String())
+		} else {
+			localFiles = append(localFiles, v.String())
+		}
+	}
+
+	blocklist, err := ipblocklist.NewFirehol(logger.Named("ipblockist"),
+		ntw,
+		conf.DownloadConcurrency.Get(1),
+		remoteURLs,
+		localFiles,
+		updateCallback)
+	if err != nil {
+		return nil, fmt.Errorf("incorrect parameters for firehol: %w", err)
+	}
+
+	go blocklist.Run(conf.UpdateEach.Get(ipblocklist.DefaultFireholUpdateEach))
+
+	return blocklist, nil
+}
+
+func makeIPAllowlist(conf config.ListConfig,
+	logger mtglib.Logger,
+	ntw mtglib.Network,
+	updateCallback ipblocklist.FireholUpdateCallback,
+) (mtglib.IPBlocklist, error) {
+	var (
+		allowlist mtglib.IPBlocklist
+		err       error
+	)
+
+	if !conf.Enabled.Get(false) {
+		allowlist, err = ipblocklist.NewFireholFromFiles(
+			logger.Named("ipblocklist"),
+			1,
+			[]files.File{
+				files.NewMem([]*net.IPNet{
+					cidranger.AllIPv4,
+					cidranger.AllIPv6,
+				}),
+			},
+			updateCallback,
+		)
+
+		go allowlist.Run(conf.UpdateEach.Get(ipblocklist.DefaultFireholUpdateEach))
+	} else {
+		allowlist, err = makeIPBlocklist(
+			conf,
+			logger,
+			ntw,
+			updateCallback,
+		)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("cannot build allowlist: %w", err)
+	}
+
+	return allowlist, nil
+}
+
+func makeEventStream(conf *config.Config, logger mtglib.Logger) (mtglib.EventStream, error) {
+	factories := make([]events.ObserverFactory, 0, 2)
+
+	if conf.Stats.StatsD.Enabled.Get(false) {
+		statsdFactory, err := stats.NewStatsd(
+			conf.Stats.StatsD.Address.Get(""),
+			logger.Named("statsd"),
+			conf.Stats.StatsD.MetricPrefix.Get(stats.DefaultStatsdMetricPrefix),
+			conf.Stats.StatsD.TagFormat.Get(stats.DefaultStatsdTagFormat),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("cannot build statsd observer: %w", err)
+		}
+
+		factories = append(factories, statsdFactory.Make)
+	}
+
+	if conf.Stats.Prometheus.Enabled.Get(false) {
+		prometheus := stats.NewPrometheus(
+			conf.Stats.Prometheus.MetricPrefix.Get(stats.DefaultMetricPrefix),
+			conf.Stats.Prometheus.HTTPPath.Get("/"),
+		)
+
+		listener, err := net.Listen("tcp", conf.Stats.Prometheus.BindTo.Get(""))
+		if err != nil {
+			return nil, fmt.Errorf("cannot start a listener for prometheus: %w", err)
+		}
+
+		go prometheus.Serve(listener) //nolint: errcheck
+
+		factories = append(factories, prometheus.Make)
+	}
+
+	if len(factories) > 0 {
+		return events.NewEventStream(factories), nil
+	}
+
+	return events.NewNoopStream(), nil
+}
+
+func warnSNIMismatch(conf *config.Config, ntw mtglib.Network, log mtglib.Logger) {
+	host := conf.Secret.Host
+	if host == "" {
+		return
+	}
+
+	res := runSNICheck(context.Background(), net.DefaultResolver, conf, ntw, host)
+
+	if res.ResolveErr != nil {
+		log.BindStr("hostname", host).
+			WarningError("SNI-DNS check: cannot resolve secret hostname", res.ResolveErr)
+		return
+	}
+
+	if !res.PublicIPKnown() {
+		log.Warning("SNI-DNS check: cannot detect public IP address; set public-ipv4/public-ipv6 in config or run 'mtg doctor'")
+		return
+	}
+
+	v4Match := res.OurIPv4 == nil || res.IPv4Match
+	v6Match := res.OurIPv6 == nil || res.IPv6Match
+
+	if v4Match && v6Match {
+		return
+	}
+
+	resolved := make([]string, 0, len(res.Resolved))
+	for _, ip := range res.Resolved {
+		resolved = append(resolved, ip.String())
+	}
+
+	our := ""
+	if res.OurIPv4 != nil {
+		our = res.OurIPv4.String()
+	}
+
+	if res.OurIPv6 != nil {
+		if our != "" {
+			our += "/"
+		}
+
+		our += res.OurIPv6.String()
+	}
+
+	entry := log.BindStr("hostname", host).
+		BindStr("resolved", strings.Join(resolved, ", ")).
+		BindStr("public_ip", our)
+
+	if res.OurIPv4 != nil {
+		entry = entry.BindStr("ipv4_match", fmt.Sprintf("%t", v4Match))
+	}
+
+	if res.OurIPv6 != nil {
+		entry = entry.BindStr("ipv6_match", fmt.Sprintf("%t", v6Match))
+	}
+
+	entry.Warning("SNI-DNS mismatch: secret hostname does not resolve to this server's public IP. " +
+		"DPI may detect and block the proxy. See 'mtg doctor' for details")
+}
+
+// warnIgnoredOfficialEnvs flags environment variables of the official
+// telegrammessenger/proxy image that mtg-multi intentionally does not
+// implement, so migrating users are not left guessing why they had no effect.
+// SECRET and TAG (and the MTG_-prefixed variants) are honored — see
+// config.ApplyEnvironment.
+func warnIgnoredOfficialEnvs(log mtglib.Logger) {
+	if _, ok := os.LookupEnv("WORKERS"); ok {
+		log.Warning("WORKERS environment variable is ignored: mtg-multi is a single Go process that already uses all CPU cores")
+	}
+
+	if _, ok := os.LookupEnv("SECRET_COUNT"); ok {
+		log.Warning("SECRET_COUNT environment variable is ignored: define named secrets in the [secrets] config section or via the management API")
+	}
+}
+
+func warnDeprecatedDomainFronting(conf *config.Config, log mtglib.Logger) {
+	if conf.DomainFrontingIP.Value != nil {
+		log.Warning(`config option "domain-fronting-ip" is deprecated and ignored; use "host" in [domain-fronting] instead`)
+	}
+
+	if conf.DomainFronting.IP.Value != nil {
+		log.Warning(`config option "ip" in [domain-fronting] is deprecated and ignored; use "host" instead`)
+	}
+}
+
+// makeSecretsReloader builds the callback Proxy.ReloadSecrets uses to re-read
+// the secret set on a POST /reload. It re-parses the same config file passed to
+// `mtg run`, so an operator editing [secrets] and calling reload swaps the set
+// without a restart. It returns nil when there is no config file (simple-run),
+// leaving reload unsupported.
+func makeSecretsReloader(configPath string) func() (mtglib.SecretConfig, error) {
+	if configPath == "" {
+		return nil
+	}
+
+	return func() (mtglib.SecretConfig, error) {
+		conf, err := utils.ReadConfig(configPath)
+		if err != nil {
+			return mtglib.SecretConfig{}, err
+		}
+
+		return mtglib.SecretConfig{
+			Secrets:      conf.GetSecrets(),
+			SecretAdTags: conf.GetSecretAdTags(),
+			GlobalAdTag:  conf.GetAdTag(),
+			Limits:       conf.GetSecretLimits(),
+		}, nil
+	}
+}
+
+func runProxy(conf *config.Config, version, configPath string) error { //nolint: funlen, cyclop
+	logger := makeLogger(conf)
+
+	logger.BindJSON("configuration", conf.String()).Debug("configuration")
+
+	warnIgnoredOfficialEnvs(logger)
+	warnDeprecatedDomainFronting(conf, logger)
+
+	eventStream, err := makeEventStream(conf, logger)
+	if err != nil {
+		return fmt.Errorf("cannot build event stream: %w", err)
+	}
+
+	ntw, err := makeNetwork(conf, version)
+	if err != nil {
+		return fmt.Errorf("cannot build network: %w", err)
+	}
+
+	warnSNIMismatch(conf, ntw, logger)
+
+	blocklist, err := makeIPBlocklist(
+		conf.Defense.Blocklist,
+		logger.Named("blocklist"),
+		ntw,
+		func(ctx context.Context, size int) {
+			eventStream.Send(ctx, mtglib.NewEventIPListSize(size, true))
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("cannot build ip blocklist: %w", err)
+	}
+
+	allowlist, err := makeIPAllowlist(
+		conf.Defense.Allowlist,
+		logger.Named("allowlist"),
+		ntw,
+		func(ctx context.Context, size int) {
+			eventStream.Send(ctx, mtglib.NewEventIPListSize(size, false))
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("cannot build ip allowlist: %w", err)
+	}
+
+	doppelGangerURLs := make([]string, len(conf.Defense.Doppelganger.URLs))
+	for i, v := range conf.Defense.Doppelganger.URLs {
+		doppelGangerURLs[i] = v.String()
+	}
+
+	opts := mtglib.ProxyOpts{
+		Logger:          logger,
+		Network:         ntw,
+		AntiReplayCache: makeAntiReplayCache(conf),
+		IPBlocklist:     blocklist,
+		IPAllowlist:     allowlist,
+		EventStream:     eventStream,
+
+		Secrets:                     conf.GetSecrets(),
+		Concurrency:                 conf.GetConcurrency(mtglib.DefaultConcurrency),
+		DomainFrontingPort:          conf.GetDomainFrontingPort(mtglib.DefaultDomainFrontingPort),
+		DomainFrontingHost:          conf.GetDomainFrontingHost(),
+		DomainFrontingProxyProtocol: conf.GetDomainFrontingProxyProtocol(false),
+		PreferIP:                    conf.PreferIP.Get(mtglib.DefaultPreferIP),
+		AutoUpdate:                  conf.AutoUpdate.Get(false),
+
+		AllowFallbackOnUnknownDC: conf.AllowFallbackOnUnknownDC.Get(false),
+		TolerateTimeSkewness:     conf.TolerateTimeSkewness.Value,
+		IdleTimeout:              conf.Network.Timeout.Idle.Get(mtglib.DefaultIdleTimeout),
+		HandshakeTimeout:         conf.Network.Timeout.Handshake.Get(mtglib.DefaultHandshakeTimeout),
+
+		DoppelGangerURLs:    doppelGangerURLs,
+		DoppelGangerPerRaid: conf.Defense.Doppelganger.Repeats.Get(mtglib.DoppelGangerPerRaid),
+		DoppelGangerEach:    conf.Defense.Doppelganger.UpdateEach.Get(mtglib.DoppelGangerEach),
+		DoppelGangerDRS:     conf.Defense.Doppelganger.DRS.Get(false),
+
+		APIBindTo:       conf.APIBindTo.Get(""),
+		APIToken:        conf.GetAPIToken(),
+		SecretsReloader: makeSecretsReloader(configPath),
+
+		GlobalAdTag:    conf.GetAdTag(),
+		SecretAdTags:   conf.GetSecretAdTags(),
+		SecretLimits:   conf.GetSecretLimits(),
+		UsageStateFile: conf.UsageStateFile,
+		EmitTraffic:    conf.Stats.StatsD.Enabled.Get(false) || conf.Stats.Prometheus.Enabled.Get(false),
+		PublicIPv4:     conf.PublicIPv4.Get(nil),
+		PublicIPv6:     conf.PublicIPv6.Get(nil),
+		AdvertisedPort: int(conf.GetFirstBindPort()),
+
+		ThrottleMaxConnections: conf.Throttle.MaxConnections.Get(0),
+		ThrottleCheckInterval:  conf.Throttle.CheckInterval.Get(5 * time.Second),
+	}
+
+	proxy, err := mtglib.NewProxy(opts)
+	if err != nil {
+		return fmt.Errorf("cannot create a proxy: %w", err)
+	}
+
+	bindAddrs := conf.GetBindAddrs()
+	listeners := make([]net.Listener, 0, len(bindAddrs))
+
+	for _, addr := range bindAddrs {
+		l, err := utils.NewListener(addr, 0)
+		if err != nil {
+			for _, prev := range listeners {
+				prev.Close() //nolint: errcheck
+			}
+
+			return fmt.Errorf("cannot start proxy on %s: %w", addr, err)
+		}
+
+		listeners = append(listeners, l)
+	}
+
+	var listener net.Listener
+
+	if len(listeners) == 1 {
+		listener = listeners[0]
+	} else {
+		listener = utils.NewMultiListener(listeners...)
+	}
+
+	if conf.ProxyProtocolListener.Get(false) {
+		listener = &proxyprotocol.ListenerAdapter{
+			Listener: proxyproto.Listener{
+				Listener: listener,
+			},
+		}
+	}
+
+	ctx := utils.RootContext()
+
+	go proxy.Serve(listener) //nolint: errcheck
+
+	<-ctx.Done()
+	listener.Close() //nolint: errcheck
+	proxy.Shutdown()
+
+	return nil
+}

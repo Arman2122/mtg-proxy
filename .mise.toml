@@ -1,0 +1,94 @@
+[tools]
+"go:golang.org/x/pkgsite/cmd/pkgsite" = "latest"
+"go:golang.org/x/tools/gopls" = "latest"
+"go:golang.org/x/vuln/cmd/govulncheck" = "latest"
+"go:mvdan.cc/gofumpt" = "latest"
+go = "latest"
+golangci-lint = "latest"
+
+[vars]
+fuzzflags = "-fuzztime=120s"
+
+[tasks.build]
+description = "Build binary"
+sources = ["**/*.go", "go.mod", "go.sum"]
+outputs = ["mtg"]
+run = "go build"
+
+[tasks."build:prof"]
+description = "Build binary with profiling enabled"
+sources = ["**/*.go", "go.mod", "go.sum"]
+outputs = ["mtg"]
+run = "go build -tags prof"
+
+[tasks.update]
+description = "Update dependencies"
+run = [
+    "go get -u",
+    "go mod tidy -go=1.26"
+]
+
+[tasks.lint]
+description = "Run linter"
+run = "golangci-lint run"
+
+[tasks.vuln]
+description = "Test for vulnerabilities"
+run = "govulncheck ./..."
+
+[tasks.test]
+description = "Run tests"
+run = "go test -v -race ./..."
+
+[tasks.covtest]
+description = "Run tests with code coverage"
+run = "go test -coverprofile=coverage.txt -covermode=atomic -count=2 -race -v ./..."
+
+[tasks.test-all]
+description = "Run all tests"
+depends = [
+    "test",
+    "test:fuzz:*"
+]
+
+[tasks."test:fuzz:client-hello"]
+description = "Run fuzzy test for ClientHello"
+run = "go test -v {{ vars.fuzzflags }} -fuzz=FuzzReadClientHello ./mtglib/internal/tls/fake"
+
+[tasks."test:fuzz:client-handshake"]
+description = "Run fuzzy test for ClientHandshake"
+run = "go test -v {{ vars.fuzzflags }} -fuzz=FuzzClientServerHandshake ./mtglib/obfuscation"
+
+[tasks."test:fuzz:server-handshake-frame"]
+description = "Run fuzzy test for GenerateHandshakeFrame"
+run = "go test -v {{ vars.fuzzflags }} -fuzz=FuzzGenerateHandshakeFrame ./mtglib/obfuscation"
+
+[tasks.static]
+description = "Build static binary"
+sources = ["**/*.go", "go.mod", "go.sum"]
+outputs = ["mtg"]
+run = """
+#!/bin/bash
+
+version="$(git describe --exact-match HEAD 2>/dev/null || git describe --tags --always)"
+go build \
+    -trimpath \
+    -mod=readonly \
+    -ldflags="-extldflags '-static' -s -w -X 'main.version=$version'" \
+    -a \
+    -tags netgo
+"""
+
+[tasks.image]
+description = "Build docker image"
+sources = ["**/*.go", "go.mod", "go.sum", "Dockerfile"]
+run = "docker buildx build --pull -t mtg ."
+
+[tasks.docs]
+description = "Run doc server"
+run = "pkgsite -http 0.0.0.0:10000"
+
+[tasks.fmt]
+description = "Reformat source code"
+sources = ["**/*.go"]
+run = "gofumpt -w --extra ."
