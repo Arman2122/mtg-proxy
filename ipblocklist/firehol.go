@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/ipblocklist/files"
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/ipblocklist/files"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/panjf2000/ants/v2"
 	"github.com/yl2chen/cidranger"
 )

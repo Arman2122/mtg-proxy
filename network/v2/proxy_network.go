@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/mhsanaei/mtg-multi/essentials"
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/essentials"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 	"golang.org/x/net/proxy"
 )
 

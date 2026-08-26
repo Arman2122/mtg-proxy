@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/mhsanaei/mtg-multi/essentials"
+	"github.com/Arman2122/mtg-proxy/essentials"
 )
 
 func Relay(ctx context.Context, log Logger, telegramConn, clientConn essentials.Conn) {

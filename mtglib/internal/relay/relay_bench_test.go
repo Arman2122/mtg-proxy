@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/mhsanaei/mtg-multi/essentials"
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/tls"
+	"github.com/Arman2122/mtg-proxy/essentials"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls"
 )
 
 // mockConn wraps a net.Conn to satisfy essentials.Conn.

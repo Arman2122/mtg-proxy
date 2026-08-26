@@ -11,14 +11,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/essentials"
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/dc"
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/doppel"
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/middleproxy"
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/relay"
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/tls"
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/tls/fake"
-	"github.com/mhsanaei/mtg-multi/mtglib/obfuscation"
+	"github.com/Arman2122/mtg-proxy/essentials"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/dc"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/doppel"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/middleproxy"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/relay"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls/fake"
+	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
 	"github.com/panjf2000/ants/v2"
 )
 

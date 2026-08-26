@@ -1,24 +1,43 @@
-# Security Policy
+# Security policy
 
-## Supported Versions
+## Supported versions
 
-We support 2 tracks: 2.x and 1.x
+Only the latest tagged release is supported. This is a small project with one
+maintainer; backporting to older tags is not something I can promise, and a
+promise I cannot keep is worse than none.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 2.x     | :white_check_mark: |
-| 1.x     | :interrobang:      |
-| < 1.0   | :x:                |
+| Version          | Supported          |
+| ---------------- | ------------------ |
+| Latest release   | :white_check_mark: |
+| Anything earlier | :x:                |
 
-1.x has adtag support. We do not plan any active development there but we guarantee:
+## Reporting a vulnerability
 
-1. Regular dependency updates
-2. Updates for Golang versions
-3. Security vulnerability fixes
-4. Merging small PRs
+Report privately, not in a public issue.
 
-2.x is in active development and have a full support.
+- GitHub: open a [security advisory](https://github.com/Arman2122/mtg-proxy/security/advisories/new)
+- Email: arman.seyri@gmail.com
 
-## Reporting a Vulnerability
+Please include what you did, what happened, and what you expected. A proof of
+concept helps but is not required to start the conversation.
 
-If you have found a vulnerability, please report about it to nineseconds@yandex.ru, telegram @9seconds or here in issues
+I will acknowledge within a few days and tell you plainly whether I can fix it,
+how long I expect it to take, and when I intend to disclose. If I cannot fix
+something, I will say so rather than leave the report open.
+
+## Scope
+
+This proxy's threat model is a network observer who wants to identify or block
+Telegram traffic, and a hostile client who wants to reach something it should
+not. Reports that matter most:
+
+- anything that lets a client be distinguished from an ordinary TLS client on
+  the wire, since that is the whole point of FakeTLS;
+- anything that lets one user's traffic, secret or counters reach another user;
+- anything reachable through the management API without its token;
+- anything that turns the proxy into a relay to a destination it should refuse.
+
+Denial of service by simply sending a lot of traffic is out of scope. So is
+anything that requires the operator to already have configured the proxy
+unsafely, though a report that the unsafe thing is too easy to configure is
+welcome as an ordinary issue.

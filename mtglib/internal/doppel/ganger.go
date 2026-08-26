@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/essentials"
+	"github.com/Arman2122/mtg-proxy/essentials"
 )
 
 const (

@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/internal/testlib"
-	"github.com/mhsanaei/mtg-multi/mtglib"
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/tls/fake"
+	"github.com/Arman2122/mtg-proxy/internal/testlib"
+	"github.com/Arman2122/mtg-proxy/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls/fake"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"

@@ -15,12 +15,12 @@ import (
 	"time"
 
 	"github.com/beevik/ntp"
-	"github.com/mhsanaei/mtg-multi/essentials"
-	"github.com/mhsanaei/mtg-multi/internal/config"
-	"github.com/mhsanaei/mtg-multi/internal/utils"
-	"github.com/mhsanaei/mtg-multi/mtglib"
-	"github.com/mhsanaei/mtg-multi/mtglib/dcprobe"
-	"github.com/mhsanaei/mtg-multi/network/v2"
+	"github.com/Arman2122/mtg-proxy/essentials"
+	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/Arman2122/mtg-proxy/internal/utils"
+	"github.com/Arman2122/mtg-proxy/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib/dcprobe"
+	"github.com/Arman2122/mtg-proxy/network/v2"
 )
 
 var (

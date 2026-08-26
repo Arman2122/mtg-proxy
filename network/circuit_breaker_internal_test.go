@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/internal/testlib"
+	"github.com/Arman2122/mtg-proxy/internal/testlib"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 )

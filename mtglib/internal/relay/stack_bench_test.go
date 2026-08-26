@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/tls"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls"
 )
 
 // BenchmarkStackVsPool measures memory consumption when N goroutines hold

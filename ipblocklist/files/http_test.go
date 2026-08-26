@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mhsanaei/mtg-multi/ipblocklist/files"
+	"github.com/Arman2122/mtg-proxy/ipblocklist/files"
 	"github.com/stretchr/testify/suite"
 )
 

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/tls"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls"
 )
 
 const (

@@ -7,7 +7,7 @@ import (
 	"net"
 	"net/url"
 
-	"github.com/mhsanaei/mtg-multi/essentials"
+	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/txthinking/socks5"
 )
 

@@ -3,7 +3,7 @@ package config
 import (
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
 // TypeExpiry is a secret validity deadline parsed from an RFC3339 timestamp or a

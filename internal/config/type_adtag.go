@@ -4,7 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
 // TypeAdTag is a Telegram advertising tag (ad_tag / proxy tag). It is a

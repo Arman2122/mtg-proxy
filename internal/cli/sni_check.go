@@ -4,8 +4,8 @@ import (
 	"context"
 	"net"
 
-	"github.com/mhsanaei/mtg-multi/internal/config"
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
 // sniCheckResult holds the data gathered while comparing the secret

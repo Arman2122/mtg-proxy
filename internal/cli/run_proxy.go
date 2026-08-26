@@ -8,17 +8,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/antireplay"
-	"github.com/mhsanaei/mtg-multi/events"
-	"github.com/mhsanaei/mtg-multi/internal/config"
-	"github.com/mhsanaei/mtg-multi/internal/proxyprotocol"
-	"github.com/mhsanaei/mtg-multi/internal/utils"
-	"github.com/mhsanaei/mtg-multi/ipblocklist"
-	"github.com/mhsanaei/mtg-multi/ipblocklist/files"
-	"github.com/mhsanaei/mtg-multi/logger"
-	"github.com/mhsanaei/mtg-multi/mtglib"
-	"github.com/mhsanaei/mtg-multi/network/v2"
-	"github.com/mhsanaei/mtg-multi/stats"
+	"github.com/Arman2122/mtg-proxy/antireplay"
+	"github.com/Arman2122/mtg-proxy/events"
+	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/Arman2122/mtg-proxy/internal/proxyprotocol"
+	"github.com/Arman2122/mtg-proxy/internal/utils"
+	"github.com/Arman2122/mtg-proxy/ipblocklist"
+	"github.com/Arman2122/mtg-proxy/ipblocklist/files"
+	"github.com/Arman2122/mtg-proxy/logger"
+	"github.com/Arman2122/mtg-proxy/mtglib"
+	"github.com/Arman2122/mtg-proxy/network/v2"
+	"github.com/Arman2122/mtg-proxy/stats"
 	"github.com/pires/go-proxyproto"
 	"github.com/rs/zerolog"
 	"github.com/yl2chen/cidranger"
@@ -272,13 +272,13 @@ func warnSNIMismatch(conf *config.Config, ntw mtglib.Network, log mtglib.Logger)
 }
 
 // warnIgnoredOfficialEnvs flags environment variables of the official
-// telegrammessenger/proxy image that mtg-multi intentionally does not
+// telegrammessenger/proxy image that mtg-proxy intentionally does not
 // implement, so migrating users are not left guessing why they had no effect.
 // SECRET and TAG (and the MTG_-prefixed variants) are honored — see
 // config.ApplyEnvironment.
 func warnIgnoredOfficialEnvs(log mtglib.Logger) {
 	if _, ok := os.LookupEnv("WORKERS"); ok {
-		log.Warning("WORKERS environment variable is ignored: mtg-multi is a single Go process that already uses all CPU cores")
+		log.Warning("WORKERS environment variable is ignored: mtg-proxy is a single Go process that already uses all CPU cores")
 	}
 
 	if _, ok := os.LookupEnv("SECRET_COUNT"); ok {

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/mhsanaei/mtg-multi/network"
+	"github.com/Arman2122/mtg-proxy/network"
 )
 
 type Listener struct {

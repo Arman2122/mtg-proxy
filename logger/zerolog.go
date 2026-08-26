@@ -3,7 +3,7 @@ package logger
 import (
 	"fmt"
 
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/rs/zerolog"
 )
 

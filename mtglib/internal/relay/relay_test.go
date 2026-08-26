@@ -5,8 +5,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/mhsanaei/mtg-multi/internal/testlib"
-	"github.com/mhsanaei/mtg-multi/mtglib/internal/relay"
+	"github.com/Arman2122/mtg-proxy/internal/testlib"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/relay"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 )

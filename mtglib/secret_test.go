@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 )

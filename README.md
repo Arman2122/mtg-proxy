@@ -1,16 +1,19 @@
-# mtg-multi
+# mtg-proxy
 
-A fast, censorship-resistant [Telegram MTProto proxy](https://core.telegram.org/mtproto),
-forked from [9seconds/mtg](https://github.com/9seconds/mtg) and extended for
-running one instance for many users.
+A fast, censorship-resistant [Telegram MTProto proxy](https://core.telegram.org/mtproto)
+built to serve many users from one process.
 
-Upstream mtg is a single-secret proxy. mtg-multi keeps everything that makes mtg
-good — FakeTLS, domain fronting, anti-replay, traffic-shape mimicry — and adds
-the pieces you need to run a shared proxy: named per-user secrets, live per-user
-traffic stats, a management API, hot reload, connection throttling, and the
-sponsored-channel ad-tag that mtg v2 removed.
+Most MTProto proxies serve one secret. mtg-proxy gives every user their own named
+secret, their own fronting host, their own traffic counters and their own limits,
+and lets you change all of that on a running proxy without dropping a single
+connection. That is what makes it usable as the engine behind a panel, and it is
+equally happy running on its own from a TOML file.
 
-## What's different from upstream
+It is a fork of [9seconds/mtg](https://github.com/9seconds/mtg), whose FakeTLS,
+domain fronting, anti-replay and traffic-shape mimicry are what make the thing
+hard to block in the first place. See [Credits](#credits).
+
+## What it adds
 
 - **Multiple secrets** — one named secret per user, each with its own fronting host.
 - **Per-user stats** — a JSON endpoint with live connection and byte counters.
@@ -22,10 +25,9 @@ sponsored-channel ad-tag that mtg v2 removed.
   a validity deadline, and an on/off switch, persisted across restarts.
 - **Public IP override** and **Docker-style environment variables**.
 
-Everything else — FakeTLS, domain fronting, the doppelganger traffic mimic,
-SOCKS5 proxy chaining, IP blocklists/allowlists, Prometheus and statsd metrics —
-works exactly as in upstream. See the [upstream README](https://github.com/9seconds/mtg)
-for the shared internals.
+Everything underneath — FakeTLS, domain fronting, the doppelganger traffic mimic,
+SOCKS5 proxy chaining, IP blocklists and allowlists, Prometheus and statsd metrics
+— is upstream's and behaves as upstream documents it.
 
 ## Table of contents
 
@@ -48,13 +50,13 @@ for the shared internals.
 
 ## Quick start
 
-Download a binary from [Releases](https://github.com/mhsanaei/mtg-multi/releases),
+Download a binary from [Releases](https://github.com/Arman2122/mtg-proxy/releases),
 or build from source (requires Go 1.26+):
 
 ```console
-git clone https://github.com/mhsanaei/mtg-multi.git
-cd mtg-multi
-go build          # produces ./mtg-multi
+git clone https://github.com/Arman2122/mtg-proxy.git
+cd mtg-proxy
+go build          # produces ./mtg-proxy
 ```
 
 If you use [mise](https://mise.jdx.dev/), `mise install && mise run build` sets
@@ -65,7 +67,7 @@ does not have to point at your server, but it should be a real, reachable HTTPS
 site — the classic choice is a large CDN such as `storage.googleapis.com`:
 
 ```console
-mtg-multi generate-secret --hex storage.googleapis.com
+mtg-proxy generate-secret --hex storage.googleapis.com
 ```
 
 Write a minimal config:
@@ -88,13 +90,13 @@ bob   = "ee0123456789abcdef0123456789abcd9573746f726167652e676f6f676c65617069732
 Run it:
 
 ```console
-mtg-multi run /etc/mtg/config.toml
+mtg-proxy run /etc/mtg/config.toml
 ```
 
 Then print the connection links and QR codes for your users:
 
 ```console
-mtg-multi access /etc/mtg/config.toml
+mtg-proxy access /etc/mtg/config.toml
 ```
 
 ## Running with Docker
@@ -109,7 +111,7 @@ docker run -d --name mtg -p 443:443 \
     -e SECRET_HOST=storage.googleapis.com \
     -e TAG=3f40462915a3e6026a4d790127b95ded \
     -e MTG_BIND_TO=0.0.0.0:443 \
-    ghcr.io/mhsanaei/mtg-multi:latest
+    ghcr.io/Arman2122/mtg-proxy:latest
 ```
 
 To run with a full config file instead, mount it over the bundled default at
@@ -118,7 +120,7 @@ To run with a full config file instead, mount it over the bundled default at
 ```console
 docker run -d --name mtg -p 443:443 \
     -v /etc/mtg/config.toml:/config/config.toml:ro \
-    ghcr.io/mhsanaei/mtg-multi:latest
+    ghcr.io/Arman2122/mtg-proxy:latest
 ```
 
 See [Environment variables](#environment-variables) for the full list.
@@ -180,7 +182,7 @@ can change without restarting the proxy:
 curl -X POST http://127.0.0.1:9090/reload
 ```
 
-On success it re-reads the same config file passed to `mtg-multi run` and swaps
+On success it re-reads the same config file passed to `mtg-proxy run` and swaps
 the secret set in atomically:
 
 - added secrets start working immediately;
@@ -239,7 +241,7 @@ localhost.
 
 ### Sponsored channel (ad-tag)
 
-Upstream mtg v2 dropped the promoted-channel feature; mtg-multi brings it back.
+Upstream mtg v2 dropped the promoted-channel feature; mtg-proxy brings it back.
 When an ad-tag is set, matching clients are routed through Telegram **middle
 proxies** (the RPC protocol) instead of directly to the data centers, and your
 sponsored channel appears at the top of their chat list.
@@ -312,7 +314,7 @@ Throttle state is exposed in the stats response:
 ### Per-user quotas, expiry & disable
 
 Each named secret can carry governance limits — a data quota, a validity
-deadline, and an on/off switch — so you can run mtg-multi as a reseller or
+deadline, and an on/off switch — so you can run mtg-proxy as a reseller or
 multi-tenant proxy. Add a `[secret-limits.<name>]` table for any secret in
 `[secrets]`; a secret without one is unlimited, never expires and is enabled.
 
@@ -373,15 +375,15 @@ public-ipv4 = "1.2.3.4"
 public-ipv6 = "2001:db8::1"
 ```
 
-These addresses are used by `mtg-multi access` to build links, by
-`mtg-multi doctor` to validate the SNI-to-DNS match, and — when an ad-tag is set
+These addresses are used by `mtg-proxy access` to build links, by
+`mtg-proxy doctor` to validate the SNI-to-DNS match, and — when an ad-tag is set
 — as this proxy's own address in the middle-proxy handshake.
 
 ### Environment variables
 
 For parity with the official
 [telegrammessenger/proxy](https://hub.docker.com/r/telegrammessenger/proxy/)
-image, `mtg-multi run` overlays a few environment variables on top of the config
+image, `mtg-proxy run` overlays a few environment variables on top of the config
 file. The environment always wins over the file, and it is re-applied on every
 config read, so an env-pinned secret or tag survives a `POST /reload`.
 
@@ -404,12 +406,12 @@ process already uses every CPU core, and multiple secrets are configured through
 
 | Command | Description |
 |---|---|
-| `mtg-multi generate-secret [--hex] <hostname>` | Generate a new secret for the given fronting hostname. `--hex`/`-x` prints hex instead of base64. |
-| `mtg-multi run <config>` | Run the proxy from a config file (supports the full feature set and hot reload). |
-| `mtg-multi simple-run <bind-to> <secret>` | Run without a config file, from flags only (no `[secrets]`, no reload). |
-| `mtg-multi access [--ipv4 IP] [--ipv6 IP] [--port N] [--hex] <config>` | Print `tg://` / `t.me` links and QR-code URLs for the configured secrets. |
-| `mtg-multi doctor [--skip-native-check] <config>` | Check connectivity, clock skew, fronting reachability, and SNI-to-DNS match. Run this first when something is off. |
-| `mtg-multi version` | Print the version. |
+| `mtg-proxy generate-secret [--hex] <hostname>` | Generate a new secret for the given fronting hostname. `--hex`/`-x` prints hex instead of base64. |
+| `mtg-proxy run <config>` | Run the proxy from a config file (supports the full feature set and hot reload). |
+| `mtg-proxy simple-run <bind-to> <secret>` | Run without a config file, from flags only (no `[secrets]`, no reload). |
+| `mtg-proxy access [--ipv4 IP] [--ipv6 IP] [--port N] [--hex] <config>` | Print `tg://` / `t.me` links and QR-code URLs for the configured secrets. |
+| `mtg-proxy doctor [--skip-native-check] <config>` | Check connectivity, clock skew, fronting reachability, and SNI-to-DNS match. Run this first when something is off. |
+| `mtg-proxy version` | Print the version. |
 
 ## Configuration
 
@@ -419,7 +421,7 @@ change — every key has a sensible default.
 
 ## Credits
 
-mtg-multi is a fork of [9seconds/mtg](https://github.com/9seconds/mtg) by Sergey
+mtg-proxy is a fork of [9seconds/mtg](https://github.com/9seconds/mtg) by Sergey
 Arkhipov and contributors. All of the core proxy engineering is theirs; this fork
 adds the multi-user layer on top. The middle-proxy (ad-tag) implementation is
 ported from the last mtg v1 release that shipped it.

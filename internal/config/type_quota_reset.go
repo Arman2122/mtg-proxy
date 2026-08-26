@@ -1,7 +1,7 @@
 package config
 
 import (
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
 // TypeQuotaReset is a per-secret data-quota reset policy: "none" (default) or

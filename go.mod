@@ -1,4 +1,4 @@
-module github.com/mhsanaei/mtg-multi
+module github.com/Arman2122/mtg-proxy
 
 go 1.26.4
 

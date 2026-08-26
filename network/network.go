@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/essentials"
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/essentials"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
 type networkHTTPTransport struct {

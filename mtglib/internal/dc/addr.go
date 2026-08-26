@@ -3,7 +3,7 @@ package dc
 import (
 	"fmt"
 
-	"github.com/mhsanaei/mtg-multi/mtglib/obfuscation"
+	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
 )
 
 type Addr struct {

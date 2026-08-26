@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
 type Optional struct {

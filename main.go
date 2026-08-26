@@ -10,7 +10,7 @@ package main
 
 import (
 	"github.com/alecthomas/kong"
-	"github.com/mhsanaei/mtg-multi/internal/cli"
+	"github.com/Arman2122/mtg-proxy/internal/cli"
 )
 
 func main() {

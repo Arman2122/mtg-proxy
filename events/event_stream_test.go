@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/events"
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/events"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 )

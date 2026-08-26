@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/mhsanaei/mtg-multi/network/v2"
+	"github.com/Arman2122/mtg-proxy/network/v2"
 	"github.com/stretchr/testify/suite"
 )
 

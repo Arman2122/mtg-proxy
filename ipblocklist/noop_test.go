@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/mhsanaei/mtg-multi/ipblocklist"
+	"github.com/Arman2122/mtg-proxy/ipblocklist"
 	"github.com/stretchr/testify/suite"
 )
 

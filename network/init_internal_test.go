@@ -3,7 +3,7 @@ package network
 import (
 	"context"
 
-	"github.com/mhsanaei/mtg-multi/essentials"
+	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/stretchr/testify/mock"
 )
 

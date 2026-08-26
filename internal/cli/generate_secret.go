@@ -3,7 +3,7 @@ package cli
 import (
 	"fmt"
 
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
 type GenerateSecret struct {

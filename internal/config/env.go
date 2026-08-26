@@ -6,13 +6,13 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
 // Environment variable names understood by ApplyEnvironment. The unprefixed
 // names mirror the official telegrammessenger/proxy Docker image
 // (https://hub.docker.com/r/telegrammessenger/proxy/), so its documented
-// "docker run -e SECRET=... -e TAG=..." invocations work with mtg-multi
+// "docker run -e SECRET=... -e TAG=..." invocations work with mtg-proxy
 // containers as well. MTG_-prefixed variants always win over the unprefixed
 // ones, so generic names like SECRET cannot be captured by accident outside
 // of a container.

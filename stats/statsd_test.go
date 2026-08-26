@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mhsanaei/mtg-multi/events"
-	"github.com/mhsanaei/mtg-multi/logger"
-	"github.com/mhsanaei/mtg-multi/mtglib"
-	"github.com/mhsanaei/mtg-multi/stats"
+	"github.com/Arman2122/mtg-proxy/events"
+	"github.com/Arman2122/mtg-proxy/logger"
+	"github.com/Arman2122/mtg-proxy/mtglib"
+	"github.com/Arman2122/mtg-proxy/stats"
 	statsd "github.com/smira/go-statsd"
 	"github.com/stretchr/testify/suite"
 )

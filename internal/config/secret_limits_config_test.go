@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/mhsanaei/mtg-multi/internal/config"
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

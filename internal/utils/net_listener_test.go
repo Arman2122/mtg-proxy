@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/mhsanaei/mtg-multi/internal/utils"
+	"github.com/Arman2122/mtg-proxy/internal/utils"
 	"github.com/stretchr/testify/suite"
 )
 

@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/mhsanaei/mtg-multi/internal/config"
-	"github.com/mhsanaei/mtg-multi/internal/utils"
-	"github.com/mhsanaei/mtg-multi/mtglib"
+	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/Arman2122/mtg-proxy/internal/utils"
+	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
 type accessResponseSecret struct {

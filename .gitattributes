@@ -1,3 +1,7 @@
+# The project targets Linux; a CRLF that sneaks into a shell script or a
+# Kbuild recipe fails at runtime with an error naming neither file nor reason.
+* text=auto eol=lf
+
 # git config merge.theirs.name "Always accept theirs"
 # git config merge.theirs.driver "cp %B %A"
 default.pgo binary merge=theirs
