@@ -120,3 +120,44 @@ func TestTheOldAssertPanickedOnEachOfThem(t *testing.T) {
 		}()
 	}
 }
+
+/*
+The same assert lived a second time, in streamContext.ClientIP.
+
+That one is worse in a specific way: newStreamContext calls it while building
+the logger, which is BEFORE the caller has registered `defer ctx.Close()`. So
+the panic did not just kill the process — on the way out it left the client
+socket open with nothing holding a reference to it.
+
+Nil is the right answer rather than a refusal here. By the time a stream context
+exists the connection has already passed the accept-loop check, so a nil means
+the transport underneath is one whose peer is not a TCP address, and the honest
+report is "no IP", not a crash. It reaches the logger as <nil> and the policy
+layer as an IP that matches nothing.
+*/
+func TestAStreamContextReportsNoClientIPRatherThanPanicking(t *testing.T) {
+	ctx := &streamContext{clientConn: connWithAddr{addr: &net.UnixAddr{Net: "unix", Name: "/tmp/x"}}}
+
+	ip := ctx.ClientIP()
+	if ip != nil {
+		t.Fatalf("want no IP for a non-TCP peer, got %v", ip)
+	}
+	// The logger formats it, so it has to survive String() on the nil.
+	if s := ip.String(); s != "<nil>" {
+		t.Fatalf("String() on the reported IP = %q", s)
+	}
+
+	real := &streamContext{clientConn: connWithAddr{addr: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 1}}}
+	if got := real.ClientIP(); !got.Equal(net.IPv4(203, 0, 113, 7)) {
+		t.Fatalf("an ordinary client lost its IP: %v", got)
+	}
+}
+
+type connWithAddr struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c connWithAddr) RemoteAddr() net.Addr { return c.addr }
+func (c connWithAddr) CloseRead() error     { return nil }
+func (c connWithAddr) CloseWrite() error    { return nil }

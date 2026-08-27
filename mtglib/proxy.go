@@ -927,8 +927,16 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	}
 
 	pool, err := ants.NewPoolWithFunc(opts.getConcurrency(),
+		// A listener that yields a plain net.Conn is adapted rather than asserted:
+		// ants recovers a worker panic and only logs it, so the old forced assert
+		// leaked one file descriptor per connection with no error path.
 		func(arg any) {
-			proxy.ServeConn(arg.(essentials.Conn)) //nolint: forcetypeassert
+			switch v := arg.(type) {
+			case essentials.Conn:
+				proxy.ServeConn(v)
+			case net.Conn:
+				proxy.ServeConn(essentials.WrapNetConn(v))
+			}
 		},
 		ants.WithLogger(opts.getLogger("ants")),
 		ants.WithNonblocking(true))

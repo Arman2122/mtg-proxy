@@ -51,8 +51,13 @@ func (s *streamContext) Close() {
 	}
 }
 
+// ClientIP is nil when the connection carries no IP the policy layer can read.
+// It runs inside newStreamContext BEFORE `defer ctx.Close()` is registered, so
+// the forced assert it used to be leaked the socket on the way out.
 func (s *streamContext) ClientIP() net.IP {
-	return s.clientConn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
+	ip, _ := acceptedClientIP(s.clientConn.RemoteAddr())
+
+	return ip
 }
 
 func newStreamContext(ctx context.Context, logger Logger, clientConn essentials.Conn) *streamContext {
