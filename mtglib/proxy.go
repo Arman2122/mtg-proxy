@@ -275,6 +275,25 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	)
 }
 
+// acceptedClientIP returns the client IP of an accepted connection, or false
+// when there is none to read.
+//
+// This is not a formality. With proxy-protocol-listener on, RemoteAddr comes
+// from a PROXY header the peer sends, and a v2 header may declare a UDP, Unix
+// or UNSPEC transport -- for which go-proxyproto hands back a *net.UDPAddr, a
+// *net.UnixAddr, or a nil net.Addr. A type assert on any of those panics on the
+// accept loop, and Serve runs in a bare goroutine, so the panic ends the whole
+// process and every client on it. Refusing the connection is the answer; a TCP
+// listener has no business with an address that is not a TCP one.
+func acceptedClientIP(addr net.Addr) (net.IP, bool) {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok || tcpAddr == nil || len(tcpAddr.IP) == 0 {
+		return nil, false
+	}
+
+	return tcpAddr.IP, true
+}
+
 // Serve starts a proxy on a given listener.
 func (p *Proxy) Serve(listener net.Listener) error {
 	p.streamWaitGroup.Add(1)
@@ -291,7 +310,14 @@ func (p *Proxy) Serve(listener net.Listener) error {
 			}
 		}
 
-		ipAddr := conn.RemoteAddr().(*net.TCPAddr).IP //nolint: forcetypeassert
+		ipAddr, ok := acceptedClientIP(conn.RemoteAddr())
+		if !ok {
+			conn.Close() //nolint: errcheck
+			p.logger.Info("connection has no usable client address")
+
+			continue
+		}
+
 		logger := p.logger.BindStr("ip", ipAddr.String())
 
 		if !p.allowlist.Contains(ipAddr) {
