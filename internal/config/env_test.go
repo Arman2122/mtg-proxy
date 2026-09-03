@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"testing"
 
@@ -81,6 +82,30 @@ func (suite *EnvTestSuite) TestBareKeyNeedsHost() {
 
 	conf := suite.MinimalConfig()
 	suite.ErrorContains(conf.ApplyEnvironment(), "SECRET_HOST")
+}
+
+// A bare key also arrives base64url-encoded, which is why the hostless guard
+// keys off the parsed secret mode rather than hex decodability.
+func (suite *EnvTestSuite) TestBareKeyBase64NeedsHost() {
+	raw, err := hex.DecodeString(envTestBareKey)
+	suite.Require().NoError(err)
+	suite.T().Setenv("SECRET", base64.RawURLEncoding.EncodeToString(raw))
+
+	conf := suite.MinimalConfig()
+	suite.ErrorContains(conf.ApplyEnvironment(), "SECRET_HOST")
+}
+
+func (suite *EnvTestSuite) TestBareKeyBase64WithHost() {
+	raw, err := hex.DecodeString(envTestBareKey)
+	suite.Require().NoError(err)
+	suite.T().Setenv("SECRET", base64.RawURLEncoding.EncodeToString(raw))
+	suite.T().Setenv("SECRET_HOST", "storage.googleapis.com")
+
+	conf := suite.MinimalConfig()
+	suite.NoError(conf.ApplyEnvironment())
+	suite.NoError(conf.Validate())
+	suite.Equal("storage.googleapis.com", conf.Secret.Host)
+	suite.Equal(envTestBareKey, hex.EncodeToString(conf.Secret.Key[:]))
 }
 
 func (suite *EnvTestSuite) TestBareKeyWithHost() {

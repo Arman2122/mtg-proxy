@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -86,27 +85,28 @@ func (c *Config) applyEnvSecret() error {
 }
 
 func parseEnvSecret(value string) (mtglib.Secret, error) {
-	// The official telegrammessenger/proxy image uses bare 16-byte hex
-	// secrets. mtg serves FakeTLS only, so such a key needs a fronting
-	// hostname to become an ee-secret. A full serialized secret is always
-	// longer than 16 bytes, so this branch cannot swallow one.
-	if raw, err := hex.DecodeString(value); err == nil && len(raw) == mtglib.SecretKeyLength {
-		host, _ := lookupEnv(EnvSecretHost)
-		if host = strings.TrimSpace(host); host == "" {
-			return mtglib.Secret{}, fmt.Errorf(
-				"%s is a bare 16-byte key (telegrammessenger/proxy format); mtg serves FakeTLS only, "+
-					"so either set %s to a fronting domain or provide a full ee-prefixed secret", EnvSecret, EnvSecretHost)
-		}
-
-		secret := mtglib.Secret{Host: host}
-		copy(secret.Key[:], raw)
-
-		return secret, nil
-	}
-
 	secret, err := mtglib.ParseSecret(value)
 	if err != nil {
 		return mtglib.Secret{}, fmt.Errorf("incorrect %s environment variable: %w", EnvSecret, err)
+	}
+
+	// The official telegrammessenger/proxy image uses bare 16-byte secrets, which
+	// parse as hostless "plain". bind-to serves FakeTLS only and the environment
+	// cannot declare the [[listener]] that would serve a hostless form, so pair it
+	// with a fronting host rather than mint a secret nothing can accept. Keyed off
+	// the parsed mode, not hex decodability: the same key also arrives base64url.
+	if secret.Mode != mtglib.SecretModeFakeTLS {
+		host, _ := lookupEnv(EnvSecretHost)
+		if host = strings.TrimSpace(host); host == "" {
+			return mtglib.Secret{}, fmt.Errorf(
+				"%s is a %s-mode secret with no fronting hostname; the bind-to listener serves FakeTLS "+
+					"only and the environment cannot declare a [[listener]], so either set %s to a fronting "+
+					"domain, provide a full ee-prefixed secret, or move the secret into the config file's "+
+					"[secrets] table alongside a matching [[listener]]", EnvSecret, secret.Mode, EnvSecretHost)
+		}
+
+		secret.Host = host
+		secret.Mode = mtglib.SecretModeFakeTLS
 	}
 
 	return secret, nil
