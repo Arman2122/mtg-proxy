@@ -66,9 +66,12 @@ func (o Obfuscator) SendHandshake(w essentials.Conn, dc int) (essentials.Conn, e
 	hasher.Reset()
 	recvCipher := o.getCipher(&frame, hasher)
 
+	// only the trailing 8 bytes (connection type + DC + noise) travel encrypted;
+	// bytes 0..55 have to stay plaintext so that the rejections generateHandshake
+	// makes on the leading bytes (0xef, HTTP verbs, transport magics) are the ones
+	// actually observable on the wire.
 	sendCipher.XORKeyStream(frame.data[:], frame.data[:])
-	copy(frame.key(), copyFrame.key())
-	copy(frame.iv(), copyFrame.iv())
+	copy(frame.data[:hfOffsetConnectionType], copyFrame.data[:hfOffsetConnectionType])
 
 	if _, err := w.Write(frame.data[:]); err != nil {
 		return nil, fmt.Errorf("cannot send a handshake: %w", err)
