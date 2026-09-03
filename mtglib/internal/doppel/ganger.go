@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls"
 )
 
 const (
@@ -196,6 +197,17 @@ func (g *Ganger) updateNoiseParams() {
 	if maxDev < 100 {
 		maxDev = 100
 	}
+
+	// The noise draw is mean±jitter and has to fit a single TLS record: an
+	// oversized payload makes WriteRecord fail, and the noise path suppresses
+	// that error, so the record is dropped entirely and the client's handshake
+	// HMAC - computed over it - no longer matches. certSizes is a sum over the
+	// whole server flight, so it can exceed one record on its own.
+	if maxDev > tls.MaxRecordPayloadSize/2 {
+		maxDev = tls.MaxRecordPayloadSize / 2
+	}
+
+	mean = min(mean, tls.MaxRecordPayloadSize-maxDev)
 
 	np := &NoiseParams{Mean: mean, Jitter: maxDev}
 	g.noiseParams.Store(np)
