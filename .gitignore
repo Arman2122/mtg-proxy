@@ -10,3 +10,4 @@ coverage.txt
 dist/
 mtg-proxy
 mtg-proxy-*
+/escapecheck
