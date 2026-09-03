@@ -77,9 +77,13 @@ func (c *connProxyProtocol) Write(p []byte) (int, error) {
 	if !c.headersWritten {
 		headers := proxyproto.HeaderProxyFromAddrs(2, c.sourceAddr, c.RemoteAddr())
 
+		// An address shape go-proxyproto refuses to encode (a port outside the
+		// uint16 a v2 header carries, say) must fail this one connection, not the
+		// process: fronting is the path every failed handshake and every
+		// quota-denied or expired user takes.
 		toSend, err := headers.Format()
 		if err != nil {
-			panic(err)
+			return 0, fmt.Errorf("cannot format proxy protocol header: %w", err)
 		}
 
 		if _, err := c.Conn.Write(toSend); err != nil {
