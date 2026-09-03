@@ -34,8 +34,10 @@ const (
 	hfOffsetDC             = hfOffsetConnectionType + hfLenConnectionType
 )
 
-// Connection-Type: Secure. We support only fake tls.
-var hfConnectionType = [hfLenConnectionType]byte{0xdd, 0xdd, 0xdd, 0xdd}
+// hfConnectionType is the padded-intermediate transport, the tag mtg has always
+// emitted and the only one the FakeTLS entry honours. Kept as an alias of
+// TagPaddedIntermediate so the two can never diverge.
+var hfConnectionType = [hfLenConnectionType]byte(TagPaddedIntermediate)
 
 type handshakeFrame struct {
 	data [hfLen]byte
@@ -74,7 +76,7 @@ func (h *handshakeFrame) revert() {
 	slices.Reverse(h.data[hfOffsetKey:hfOffsetConnectionType])
 }
 
-func generateHandshake(dc int) handshakeFrame {
+func generateHandshake(dc int, tag ConnectionTag) handshakeFrame {
 	frame := handshakeFrame{}
 
 	for {
@@ -103,7 +105,9 @@ func generateHandshake(dc int) handshakeFrame {
 			continue
 		}
 
-		copy(frame.connectionType(), hfConnectionType[:])
+		// The rejections above concern the frame's LEADING plaintext noise and
+		// are orthogonal to the transport stamped here at offset 56.
+		copy(frame.connectionType(), tag[:])
 		binary.LittleEndian.PutUint16(frame.dcSlice(), uint16(dc))
 
 		return frame

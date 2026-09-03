@@ -1,11 +1,11 @@
 package obfuscation_test
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 
 	"github.com/Arman2122/mtg-proxy/internal/testlib"
-	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -42,8 +42,7 @@ var wireForbiddenPrefixes = []uint32{
 func TestSendHandshakeWirePrefixIsPlaintext(t *testing.T) {
 	t.Parallel()
 
-	secret := mtglib.GenerateSecret("hostname.com")
-	obfs := obfuscation.Obfuscator{Secret: secret.Key[:]}
+	obfs := obfuscation.Obfuscator{Secret: randomKey()}
 
 	frames := make([][]byte, 0, wireHandshakeSamples)
 
@@ -57,7 +56,7 @@ func TestSendHandshakeWirePrefixIsPlaintext(t *testing.T) {
 		})
 
 	for range wireHandshakeSamples {
-		_, err := obfs.SendHandshake(connMock, 2)
+		_, err := obfs.SendHandshake(connMock, 2, obfuscation.TagPaddedIntermediate)
 		require.NoError(t, err)
 	}
 
@@ -100,8 +99,7 @@ func TestSendHandshakeWirePrefixIsPlaintext(t *testing.T) {
 func TestSendHandshakeRoundTripsAfterPlaintextPrefix(t *testing.T) {
 	t.Parallel()
 
-	secret := mtglib.GenerateSecret("hostname.com")
-	obfs := obfuscation.Obfuscator{Secret: secret.Key[:]}
+	obfs := obfuscation.Obfuscator{Secret: randomKey()}
 
 	for dc := 1; dc <= 5; dc++ {
 		wire := make([]byte, 0, 64)
@@ -115,7 +113,7 @@ func TestSendHandshakeRoundTripsAfterPlaintextPrefix(t *testing.T) {
 				wire = append(wire, args.Get(0).([]byte)...)
 			})
 
-		_, err := obfs.SendHandshake(writeMock, dc)
+		_, err := obfs.SendHandshake(writeMock, dc, obfuscation.TagPaddedIntermediate)
 		require.NoError(t, err)
 
 		readMock := &testlib.EssentialsConnMock{}
@@ -127,11 +125,48 @@ func TestSendHandshakeRoundTripsAfterPlaintextPrefix(t *testing.T) {
 				copy(args.Get(0).([]byte), wire)
 			})
 
-		readDC, _, err := obfs.ReadHandshake(readMock)
+		readDC, _, _, err := obfs.ReadHandshake(readMock, paddedOnly)
 		require.NoError(t, err)
 		assert.Equal(t, dc, readDC)
 
 		writeMock.AssertExpectations(t)
 		readMock.AssertExpectations(t)
 	}
+}
+
+// The tag is a parameter now, so the one thing that must not change is what it
+// puts on the wire: bytes 56..59, encrypted under the send cipher, decrypting to
+// exactly the tag that was asked for. TagPaddedIntermediate must still produce
+// the dddddddd every existing client and every existing DC expects.
+func TestSendHandshakeStampsRequestedTag(t *testing.T) {
+	t.Parallel()
+
+	for _, tag := range allTags {
+		key := randomKey()
+		obfs := obfuscation.Obfuscator{Secret: key}
+
+		sink := &memConn{}
+
+		_, err := obfs.SendHandshake(sink, 2, tag)
+		require.NoError(t, err)
+
+		wire := sink.wrote.Bytes()
+		require.Len(t, wire, 64)
+
+		readDC, readTag, _, err := obfs.ReadHandshake(
+			&memConn{read: bytes.NewReader(wire)}, allTagsSet)
+		require.NoError(t, err)
+
+		assert.Equal(t, 2, readDC)
+		assert.Equal(t, tag, readTag, "tag %s", tag)
+	}
+}
+
+// The one value that is a compatibility contract rather than a parameter.
+func TestPaddedIntermediateTagIsDDDDDDDD(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t,
+		obfuscation.ConnectionTag{0xdd, 0xdd, 0xdd, 0xdd},
+		obfuscation.TagPaddedIntermediate)
 }

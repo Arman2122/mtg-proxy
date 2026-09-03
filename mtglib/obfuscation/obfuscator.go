@@ -4,11 +4,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/hex"
 	"fmt"
 	"hash"
-	"io"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
 )
@@ -22,41 +19,27 @@ type Obfuscator struct {
 }
 
 // ReadHandshake reads the 64-byte obfuscated2 client handshake from r,
-// validates it, and returns the DC the client requested along with a
-// transparent en/decrypting wrapper over r.
-func (o Obfuscator) ReadHandshake(r essentials.Conn) (int, essentials.Conn, error) {
-	frame := handshakeFrame{}
-
-	if _, err := io.ReadFull(r, frame.data[:]); err != nil {
-		return 0, nil, fmt.Errorf("cannot read frame: %w", err)
+// validates that its transport tag is one the caller honours, and returns the
+// requested DC and that tag along with a transparent en/decrypting wrapper
+// over r.
+//
+// It is the single-candidate case of MatchHandshake, so the cipher derivation
+// lives in exactly one place and the two cannot drift.
+func (o Obfuscator) ReadHandshake(r essentials.Conn, allowed TagSet) (int, ConnectionTag, essentials.Conn, error) {
+	result, err := MatchHandshake(r, [][]byte{o.Secret}, allowed)
+	if err != nil {
+		return 0, ConnectionTag{}, nil, err
 	}
 
-	hasher := sha256.New()
-	recvCipher := o.getCipher(&frame, hasher)
-
-	frame.revert()
-	hasher.Reset()
-	sendCipher := o.getCipher(&frame, hasher)
-
-	recvCipher.XORKeyStream(frame.data[:], frame.data[:])
-
-	if val := frame.connectionType(); subtle.ConstantTimeCompare(val, hfConnectionType[:]) != 1 {
-		return 0, nil, fmt.Errorf("unsupported connection type: %s", hex.EncodeToString(val))
-	}
-
-	cn := conn{
-		Conn:       r,
-		recvCipher: recvCipher,
-		sendCipher: sendCipher,
-	}
-
-	return frame.dc(), cn, nil
+	return result.DC, result.Tag, result.Conn, nil
 }
 
-// SendHandshake writes a fresh 64-byte obfuscated2 handshake for the given
-// DC to w and returns a transparent en/decrypting wrapper over w.
-func (o Obfuscator) SendHandshake(w essentials.Conn, dc int) (essentials.Conn, error) {
-	frame := generateHandshake(dc)
+// SendHandshake writes a fresh 64-byte obfuscated2 handshake for the given DC
+// and transport tag to w and returns a transparent en/decrypting wrapper over
+// w. The tag must be the client's own: the relay above is byte-transparent, so
+// announcing a different transport to Telegram corrupts every packet.
+func (o Obfuscator) SendHandshake(w essentials.Conn, dc int, tag ConnectionTag) (essentials.Conn, error) {
+	frame := generateHandshake(dc, tag)
 	copyFrame := frame
 	hasher := sha256.New()
 

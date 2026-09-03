@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/Arman2122/mtg-proxy/internal/testlib"
-	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -15,15 +14,10 @@ import (
 
 type ObfuscatorTestSuite struct {
 	SnapshotTestSuite
-
-	secret *mtglib.Secret
 }
 
 func (s *ObfuscatorTestSuite) SetupSuite() {
 	s.Setup("", "client-handshake")
-
-	secret := mtglib.GenerateSecret("hostname.com")
-	s.secret = &secret
 }
 
 func (s *ObfuscatorTestSuite) TestSnapshot() {
@@ -50,7 +44,8 @@ func (s *ObfuscatorTestSuite) TestSnapshot() {
 					require.NoError(t, err)
 				})
 
-			dc, cn, err := obfs.ReadHandshake(connMock)
+			dc, tag, cn, err := obfs.ReadHandshake(connMock, paddedOnly)
+			assert.Equal(t, obfuscation.TagPaddedIntermediate, tag)
 			assert.EqualValues(t, 2, dc)
 			assert.NoError(t, err)
 
