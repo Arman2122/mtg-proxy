@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -338,4 +339,46 @@ func TestServeHTTPLastSeenZeroIsNull(t *testing.T) {
 	require.NoError(t, json.Unmarshal(users["alice"], &aliceRaw))
 
 	assert.Equal(t, "null", string(aliceRaw["last_seen"]))
+}
+
+// TestFailedObfuscatedHandshakeCreatesNoEmptyUser is the accounting half of the
+// entry split. On a plaintext listener the secret is unknown until the frame is
+// trial-decrypted, so a probe that matches nothing must leave no trace at all:
+// an "" bucket in /stats would silently collect every unattributed byte and
+// would appear in the panel as a user nobody can find.
+func TestFailedObfuscatedHandshakeCreatesNoEmptyUser(t *testing.T) {
+	t.Parallel()
+
+	known, err := GenerateSecretMode(SecretModeDD, "")
+	require.NoError(t, err)
+
+	unknown, err := GenerateSecretMode(SecretModeDD, "")
+	require.NoError(t, err)
+
+	h := newEntryHarness(t, map[string]Secret{"alice": known}, nil)
+
+	client, done := h.dialProxy(t, obfuscatedPolicy(ModeSetOf(SecretModeDD), UnknownSecretClose))
+
+	_, err = client.Write(obfuscatedFrame(t, unknown.Key, obfuscation.TagPaddedIntermediate, 2))
+	require.NoError(t, err)
+
+	<-done
+
+	h.proxy.stats.mu.RLock()
+	_, hasEmpty := h.proxy.stats.users[""]
+	h.proxy.stats.mu.RUnlock()
+
+	assert.False(t, hasEmpty, "a failed obfuscated handshake must not create an unnamed user")
+
+	rec := httptest.NewRecorder()
+	h.proxy.stats.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+
+	var resp StatsResponse
+
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.NotContains(t, resp.Users, "")
+
+	h.proxy.liveMu.Lock()
+	assert.NotContains(t, h.proxy.liveConns, "")
+	h.proxy.liveMu.Unlock()
 }

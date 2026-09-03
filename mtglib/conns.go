@@ -42,6 +42,16 @@ func (c connTraffic) Write(b []byte) (int, error) {
 	return n, err //nolint: wrapcheck
 }
 
+// policyConn carries the accepting listener's policy into ServeConn.
+// MultiListener fans several sockets into one Accept and the PROXY-protocol
+// adapter rewrites LocalAddr from a peer-supplied header, so the policy cannot
+// be recovered downstream from the connection's own addresses.
+type policyConn struct {
+	essentials.Conn
+
+	policy ListenerPolicy
+}
+
 type connRewind struct {
 	essentials.Conn
 

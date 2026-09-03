@@ -3,7 +3,88 @@ package mtglib
 import (
 	"net"
 	"time"
+
+	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
 )
+
+// UnknownSecretAction is how an obfuscated2 listener disposes of a connection
+// it refused. The ZERO VALUE is close, which is the right answer on loopback.
+type UnknownSecretAction uint8
+
+const (
+	// UnknownSecretClose closes a refused connection immediately.
+	UnknownSecretClose UnknownSecretAction = iota
+
+	// UnknownSecretDrain reads and discards from a refused connection, bounded
+	// in both bytes and time, before closing. On a public listener a socket that
+	// neither answers nor hangs up is less distinctive than a prompt reset.
+	UnknownSecretDrain
+)
+
+// ListenerPolicy is what one listening socket HONOURS. The mode a connection
+// actually uses is always derived (entry path + decrypted tag); this only says
+// which derivations are served. The ZERO VALUE is FakeTLS-only, so an existing
+// Serve(listener) call and a bare ServeConn are byte-for-byte unchanged.
+type ListenerPolicy struct {
+	// Modes is the set of secret forms this socket serves.
+	Modes ModeSet
+
+	// Public is the operator's acknowledgement that a non-loopback obfuscated2
+	// port is fingerprintable as an MTProto proxy. It also arms HandshakesPerIP.
+	Public bool
+
+	// ProxyProtocol says a PROXY header is expected on this listener. It is
+	// consumed by the CLI when it builds the socket, not by the proxy.
+	ProxyProtocol bool
+
+	// OnUnknownSecret is the disposal of a refused connection.
+	OnUnknownSecret UnknownSecretAction
+
+	// HandshakesPerIP is the per-IP failed-handshake budget per second (burst
+	// 2x). 0 disables it, and it is armed only when Public is set.
+	HandshakesPerIP uint
+}
+
+// DefaultListenerPolicy is what an unstamped connection gets: FakeTLS only.
+// Failing closed here is what keeps a wiring mistake from turning a public port
+// into an obfuscated2 oracle.
+var DefaultListenerPolicy = ListenerPolicy{Modes: ModeSetOf(SecretModeFakeTLS)}
+
+// Obfuscated reports whether this socket serves the pre-FakeTLS entry.
+func (p ListenerPolicy) Obfuscated() bool {
+	return p.Modes.Has(SecretModeDD) || p.Modes.Has(SecretModePlain)
+}
+
+// Tags is the set of obfuscated2 connection-type tags this socket honours.
+func (p ListenerPolicy) Tags() obfuscation.TagSet {
+	return p.Modes.Tags()
+}
+
+// ListenerJSON is one entry of the listener capability report on GET /stats.
+type ListenerJSON struct {
+	Bind   string   `json:"bind"`
+	Accept []string `json:"accept"`
+	Public bool     `json:"public"`
+}
+
+// SecretsCanFront reports whether a secret set leaves the always-present FakeTLS
+// listener a cover site to fall back to: at least one ee secret, or an explicit
+// domain-fronting host. Without one, every failed ClientHello on the public port
+// would have nowhere to go, and closing instead of fronting is exactly the
+// distinguisher the fronting path exists to avoid.
+func SecretsCanFront(secrets map[string]Secret, domainFrontingHost string) bool {
+	if domainFrontingHost != "" {
+		return true
+	}
+
+	for _, secret := range secrets {
+		if secret.Hosted() && secret.Host != "" {
+			return true
+		}
+	}
+
+	return false
+}
 
 // SecretConfig is the full set of runtime-swappable secret state produced by a
 // SecretsReloader: the named secrets plus the optional advertising tags. It is
@@ -292,6 +373,20 @@ type ProxyOpts struct {
 	//
 	// This is an optional setting.
 	AdvertisedPort int
+
+	// Listeners describes every socket this proxy was configured to serve, for
+	// the capability report on GET /stats. It is display only: the policy that
+	// actually governs a connection travels on the connection itself.
+	//
+	// This is an optional setting.
+	Listeners []ListenerJSON
+
+	// ListenerModes is the union of every configured listener's accept set. It
+	// is what tells NewProxy that a dd or plain secret has no door, so the
+	// operator gets a warning instead of a client that silently cannot connect.
+	//
+	// This is an optional setting.
+	ListenerModes ModeSet
 
 	// APIToken, when non-empty, requires every management-API request to carry
 	// an "Authorization: Bearer <token>" header. Empty keeps the API
