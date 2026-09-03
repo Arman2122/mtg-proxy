@@ -21,9 +21,17 @@ type tomlConfig struct {
 		Expires    string `toml:"expires" json:"expires,omitempty"`
 		Disabled   bool   `toml:"disabled" json:"disabled,omitempty"`
 	} `toml:"secret-limits" json:"secretLimits,omitempty"`
-	UsageStateFile              string `toml:"usage-state-file" json:"usageStateFile,omitempty"`
-	APIToken                    string `toml:"api-token" json:"apiToken,omitempty"`
-	BindTo                      any    `toml:"bind-to" json:"bindTo"`
+	UsageStateFile string `toml:"usage-state-file" json:"usageStateFile,omitempty"`
+	APIToken       string `toml:"api-token" json:"apiToken,omitempty"`
+	BindTo         any    `toml:"bind-to" json:"bindTo"`
+	Listeners      []struct {
+		BindTo          string   `toml:"bind-to"           json:"bindTo"`
+		Accept          []string `toml:"accept"            json:"accept,omitempty"`
+		Public          bool     `toml:"public"            json:"public,omitempty"`
+		ProxyProtocol   bool     `toml:"proxy-protocol"    json:"proxyProtocol,omitempty"`
+		OnUnknownSecret string   `toml:"on-unknown-secret" json:"onUnknownSecret,omitempty"`
+		HandshakesPerIP uint     `toml:"handshakes-per-ip" json:"handshakesPerIp,omitempty"`
+	} `toml:"listener" json:"listeners,omitempty"`
 	ProxyProtocolListener       bool   `toml:"proxy-protocol-listener" json:"proxyProtocolListener"`
 	PreferIP                    string `toml:"prefer-ip" json:"preferIp,omitempty"`
 	AutoUpdate                  bool   `toml:"auto-update" json:"autoUpdate,omitempty"`

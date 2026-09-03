@@ -46,6 +46,7 @@ SOCKS5 proxy chaining, IP blocklists and allowlists, Prometheus and statsd metri
   - [Environment variables](#environment-variables)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
+  - [Extra listeners (`[[listener]]`)](#extra-listeners-listener)
 - [Credits](#credits)
 
 ## Quick start
@@ -428,6 +429,48 @@ process already uses every CPU core, and multiple secrets are configured through
 [example.config.toml](example.config.toml) documents every option with its
 default value and inline notes. A real config only needs the options you actually
 change — every key has a sensible default.
+
+### Extra listeners (`[[listener]]`)
+
+`bind-to` is, and stays, FakeTLS-only. To also serve the two pre-FakeTLS secret
+forms — `dd` (`dd` + 32 hex) and plain (a bare 32-hex key) — add a `[[listener]]`
+block. It is a separate socket: one port never serves both entry paths, and there
+is no sniffing.
+
+```toml
+bind-to = "0.0.0.0:443"        # unchanged, FakeTLS only
+
+[[listener]]
+bind-to = "127.0.0.1:2398"
+accept  = ["dd", "plain"]
+```
+
+The intended consumer is Telegram's own WEB proxy front-end
+([tproxy-server](https://github.com/telegramdesktop/tproxy-server)), whose backend
+address is restricted to loopback and which speaks plain obfuscated2 to it.
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `bind-to` | `host:port`, host must be a literal IP | *required* | address for this obfuscated2 listener |
+| `accept` | string array, non-empty subset of `{"dd","plain"}` | *required* | which secret forms this socket honours. `"ee"` is rejected — run two listeners if you need both |
+| `public` | bool | `false` | your acknowledgement that a non-loopback obfuscated2 port is fingerprintable as an MTProto proxy. Required on any non-loopback `bind-to` |
+| `proxy-protocol` | bool | `false` | expect a PROXY header on **this** listener. The top-level `proxy-protocol-listener` applies to `bind-to` only |
+| `on-unknown-secret` | `"close"` \| `"drain"` | `"close"` | disposal of a connection no secret matches. `drain` reads and discards under a bounded budget instead of resetting |
+| `handshakes-per-ip` | uint | `30` | per-IP failed-handshake budget per second (burst 2×). Armed only when `public = true`, because behind a loopback carrier every connection presents `127.0.0.1` and one shared bucket is a self-DoS |
+
+Secrets are not per-listener. A secret is 16 key bytes, and the same key is valid
+in all three wire forms; the prefix only tells the *client* how to connect. So an
+existing `ee` user keeps one name, one quota bucket and one set of stats whichever
+door they arrive through — nothing needs to be re-issued.
+
+> **TOML ordering.** `[[listener]]` is an array of tables, so every top-level key
+> written after it belongs to the listener rather than to the global scope — the
+> same rule that already forces `[secrets]` to come last. Put your `[[listener]]`
+> blocks after all global keys, and `[secrets]` after those.
+
+Older mtg-proxy binaries ignore unknown TOML keys, so a config carrying
+`[[listener]]` still runs on one that predates this feature: it simply serves
+`ee` on `bind-to` as before, and no user of any existing mode is affected.
 
 ## Credits
 

@@ -68,6 +68,65 @@ bind-to = "0.0.0.0:3128"
 # Or an array to listen on multiple addresses at once:
 # bind-to = ["127.0.0.1:443", "[::1]:443"]
 
+# Additional listeners for the pre-FakeTLS secret forms. This section is purely
+# additive: bind-to above is never replaced and always serves FakeTLS only, so a
+# config written for this feature still runs on an older mtg-proxy (which ignores
+# unknown TOML keys) -- it just loses the extra listener.
+#
+# The intended consumer is Telegram's own WEB proxy front-end
+# (github.com/telegramdesktop/tproxy-server), whose backend address is restricted
+# to loopback. It speaks plain TCP obfuscated2 to its backend and accepts only
+# 16-byte and 17-byte-0xdd secrets, so this is what makes mtg-proxy a drop-in
+# replacement for stock MTProxy behind it.
+#
+# There is deliberately no way to accept dd or plain on the bind-to port: a
+# listener that answers obfuscated2 is fingerprintable as an MTProto proxy, and
+# that has to be an explicit stanza, not a one-token edit.
+#
+# [[listener]] is an array of TABLES: every top-level key that follows it belongs
+# to the listener, not to the global scope. Uncommenting the block where it
+# stands would silently swallow proxy-protocol-listener, concurrency and
+# everything else below. Move it down to just above [secrets] instead.
+#
+# [[listener]]
+# # Required. Host must be a literal IP.
+# bind-to = "127.0.0.1:2398"
+#
+# # Required. Non-empty subset of ["dd", "plain"]. "ee" is not accepted here.
+# #   dd    - honours 0xdddddddd (padded-intermediate) only.
+# #   plain - honours 0xdddddddd, 0xeeeeeeee and 0xefefefef. A bare 16-byte
+# #           secret places no constraint on the client's transport: tdlib sends
+# #           intermediate, Telegram Desktop and iOS send abridged, and any of
+# #           them may pick padded-intermediate.
+# accept = ["dd", "plain"]
+#
+# # Required when bind-to above is not a loopback address. It is your
+# # acknowledgement that this port answers obfuscated2 in the clear.
+# # public = false
+#
+# # Expect a PROXY protocol header on THIS listener. Independent of the
+# # top-level proxy-protocol-listener, which applies to bind-to only.
+# # tproxy-server does not send one, so leave this false for a WEB backend.
+# # proxy-protocol = false
+#
+# # What to do with a connection no secret matches (also: unhonoured transport,
+# # rate-limited peer, replayed frame, disabled/expired/over-quota user -- all
+# # take the same exit, so none is distinguishable from the others).
+# #   close - close immediately. The default, and the right answer on loopback.
+# #   drain - read and discard, bounded to 8 KiB / 20 seconds, then close. For a
+# #           public listener, where a socket that neither answers nor hangs up
+# #           is less distinctive than a prompt reset.
+# # This listener never domain-fronts: it does not speak TLS, so relaying a probe
+# # to an HTTPS cover site would pipe a TLS alert back out of a plaintext port.
+# # on-unknown-secret = "close"
+#
+# # Failed-handshake budget per client IP, per second (burst 2x), minimum 1.
+# # Armed only when public = true: behind a loopback carrier every connection
+# # presents 127.0.0.1, so a per-IP bucket there is one shared bucket an attacker
+# # empties for every legitimate user -- a self-DoS, not a defence. That is also
+# # how you turn it off: leave public unset.
+# # handshakes-per-ip = 30
+
 # This defines what types of traffic mtg listens to. If you are not sure,
 # then definitely keep it disable. Enable it only and only if incoming traffic
 # is coming from some sort of load-balancer like HAProxy or ELB.

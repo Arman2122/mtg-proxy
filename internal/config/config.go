@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"time"
 
@@ -22,6 +23,58 @@ type ConfigSecretLimit struct {
 	QuotaReset TypeQuotaReset `json:"quotaReset"`
 	Expires    TypeExpiry     `json:"expires"`
 	Disabled   TypeBool       `json:"disabled"`
+}
+
+// ConfigListener is one [[listener]] block: an extra socket serving the
+// pre-FakeTLS secret forms. It is purely additive -- the top-level bind-to is
+// never replaced and always stays FakeTLS-only, because a socket that answers
+// obfuscated2 is fingerprintable as an MTProto proxy and that has to be an
+// explicit stanza rather than a one-token edit of an existing key.
+type ConfigListener struct {
+	BindTo          TypeHostPort            `json:"bindTo"`
+	Accept          []TypeSecretMode        `json:"accept"`
+	Public          TypeBool                `json:"public"`
+	ProxyProtocol   TypeBool                `json:"proxyProtocol"`
+	OnUnknownSecret TypeUnknownSecretAction `json:"onUnknownSecret"`
+	HandshakesPerIP TypeConcurrency         `json:"handshakesPerIp"`
+}
+
+// defaultHandshakesPerIP is the per-IP obfuscated2 failure budget used when a
+// [[listener]] names none. It is armed only on a public listener.
+const defaultHandshakesPerIP = 30
+
+// Policy converts one configured listener into the runtime policy the proxy
+// stamps onto every connection accepted from its socket. It is also where V2 is
+// enforced, so Validate and run_proxy cannot disagree about what a listener
+// honours.
+func (l ConfigListener) Policy() (mtglib.ListenerPolicy, error) {
+	modes := make([]mtglib.SecretMode, 0, len(l.Accept))
+
+	for _, entry := range l.Accept {
+		modes = append(modes, entry.Get())
+	}
+
+	set := mtglib.ModeSetOf(modes...)
+
+	if set.Empty() || set.Has(mtglib.SecretModeFakeTLS) {
+		return mtglib.ListenerPolicy{}, fmt.Errorf(
+			"listener %s: accept must be a non-empty subset of [\"dd\",\"plain\"]; "+
+				"the top-level bind-to serves FakeTLS and a [[listener]] never does. "+
+				"Run two listeners if you need both", l.BindTo.Get(""))
+	}
+
+	action := mtglib.UnknownSecretClose
+	if l.OnUnknownSecret.Get(TypeUnknownSecretActionClose) == TypeUnknownSecretActionDrain {
+		action = mtglib.UnknownSecretDrain
+	}
+
+	return mtglib.ListenerPolicy{
+		Modes:           set,
+		Public:          l.Public.Get(false),
+		ProxyProtocol:   l.ProxyProtocol.Get(false),
+		OnUnknownSecret: action,
+		HandshakesPerIP: l.HandshakesPerIP.Get(defaultHandshakesPerIP),
+	}, nil
 }
 
 type ListConfig struct {
@@ -43,6 +96,7 @@ type Config struct {
 	UsageStateFile              string                       `json:"usageStateFile"`
 	APIToken                    string                       `json:"apiToken"`
 	BindTo                      []TypeHostPort               `json:"bindTo"`
+	Listeners                   []ConfigListener             `json:"listeners"`
 	ProxyProtocolListener       TypeBool                     `json:"proxyProtocolListener"`
 	PreferIP                    TypePreferIP                 `json:"preferIp"`
 	AutoUpdate                  TypeBool                     `json:"autoUpdate"`
@@ -180,12 +234,60 @@ func (c *Config) Validate() error {
 		seen[v] = struct{}{}
 	}
 
+	if err := c.validateListeners(seen); err != nil {
+		return err
+	}
+
+	// V4: bind-to is mandatory and permanently ee-only, so every process has a
+	// FakeTLS listener. Without a hostname to fall back to it could not front a
+	// failed ClientHello, and closing instead is exactly the distinguisher the
+	// fronting path exists to avoid.
+	if !mtglib.SecretsCanFront(c.GetSecrets(), c.GetDomainFrontingHost()) {
+		return fmt.Errorf("no secret carries a fronting hostname and domain-fronting.host is unset; " +
+			"the FakeTLS listener would have no cover site. " +
+			"Set domain-fronting.host, or keep at least one ee secret")
+	}
+
 	if err := c.validateAdTags(); err != nil {
 		return err
 	}
 
 	if err := c.validateSecretLimits(); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// validateListeners enforces V1-V3 for the [[listener]] blocks. It is handed
+// the map already holding every top-level bind-to address, so one lookup catches
+// a collision inside either group and across the two: an address serves exactly
+// one accept policy, and two sockets on it would race for the same port.
+func (c *Config) validateListeners(seen map[string]struct{}) error {
+	for _, l := range c.Listeners {
+		addr := l.BindTo.Get("")
+		if addr == "" {
+			return fmt.Errorf("incorrect listener bind-to parameter: empty address")
+		}
+
+		if _, ok := seen[addr]; ok {
+			return fmt.Errorf("two listeners bind %s; one address serves one accept policy", addr)
+		}
+
+		seen[addr] = struct{}{}
+
+		policy, err := l.Policy()
+		if err != nil {
+			return err
+		}
+
+		if ip := net.ParseIP(l.BindTo.Host); (ip == nil || !ip.IsLoopback()) && !l.Public.Get(false) {
+			return fmt.Errorf(
+				"listener %s accepts %v on a public address. "+
+					"A non-FakeTLS listener answers obfuscated2 and is fingerprintable as an MTProto proxy. "+
+					"Set public = true on this [[listener]] to confirm, or bind it to 127.0.0.1",
+				addr, policy.Modes.Strings())
+		}
 	}
 
 	return nil
@@ -325,6 +427,29 @@ func (c *Config) GetBindAddrs() []string {
 	}
 
 	return addrs
+}
+
+// GetListeners returns every configured [[listener]], or nil.
+func (c *Config) GetListeners() []ConfigListener {
+	if len(c.Listeners) == 0 {
+		return nil
+	}
+
+	return c.Listeners
+}
+
+// GetListenerModes returns the union of every [[listener]]'s accept set, for
+// the /stats capability report and the unserved-secret warning.
+func (c *Config) GetListenerModes() mtglib.ModeSet {
+	var set mtglib.ModeSet
+
+	for _, l := range c.Listeners {
+		for _, entry := range l.Accept {
+			set |= mtglib.ModeSetOf(entry.Get())
+		}
+	}
+
+	return set
 }
 
 // GetFirstBindPort returns the port of the first bind address.
