@@ -12,13 +12,14 @@ fuzzflags = "-fuzztime=120s"
 [tasks.build]
 description = "Build binary"
 sources = ["**/*.go", "go.mod", "go.sum"]
-outputs = ["mtg"]
+outputs = ["mtg-proxy"]
 run = "go build"
 
+# No `outputs`: this writes the same ./mtg-proxy path as `build` and `static`,
+# so a staleness check would skip it and leave the previous variant in place.
 [tasks."build:prof"]
 description = "Build binary with profiling enabled"
 sources = ["**/*.go", "go.mod", "go.sum"]
-outputs = ["mtg"]
 run = "go build -tags prof"
 
 [tasks.update]
@@ -63,10 +64,10 @@ run = "go test -v {{ vars.fuzzflags }} -fuzz=FuzzClientServerHandshake ./mtglib/
 description = "Run fuzzy test for GenerateHandshakeFrame"
 run = "go test -v {{ vars.fuzzflags }} -fuzz=FuzzGenerateHandshakeFrame ./mtglib/obfuscation"
 
+# No `outputs`, for the same reason as build:prof — same path, different flags.
 [tasks.static]
 description = "Build static binary"
 sources = ["**/*.go", "go.mod", "go.sum"]
-outputs = ["mtg"]
 run = """
 #!/bin/bash
 
@@ -82,7 +83,7 @@ go build \
 [tasks.image]
 description = "Build docker image"
 sources = ["**/*.go", "go.mod", "go.sum", "Dockerfile"]
-run = "docker buildx build --pull -t mtg ."
+run = "docker buildx build --pull -t mtg-proxy ."
 
 [tasks.docs]
 description = "Run doc server"
