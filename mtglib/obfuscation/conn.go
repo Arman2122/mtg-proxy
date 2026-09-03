@@ -15,13 +15,16 @@ type conn struct {
 
 func (c conn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
-	if err != nil {
-		return n, err
+
+	// io.Reader is allowed to return n > 0 together with an error, and callers
+	// like io.CopyBuffer do forward those n bytes. Decryption cannot be skipped
+	// on the error path for a second reason too: the CTR keystream must advance
+	// by exactly n, otherwise every later read decrypts at the wrong offset.
+	if n > 0 {
+		c.recvCipher.XORKeyStream(p, p[:n])
 	}
 
-	c.recvCipher.XORKeyStream(p, p[:n])
-
-	return n, nil
+	return n, err
 }
 
 func (c conn) Write(p []byte) (int, error) {
