@@ -159,19 +159,29 @@ curl http://127.0.0.1:9090/stats
   "started_at": "2026-03-29T10:30:00Z",
   "uptime_seconds": 3600,
   "total_connections": 15,
+  "features": ["faketls", "quota-reset", "secrets-api"],
   "users": {
     "alice": {
       "connections": 8,
       "bytes_in": 1048576,
       "bytes_out": 2097152,
-      "last_seen": "2026-03-29T11:25:30Z"
+      "last_seen": "2026-03-29T11:25:30Z",
+      "quota_used": 3145728
     }
   }
 }
 ```
 
 `last_seen` is `null` for a user who has never connected. The `throttle` object
-is included only when [throttling](#connection-throttling) is configured.
+is included only when [throttling](#connection-throttling) is configured, and a
+user's `quota`, `quota_remaining`, `quota_reset`, `expires_at` and `disabled`
+fields appear only when that user has the corresponding
+[limit](#per-user-quotas-expiry--disable) set.
+
+`features` is a sorted list of capability names this build supports, meant to be
+read before a capability is used — it is how a panel can tell an older binary
+from a newer one without parsing version strings. Names are a public contract:
+existing ones are never renamed or removed, and new ones are only ever appended.
 
 ### Hot secret reload
 

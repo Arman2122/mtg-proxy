@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -351,11 +352,37 @@ func computeFairCaps(userConns map[string]int64, limit int64) map[string]int64 {
 	return caps
 }
 
+// Capability names reported in the "features" array of the /stats response.
+// They are a PUBLIC CONTRACT: downstream tooling (the management panel) matches
+// on these exact strings to decide whether an endpoint may be called, so
+// renaming one is a breaking API change, not a refactor. Only add a name once
+// the capability actually exists in the binary — advertising an absent one
+// defeats the point of the array.
+const (
+	// FeatureFakeTLS means the proxy speaks the FakeTLS (obfuscated) handshake.
+	FeatureFakeTLS = "faketls"
+
+	// FeatureQuotaReset means POST /secrets/{name}/reset-quota is served.
+	FeatureQuotaReset = "quota-reset"
+
+	// FeatureSecretsAPI means the GET/PUT/POST/DELETE /secrets routes are served.
+	FeatureSecretsAPI = "secrets-api"
+)
+
+// supportedFeatures is the sorted capability list this build advertises. Keep it
+// sorted so the response is byte-stable across restarts.
+var supportedFeatures = []string{
+	FeatureFakeTLS,
+	FeatureQuotaReset,
+	FeatureSecretsAPI,
+}
+
 // StatsResponse is the JSON response for the stats endpoint.
 type StatsResponse struct {
 	StartedAt        time.Time                `json:"started_at"`
 	UptimeSeconds    int64                    `json:"uptime_seconds"`
 	TotalConnections int64                    `json:"total_connections"`
+	Features         []string                 `json:"features"`
 	Throttle         *ThrottleJSON            `json:"throttle,omitempty"`
 	Users            map[string]UserStatsJSON `json:"users"`
 }
@@ -434,10 +461,14 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 		}
 	}
 
+	// Features is cloned so a caller cannot mutate the shared package-level list
+	// through a response, and so the field is never nil: it serializes as [],
+	// never null, which the panel relies on.
 	return StatsResponse{
 		StartedAt:        s.startedAt,
 		UptimeSeconds:    int64(time.Since(s.startedAt).Seconds()),
 		TotalConnections: totalConns,
+		Features:         slices.Clone(supportedFeatures),
 		Throttle:         throttle,
 		Users:            users,
 	}
