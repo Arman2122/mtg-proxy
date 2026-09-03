@@ -67,8 +67,9 @@ func (m *middleConn) Write(p []byte) (int, error) {
 		}
 
 		packet := m.inbuf[4 : 4+length]
-		// Secure (padded-intermediate) frames carry 0-3 random padding bytes;
-		// strip them back to the 4-byte-aligned inner packet.
+		// Clients pad padded-intermediate frames with 0-15 random bytes. Trim
+		// only to 4-byte alignment, as MTProxy (packet_len & -4) does: the
+		// aligned remainder is the DC's to discard, not ours.
 		packet = packet[:len(packet)-len(packet)%4]
 
 		if err := m.frame.writePacket(m.buildProxyReq(packet, quickAck)); err != nil {
