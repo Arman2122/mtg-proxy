@@ -22,11 +22,11 @@ const (
 
 // middleConn adapts a middle-proxy RPC channel to essentials.Conn so the
 // existing byte-transparent relay can drive it unchanged. Bytes written to it
-// are the client's padded-intermediate stream (client -> telegram): each
+// are the client's (padded-)intermediate stream (client -> telegram): each
 // complete inner packet is repackaged as an RPC_PROXY_REQ carrying the ad_tag.
 // Bytes read from it (telegram -> client) are RPC_PROXY_ANS payloads reframed
-// as padded-intermediate packets. All framing is internal, so the relay only
-// ever sees a plain byte stream.
+// with a bare 4-byte length, which both transports accept. All framing is
+// internal, so the relay only ever sees a plain byte stream.
 type middleConn struct {
 	raw        essentials.Conn
 	frame      *frameConn
@@ -35,11 +35,16 @@ type middleConn struct {
 	clientAddr *net.TCPAddr
 	ourAddr    *net.TCPAddr
 
+	// padded is true when the client speaks padded-intermediate (0xdddddddd).
+	// It is the only transport that appends padding, so it is the only one that
+	// may declare RPC_F_PAD or have its packets trimmed.
+	padded bool
+
 	inbuf  []byte
 	outbuf []byte
 }
 
-func newMiddleConn(raw essentials.Conn, frame *frameConn, connID [8]byte, adTag [adTagLength]byte, clientAddr, ourAddr *net.TCPAddr) *middleConn {
+func newMiddleConn(raw essentials.Conn, frame *frameConn, connID [8]byte, adTag [adTagLength]byte, clientAddr, ourAddr *net.TCPAddr, padded bool) *middleConn {
 	return &middleConn{
 		raw:        raw,
 		frame:      frame,
@@ -47,6 +52,7 @@ func newMiddleConn(raw essentials.Conn, frame *frameConn, connID [8]byte, adTag 
 		adTag:      adTag,
 		clientAddr: clientAddr,
 		ourAddr:    ourAddr,
+		padded:     padded,
 	}
 }
 
@@ -67,10 +73,14 @@ func (m *middleConn) Write(p []byte) (int, error) {
 		}
 
 		packet := m.inbuf[4 : 4+length]
-		// Clients pad padded-intermediate frames with 0-15 random bytes. Trim
-		// only to 4-byte alignment, as MTProxy (packet_len & -4) does: the
-		// aligned remainder is the DC's to discard, not ours.
-		packet = packet[:len(packet)-len(packet)%4]
+		// A plain intermediate frame carries no padding, so trimming it would
+		// silently truncate real payload.
+		if m.padded {
+			// Clients pad padded-intermediate frames with 0-15 random bytes. Trim
+			// only to 4-byte alignment, as MTProxy (packet_len & -4) does: the
+			// aligned remainder is the DC's to discard, not ours.
+			packet = packet[:len(packet)-len(packet)%4]
+		}
 
 		if err := m.frame.writePacket(m.buildProxyReq(packet, quickAck)); err != nil {
 			return 0, err
@@ -112,8 +122,20 @@ func (m *middleConn) Read(dst []byte) (int, error) {
 	return n, nil
 }
 
+// baseFlags mirrors MTProxy's tag->flags mapping. RPC_F_PAD tells the middle
+// proxy the client's transport carries 0-15 bytes of trailing padding, which is
+// true only for 0xdddddddd.
+func (m *middleConn) baseFlags() uint32 {
+	flags := flagHasAdTag | flagMagic | flagExtMode2 | flagIntermediate
+	if m.padded {
+		flags |= flagPad
+	}
+
+	return flags
+}
+
 func (m *middleConn) buildProxyReq(packet []byte, quickAck bool) []byte {
-	flags := flagHasAdTag | flagMagic | flagExtMode2 | flagIntermediate | flagPad
+	flags := m.baseFlags()
 
 	if quickAck {
 		flags |= flagQuickAck

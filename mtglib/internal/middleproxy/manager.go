@@ -294,12 +294,16 @@ func (m *Manager) orderedAddresses(dc int) []middleAddress {
 // source (needed on multi-homed hosts); the family matching the dialed socket
 // is used. AdvertisedPort is the port reported as ours in RPC_PROXY_REQ.
 type DialParams struct {
-	DC            int
-	ClientAddr    *net.TCPAddr
-	PublicIPv4    net.IP
-	PublicIPv6    net.IP
-	AdvertisedPort int
-	AdTag         [adTagLength]byte
+	DC         int
+	ClientAddr *net.TCPAddr
+	PublicIPv4 net.IP
+	PublicIPv6 net.IP
+	// PaddedIntermediate says the client's transport is 0xdddddddd, the only
+	// one whose frames carry 0-15 bytes of trailing padding. It drives RPC_F_PAD
+	// and the alignment trim, both of which are a lie for plain intermediate.
+	PaddedIntermediate bool
+	AdvertisedPort     int
+	AdTag              [adTagLength]byte
 }
 
 // DialProxyStream connects to a middle proxy for params.DC, performs the RPC
@@ -371,7 +375,8 @@ func (m *Manager) DialProxyStream(dialer Dialer, params DialParams) (essentials.
 			return nil, nil, err //nolint: wrapcheck
 		}
 
-		return newMiddleConn(conn, frame, connID, params.AdTag, params.ClientAddr, rpcOurAddr), remote.IP, nil
+		return newMiddleConn(conn, frame, connID, params.AdTag,
+			params.ClientAddr, rpcOurAddr, params.PaddedIntermediate), remote.IP, nil
 	}
 
 	return nil, nil, fmt.Errorf("cannot connect to any middle proxy for dc %d: %w", params.DC, lastErr)

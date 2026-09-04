@@ -64,6 +64,7 @@ func TestBuildProxyReqLayout(t *testing.T) {
 		adTag:      [adTagLength]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99},
 		clientAddr: &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 5678},
 		ourAddr:    &net.TCPAddr{IP: net.ParseIP("9.10.11.12"), Port: 443},
+		padded:     true,
 	}
 
 	packet := []byte{0xde, 0xad, 0xbe, 0xef}
@@ -72,7 +73,8 @@ func TestBuildProxyReqLayout(t *testing.T) {
 	assert.Equal(t, tagProxyRequest, got[0:4], "tag")
 
 	flags := binary.LittleEndian.Uint32(got[4:8])
-	assert.Equal(t, flagHasAdTag|flagMagic|flagExtMode2|flagIntermediate|flagPad, flags, "flags")
+	assert.Equal(t, flagHasAdTag|flagMagic|flagExtMode2|flagIntermediate|flagPad, flags,
+		"padded-intermediate flags")
 	assert.Zero(t, flags&flagQuickAck, "no quick ack")
 	assert.Zero(t, flags&flagEncrypted, "no encrypted flag for non-zero prefix")
 
@@ -109,6 +111,118 @@ func TestBuildProxyReqFlags(t *testing.T) {
 
 	enc := m.buildProxyReq(bytes.Repeat([]byte{0}, 12), false)
 	assert.NotZero(t, binary.LittleEndian.Uint32(enc[4:8])&flagEncrypted, "encrypted flag set for zero prefix")
+}
+
+func TestBuildProxyReqFlagsIntermediate(t *testing.T) {
+	t.Parallel()
+
+	// A plain intermediate client sends no padding, so RPC_F_PAD must be absent.
+	m := &middleConn{
+		clientAddr: &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 1},
+		ourAddr:    &net.TCPAddr{IP: net.ParseIP("5.6.7.8"), Port: 2},
+	}
+
+	got := m.buildProxyReq([]byte{0xde, 0xad, 0xbe, 0xef}, false)
+
+	flags := binary.LittleEndian.Uint32(got[4:8])
+	assert.Equal(t, flagHasAdTag|flagMagic|flagExtMode2|flagIntermediate, flags,
+		"intermediate flags")
+	assert.Zero(t, flags&flagPad, "no pad flag for intermediate")
+}
+
+// frameMessage extracts the MSG of a single RPC transport frame
+// [MSGLEN(4)|SEQNO(4)|MSG|CRC32(4)]. readPacket cannot be used here: it enforces
+// MSGLEN%4==0, and the deliberately unaligned packet the trim test feeds through
+// makes MSGLEN 102. A real intermediate client never sends one -- MTProto
+// payloads are 4-aligned -- and a hostile one has its frame refused by cbcConn,
+// which is what MTProxy does too.
+func frameMessage(t *testing.T, raw []byte) []byte {
+	t.Helper()
+
+	require.GreaterOrEqual(t, len(raw), 12)
+
+	messageLength := binary.LittleEndian.Uint32(raw[:4])
+	require.LessOrEqual(t, int(messageLength), len(raw))
+
+	return raw[8 : messageLength-4]
+}
+
+func TestWriteAlignmentTrim(t *testing.T) {
+	t.Parallel()
+
+	// The RPC_PROXY_REQ header is a fixed 84 bytes (81 + 3 alignment bytes);
+	// everything after it is the client packet as forwarded.
+	const headerLength = 84
+
+	for name, tc := range map[string]struct {
+		padded bool
+		want   []byte
+	}{
+		// Padded-intermediate: 6 bytes trim to 4, as MTProxy's packet_len & -4.
+		"padded": {padded: true, want: []byte{1, 2, 3, 4}},
+		// Intermediate: no padding exists, so all 6 bytes must survive.
+		"intermediate": {padded: false, want: []byte{1, 2, 3, 4, 5, 6}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			buf := &bytes.Buffer{}
+			m := &middleConn{
+				frame:      newFrameConn(buf, 0),
+				clientAddr: &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 1},
+				ourAddr:    &net.TCPAddr{IP: net.ParseIP("5.6.7.8"), Port: 2},
+				padded:     tc.padded,
+			}
+
+			n, err := m.Write([]byte{6, 0, 0, 0, 1, 2, 3, 4, 5, 6})
+			require.NoError(t, err)
+			assert.Equal(t, 10, n)
+
+			msg := frameMessage(t, buf.Bytes())
+			require.GreaterOrEqual(t, len(msg), headerLength)
+			assert.Equal(t, tc.want, msg[headerLength:], "forwarded packet")
+		})
+	}
+}
+
+// Real MTProto payloads are always a multiple of 4 -- tdlib asserts it and
+// MTProxy rejects packet_len & 3 -- so on every packet that can actually occur
+// the trim is a no-op and the two paths must be byte-identical. Without this,
+// the only coverage of the intermediate branch is an unaligned packet that
+// production never produces, and a change to the padded path could regress real
+// traffic while TestWriteAlignmentTrim stayed green.
+func TestAlignedPacketIsIdenticalBothWays(t *testing.T) {
+	t.Parallel()
+
+	// The RPC_PROXY_REQ header is a fixed 84 bytes and legitimately differs
+	// between the two -- flagPad is exactly what C3 made conditional. What must
+	// not differ is the client packet carried after it.
+	const headerLength = 84
+
+	forwarded := func(padded bool) []byte {
+		t.Helper()
+
+		buf := &bytes.Buffer{}
+		m := &middleConn{
+			frame:      newFrameConn(buf, 0),
+			clientAddr: &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 1},
+			ourAddr:    &net.TCPAddr{IP: net.ParseIP("5.6.7.8"), Port: 2},
+			padded:     padded,
+		}
+
+		n, err := m.Write([]byte{8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8})
+		require.NoError(t, err)
+		require.Equal(t, 12, n)
+
+		msg := frameMessage(t, buf.Bytes())
+		require.GreaterOrEqual(t, len(msg), headerLength)
+
+		return msg[headerLength:]
+	}
+
+	assert.Equal(t, []byte{1, 2, 3, 4, 5, 6, 7, 8}, forwarded(true))
+	assert.Equal(t, forwarded(true), forwarded(false),
+		"a 4-aligned packet must forward identically whether or not padding is declared")
 }
 
 func TestParseProxyResponse(t *testing.T) {
