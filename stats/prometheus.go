@@ -5,11 +5,26 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/Arman2122/mtg-proxy/events"
 	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// Deadlines for the scrape endpoint. Without them a client that opens a
+// connection and dribbles header bytes holds a goroutine and a socket forever.
+const (
+	// A scrape is a bodyless GET, so headers and the whole request are bounded
+	// tightly; 5s/10s only ever hits a client that is not really sending.
+	scrapeReadHeaderTimeout = 5 * time.Second
+	scrapeReadTimeout       = 10 * time.Second
+	// Rendering the registry is fast, but a slow scraper drains the body at its
+	// own pace; 30s is well past any sane scrape_timeout.
+	scrapeWriteTimeout = 30 * time.Second
+	// Keep-alive idle between scrapes, which come far more often than this.
+	scrapeIdleTimeout = 120 * time.Second
 )
 
 type prometheusProcessor struct {
@@ -193,7 +208,11 @@ func NewPrometheus(metricPrefix, httpPath string) *PrometheusFactory { //nolint:
 
 	factory := &PrometheusFactory{
 		httpServer: &http.Server{
-			Handler: mux,
+			Handler:           mux,
+			ReadHeaderTimeout: scrapeReadHeaderTimeout,
+			ReadTimeout:       scrapeReadTimeout,
+			WriteTimeout:      scrapeWriteTimeout,
+			IdleTimeout:       scrapeIdleTimeout,
 		},
 
 		metricClientConnections: prometheus.NewGaugeVec(prometheus.GaugeOpts{

@@ -210,10 +210,7 @@ func (p *Proxy) SetGlobalAdTag(tag *[AdTagLength]byte) error {
 // the mux is built with access to the whole proxy so it can serve the secrets
 // and adtag routes in addition to /stats and /reload.
 func (p *Proxy) startAPIServer(ctx context.Context, bindTo, token string) {
-	srv := &http.Server{
-		Addr:    bindTo,
-		Handler: p.buildAPIHandler(token),
-	}
+	srv := newAPIServer(bindTo, p.buildAPIHandler(token))
 
 	// Background, not ctx, and contextcheck is told so deliberately.
 	// net.Listen never took a context; ListenConfig is spelled out here only
@@ -253,6 +250,33 @@ func (p *Proxy) startAPIServer(ctx context.Context, bindTo, token string) {
 	}
 
 	p.logger.BindStr("bind", bindTo).BindStr("auth", authState).Info("Management API server started")
+}
+
+// Deadlines for the management API. Without them a client that opens a
+// connection and dribbles header bytes holds a goroutine and a socket forever.
+const (
+	// Headers are a few hundred bytes and arrive in the first packet even on a
+	// bad link, so 5s only ever hits a client that is not really sending.
+	apiReadHeaderTimeout = 5 * time.Second
+	// Bounds the request body too (PUT /secrets is the largest, still small).
+	apiReadTimeout = 30 * time.Second
+	// Must outlast the slowest handler: a /reload config re-read and secret swap,
+	// or a big /stats drained by a loaded panel. Both are far under a minute.
+	apiWriteTimeout = 60 * time.Second
+	// Keep-alive idle between panel polls; the panel scrapes far more often.
+	apiIdleTimeout = 120 * time.Second
+)
+
+// newAPIServer builds the management API HTTP server with the deadlines above.
+func newAPIServer(bindTo string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              bindTo,
+		Handler:           handler,
+		ReadHeaderTimeout: apiReadHeaderTimeout,
+		ReadTimeout:       apiReadTimeout,
+		WriteTimeout:      apiWriteTimeout,
+		IdleTimeout:       apiIdleTimeout,
+	}
 }
 
 // buildAPIHandler wires every management route and wraps the mux in the bearer
