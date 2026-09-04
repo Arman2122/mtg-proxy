@@ -43,7 +43,20 @@ import (
 )
 
 // acceptGUID is the constant RFC 6455 §1.3 defines for the accept hash.
-const acceptGUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11D"
+//
+// It is verified against the RFC's own published test vector in
+// TestAcceptKeyMatchesTheRFCVector, and that test is not decoration. This
+// constant was wrong for the life of the package -- the last group read
+// "5AB0DC85B11D" instead of "C5AB0DC85B11", one character rotated off the front
+// and onto the end -- and nothing caught it, because every test that exercised
+// the handshake computed the expected answer with THIS constant and agreed with
+// itself. A real browser does not: it recomputes the hash and closes the socket
+// before onopen, which is exactly what Telegram Desktop did, on every attempt,
+// with no error anywhere that named the cause.
+//
+// The lesson is in the shape of the bug, not the typo. A wire constant is only
+// ever validated by a value that came from outside this codebase.
+const acceptGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 // Opcodes. The carrier uses binary and the three control frames.
 const (

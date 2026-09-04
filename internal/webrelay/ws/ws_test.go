@@ -91,7 +91,12 @@ func (c *rawClient) response() *http.Response {
 }
 
 func (c *rawClient) acceptKey() string {
-	sum := sha1.Sum([]byte(c.key + "258EAFA5-E914-47DA-95CA-5AB0DC85B11D")) //nolint:gosec // the RFC names SHA-1
+	// The RFC 6455 GUID, typed out here independently of the server's copy. That
+	// independence is the point: when this test client shared a mistyped
+	// constant with the server, the two agreed perfectly and every real browser
+	// refused the handshake. If these two ever disagree, one of them is wrong
+	// and TestAcceptKeyMatchesTheRFCVector says which.
+	sum := sha1.Sum([]byte(c.key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")) //nolint:gosec // the RFC names SHA-1
 
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
@@ -552,11 +557,13 @@ func TestLiveness(t *testing.T) {
 // so it is pinned against a fixed vector rather than recomputed by the test with
 // the same code under test.
 //
-// The expected value was produced by an independent implementation of the same
-// construction (Node's crypto, in a scratch script) rather than copied from a
-// document, because a mistyped constant here would pass review and fail every
-// real browser. TestBridgeInABrowser is the end of that argument: a genuine
-// Chromium handshake refuses a wrong accept key outright.
+// The key and the expected answer are the ones printed in RFC 6455 section 1.3,
+// copied from the document. An earlier version of this test pinned a value
+// "produced by an independent implementation" instead, and that value was wrong:
+// it had been generated with the same mistyped GUID, so it agreed with the code
+// and disagreed with every browser on earth. Telegram Desktop connected and
+// dropped, on every attempt, for exactly this reason. Take these two strings
+// from the RFC and nowhere else.
 func TestAcceptKeyIsCorrectForAFixedVector(t *testing.T) {
 	t.Parallel()
 
@@ -582,5 +589,5 @@ func TestAcceptKeyIsCorrectForAFixedVector(t *testing.T) {
 	defer response.Body.Close()
 
 	require.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
-	require.Equal(t, "7NQHw21/u2y5o3iigl/YosUutlE=", response.Header.Get("Sec-WebSocket-Accept"))
+	require.Equal(t, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", response.Header.Get("Sec-WebSocket-Accept"))
 }

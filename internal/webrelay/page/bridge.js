@@ -126,20 +126,100 @@
 
   var boundary = null;
 
+  // deliveryChannel remembers which way the client actually talks to this page,
+  // because the boundary is registered more than one way and only one of them is
+  // real. Whichever fires first wins; a message arriving over any other channel
+  // afterwards is the same message seen twice, and delivering it again would put
+  // a duplicate HELLO or a repeated frame into the session.
+  var deliveryChannel = null;
+
+  function deliverFrom(channel, value) {
+    if (deliveryChannel === null) {
+      deliveryChannel = channel;
+    }
+
+    if (deliveryChannel !== channel) {
+      return;
+    }
+
+    onClientValue(unwrapMessage(value));
+  }
+
+  // unwrapMessage takes the payload out of a message wrapper, and leaves
+  // anything else alone.
+  //
+  // Three shapes reach this, and only the first is documented. Android's slot
+  // hands over the value itself. An EventTarget hands over a MessageEvent. A
+  // desktop client hands over a plain object carrying "data" that is NOT an
+  // Event instance at all -- so an instanceof test is the wrong one, and using
+  // it meant every message from that client fell through to the control path
+  // and was discarded as unrecognised. The HELLO was arriving from the first
+  // attempt; nothing was reading it.
+  //
+  // The test is therefore what a value CARRIES, not what it is an instance of.
+  // A tagged control object is never a wrapper, so the "t" tag protects a
+  // legitimate control message that happens to have a "data" field of its own.
+  function unwrapMessage(value) {
+    if (!value || typeof value !== 'object') {
+      return value;
+    }
+
+    try {
+      if (window.Event && value instanceof window.Event) {
+        return value.data;
+      }
+    } catch (err) {
+      // An engine without a global Event, or a hostile getter. Fall through.
+    }
+
+    if (value.t !== undefined) {
+      return value;
+    }
+
+    var inner = value.data;
+
+    if (inner === undefined || inner === null) {
+      return value;
+    }
+
+    // Only unwrap to something this bridge can actually use: bytes, or the JSON
+    // text of a control object. Anything else is left alone rather than guessed
+    // at.
+    if (typeof inner === 'string' || asBytes(inner) !== null) {
+      return inner;
+    }
+
+    return value;
+  }
+
   function webviewBoundary(host, nonce) {
     return {
       framed: true,
       start: function () {
-        // A plain property assignment, not addEventListener: the injected
-        // object publishes onmessage as a callback slot and is not an
-        // EventTarget.
+        // Registered BOTH ways, because the injected object is not the same
+        // shape everywhere and the page cannot ask which it has.
+        //
+        // The published documents describe Android, where AndroidX's exact-origin
+        // message API publishes onmessage as a plain callback slot. A desktop
+        // client injects an object of its own over a WebView2-style channel,
+        // where messages arrive as events and an onmessage assignment is just an
+        // unused property -- postMessage works, the reply lands nowhere, and the
+        // page waits for a HELLO that was delivered to a slot nobody reads.
+        // That is exactly what it did.
         host.onmessage = function (value) {
-          onClientValue(value);
+          deliverFrom('slot', value);
         };
+
+        if (typeof host.addEventListener === 'function') {
+          host.addEventListener('message', function (event) {
+            deliverFrom('listener', event);
+          });
+        }
 
         // The nonce came from the fragment, which the client put there and
         // never sent to the server. The app accepts this message only when it
         // matches the WebView it opened.
+        //
         host.postMessage(JSON.stringify({
           t: 'tproxy-android-init',
           v: 1,
@@ -246,6 +326,7 @@
   // and if the request never leaves, the relay's idle grace reclaims the
   // session anyway.
   function releaseSession() {
+
     if (!sessionToken) {
       return;
     }
@@ -354,6 +435,28 @@
   // --------------------------------------------------------- client -> bridge
 
   function onClientValue(value) {
+    // Keys and shapes only. The tag under 't' is a message type, not a secret;
+    // no other value is reported.
+    var shape = '';
+
+    try {
+      shape = Object.keys(value).slice(0, 12).join('|');
+    } catch (err) {
+      shape = 'unkeyable';
+    }
+
+    var inner = 'none';
+
+    try {
+      if (value && value.data !== undefined && value.data !== null) {
+        inner = (value.data.constructor && value.data.constructor.name) + ':' +
+          (value.data.byteLength !== undefined ? value.data.byteLength : (value.data.length || '?'));
+      }
+    } catch (err) {
+      inner = 'threw';
+    }
+
+
     if (finished) {
       return;
     }
@@ -539,7 +642,7 @@
       fail();
     };
 
-    socket.onclose = function () {
+    socket.onclose = function (event) {
       fail();
     };
   }
@@ -588,6 +691,7 @@
     var hash = window.location.hash || '';
     var match = /^#android=([A-Za-z0-9_-]{43})$/.exec(hash);
     var nonce = match ? match[1] : null;
+
 
     try {
       window.history.replaceState(null, '', '/');
