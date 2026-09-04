@@ -22,9 +22,16 @@ func (suite *BackendTestSuite) SetupTest() {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	suite.Require().NoError(err)
 
-	suite.listener = listener
-	suite.accepted = make(chan net.Conn, 4)
+	accepted := make(chan net.Conn, 4)
 
+	suite.listener = listener
+	suite.accepted = accepted
+
+	// The goroutine closes over the listener and the channel rather than reading
+	// them back off the suite. TearDownTest closing the listener is what ends
+	// it, but not synchronously -- so the next test's SetupTest can be assigning
+	// these fields while this loop is still running, and reading them here is a
+	// genuine race that the suite's own sequencing hides.
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -32,7 +39,7 @@ func (suite *BackendTestSuite) SetupTest() {
 				return
 			}
 
-			suite.accepted <- conn
+			accepted <- conn
 		}
 	}()
 }

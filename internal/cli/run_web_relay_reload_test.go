@@ -2,18 +2,31 @@ package cli
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/Arman2122/mtg-proxy/internal/utils"
+	"github.com/Arman2122/mtg-proxy/internal/webrelay"
 	"github.com/stretchr/testify/require"
 )
 
 const oneSecret = `alice = "7oe1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"`
 
-const twoSecrets = oneSecret + "\n" + `bob = "7oe1GqLy6TBc38CV3jx7q09nb29nbGUuY29u"`
+// bob differs from alice in the KEY, not only in the fronting host. Two ee
+// secrets that share a key are one WEB profile -- the capability is derived over
+// the key alone -- so a fixture that varied the host would be testing a
+// collision rather than a second client. See TestReloadRefusesCollidingSecrets.
+const twoSecrets = oneSecret + "\n" + `bob = "7ni1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"`
+
+// collidingSecrets is that hazard written down: same key, different fronting
+// host. The proxy serves them as two distinct FakeTLS profiles; the relay cannot
+// tell them apart at all.
+const collidingSecrets = oneSecret + "\n" + `carol = "7oe1GqLy6TBc38CV3jx7q09nb29nbGUuY29u"`
 
 // reloadConfigTOML builds a config whose [web] table and secret set vary
 // independently, which is the whole distinction a reload rests on.
@@ -185,4 +198,140 @@ func TestWebStructureCoversTheWholeTable(t *testing.T) {
 	}
 
 	require.Len(t, covered, fields.NumField(), "webStructure names a field config.ConfigWeb no longer has")
+}
+
+// writeReloadConfig puts a config on disk with a real signing key beside it, so
+// the reload path can be driven exactly as the signal handler drives it.
+func writeReloadConfig(t *testing.T, dir string, web map[string]string, listener, secrets string) string {
+	t.Helper()
+
+	key := filepath.Join(dir, "web.key")
+	if _, err := os.Stat(key); os.IsNotExist(err) {
+		require.NoError(t, webrelay.GenerateTokenKey(key))
+	}
+
+	if web == nil {
+		web = map[string]string{}
+	}
+
+	// A forward-slashed path so the TOML string needs no escaping on Windows.
+	web["token-key"] = `"` + filepath.ToSlash(key) + `"`
+	web["cover-dir"] = `"` + filepath.ToSlash(dir) + `"`
+
+	path := filepath.Join(dir, "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(reloadConfigTOML(web, listener, secrets)), 0o600))
+
+	return path
+}
+
+// The whole reload, driven the way SIGHUP drives it: a client is added to the
+// file on disk, and the running relay starts serving them without restarting.
+func TestReloadPicksUpANewClient(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := writeReloadConfig(t, dir, nil, "", oneSecret)
+
+	conf, err := utils.ReadConfig(path)
+	require.NoError(t, err)
+	require.NoError(t, conf.ValidateWeb())
+
+	log := newRecordingLogger()
+
+	origin, _, err := buildOrigin(conf, log)
+	require.NoError(t, err)
+
+	structure, err := webStructure(conf)
+	require.NoError(t, err)
+	require.Equal(t, 1, origin.Profiles())
+
+	writeReloadConfig(t, dir, nil, "", twoSecrets)
+	reloadWebProfiles(path, origin, structure, log)
+
+	require.Equal(t, 2, origin.Profiles(), "the added client never reached the running relay")
+	require.Empty(t, log.recorded(), "a clean reload must report nothing")
+}
+
+// A file that changed more than its secrets is refused whole, loudly, and the
+// relay keeps serving what it has. Half-applying it is how a process ends up in
+// a state no configuration describes.
+func TestReloadRefusesAStructuralChange(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := writeReloadConfig(t, dir, nil, "", oneSecret)
+
+	conf, err := utils.ReadConfig(path)
+	require.NoError(t, err)
+
+	log := newRecordingLogger()
+
+	origin, _, err := buildOrigin(conf, log)
+	require.NoError(t, err)
+
+	structure, err := webStructure(conf)
+	require.NoError(t, err)
+
+	// A new hostname AND a new client. Neither is applied: the capability every
+	// live client holds was derived over the old host.
+	writeReloadConfig(t, dir, map[string]string{"host": `"other.example.com"`}, "", twoSecrets)
+	reloadWebProfiles(path, origin, structure, log)
+
+	require.Equal(t, 1, origin.Profiles(), "a structural change was partly applied")
+	require.Contains(t, strings.Join(log.recorded(), "\n"), "restart")
+}
+
+// An unreadable or invalid file must never take a working relay off the air.
+func TestReloadKeepsTheRunningSetOnABadFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := writeReloadConfig(t, dir, nil, "", oneSecret)
+
+	conf, err := utils.ReadConfig(path)
+	require.NoError(t, err)
+
+	log := newRecordingLogger()
+
+	origin, _, err := buildOrigin(conf, log)
+	require.NoError(t, err)
+
+	structure, err := webStructure(conf)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(path, []byte("this is not toml at all ]["), 0o600))
+	reloadWebProfiles(path, origin, structure, log)
+
+	require.Equal(t, 1, origin.Profiles(), "a broken file emptied the registry")
+	require.NotEmpty(t, log.recorded(), "a failed reload said nothing")
+}
+
+// A WEB capability is derived over the secret's key and the hostname, and
+// nothing else -- so two ee secrets that share a key are indistinguishable here
+// however different they look to the proxy, which also matches on the fronting
+// host. The relay refuses the whole set rather than picking one: a request
+// carrying that capability cannot name a single profile, and quietly resolving
+// it to whichever came first would attribute one client's traffic to another.
+func TestReloadRefusesCollidingSecrets(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := writeReloadConfig(t, dir, nil, "", oneSecret)
+
+	conf, err := utils.ReadConfig(path)
+	require.NoError(t, err)
+
+	log := newRecordingLogger()
+
+	origin, _, err := buildOrigin(conf, log)
+	require.NoError(t, err)
+
+	structure, err := webStructure(conf)
+	require.NoError(t, err)
+
+	writeReloadConfig(t, dir, nil, "", collidingSecrets)
+	reloadWebProfiles(path, origin, structure, log)
+
+	require.Equal(t, 1, origin.Profiles(), "a colliding set was accepted")
+	require.Contains(t, strings.Join(log.recorded(), "\n"), "keeping the current one")
 }
