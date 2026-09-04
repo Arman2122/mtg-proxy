@@ -101,7 +101,7 @@ func runWebRelay(conf *config.Config, version string, checkOnly bool) error {
 		return err
 	}
 
-	defer listener.Close()
+	defer listener.Close() //nolint: errcheck // best effort on shutdown
 
 	server := &http.Server{
 		Handler:           origin,
@@ -171,8 +171,8 @@ func buildOrigin(conf *config.Config, log mtglib.Logger) (*webrelay.Origin, stri
 	}
 
 	limits := frame.Limits{
-		MaxPayload: int(conf.Web.MaxPayload.Get(0)),   //nolint: gosec // a configured bound, validated below
-		BatchBytes: int64(conf.Web.BatchBytes.Get(0)), //nolint: gosec // ditto
+		MaxPayload: int(conf.Web.MaxPayload.Get(0)), //nolint: gosec // a configured bound, validated below
+		BatchBytes: conf.Web.BatchBytes.Get(0),
 	}
 
 	if err := limits.Validate(); err != nil {

@@ -385,6 +385,16 @@ const (
 
 	// FeatureSecretsAPI means the GET/PUT/POST/DELETE /secrets routes are served.
 	FeatureSecretsAPI = "secrets-api"
+
+	// FeatureWebRelay means this binary carries the WEB proxy transport: the
+	// `web-relay` and `generate-web-key` subcommands, and the [web] config
+	// table they read.
+	//
+	// It is advertised by the PROXY, which does not serve that transport, and
+	// that is the point: the panel decides whether to render the WEB settings
+	// and start a second process, and the only thing it can ask is the running
+	// binary. A proxy answering /stats is the one component it always has.
+	FeatureWebRelay = "web-relay"
 )
 
 // supportedFeatures is the sorted capability list this build advertises. Keep it
@@ -395,6 +405,7 @@ var supportedFeatures = []string{
 	FeatureQuotaReset,
 	FeatureSecretModes,
 	FeatureSecretsAPI,
+	FeatureWebRelay,
 }
 
 // StatsResponse is the JSON response for the stats endpoint.

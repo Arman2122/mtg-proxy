@@ -44,7 +44,10 @@ func TestStatsFeatures(t *testing.T) {
 		require.NoError(t, json.Unmarshal(serveStats(t, NewProxyStats()).Body.Bytes(), &resp))
 
 		assert.Equal(t,
-			[]string{FeatureFakeTLS, FeatureListeners, FeatureQuotaReset, FeatureSecretModes, FeatureSecretsAPI},
+			[]string{
+				FeatureFakeTLS, FeatureListeners, FeatureQuotaReset,
+				FeatureSecretModes, FeatureSecretsAPI, FeatureWebRelay,
+			},
 			resp.Features)
 	})
 
@@ -56,6 +59,7 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t, "quota-reset", FeatureQuotaReset)
 		assert.Equal(t, "secret-modes", FeatureSecretModes)
 		assert.Equal(t, "secrets-api", FeatureSecretsAPI)
+		assert.Equal(t, "web-relay", FeatureWebRelay)
 	})
 
 	t.Run("every advertised route actually exists", func(t *testing.T) {
@@ -76,7 +80,7 @@ func TestStatsFeatures(t *testing.T) {
 		features, ok := raw["features"].([]any)
 		require.True(t, ok, "features must be a JSON array")
 		assert.Equal(t,
-			[]any{"faketls", "listeners", "quota-reset", "secret-modes", "secrets-api"},
+			[]any{"faketls", "listeners", "quota-reset", "secret-modes", "secrets-api", "web-relay"},
 			features)
 		// Asserted independently of the literal above, so appending a capability
 		// out of order cannot be "fixed" by editing the expectation to match.
@@ -93,7 +97,10 @@ func TestStatsFeatures(t *testing.T) {
 		first.Features[0] = "tampered"
 
 		assert.Equal(t,
-			[]string{FeatureFakeTLS, FeatureListeners, FeatureQuotaReset, FeatureSecretModes, FeatureSecretsAPI},
+			[]string{
+				FeatureFakeTLS, FeatureListeners, FeatureQuotaReset,
+				FeatureSecretModes, FeatureSecretsAPI, FeatureWebRelay,
+			},
 			stats.buildResponse().Features)
 	})
 
@@ -107,7 +114,10 @@ func TestStatsFeatures(t *testing.T) {
 		var resp StatsResponse
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 		assert.Equal(t,
-			[]string{FeatureFakeTLS, FeatureListeners, FeatureQuotaReset, FeatureSecretModes, FeatureSecretsAPI},
+			[]string{
+				FeatureFakeTLS, FeatureListeners, FeatureQuotaReset,
+				FeatureSecretModes, FeatureSecretsAPI, FeatureWebRelay,
+			},
 			resp.Features)
 	})
 }

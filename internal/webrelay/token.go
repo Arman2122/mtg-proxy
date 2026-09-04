@@ -131,7 +131,7 @@ func GenerateTokenKey(path string) error {
 		return fmt.Errorf("cannot create the token key %s: %w", path, err)
 	}
 
-	defer file.Close()
+	defer file.Close() //nolint: errcheck // the write below is what can fail
 
 	if _, err := file.Write(key); err != nil {
 		return fmt.Errorf("cannot write the token key %s: %w", path, err)

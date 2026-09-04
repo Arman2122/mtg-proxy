@@ -23,6 +23,9 @@ hard to block in the first place. See [Credits](#credits).
 - **Connection throttling** — automatic fair-share per-user connection caps.
 - **Per-user quotas, expiry & disable** — data caps (with optional monthly reset),
   a validity deadline, and an on/off switch, persisted across restarts.
+- **WEB proxy transport** — the connection type Telegram Desktop 7.1
+  added: a page on your hostname carries MTProto over a WebSocket, so a
+  network in between sees a browser visiting a website.
 - **Public IP override** and **Docker-style environment variables**.
 
 Everything underneath — FakeTLS, domain fronting, the doppelganger traffic mimic,
@@ -44,6 +47,7 @@ SOCKS5 proxy chaining, IP blocklists and allowlists, Prometheus and statsd metri
   - [Sponsored channel (ad-tag)](#sponsored-channel-ad-tag)
   - [Connection throttling](#connection-throttling)
   - [Per-user quotas, expiry & disable](#per-user-quotas-expiry--disable)
+  - [WEB proxy transport](#web-proxy-transport)
   - [Public IP override](#public-ip-override)
   - [Environment variables](#environment-variables)
 - [Command reference](#command-reference)
@@ -495,6 +499,64 @@ manually with `POST /secrets/{name}/reset-quota`. Limits set through the
 management API are in-memory only and are overridden by the next reload — the
 config file remains the source of truth.
 
+### WEB proxy transport
+
+Telegram Desktop 7.1 added a **WEB proxy** connection type. The client loads a
+page from your hostname inside its own WebView, and that page carries an MTProto
+stream over a WebSocket. On the wire it is a browser visiting a website over
+ordinary HTTPS — no obfuscated2 handshake to fingerprint and no FakeTLS to
+distinguish, because the TLS is real.
+
+`mtg-proxy` serves it from a **second process of the same binary**, reading the
+same configuration file:
+
+```bash
+mtg-proxy generate-web-key /etc/mtg-proxy/web.key
+mtg-proxy web-relay --check /etc/mtg-proxy/config.toml   # validates and exits
+mtg-proxy web-relay /etc/mtg-proxy/config.toml
+```
+
+```toml
+[[listener]]
+bind-to = "127.0.0.1:2398"
+accept = ["dd", "plain"]
+proxy-protocol = true          # carries the browser's address to the proxy
+
+[web]
+enabled = true
+host = "web.example.com"       # real certificate, port 443, no IP literals
+bind-to = "127.0.0.1:8099"     # where the front proxy reaches the relay
+backend = "127.0.0.1:2398"     # must name the [[listener]] above
+token-key = "/etc/mtg-proxy/web.key"
+cover-dir = "/srv/site"        # or cover-upstream = "http://127.0.0.1:8080"
+```
+
+`mtg-proxy access` then prints a `web` object per secret. Four things are
+different from every other link in this README, and all four come from the
+client:
+
+- **The secret is the `dd` form.** A WEB-capable client refuses an `ee` secret
+  before it opens a socket. It is the same sixteen bytes; only the spelling
+  changes, so nothing has to be re-issued.
+- **There is no address and no port.** The client's form has one field, a
+  hostname, and forces `https` and 443. Changing the hostname invalidates every
+  WEB link ever issued, exactly like changing an `ee` secret's fronting domain.
+- **A real certificate is required.** The WebView validates it normally and
+  offers no way past an error, so this needs a front proxy that terminates TLS
+  — Caddy in the [deployment guide](contrib/web-relay/README.md).
+- **Telegram Desktop 7.1.2 or later.** Earlier 7.1 builds had a WebView2 bug
+  that broke some WEB proxies on Windows.
+
+The hostname must also serve a plausible website. Everything that arrives without
+a credential the relay minted gets it — on every path, including the API ones
+— and nothing ships as a default, because a starter page many operators
+installed would be a better signature than anything the protocol leaks.
+
+[contrib/web-relay/](contrib/web-relay/README.md) is the deployment: the Caddy
+vhost, the four hops that have to carry the client's address, and the acceptance
+checklist for a real client. `/stats` advertises `web-relay` in `features` when a
+binary can serve this.
+
 ### Public IP override
 
 Useful when automatic detection via ifconfig.co is unavailable, or when the
@@ -541,6 +603,8 @@ process already uses every CPU core, and multiple secrets are configured through
 | `mtg-proxy simple-run <bind-to> <secret>` | Run without a config file, from flags only (no `[secrets]`, no reload). |
 | `mtg-proxy access [--ipv4 IP] [--ipv6 IP] [--port N] [--hex] <config>` | Print `tg://` / `t.me` links and QR-code URLs for the configured secrets. |
 | `mtg-proxy doctor [--skip-native-check] <config>` | Check connectivity, clock skew, fronting reachability, and SNI-to-DNS match. Run this first when something is off. |
+| `mtg-proxy web-relay [--check] <config>` | Run the WEB proxy relay for the secrets in a config file. `--check` validates the `[web]` table and exits. |
+| `mtg-proxy generate-web-key <path>` | Write the WEB relay's 32-byte token signing key. |
 | `mtg-proxy version` | Print the version. |
 
 ## Configuration

@@ -215,16 +215,6 @@ func (s *store) remove(token string) bool {
 	return ok
 }
 
-// touch extends a live session's grace.
-func (s *store) touch(token string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if entry, ok := s.sessions[token]; ok {
-		entry.expires = s.now().Add(ReconnectGrace)
-	}
-}
-
 func (s *store) countSessions() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

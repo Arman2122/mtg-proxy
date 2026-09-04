@@ -126,7 +126,7 @@ func (s *stream) start(ctx context.Context, dialTimeout time.Duration) {
 		s.conn = conn
 		close(s.ready)
 
-		defer conn.Close()
+		defer conn.Close() //nolint: errcheck // an aborted stream has nothing to report
 
 		go s.pump()
 

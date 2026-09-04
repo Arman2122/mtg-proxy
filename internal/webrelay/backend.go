@@ -76,13 +76,13 @@ func (b *TCPBackend) Dial(ctx context.Context, client net.Addr) (net.Conn, error
 
 	header, err := b.header(client, conn)
 	if err != nil {
-		conn.Close()
+		conn.Close() //nolint: errcheck // the dial already failed
 
 		return nil, err
 	}
 
 	if _, err := header.WriteTo(conn); err != nil {
-		conn.Close()
+		conn.Close() //nolint: errcheck // the dial already failed
 
 		return nil, fmt.Errorf("cannot write the PROXY header: %w", err)
 	}

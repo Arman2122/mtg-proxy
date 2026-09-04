@@ -170,7 +170,6 @@ backend = "127.0.0.1:2398"
 token-key = "/etc/mtg-proxy/web.key"
 cover-dir = "/var/www/site"
 `, host))))
-
 			if err != nil {
 				return
 			}

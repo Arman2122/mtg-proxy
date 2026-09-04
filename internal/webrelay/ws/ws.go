@@ -29,7 +29,7 @@ package ws
 
 import (
 	"bufio"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // RFC 6455 names SHA-1 for the accept key; it is not a security property
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -191,7 +191,7 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts Options) (*Conn, error
 	// buffered reader; a WebSocket client sends nothing before the response, so
 	// data here means a smuggling attempt or a broken middlebox.
 	if buffered.Reader.Buffered() > 0 {
-		conn.Close()
+		conn.Close() //nolint: errcheck // the handshake already failed
 
 		return nil, fmt.Errorf("%w: unexpected buffered data", ErrHandshake)
 	}
@@ -208,13 +208,13 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts Options) (*Conn, error
 	response += "\r\n"
 
 	if err := conn.SetWriteDeadline(time.Now().Add(opts.WriteTimeout)); err != nil {
-		conn.Close()
+		conn.Close() //nolint: errcheck // the handshake already failed
 
 		return nil, fmt.Errorf("%w: %w", ErrHandshake, err)
 	}
 
 	if _, err := io.WriteString(conn, response); err != nil {
-		conn.Close()
+		conn.Close() //nolint: errcheck // the handshake already failed
 
 		return nil, fmt.Errorf("%w: %w", ErrHandshake, err)
 	}
@@ -398,10 +398,10 @@ func (c *Conn) writeFrame(opcode byte, payload []byte) error {
 	case len(payload) <= maxControlPayload:
 		header[1] = byte(len(payload))
 	case len(payload) <= 0xFFFF:
-		header[1] = 126
+		header[1] = 126                                                      //nolint:gosec // header was made with len 2, cap 10
 		header = binary.BigEndian.AppendUint16(header, uint16(len(payload))) //nolint:gosec // bounded by the case
 	default:
-		header[1] = 127
+		header[1] = 127                                                      //nolint:gosec // ditto
 		header = binary.BigEndian.AppendUint64(header, uint64(len(payload))) //nolint:gosec // a length is never negative
 	}
 

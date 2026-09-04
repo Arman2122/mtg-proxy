@@ -125,6 +125,11 @@ linters:
         linters:
           - errcheck
           - ineffassign
+          # A WebSocket test reads a 101 response off a hijacked connection.
+          # Closing that body is not tidiness, it is a bug: the "body" is the
+          # socket, and draining it consumes the frames the test is about to
+          # assert on. The linter cannot tell that apart from a leak.
+          - bodyclose
 
       # ==== test and benchmark code ======================================
 
