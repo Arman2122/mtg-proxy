@@ -173,6 +173,13 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 	}
 }
 
+// middleProxyDialer is the single call mtglib makes into the middle proxy.
+// It is an interface so the advertised path can be driven in tests without an
+// RPC-speaking fake; production always holds a *middleproxy.Manager.
+type middleProxyDialer interface {
+	DialProxyStream(dialer middleproxy.Dialer, params middleproxy.DialParams) (essentials.Conn, net.IP, error)
+}
+
 // Proxy is an MTPROTO proxy structure.
 type Proxy struct {
 	ctx             context.Context
@@ -191,7 +198,9 @@ type Proxy struct {
 	configUpdater               *dc.PublicConfigUpdater
 	doppelGanger                *doppel.Ganger
 
-	middleProxy    *middleproxy.Manager
+	// Untyped nil when no middle proxy is wired: a typed-nil *middleproxy.Manager
+	// stored here would pass the "!= nil" gate in doTelegramCall and panic.
+	middleProxy    middleProxyDialer
 	ourIPv4        net.IP
 	ourIPv6        net.IP
 	advertisedPort int
@@ -1272,15 +1281,18 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	// middle-proxy list lazily (nothing happens until an ad-tagged stream is
 	// dialed), so a proxy without advertising never touches the network. When
 	// advertising is already configured, warm it so the first client is fast.
-	proxy.middleProxy = middleproxy.NewManager(
+	// Kept concrete here: Warm is a manager-only method, and the field is the
+	// narrow dial interface.
+	manager := middleproxy.NewManager(
 		ctx,
 		opts.Network.MakeHTTPClient(nil),
 		updatersLogger.Named("middle-proxy"),
 		opts.getPreferIP(),
 	)
+	proxy.middleProxy = manager
 
 	if opts.GlobalAdTag != nil || len(opts.SecretAdTags) > 0 {
-		proxy.middleProxy.Warm()
+		manager.Warm()
 	}
 
 	proxy.secrets.Store(initialSet)

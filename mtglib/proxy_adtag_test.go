@@ -143,6 +143,12 @@ func newAdTagHarness(
 		DefaultPreferIP,
 	)
 
+	return h, startUpstreamAccepts(h)
+}
+
+// startUpstreamAccepts drains the harness upstream so every connection the
+// proxy opens -- direct DC or advertised -- reaches the test in dial order.
+func startUpstreamAccepts(h *entryHarness) <-chan net.Conn {
 	accepted := make(chan net.Conn, 4)
 
 	go func() {
@@ -158,7 +164,7 @@ func newAdTagHarness(
 		}
 	}()
 
-	return h, accepted
+	return accepted
 }
 
 // nextUpstream returns the next connection the proxy opened towards Telegram,
@@ -225,10 +231,11 @@ func userStatsJSON(t *testing.T, stats *ProxyStats, name string) map[string]json
 // would still be one case too wide.
 //
 // What this does NOT prove: that a single byte ever travels the advertised
-// path. It proves the stream is OFFERED to the middle proxy and then falls
-// through to the direct DC when the offer fails. Nothing in mtglib observes the
-// success tail of doMiddleProxyCall -- that needs an RPC-speaking fake, which
-// today lives unexported in the middleproxy package.
+// path. It proves the stream is OFFERED to the real manager -- the one that
+// speaks RPC -- and then falls through to the direct DC when the offer fails.
+// The success tail of doMiddleProxyCall is covered by
+// TestAdTagAdvertisedStreamCarriesTheClientAndItsParams, which drives the
+// middleProxyDialer seam instead of the manager.
 func TestAdTagIntermediateModesAreOfferedToMiddleProxy(t *testing.T) {
 	t.Parallel()
 
@@ -425,6 +432,286 @@ func TestAdTagAbridgedTakesDirectPath(t *testing.T) {
 	// omitempty: a deployment that never skips must see a byte-identical user
 	// object, so the field may not appear at zero.
 	assert.NotContains(t, userStatsJSON(t, h.proxy.stats, "bob"), "ad_tag_skipped")
+
+	client.Close() //nolint: errcheck
+	<-done
+}
+
+// fakeMiddleProxy stands in for *middleproxy.Manager behind the
+// middleProxyDialer seam. It speaks no RPC: it records the DialParams and hands
+// back a raw connection to the harness upstream, so a test can read the
+// client's own bytes on the middle-proxy side and assert the parameters that
+// produced them. Nothing else can observe the success tail of
+// doMiddleProxyCall -- the real manager fails its handshake against this
+// upstream and the stream falls through to the direct DC.
+type fakeMiddleProxy struct {
+	upstream net.Listener
+	middleIP net.IP
+
+	// Buffered channels rather than fields: DialProxyStream runs on the
+	// ServeConn goroutine while the test reads, and -race calls that a data race.
+	dialer chan middleproxy.Dialer
+	params chan middleproxy.DialParams
+}
+
+func (f *fakeMiddleProxy) DialProxyStream(
+	dialer middleproxy.Dialer, params middleproxy.DialParams,
+) (essentials.Conn, net.IP, error) {
+	f.dialer <- dialer
+	f.params <- params
+
+	// Dialled directly, NOT through the proxy's Network: that keeps
+	// fakeNetwork.dialed empty on the advertised path, which is what makes a
+	// second, direct dial to Telegram visible.
+	conn, err := net.Dial("tcp", f.upstream.Addr().String())
+	if err != nil {
+		return nil, nil, err //nolint: wrapcheck
+	}
+
+	return essentials.WrapNetConn(conn), f.middleIP, nil
+}
+
+// nextDialParams returns the parameters of the single advertised dial,
+// deadlined so a stream that never reaches the middle proxy fails here.
+func nextDialParams(t *testing.T, fake *fakeMiddleProxy) middleproxy.DialParams {
+	t.Helper()
+
+	select {
+	case params := <-fake.params:
+		return params
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "the stream was never offered to the middle proxy")
+
+		return middleproxy.DialParams{}
+	}
+}
+
+// newFakeMiddleHarness wires the advertised path to fakeMiddleProxy. emitTraffic
+// is on because EventTraffic is gated on it: without it the wrapTraffic
+// assertions would be green whether or not the wrap exists.
+func newFakeMiddleHarness(
+	t *testing.T,
+	secrets map[string]Secret,
+	perSecret map[string][AdTagLength]byte,
+	global *[AdTagLength]byte,
+) (*entryHarness, *fakeMiddleProxy, <-chan net.Conn) {
+	t.Helper()
+
+	h := newEntryHarness(t, secrets, nil)
+
+	h.proxy.secrets.Store(buildSecretSet(secrets, perSecret, global, nil))
+	h.proxy.emitTraffic = true
+
+	fake := &fakeMiddleProxy{
+		upstream: h.upstream,
+		// An address no other code path in the harness can produce, so the
+		// connected-to-DC event can only have got it from the middle-proxy dial.
+		middleIP: net.ParseIP("10.9.9.9"),
+		dialer:   make(chan middleproxy.Dialer, 1),
+		params:   make(chan middleproxy.DialParams, 1),
+	}
+	h.proxy.middleProxy = fake
+
+	return h, fake, startUpstreamAccepts(h)
+}
+
+// trafficEvents counts EventTraffic for one stream in one direction.
+func trafficEvents(events *recordingEventStream, streamID string, isRead bool) int {
+	return events.count(func(evt Event) bool {
+		traffic, ok := evt.(EventTraffic)
+
+		return ok && traffic.StreamID() == streamID && traffic.IsRead == isRead
+	})
+}
+
+// TestAdTagAdvertisedStreamCarriesTheClientAndItsParams drives the SUCCESS tail
+// of doMiddleProxyCall, which nothing in mtglib observed before: the stream
+// really relays over the advertised connection, Telegram is not ALSO dialled
+// directly, and every field the middle proxy is asked to bill and pad by is the
+// one this stream actually has.
+//
+// Both intermediate transports are driven because PaddedIntermediate is derived
+// from the client's tag: one arm alone cannot tell a derived boolean from a
+// constant.
+func TestAdTagAdvertisedStreamCarriesTheClientAndItsParams(t *testing.T) {
+	t.Parallel()
+
+	for _, tag := range []obfuscation.ConnectionTag{
+		obfuscation.TagPaddedIntermediate,
+		obfuscation.TagIntermediate,
+	} {
+		t.Run(tag.String(), func(t *testing.T) {
+			t.Parallel()
+
+			alice, err := GenerateSecretMode(SecretModePlain, "")
+			require.NoError(t, err)
+
+			// A per-secret tag AND a global one: with only one configured, a
+			// lookup that ignored the override would still produce the right
+			// bytes.
+			perSecret := [AdTagLength]byte{0xa1}
+			global := [AdTagLength]byte{0xff}
+
+			h, fake, accepted := newFakeMiddleHarness(t,
+				map[string]Secret{"alice": alice},
+				map[string][AdTagLength]byte{"alice": perSecret},
+				&global,
+			)
+
+			// The middle proxy mixes these into its key schedule, so a v4/v6
+			// swap corrupts it and kills advertising on every NAT'd deployment
+			// while logging nothing. They are distinct here, and non-zero,
+			// because the harness default of zero makes a swap unobservable.
+			h.proxy.ourIPv4 = net.IPv4(203, 0, 113, 7)
+			h.proxy.ourIPv6 = net.ParseIP("2001:db8::7")
+			h.proxy.advertisedPort = 8443
+
+			client, done := h.dialProxy(t, obfuscatedPolicy(ModeSetOf(SecretModePlain), UnknownSecretClose))
+			require.NoError(t, client.SetDeadline(time.Now().Add(10*time.Second)))
+
+			// A real client connection, not a bare frame: the claim is that bytes
+			// travel, and only relaying through it can show that. DC 4, not the
+			// default 2, so a hardcoded DC downstream is visible.
+			clientConn, err := obfuscation.Obfuscator{Secret: alice.Key[:]}.
+				SendHandshake(essentials.WrapNetConn(client), 4, tag)
+			require.NoError(t, err)
+
+			// Raw on this side: the RPC framing lives inside the manager we
+			// replaced, so what the proxy relays here is the client's own payload.
+			middle := nextUpstream(t, accepted)
+
+			_, err = clientConn.Write([]byte("ping from client"))
+			require.NoError(t, err)
+
+			fromClient := make([]byte, len("ping from client"))
+			_, err = io.ReadFull(middle, fromClient)
+			require.NoError(t, err,
+				"nothing arrived over the advertised connection; telegram dials so far: %v",
+				dialedAddresses(h.network))
+			assert.Equal(t, "ping from client", string(fromClient))
+
+			_, err = middle.Write([]byte("pong from middle"))
+			require.NoError(t, err)
+
+			fromMiddle := make([]byte, len("pong from middle"))
+			_, err = io.ReadFull(clientConn, fromMiddle)
+			require.NoError(t, err)
+			assert.Equal(t, "pong from middle", string(fromMiddle))
+
+			// Only after the round trip: doMiddleProxyCall records its params
+			// before doTelegramCall decides whether to return, so asserting the
+			// absence of a direct dial any earlier would race the fall-through.
+			assert.Empty(t, dialedAddresses(h.network),
+				"a working advertised stream must not also be dialled straight to Telegram")
+
+			params := nextDialParams(t, fake)
+
+			assert.Equal(t, 4, params.DC)
+			assert.Equal(t, perSecret, params.AdTag,
+				"the per-secret tag must beat the global one; the middle proxy bills whoever it names")
+			assert.Equal(t, tag == obfuscation.TagPaddedIntermediate, params.PaddedIntermediate,
+				"PaddedIntermediate drives RPC_F_PAD and the alignment trim; it is the client's tag or nothing")
+
+			// The client address is what the middle proxy sees as the subscriber.
+			require.NotNil(t, params.ClientAddr, "the middle proxy must be told who is calling")
+			assert.Equal(t, client.LocalAddr().String(), params.ClientAddr.String())
+
+			assert.True(t, h.proxy.ourIPv4.Equal(params.PublicIPv4),
+				"the v4 address must reach the middle proxy as v4; a swap corrupts its key schedule")
+			assert.True(t, h.proxy.ourIPv6.Equal(params.PublicIPv6),
+				"and the v6 address as v6")
+			assert.Equal(t, 8443, params.AdvertisedPort)
+
+			// The proxy's own Network, so the middle proxy inherits the configured
+			// dialer (prefer-ip, timeouts) rather than a fresh default one.
+			dialer := <-fake.dialer
+			require.NotNil(t, dialer, "the middle proxy must be handed a dialer")
+			assert.Same(t, h.network, dialer)
+
+			stream := h.liveStream(t, "alice")
+			require.NotNil(t, stream)
+
+			// The wrap: EventTraffic exists only because doMiddleProxyCall passed
+			// the middle-proxy stream through wrapTraffic, and it is attributed by
+			// the stream ID this user's connection was given.
+			assert.Positive(t, trafficEvents(h.events, stream.streamID, false),
+				"the client's bytes towards the middle proxy must be counted")
+			assert.Positive(t, trafficEvents(h.events, stream.streamID, true),
+				"the middle proxy's bytes towards the client must be counted")
+
+			// The connected-to-DC event reports the middle proxy that was reached,
+			// not the client's DC address.
+			assert.Equal(t, 1, h.events.count(func(evt Event) bool {
+				connected, ok := evt.(EventConnectedToDC)
+
+				return ok && connected.StreamID() == stream.streamID &&
+					connected.DC == 4 && connected.RemoteIP.Equal(fake.middleIP)
+			}), "exactly one connected-to-DC event, naming the middle proxy")
+
+			client.Close() //nolint: errcheck
+			<-done
+		})
+	}
+}
+
+// TestAdTagWithoutMiddleProxyStaysOnTheDirectPath is the regression the
+// middleProxyDialer seam makes possible. A typed-nil *middleproxy.Manager
+// stored in an interface field is NOT nil as an interface, so the "advertising
+// is not configured" arm of doTelegramCall would stop being a fall-through and
+// become a nil dereference on the first ad-tagged stream -- killing every
+// advertised connection on a proxy that never wired a middle proxy.
+func TestAdTagWithoutMiddleProxyStaysOnTheDirectPath(t *testing.T) {
+	t.Parallel()
+
+	alice, err := GenerateSecretMode(SecretModePlain, "")
+	require.NoError(t, err)
+
+	h := newEntryHarness(t, map[string]Secret{"alice": alice}, nil)
+
+	// Tagged for advertising, but nothing to advertise through: this is a proxy
+	// configured with an ad tag before its middle proxy is wired.
+	adTag := [AdTagLength]byte{0xad}
+	h.proxy.secrets.Store(buildSecretSet(map[string]Secret{"alice": alice}, nil, &adTag, nil))
+
+	accepted := startUpstreamAccepts(h)
+
+	client, done := h.dialProxy(t, obfuscatedPolicy(ModeSetOf(SecretModePlain), UnknownSecretClose))
+	require.NoError(t, client.SetDeadline(time.Now().Add(10*time.Second)))
+
+	// Padded intermediate: the transport the middle proxy DOES support, so the
+	// abridged skip cannot be what saves this stream. DC 5, not the default.
+	clientConn, err := obfuscation.Obfuscator{Secret: alice.Key[:]}.
+		SendHandshake(essentials.WrapNetConn(client), 5, obfuscation.TagPaddedIntermediate)
+	require.NoError(t, err)
+
+	upstream := nextUpstream(t, accepted)
+
+	require.Equal(t,
+		[]string{h.proxy.telegram.GetAddresses(5)[0].Address},
+		dialedAddresses(h.network),
+		"with no middle proxy the stream goes straight to its own DC")
+
+	dcID, _, tgConn, err := obfuscation.Obfuscator{}.
+		ReadHandshake(essentials.WrapNetConn(upstream), obfuscation.TagSetOf(obfuscation.TagPaddedIntermediate))
+	require.NoError(t, err)
+	assert.Equal(t, 5, dcID)
+
+	// Bytes both ways: "did not panic" is not the same claim as "stayed online".
+	_, err = clientConn.Write([]byte("ping from client"))
+	require.NoError(t, err)
+
+	fromClient := make([]byte, len("ping from client"))
+	_, err = io.ReadFull(tgConn, fromClient)
+	require.NoError(t, err)
+	assert.Equal(t, "ping from client", string(fromClient))
+
+	_, err = tgConn.Write([]byte("pong from telegram"))
+	require.NoError(t, err)
+
+	fromTelegram := make([]byte, len("pong from telegram"))
+	_, err = io.ReadFull(clientConn, fromTelegram)
+	require.NoError(t, err)
+	assert.Equal(t, "pong from telegram", string(fromTelegram))
 
 	client.Close() //nolint: errcheck
 	<-done
