@@ -1,6 +1,7 @@
 package webrelay
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -20,8 +21,9 @@ import (
 // atomicity rules are written about and what a real socket would let a test
 // accidentally split.
 type testCarrier struct {
-	in  chan []byte
-	out chan []byte
+	in   chan []byte
+	out  chan []byte
+	done chan struct{}
 
 	mu        sync.Mutex
 	closeCode uint16
@@ -29,7 +31,15 @@ type testCarrier struct {
 }
 
 func newTestCarrier() *testCarrier {
-	return &testCarrier{in: make(chan []byte, 64), out: make(chan []byte, 256)}
+	return &testCarrier{in: make(chan []byte, 64), out: make(chan []byte, 256), done: make(chan struct{})}
+}
+
+// newSyncCarrier is the same carrier with no room to buffer, so a test that
+// does not read is a client that is not draining. That is what lets the pending
+// budget actually fill: with a buffered channel the write loop empties the
+// outbox as fast as it is filled and the backpressure path never runs.
+func newSyncCarrier() *testCarrier {
+	return &testCarrier{in: make(chan []byte, 64), out: make(chan []byte), done: make(chan struct{})}
 }
 
 func (c *testCarrier) Read() ([]byte, error) {
@@ -50,9 +60,15 @@ func (c *testCarrier) Write(payload []byte) error {
 		return net.ErrClosed
 	}
 
-	c.out <- payload
-
-	return nil
+	// A real socket fails a blocked write when it is closed, and the session
+	// joins its write loop before returning, so a carrier that could block for
+	// ever here would hang shutdown rather than test it.
+	select {
+	case c.out <- payload:
+		return nil
+	case <-c.done:
+		return net.ErrClosed
+	}
 }
 
 func (c *testCarrier) Close(code uint16, _ string) error {
@@ -62,6 +78,7 @@ func (c *testCarrier) Close(code uint16, _ string) error {
 	if !c.closed {
 		c.closed = true
 		c.closeCode = code
+		close(c.done)
 	}
 
 	return nil
@@ -129,7 +146,12 @@ type harness struct {
 func newHarness(t *testing.T, opts SessionOptions) *harness {
 	t.Helper()
 
-	carrier := newTestCarrier()
+	return newHarnessOn(t, newTestCarrier(), opts)
+}
+
+func newHarnessOn(t *testing.T, carrier *testCarrier, opts SessionOptions) *harness {
+	t.Helper()
+
 	backend := newPipeBackend()
 	opts.Backend = backend
 
@@ -197,6 +219,27 @@ func (h *harness) nextOfType(t frame.Type) frame.Frame {
 	h.t.Fatalf("no %s frame arrived", t)
 
 	return frame.Frame{}
+}
+
+// drain collects every frame the relay emits until it has been quiet for one
+// interval. Ordering tests need the whole sequence, not the next frame.
+func (h *harness) drain(quiet time.Duration) []frame.Frame {
+	h.t.Helper()
+
+	collected := h.frames
+	h.frames = nil
+
+	for {
+		select {
+		case payload := <-h.carrier.out:
+			decoded, err := frame.Limits{}.DecodeBatch(payload, frame.RelayToClient)
+			require.NoError(h.t, err)
+
+			collected = append(collected, decoded...)
+		case <-time.After(quiet):
+			return collected
+		}
+	}
 }
 
 // fatal waits for the session to end and returns why.
@@ -457,6 +500,79 @@ func (suite *SessionTestSuite) TestBackendEOFDeliversTheTailBeforeClose() {
 	closed := h.next()
 	suite.Equal(frame.TypeClose, closed.Type)
 	suite.Equal(uint32(17), closed.StreamID)
+}
+
+// The same ordering rule at the only moment it is actually hard to hold.
+//
+// TestBackendEOFDeliversTheTailBeforeClose passes on an empty queue, where
+// every push succeeds immediately and any implementation looks correct. Here the
+// session's pending budget is full, so the stream's downlink pump is parked
+// inside PushData holding data the client has not seen -- and the stream is then
+// killed from the uplink side. A CLOSE queued by that goroutine draws on the
+// control reserve, never blocks, and so reaches the client first; the client
+// tombstones the id, and the tail that arrives afterwards is discarded. It is a
+// truncated Telegram response with nothing anywhere reporting an error.
+func (suite *SessionTestSuite) TestACloseNeverOvertakesABlockedTail() {
+	t := suite.T()
+
+	// Room for three 64 KiB DATA frames beyond the control reserve, which is
+	// enough for the fourth push to park. The item ceiling is deliberately not
+	// the binding one.
+	h := newHarnessOn(t, newSyncCarrier(), SessionOptions{
+		PendingBytes: ControlReserveBytes + 200<<10,
+		PendingItems: ControlReserveItems + 32,
+	})
+
+	h.send(frame.NewOpen(17), frame.NewData(17, []byte("q")))
+
+	backend := h.backend.accept(t)
+
+	// Nothing here ever reads the pipe, so the relay's uplink goroutine is
+	// blocked writing that one byte -- and the downlink pump fills the queue
+	// until PushData parks. Both goroutines are now stuck, which is the state
+	// the ordering has to survive.
+	go func() {
+		_, _ = backend.Write(bytes.Repeat([]byte("x"), 512<<10))
+	}()
+
+	require.Eventually(t, func() bool {
+		_, items := h.session.out.session.pending()
+
+		return items >= 3
+	}, 5*time.Second, 5*time.Millisecond, "the pending budget never filled")
+
+	// Kill the backend. The uplink write fails first: that is the goroutine
+	// that must not be the one to announce the close.
+	require.NoError(t, backend.Close())
+
+	frames := h.drain(500 * time.Millisecond)
+
+	var (
+		data   int
+		closed = -1
+	)
+
+	for i, f := range frames {
+		if f.StreamID != 17 {
+			continue
+		}
+
+		switch f.Type { //nolint: exhaustive // only these two are ordered against each other
+		case frame.TypeClose:
+			closed = i
+		case frame.TypeData:
+			data++
+
+			suite.Equal(-1, closed, "DATA for stream 17 arrived after its CLOSE")
+		}
+	}
+
+	suite.NotEqual(-1, closed, "the stream was never closed")
+
+	// Four means the queue really did fill: three parked plus the one the write
+	// loop had already taken. A smaller number would make the assertion above
+	// pass without the pressure it is written about ever existing.
+	suite.GreaterOrEqual(data, 4, "the backend's data never reached the client")
 }
 
 // A dial that fails is a stream-level failure. The session and every other

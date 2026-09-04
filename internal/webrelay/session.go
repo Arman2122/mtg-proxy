@@ -64,11 +64,26 @@ type SessionOptions struct {
 	ClientAddr  net.Addr
 	MaxStreams  int
 	DialTimeout time.Duration
+
+	// PendingBytes and PendingItems bound this one session's downlink queue.
+	// Zero means the defaults. They are separate from the global budget because
+	// the two answer different questions: the global one stops the process
+	// growing without limit, this one stops a single session doing it.
+	PendingBytes int64
+	PendingItems int64
 }
 
 func (o SessionOptions) withDefaults() SessionOptions {
 	if o.MaxStreams <= 0 {
 		o.MaxStreams = DefaultMaxStreams
+	}
+
+	if o.PendingBytes <= 0 {
+		o.PendingBytes = DefaultPendingBytes
+	}
+
+	if o.PendingItems <= 0 {
+		o.PendingItems = DefaultPendingItems
 	}
 
 	if o.DialTimeout <= 0 {
@@ -121,7 +136,7 @@ func newSession(conn carrier, opts SessionOptions) *session {
 
 	return &session{
 		conn:        conn,
-		out:         newOutbox(newBudget(DefaultPendingBytes, DefaultPendingItems), opts.Global, opts.Limits),
+		out:         newOutbox(newBudget(opts.PendingBytes, opts.PendingItems), opts.Global, opts.Limits),
 		backend:     opts.Backend,
 		limits:      opts.Limits,
 		log:         opts.Logger,
@@ -420,26 +435,44 @@ func (s *session) perform(act action) error {
 	}
 }
 
-// streamEnded is called once by each stream when both its pumps are finished.
-// It is the only place a CLOSE is generated for a stream the client did not
-// close itself.
+// streamEnded is called when a stream's uplink goroutine finishes. It only
+// tears the stream down; it deliberately does not queue the CLOSE.
+//
+// The CLOSE belongs to the downlink goroutine, and the reason is an ordering
+// one. This runs on the uplink goroutine, and PushControl draws on the reserve,
+// so it never blocks -- while the downlink pump's PushData does block once the
+// session's pending budget is full. A CLOSE queued from here while the pump is
+// holding the last DATA of a response would be delivered ahead of it, and the
+// client tombstones the id the moment it sees a CLOSE: the tail would be
+// dropped. Ordering that depends on which goroutine happened to be scheduled is
+// not ordering, so only closeStream queues one, and only the pump calls it.
 func (s *session) streamEnded(st *stream) {
-	s.mu.Lock()
-	_, tracked := s.streams[st.id]
-	s.mu.Unlock()
-
 	st.close()
+}
+
+// closeStream retires a stream and tells the client, exactly once. It is called
+// from the goroutine that pushed that stream's DATA, so the CLOSE lands behind
+// every byte the backend produced: CLOSE is an abort, and one that overtook the
+// last DATA would truncate a Telegram response.
+//
+// A stream the client closed itself is already retired, and is not told again.
+// The quiet direction is the one that cannot desynchronise.
+func (s *session) closeStream(id uint32) {
+	s.mu.Lock()
+	_, tracked := s.streams[id]
+
+	if tracked {
+		delete(s.streams, id)
+		s.tombstones.add(id)
+	}
+
+	s.mu.Unlock()
 
 	if !tracked {
 		return
 	}
 
-	s.retire(st.id)
-
-	// Queued behind whatever this stream already pushed, so a backend that
-	// reached EOF still delivers its tail: CLOSE is an abort, and a CLOSE that
-	// overtook the last DATA would truncate a Telegram response.
-	_ = s.out.PushControl(frame.NewClose(st.id))
+	_ = s.out.PushControl(frame.NewClose(id))
 }
 
 // retire drops a stream from the live set and remembers its id.

@@ -120,6 +120,11 @@ func (s *stream) start(ctx context.Context, dialTimeout time.Duration) {
 		if err != nil {
 			s.session.logStreamError(s.id, err)
 
+			// The only CLOSE this side generates that does not come from the
+			// downlink pump, because there is no pump: nothing was ever read
+			// from this backend, so nothing can be ordered behind.
+			s.session.closeStream(s.id)
+
 			return
 		}
 
@@ -274,8 +279,20 @@ func (s *stream) refund(n int) {
 // reached EOF has ended the stream in both directions -- CLOSE is an abort, not
 // a half-close -- and without this the uplink goroutine would sit in its queue
 // forever, so the CLOSE that tells the client would never be queued at all.
+//
+// The CLOSE is queued here, on this goroutine, rather than wherever the stream
+// happens to end. PushData blocks when the session's pending budget is full, so
+// at the moment a stream dies this goroutine may be holding the last DATA of a
+// response; a CLOSE queued from anywhere else draws on the control reserve,
+// does not block, and would overtake it. Queueing it after the loop makes the
+// ordering a property of the code path instead of the scheduler.
 func (s *stream) pump() {
-	defer s.close()
+	defer func() {
+		// close() first, so the uplink goroutine stops before the client is
+		// told, then the CLOSE itself.
+		s.close()
+		s.session.closeStream(s.id)
+	}()
 
 	chunk := s.session.limits.EffectivePayload()
 

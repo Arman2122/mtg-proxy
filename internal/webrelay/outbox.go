@@ -85,8 +85,31 @@ func (b *budget) acquire(cost, reserveBytes, reserveItems int64) error {
 			return nil
 		}
 
+		// An empty queue admits anything. Without this an item larger than the
+		// ceiling itself waits forever for room that cannot exist -- and the
+		// ceilings are per-deployment while the 64 KiB relay chunk is not, so
+		// "cost exceeds the whole budget" is a configuration away rather than
+		// impossible. The bound this gives up is small and stated: one
+		// oversized item at a time, instead of a stream that stalls silently.
+		if b.items == 0 {
+			b.bytes += cost
+			b.items++
+
+			return nil
+		}
+
 		b.cond.Wait()
 	}
+}
+
+// pending reports what is currently charged. Nothing in the relay steers on it;
+// it exists so a test can wait for the queue to be genuinely full instead of
+// sleeping and hoping.
+func (b *budget) pending() (int64, int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.bytes, b.items
 }
 
 func (b *budget) release(cost, items int64) {
