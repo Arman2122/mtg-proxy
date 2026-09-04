@@ -3,6 +3,7 @@ package mtglib
 import (
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -226,9 +227,14 @@ func TestConnectionsAreCountedPerUser(t *testing.T) {
 func TestCountersStayExactUnderConcurrentChurn(t *testing.T) {
 	t.Parallel()
 
+	// Sized to what CI can actually run: covtest is -count=2 under -race inside
+	// a ten-minute job for the whole tree, so this has to prove the budgets
+	// hold and the registry drains without eating that. Two hundred concurrent
+	// streams does; two thousand would not, and a test nobody can afford to run
+	// is a test that does not exist.
 	const (
-		users       = 4
-		perUser     = 6
+		users       = 8
+		perUser     = 25
 		connections = users * perUser
 	)
 
@@ -251,6 +257,11 @@ func TestCountersStayExactUnderConcurrentChurn(t *testing.T) {
 	h.proxy.trackClientIPs = true
 
 	sink := newUpstreamSink(t, h.upstream)
+
+	// The goroutine floor to come back to. Taken after the harness is built, so
+	// the harness's own goroutines are inside the baseline and only the streams
+	// are being measured.
+	baseline := stableGoroutines()
 
 	// A scraper running for the whole test, so every report below is taken
 	// while the registry is being mutated rather than after it settles. Under
@@ -351,6 +362,35 @@ func TestCountersStayExactUnderConcurrentChurn(t *testing.T) {
 			"a connection counter that does not return to zero double-counts every restart")
 		require.Empty(t, after.Users[name].ConnectedIPs)
 	}
+
+	// Counters returning to zero says the bookkeeping is right; it says nothing
+	// about whether the goroutines behind those streams went away. On a proxy
+	// that is the difference between a correct gauge and a process that grows
+	// until it is killed.
+	//
+	// A tolerance, not an equality: the runtime, the race detector and the test
+	// framework all keep goroutines of their own whose count is not ours to
+	// predict. Two hundred leaked streams would clear this by two orders of
+	// magnitude.
+	require.Eventually(t, func() bool {
+		return stableGoroutines()-baseline <= goroutineTolerance
+	}, 30*time.Second, 100*time.Millisecond,
+		"goroutines must return to the baseline: %d streams ended, and started from %d",
+		connections, baseline)
+}
+
+// goroutineTolerance is the slack allowed around the baseline. It matches the
+// figure benchmarks/goroutine_test.go already uses, so the two places in this
+// repo that make this kind of assertion make it the same way.
+const goroutineTolerance = 5
+
+// stableGoroutines counts goroutines after giving finished ones a chance to be
+// reaped, so the number is about leaks rather than about scheduling.
+func stableGoroutines() int {
+	runtime.GC()
+	runtime.Gosched()
+
+	return runtime.NumGoroutine()
 }
 
 // A user's connections are attributed to that user on both doors at once.
