@@ -167,16 +167,22 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # VERSION travels as an environment variable rather than being
+      # interpolated into the script body. It derives from GITHUB_REF_NAME, so
+      # only someone who can already push a tag could put anything odd in it --
+      # but this is the job holding contents: write, and the idiomatic form
+      # costs nothing.
       - name: Generate checksums
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -eu
           cd dist
           # Written outside dist first: the glob must not pick up the file it
           # is producing.
           sha256sum -- * > "${RUNNER_TEMP}/checksums.txt"
-          mv "${RUNNER_TEMP}/checksums.txt" \
-            "mtg-proxy-${{ steps.version.outputs.version }}-checksums.txt"
-          cat "mtg-proxy-${{ steps.version.outputs.version }}-checksums.txt"
+          mv "${RUNNER_TEMP}/checksums.txt" "mtg-proxy-${VERSION}-checksums.txt"
+          cat "mtg-proxy-${VERSION}-checksums.txt"
 
       # Signed provenance tying every published file to this workflow, this
       # commit and this run. A checksums file lives on the same origin as the

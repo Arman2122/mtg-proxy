@@ -28,7 +28,8 @@ paths = [
 
 [[allowlists]]
 description = "Obvious placeholder credentials in documentation and defaults"
-regexTarget = "match"
+# No regexTarget here: it only changes what `regexes` are matched against, and
+# this allowlist defines stopwords instead, so setting one did nothing.
 stopwords = [
   "change-me",
   "changeme",
