@@ -1,0 +1,32 @@
+# WEB proxy vhost, to be added to contrib/sni-router/Caddyfile.
+#
+# Everything on this hostname goes to the relay -- the site, the API paths, the
+# upgrade, the 404s. Splitting it between Caddy and the relay would hand a prober
+# a header-order and timing difference between two components' answers, which is
+# precisely the distinguisher the relay's three-tier recognition exists to
+# remove.
+
+{$WEB_DOMAIN} {
+	# The bearer for a live session travels inside Sec-WebSocket-Protocol, so an
+	# access log on this vhost writes live credentials to disk. Discard it here
+	# rather than filtering it: a filter is one upgrade away from being wrong.
+	log {
+		output discard
+	}
+
+	reverse_proxy {$WEB_RELAY_UPSTREAM:127.0.0.1:8099} {
+		transport http {
+			# The relay has no fallback to the socket's own peer, because behind
+			# this proxy that address is loopback for every user alive. Without
+			# this line every stream is refused rather than silently attributed
+			# to 127.0.0.1 -- which is the failure mode worth having.
+			proxy_protocol v2
+
+			# A carrier lives far longer than any ordinary response, and a
+			# session that survives an idle period is one of the acceptance
+			# criteria.
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}

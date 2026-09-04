@@ -1,0 +1,41 @@
+# Overlay adding the WEB relay to the sni-router deployment.
+#
+#   cd contrib/sni-router
+#   docker compose -f docker-compose.yml -f ../web-relay/compose.web.yml up -d
+#
+# WEB_DOMAIN is the hostname clients type and the certificate Caddy obtains. It
+# is a different name from the FakeTLS DOMAIN, so HAProxy routes it to Caddy the
+# way it routes everything that is not the FakeTLS SNI, and no rule has to
+# change.
+
+services:
+  web-relay:
+    image: ghcr.io/arman2122/mtg-proxy:latest
+    command: ["web-relay", "/config/config.toml"]
+    volumes:
+      - ./mtg-config.toml:/config/config.toml:ro,Z
+      # The signing key. Generated once with `mtg-proxy generate-web-key`, mode
+      # 0600, and never regenerated: a new one invalidates every live session.
+      - ./web.key:/config/web.key:ro,Z
+      # The cover site the relay serves to everyone who is not a Telegram
+      # client. Point [web].cover-dir at /srv, or drop this and use
+      # cover-upstream to reverse-proxy an application instead.
+      - ./www:/srv:ro,Z
+    # No published port. Caddy reaches the relay by service name on the compose
+    # network and nothing else can, which is the isolation a loopback bind would
+    # give on a host -- and inside a container a loopback bind would make it
+    # unreachable from Caddy instead. So in THIS deployment the config must say
+    #
+    #     [web] bind-to = "0.0.0.0:8099"
+    #
+    # which is safe precisely because the port is not published. On a host
+    # install, keep 127.0.0.1.
+    depends_on:
+      - mtg
+    restart: unless-stopped
+
+  web:
+    environment:
+      WEB_DOMAIN: ${WEB_DOMAIN:-web.example.com}
+      # Caddy runs in the compose network; the relay is a service name there.
+      WEB_RELAY_UPSTREAM: web-relay:8099

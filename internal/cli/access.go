@@ -25,6 +25,46 @@ type accessResponse struct {
 	IPv6    *accessResponseURLs             `json:"ipv6,omitempty"`
 	Secret  accessResponseSecret            `json:"secret"`
 	Secrets map[string]accessResponseSecret `json:"secrets,omitempty"`
+	Web     *accessResponseWeb              `json:"web,omitempty"`
+}
+
+// accessResponseWeb is how a client reaches this proxy over the WEB transport.
+//
+// Two things are different from every other link here, and both come from the
+// client rather than from us:
+//
+// The secret is the dd form. A WEB-capable client refuses an ee secret outright,
+// before any network activity, so the ee spelling of the same key -- the one the
+// panel mints and every other link uses -- is unusable here. These are the same
+// sixteen bytes told differently.
+//
+// There is no address and no port. The client's WEB proxy form has one field, a
+// hostname; the scheme is fixed to https and the port to 443. So a WEB link is
+// not tied to an IP, and changing the hostname invalidates every link ever
+// issued -- exactly like the fronting domain of an ee secret.
+type accessResponseWeb struct {
+	Host    string                             `json:"host"`
+	Secret  accessResponseWebSecret            `json:"secret"`
+	Secrets map[string]accessResponseWebSecret `json:"secrets,omitempty"`
+}
+
+type accessResponseWebSecret struct {
+	// Secret is the dd form, which is what the client's own field expects.
+	Secret string `json:"secret"`
+
+	// TgURL is the deep link. Only the tg:// form is emitted: the client routes
+	// both tg://webproxy and t.me/webproxy, but t.me has not registered the
+	// route, so an https link resolves as the USERNAME @webproxy and shows a
+	// stranger's contact page.
+	//
+	// The parameter names mirror tg://proxy, which is the only published
+	// precedent -- they are not confirmed against a real client, and confirming
+	// them is an item on the acceptance checklist. The host and secret above are
+	// what an operator types into the client's own two fields, so this output
+	// stays usable either way.
+	TgURL string `json:"tg_url"` //nolint: tagliatelle
+
+	TgQrCode string `json:"tg_qrcode"` //nolint: tagliatelle
 }
 
 type accessResponseURLs struct {
@@ -79,6 +119,8 @@ func (a *Access) Run(cli *CLI, version string) error {
 			}
 		}
 	}
+
+	resp.Web = makeWebAccess(conf, secrets, sortedNames)
 
 	ntw, err := makeNetwork(conf, version)
 	if err != nil {
@@ -187,4 +229,42 @@ func (a *Access) makeURLs(conf *config.Config, ip net.IP) *accessResponseURLs {
 	rv.TmeQrCode = utils.MakeQRCodeURL(rv.TmeURL)
 
 	return rv
+}
+
+// makeWebAccess builds the WEB links, or nothing when this proxy has no relay.
+func makeWebAccess(conf *config.Config, secrets map[string]mtglib.Secret, names []string) *accessResponseWeb {
+	host := conf.Web.Host.Get("")
+	if !conf.Web.Enabled.Get(false) || host == "" {
+		return nil
+	}
+
+	web := &accessResponseWeb{Host: host}
+
+	if len(names) > 0 {
+		web.Secret = makeWebSecret(host, secrets[names[0]])
+	}
+
+	if len(names) > 1 {
+		web.Secrets = make(map[string]accessResponseWebSecret, len(names))
+
+		for _, name := range names {
+			web.Secrets[name] = makeWebSecret(host, secrets[name])
+		}
+	}
+
+	return web
+}
+
+func makeWebSecret(host string, secret mtglib.Secret) accessResponseWebSecret {
+	values := url.Values{}
+	values.Set("server", host)
+	values.Set("secret", secret.DDHex())
+
+	link := (&url.URL{Scheme: "tg", Host: "webproxy", RawQuery: values.Encode()}).String()
+
+	return accessResponseWebSecret{
+		Secret:   secret.DDHex(),
+		TgURL:    link,
+		TgQrCode: utils.MakeQRCodeURL(link),
+	}
 }

@@ -106,7 +106,13 @@ bind-to = "0.0.0.0:3128"
 #
 # # Expect a PROXY protocol header on THIS listener. Independent of the
 # # top-level proxy-protocol-listener, which applies to bind-to only.
-# # tproxy-server does not send one, so leave this false for a WEB backend.
+# #
+# # For a [web] backend this is the setting that decides whether the browser's
+# # real address reaches the proxy: mtg-proxy's own relay reads this stanza and
+# # sends a header only when it says true. Leave it false and every WEB user is
+# # 127.0.0.1 here -- the blocklist stops matching and the per-IP limits stop
+# # counting, with nothing in a log to say so. Telegram's own tproxy-server
+# # sends no header at all, so leave it false if that is your relay.
 # # proxy-protocol = false
 #
 # # What to do with a connection no secret matches (also: unhonoured transport,
@@ -126,6 +132,77 @@ bind-to = "0.0.0.0:3128"
 # # empties for every legitimate user -- a self-DoS, not a defence. That is also
 # # how you turn it off: leave public unset.
 # # handshakes-per-ip = 30
+
+# The WEB proxy relay: the transport Telegram Desktop 7.1 added, where the
+# client loads a page from your hostname inside its own WebView and carries
+# MTProto over a WebSocket from there.
+#
+# It is served by a SEPARATE PROCESS of this binary, reading this same file:
+#
+#     mtg-proxy web-relay /etc/mtg-proxy/config.toml
+#
+# The proxy ignores this table entirely, so an unusable [web] block cannot stop
+# the MTProto port. Check it on its own with `web-relay --check`.
+#
+# Requires a real hostname with a browser-trusted certificate on 443 and a
+# client on Telegram Desktop 7.1.2 or later. There is no FakeTLS here: a WEB
+# client refuses an ee secret before it opens a socket, so `mtg-proxy access`
+# prints the dd spelling of the same key for these links.
+#
+# [web] is a TABLE, so like [[listener]] every top-level key after it belongs to
+# it. Put it just above [secrets], with the listener it names.
+#
+# [web]
+# # Off unless this is true. The relay refuses to start without it.
+# enabled = true
+#
+# # Required. The hostname a client types, and the name its capability is
+# # derived over -- changing it invalidates every WEB link ever issued, exactly
+# # like changing an ee secret's fronting domain. Must be a bare name with a
+# # public certificate: no scheme, no port, no IP literal, no localhost.
+# host = "web.example.com"
+#
+# # Required. Where the relay listens for the front proxy. Loopback on a host
+# # install; inside a container it must be reachable from the front proxy, so
+# # 0.0.0.0 with the port unpublished.
+# bind-to = "127.0.0.1:8099"
+#
+# # Required. Must name a [[listener]] above that accepts "dd". That stanza also
+# # decides whether the relay sends a PROXY header, so the two processes cannot
+# # disagree about what the socket between them speaks.
+# backend = "127.0.0.1:2398"
+#
+# # Required. 32 bytes, mode 0600, from `mtg-proxy generate-web-key <path>`.
+# # Never generated at startup: a key invented on a missing file works until the
+# # first restart and then hands this relay's own live tokens to the cover site.
+# token-key = "/etc/mtg-proxy/web.key"
+#
+# # Required: exactly one. The hostname must serve a plausible website to
+# # everyone who is not a Telegram client, and no default ships -- a starter
+# # page many operators installed would be a better signature than anything the
+# # protocol leaks. cover-dir serves a directory; cover-upstream reverse-proxies
+# # an application. Listings are always off.
+# cover-dir = "/srv/site"
+# # cover-upstream = "http://127.0.0.1:8080"
+#
+# # How the relay learns the browser's address. There is no fallback to the
+# # socket: behind a front proxy that is loopback for every user alive.
+# #   proxy-protocol  - a PROXY header from the front proxy. The default, and
+# #                     REQUIRED once chosen: a connection without one is
+# #                     refused rather than silently attributed to the loopback.
+# #   x-forwarded-for - the right-most entry, and only from a loopback peer.
+# # client-ip = "proxy-protocol"
+#
+# # Ceilings. Both may only be LOWERED: the client has these compiled in and
+# # learns nothing from the handshake, so a larger value breaks interop with no
+# # error anywhere. The published reason to lower the first is a deployment
+# # still serving Linux Desktop builds from before the 2 MiB message cap.
+# # max-frame-payload = "512kib"
+# # carrier-batch-bytes = "2mib"
+#
+# # Ceilings on concurrency. Defaults shown.
+# # max-sessions = 1024
+# # max-streams = 512
 
 # This defines what types of traffic mtg listens to. If you are not sure,
 # then definitely keep it disable. Enable it only and only if incoming traffic

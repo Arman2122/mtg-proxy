@@ -222,7 +222,19 @@ func webListener(conf *config.Config) (net.Listener, error) {
 	}
 
 	return &proxyprotocol.ListenerAdapter{
-		Listener: proxyproto.Listener{Listener: base},
+		Listener: proxyproto.Listener{
+			Listener: base,
+			// REQUIRE, not the library's permissive default. Without a header
+			// the default would hand back the front proxy's own address, and
+			// the relay would run perfectly while every WEB user appeared to
+			// the proxy as the loopback: the blocklist would stop matching, the
+			// per-IP limits would stop counting, and nothing would say so. A
+			// front proxy configured without proxy_protocol should fail
+			// loudly on the first connection instead.
+			ConnPolicy: func(proxyproto.ConnPolicyOptions) (proxyproto.Policy, error) {
+				return proxyproto.REQUIRE, nil
+			},
+		},
 	}, nil
 }
 
