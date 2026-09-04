@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 
 	"github.com/alecthomas/units"
@@ -30,12 +32,31 @@ func (t *TypeBytes) Set(value string) error {
 	return nil
 }
 
-func (t TypeBytes) Get(defaultValue uint) uint {
+// Get keeps the parsed int64 width. uint is 32 bits on the 386/arm builds we
+// ship, and narrowing here wrapped a per-secret quota above 4 GiB silently.
+func (t TypeBytes) Get(defaultValue int64) int64 {
 	if t.Value == 0 {
 		return defaultValue
 	}
 
-	return uint(t.Value)
+	return int64(t.Value)
+}
+
+// GetUint serves the two machine-word consumers (bloom filter size,
+// TCP_NOTSENT_LOWAT). It refuses what does not fit rather than wrapping or
+// clamping it, bounded by MaxInt so their int cast is safe on 32-bit too.
+func (t TypeBytes) GetUint(defaultValue uint) (uint, error) {
+	if t.Value == 0 {
+		return defaultValue, nil
+	}
+
+	value := int64(t.Value)
+	if value < 0 || value > math.MaxInt {
+		return 0, fmt.Errorf("bytes value %s does not fit into a %d-bit int (max %d bytes)",
+			t.Value, strconv.IntSize, int64(math.MaxInt))
+	}
+
+	return uint(value), nil
 }
 
 func (t *TypeBytes) UnmarshalText(data []byte) error {

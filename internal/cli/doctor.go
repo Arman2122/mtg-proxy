@@ -94,6 +94,13 @@ func (d *Doctor) Run(cli *CLI, version string) error {
 		return fmt.Errorf("cannot create DNS resolver: %w", err)
 	}
 
+	// The socket option takes a machine word, so an oversized watermark is
+	// refused here rather than wrapped on the 32-bit builds we ship.
+	lowat, err := conf.Network.TCPNotSentLowat.GetUint(network.DefaultTCPNotSentLowat)
+	if err != nil {
+		return fmt.Errorf("incorrect tcp-not-sent-lowat: %w", err)
+	}
+
 	base := network.New(
 		resolver,
 		"",
@@ -106,7 +113,7 @@ func (d *Doctor) Run(cli *CLI, version string) error {
 			Interval: conf.Network.KeepAlive.Interval.Get(0),
 			Count:    int(conf.Network.KeepAlive.Count.Get(0)),
 		},
-		int(conf.Network.TCPNotSentLowat.Get(network.DefaultTCPNotSentLowat)),
+		int(lowat),
 	)
 
 	fmt.Println("Validate native network connectivity")

@@ -389,7 +389,7 @@ func (c *Config) GetSecretLimits() map[string]mtglib.SecretLimits {
 
 	for name, l := range c.SecretLimits {
 		lim := mtglib.SecretLimits{
-			QuotaBytes: int64(l.Quota.Get(0)),
+			QuotaBytes: l.Quota.Get(0),
 			ExpiresAt:  l.Expires.Get(time.Time{}),
 			Disabled:   l.Disabled.Get(false),
 		}

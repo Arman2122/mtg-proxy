@@ -46,6 +46,13 @@ func makeNetwork(conf *config.Config, version string) (mtglib.Network, error) {
 		return nil, fmt.Errorf("cannot create DNS resolver: %w", err)
 	}
 
+	// The socket option takes a machine word, so an oversized watermark is
+	// refused here rather than wrapped on the 32-bit builds we ship.
+	lowat, err := conf.Network.TCPNotSentLowat.GetUint(network.DefaultTCPNotSentLowat)
+	if err != nil {
+		return nil, fmt.Errorf("incorrect tcp-not-sent-lowat: %w", err)
+	}
+
 	base := network.New(
 		resolver,
 		"",
@@ -58,7 +65,7 @@ func makeNetwork(conf *config.Config, version string) (mtglib.Network, error) {
 			Interval: conf.Network.KeepAlive.Interval.Get(0),
 			Count:    int(conf.Network.KeepAlive.Count.Get(0)),
 		},
-		int(conf.Network.TCPNotSentLowat.Get(network.DefaultTCPNotSentLowat)),
+		int(lowat),
 	)
 
 	proxyDialers := make([]mtglib.Network, len(conf.Network.Proxies))
@@ -85,15 +92,22 @@ func makeNetwork(conf *config.Config, version string) (mtglib.Network, error) {
 	return value, nil
 }
 
-func makeAntiReplayCache(conf *config.Config) mtglib.AntiReplayCache {
+func makeAntiReplayCache(conf *config.Config) (mtglib.AntiReplayCache, error) {
 	if !conf.Defense.AntiReplay.Enabled.Get(false) {
-		return antireplay.NewNoop()
+		return antireplay.NewNoop(), nil
+	}
+
+	// The filter is sized in machine words, so an oversized max-size is refused
+	// here rather than wrapped on the 32-bit builds we ship.
+	maxSize, err := conf.Defense.AntiReplay.MaxSize.GetUint(antireplay.DefaultStableBloomFilterMaxSize)
+	if err != nil {
+		return nil, fmt.Errorf("incorrect anti-replay max-size: %w", err)
 	}
 
 	return antireplay.NewStableBloomFilter(
-		conf.Defense.AntiReplay.MaxSize.Get(antireplay.DefaultStableBloomFilterMaxSize),
+		maxSize,
 		conf.Defense.AntiReplay.ErrorRate.Get(antireplay.DefaultStableBloomFilterErrorRate),
-	)
+	), nil
 }
 
 func makeIPBlocklist(conf config.ListConfig,
@@ -507,6 +521,11 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 		return fmt.Errorf("cannot build ip allowlist: %w", err)
 	}
 
+	antiReplayCache, err := makeAntiReplayCache(conf)
+	if err != nil {
+		return fmt.Errorf("cannot build anti-replay cache: %w", err)
+	}
+
 	doppelGangerURLs := make([]string, len(conf.Defense.Doppelganger.URLs))
 	for i, v := range conf.Defense.Doppelganger.URLs {
 		doppelGangerURLs[i] = v.String()
@@ -515,7 +534,7 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 	opts := mtglib.ProxyOpts{
 		Logger:          logger,
 		Network:         ntw,
-		AntiReplayCache: makeAntiReplayCache(conf),
+		AntiReplayCache: antiReplayCache,
 		IPBlocklist:     blocklist,
 		IPAllowlist:     allowlist,
 		EventStream:     eventStream,
