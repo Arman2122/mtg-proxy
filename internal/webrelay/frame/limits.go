@@ -44,6 +44,15 @@ func (l Limits) batchBytes() int64 {
 	return l.BatchBytes
 }
 
+// EffectivePayload is the per-frame bound after clamping. A producer that must
+// chop a stream into frames needs to see the same number the encoder enforces,
+// rather than deriving its own from the raw field and disagreeing at the edge.
+func (l Limits) EffectivePayload() int { return l.maxPayload() }
+
+// EffectiveBatchBytes is the whole-batch bound after clamping, for a caller
+// assembling a batch itself instead of handing a slice to EncodeBatch.
+func (l Limits) EffectiveBatchBytes() int64 { return l.batchBytes() }
+
 // Validate reports a Limits that a config loader should refuse at startup. The
 // accessors clamp an out-of-range field anyway, so this is not a safety check;
 // it is how an operator who typed a bound the client cannot honour is told,
