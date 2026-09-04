@@ -1,0 +1,12 @@
+{
+  "name": "mtg-proxy-webbridge-harness",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Headless-browser harness for the WEB proxy bridge page.",
+  "scripts": {
+    "test": "node harness.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.56.0"
+  }
+}
