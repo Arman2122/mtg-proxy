@@ -37,6 +37,12 @@ type secretStats struct {
 	// adTagSkipped counts ad-tagged streams that fell back to the direct path
 	// because their transport is not re-framable for the middle proxy.
 	adTagSkipped atomic.Int64
+
+	// lastIP is the client address of the most recently admitted connection,
+	// stored as a string. It is written only when the proxy is configured to
+	// track addresses, so a deployment that does not ask for them never holds
+	// one, and it is never persisted: FlushUsage writes quota counters alone.
+	lastIP atomic.Value // stores string
 }
 
 // rolloverIfNeeded zeroes quotaUsed when the monthly quota period has elapsed.
@@ -104,6 +110,7 @@ func (s *ProxyStats) getOrCreate(name string) *secretStats {
 
 	st = &secretStats{}
 	st.lastSeen.Store(time.Time{})
+	st.lastIP.Store("")
 	s.users[name] = st
 
 	return st
@@ -144,6 +151,13 @@ func (s *ProxyStats) OnAdTagSkipped(name string) {
 // UpdateLastSeen sets the last-seen timestamp for the given secret to now.
 func (s *ProxyStats) UpdateLastSeen(name string) {
 	s.getOrCreate(name).lastSeen.Store(time.Now())
+}
+
+// SetLastIP records the client address of the most recent admitted connection
+// for the given secret. Callers gate this on the proxy's tracking setting; it
+// is not checked here, so a caller that reaches this has already decided.
+func (s *ProxyStats) SetLastIP(name, ip string) {
+	s.getOrCreate(name).lastIP.Store(ip)
 }
 
 // QuotaUsed returns the bytes counted against the secret's current quota period,
@@ -369,6 +383,13 @@ func computeFairCaps(userConns map[string]int64, limit int64) map[string]int64 {
 // the capability actually exists in the binary — advertising an absent one
 // defeats the point of the array.
 const (
+	// FeatureClientIPs means the binary understands the track-client-ips
+	// option, so a panel may offer the switch and may expect connected_ips and
+	// last_ip on GET /stats when it is on. It says nothing about whether the
+	// running deployment has actually enabled it -- the fields' presence says
+	// that, and their absence is indistinguishable from an idle secret.
+	FeatureClientIPs = "client-ips"
+
 	// FeatureFakeTLS means the proxy speaks the FakeTLS (obfuscated) handshake.
 	FeatureFakeTLS = "faketls"
 
@@ -400,6 +421,7 @@ const (
 // supportedFeatures is the sorted capability list this build advertises. Keep it
 // sorted so the response is byte-stable across restarts.
 var supportedFeatures = []string{
+	FeatureClientIPs,
 	FeatureFakeTLS,
 	FeatureListeners,
 	FeatureQuotaReset,
@@ -477,6 +499,17 @@ type UserStatsJSON struct {
 	// operator who monetises through @MTProxybot has to be able to see this: a
 	// silent skip is a revenue bug nobody can diagnose.
 	AdTagSkipped int64 `json:"ad_tag_skipped,omitempty"`
+
+	// ConnectedIPs lists the distinct client addresses holding a live
+	// connection right now, sorted. LastIP is the address of the most recent
+	// admitted connection, which outlives that connection.
+	//
+	// Both are filled in only when the proxy is configured with
+	// track-client-ips, and both are omitted when empty, so /stats on a
+	// deployment that never enabled it is byte-identical to before they
+	// existed. See ProxyOpts.TrackClientIPs for why that is the default.
+	ConnectedIPs []string `json:"connected_ips,omitempty"`
+	LastIP       string   `json:"last_ip,omitempty"`
 }
 
 // buildResponse assembles the base stats response (runtime counters and throttle
@@ -498,6 +531,8 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 			lastSeenPtr = &lastSeen
 		}
 
+		lastIP, _ := st.lastIP.Load().(string)
+
 		users[name] = UserStatsJSON{
 			Connections:  conns,
 			BytesIn:      st.bytesIn.Load(),
@@ -505,6 +540,7 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 			LastSeen:     lastSeenPtr,
 			QuotaUsed:    st.quotaUsed.Load(),
 			AdTagSkipped: st.adTagSkipped.Load(),
+			LastIP:       lastIP,
 		}
 	}
 	s.mu.RUnlock()

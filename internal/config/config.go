@@ -101,6 +101,7 @@ type Config struct {
 	ProxyProtocolListener       TypeBool                     `json:"proxyProtocolListener"`
 	PreferIP                    TypePreferIP                 `json:"preferIp"`
 	AutoUpdate                  TypeBool                     `json:"autoUpdate"`
+	TrackClientIPs              TypeBool                     `json:"trackClientIps"`
 	DomainFrontingPort          TypePort                     `json:"domainFrontingPort"`
 	DomainFrontingIP            TypeIP                       `json:"domainFrontingIp"`
 	DomainFrontingProxyProtocol TypeBool                     `json:"domainFrontingProxyProtocol"`

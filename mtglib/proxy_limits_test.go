@@ -236,6 +236,19 @@ func govEntryCases() []govEntryCase {
 			policy:               obfuscatedPolicy(ModeSetOf(SecretModeDD), UnknownSecretClose),
 			frontingsOnEntryDeny: 0,
 		},
+		{
+			// The third wire form is not a variation on dd. It arrives on a
+			// socket that honours the abridged and intermediate transport tags
+			// as well as padded-intermediate, and it is the form a WEB relay
+			// backend may be configured to accept -- so every governance rule
+			// built on top of these cases (quota billing, expiry, disable,
+			// revocation, throttling) has to hold on it too, and nothing
+			// asserted that until it had a row here.
+			name:                 "plain",
+			mode:                 SecretModePlain,
+			policy:               obfuscatedPolicy(ModeSetOf(SecretModePlain), UnknownSecretClose),
+			frontingsOnEntryDeny: 0,
+		},
 	}
 }
 

@@ -247,6 +247,24 @@ type ProxyOpts struct {
 	// This is an optional setting.
 	DomainFrontingProxyProtocol bool
 
+	// TrackClientIPs makes GET /stats report per-user client addresses:
+	// connected_ips, the distinct addresses holding a live connection right
+	// now, and last_ip, the address of the most recent admitted connection.
+	//
+	// It defaults to FALSE, and that default is deliberate. This is a
+	// circumvention proxy: the people using it are frequently the reason it
+	// exists, and an operator's answer to "who connected from where" is also
+	// the answer anyone who takes the server gets. connected_ips costs no new
+	// retention -- those addresses are already held for the duration of the
+	// connection, and vanish with it -- but last_ip outlives the connection it
+	// came from, so a deployment that never asks for it never accumulates it.
+	//
+	// Nothing here is written to disk. The usage state file holds quota
+	// counters only, so an address survives a restart in no form at all.
+	//
+	// This is an optional setting.
+	TrackClientIPs bool
+
 	// AllowFallbackOnUnknownDC defines how proxy behaves if unknown DC was
 	// requested. If this setting is set to false, then such connection will be
 	// rejected. Otherwise, proxy will chose any DC.

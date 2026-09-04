@@ -187,6 +187,7 @@ type Proxy struct {
 	streamWaitGroup sync.WaitGroup
 
 	allowFallbackOnUnknownDC    bool
+	trackClientIPs              bool
 	tolerateTimeSkewness        time.Duration
 	idleTimeout                 time.Duration
 	handshakeTimeout            time.Duration
@@ -410,6 +411,17 @@ func (p *Proxy) admit(ctx *streamContext) bool {
 
 	p.stats.OnConnect(ctx.secretName)
 	p.stats.UpdateLastSeen(ctx.secretName)
+
+	// Only once the secret is known, for the same reason nothing is billed
+	// before attribution: on the dd/plain door the name does not exist until
+	// the frame is trial-decrypted, and an address recorded earlier would be
+	// filed under the empty name for every obfuscated user at once.
+	if p.trackClientIPs {
+		if ip, ok := acceptedClientIP(ctx.client().RemoteAddr()); ok {
+			p.stats.SetLastIP(ctx.secretName, ip.String())
+		}
+	}
+
 	p.registerConn(ctx)
 
 	return true
@@ -595,6 +607,72 @@ func (p *Proxy) registerConn(ctx *streamContext) {
 	}
 
 	conns[ctx] = struct{}{}
+}
+
+// connectedIPs snapshots the distinct client addresses holding a live
+// connection, per secret name. It returns nil when address tracking is off, so
+// the field stays absent from /stats rather than present and empty.
+//
+// The lock discipline is closeStaleConns': collect under liveMu, resolve
+// outside it. Nothing but the contexts themselves is touched inside the
+// critical section -- liveMu is a plain Mutex on the connect and disconnect
+// path of every stream, and ClientIP takes a second lock of its own, which is
+// a lock edge worth not creating for a stats scrape.
+//
+// Addresses are deduplicated and sorted. Map iteration order is randomised per
+// run, and an unsorted list would make two scrapes of an unchanged proxy
+// differ -- the same reason the feature list is kept sorted.
+func (p *Proxy) connectedIPs() map[string][]string {
+	if !p.trackClientIPs {
+		return nil
+	}
+
+	p.liveMu.Lock()
+
+	snapshot := make(map[string][]*streamContext, len(p.liveConns))
+
+	for name, conns := range p.liveConns {
+		contexts := make([]*streamContext, 0, len(conns))
+		for sc := range conns {
+			contexts = append(contexts, sc)
+		}
+
+		snapshot[name] = contexts
+	}
+	p.liveMu.Unlock()
+
+	rv := make(map[string][]string, len(snapshot))
+
+	for name, contexts := range snapshot {
+		seen := make(map[string]struct{}, len(contexts))
+		addresses := make([]string, 0, len(contexts))
+
+		for _, sc := range contexts {
+			ip := sc.ClientIP()
+			if ip == nil {
+				continue
+			}
+
+			text := ip.String()
+			if _, ok := seen[text]; ok {
+				continue
+			}
+
+			seen[text] = struct{}{}
+
+			addresses = append(addresses, text)
+		}
+
+		if len(addresses) == 0 {
+			continue
+		}
+
+		sort.Strings(addresses)
+
+		rv[name] = addresses
+	}
+
+	return rv
 }
 
 func (p *Proxy) unregisterConn(ctx *streamContext) {
@@ -1226,6 +1304,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		idleTimeout:              opts.getIdleTimeout(),
 		handshakeTimeout:         opts.getHandshakeTimeout(),
 		allowFallbackOnUnknownDC: opts.AllowFallbackOnUnknownDC,
+		trackClientIPs:           opts.TrackClientIPs,
 		telegram:                 tg,
 		doppelGanger: doppel.NewGanger(
 			ctx,

@@ -290,6 +290,26 @@ tolerate-time-skewness = "5s"
 # Otherwise, chose a new DC.
 allow-fallback-on-unknown-dc = false
 
+# Report per-user client addresses on GET /stats: "connected_ips", the distinct
+# addresses holding a live connection right now, and "last_ip", the address of
+# the most recent admitted connection.
+#
+# Off by default, and that default is deliberate rather than cautious. This is a
+# circumvention proxy: the people using it are often the reason it exists, and
+# an operator's answer to "who connected from where" is also the answer to
+# whoever takes the server. "connected_ips" costs no new retention -- those
+# addresses are already held for the life of the connection and vanish with it
+# -- but "last_ip" outlives the connection it came from, so a deployment that
+# never asks for either never accumulates one.
+#
+# Nothing here is written to disk in any form: usage-state-file below persists
+# quota counters only, so no address survives a restart.
+#
+# Behind a front proxy this reports what the PROXY header said, which is the
+# client's real address -- see proxy-protocol-listener and the per-listener
+# proxy-protocol option.
+# track-client-ips = false
+
 # Path of a JSON file where per-secret data-quota usage is persisted so it
 # survives restarts (see [secret-limits] below). When unset (default), quota
 # accounting is in-memory only and resets when the process restarts. The file is

@@ -548,6 +548,7 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 		AutoUpdate:                  conf.AutoUpdate.Get(false),
 
 		AllowFallbackOnUnknownDC: conf.AllowFallbackOnUnknownDC.Get(false),
+		TrackClientIPs:           conf.TrackClientIPs.Get(false),
 		TolerateTimeSkewness:     conf.TolerateTimeSkewness.Value,
 		IdleTimeout:              conf.Network.Timeout.Idle.Get(mtglib.DefaultIdleTimeout),
 		HandshakeTimeout:         conf.Network.Timeout.Handshake.Get(mtglib.DefaultHandshakeTimeout),

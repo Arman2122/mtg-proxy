@@ -361,6 +361,21 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		resp.Obfuscated = obfuscatedJSONOf(&p.obfsStats)
 	}
 
+	// Keyed on resp.Users rather than on the secret snapshot, deliberately: a
+	// secret removed through DELETE /secrets keeps its counter bucket (nothing
+	// ever deletes one), so it is still reported, and its connections are still
+	// live until they are swept. The loop below is keyed on the snapshot
+	// instead, because a limit only exists for a secret that still does.
+	for name, addresses := range p.connectedIPs() {
+		user, ok := resp.Users[name]
+		if !ok {
+			continue
+		}
+
+		user.ConnectedIPs = addresses
+		resp.Users[name] = user
+	}
+
 	set := p.secrets.Load()
 	for i, name := range set.names {
 		user, ok := resp.Users[name]
