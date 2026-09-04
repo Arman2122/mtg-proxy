@@ -41,6 +41,24 @@ type SecretInfo struct {
 	// never take an inbound offline -- but it is the thing an operator needs to
 	// see.
 	Unserved bool `json:"unserved,omitempty"`
+
+	// Connections and LastSeen are the runtime view of this secret, carried
+	// here so a caller rendering one user does not have to fetch and filter the
+	// whole of GET /stats to learn whether anybody is on it. They are the same
+	// numbers /stats reports, read from the same counters.
+	Connections int64      `json:"connections"`
+	LastSeen    *time.Time `json:"last_seen"`
+
+	// ConnectedIPs and LastIP mirror the same fields on GET /stats, and are
+	// filled in on exactly the same condition: only when the proxy is
+	// configured with track-client-ips. See ProxyOpts.TrackClientIPs for why
+	// that is off by default.
+	//
+	// Connections and LastSeen above are NOT gated, because they are not
+	// addresses -- knowing that a user has two connections says nothing about
+	// where they are.
+	ConnectedIPs []string `json:"connected_ips,omitempty"`
+	LastIP       string   `json:"last_ip,omitempty"`
 }
 
 // SnapshotSecrets returns the active secret set as a name-sorted list, exposing
@@ -55,6 +73,13 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 	// client of this form might pick is honoured, not merely that some
 	// obfuscated listener exists.
 	listenerTags := p.listenerModes.Tags()
+
+	// One snapshot for the whole list rather than one per secret: the registry
+	// is walked under a mutex that every connect and disconnect also takes, and
+	// taking it once per user would put a stats read on that path N times for
+	// one request. Nil when address tracking is off, and a lookup into a nil
+	// map is the empty slice, so the gating needs no second branch below.
+	addresses := p.connectedIPs()
 
 	for i, name := range set.names {
 		secret := set.secrets[i]
@@ -75,6 +100,9 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 		}
 
 		fillLimitInfo(&info, set.limits[i], p.stats.quotaUsedValue(name))
+		p.stats.fillRuntimeInfo(&info, name)
+
+		info.ConnectedIPs = addresses[name]
 
 		out[i] = info
 	}

@@ -184,6 +184,35 @@ func (s *ProxyStats) quotaUsedValue(name string) int64 {
 	return st.quotaUsed.Load()
 }
 
+// fillRuntimeInfo copies the live counters for one secret onto a SecretInfo, so
+// GET /secrets/{name} answers the same questions GET /stats does about that
+// user without a caller having to fetch and filter the whole report.
+//
+// LastIP is copied here; ConnectedIPs is not, because it is derived from the
+// proxy's connection registry rather than held on the counters, and the caller
+// takes one snapshot of that for the whole list.
+//
+// A secret with no bucket is a secret nobody has ever connected to, which is
+// zero connections and no last seen -- not an error, and not a reason to create
+// a bucket as a side effect of reading.
+func (s *ProxyStats) fillRuntimeInfo(info *SecretInfo, name string) {
+	s.mu.RLock()
+	st, ok := s.users[name]
+	s.mu.RUnlock()
+
+	if !ok {
+		return
+	}
+
+	info.Connections = st.connections.Load()
+
+	if lastSeen, _ := st.lastSeen.Load().(time.Time); !lastSeen.IsZero() {
+		info.LastSeen = &lastSeen
+	}
+
+	info.LastIP, _ = st.lastIP.Load().(string)
+}
+
 // rollover applies a monthly quota rollover for a single secret if it is due.
 func (s *ProxyStats) rollover(name string, reset QuotaReset, now time.Time) {
 	s.getOrCreate(name).rolloverIfNeeded(reset, now)
