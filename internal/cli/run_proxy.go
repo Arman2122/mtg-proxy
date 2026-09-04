@@ -321,6 +321,147 @@ func makeSecretsReloader(configPath string) func() (mtglib.SecretConfig, error) 
 	}
 }
 
+// servedListener is one accepting socket: raw is what shutdown closes, serve is
+// what the proxy accepts from (raw itself, or a PROXY-protocol adapter around
+// it) and policy is stamped onto every connection accepted from it.
+//
+// The policy has to travel with the socket because MultiListener fans several
+// sockets into one Accept and the PROXY-protocol adapter rewrites LocalAddr, so
+// listener identity cannot be recovered downstream.
+type servedListener struct {
+	raw    net.Listener
+	serve  net.Listener
+	policy mtglib.ListenerPolicy
+}
+
+// maybeProxyProtocol wraps a listener into the PROXY-protocol adapter when the
+// socket expects a header.
+func maybeProxyProtocol(listener net.Listener, enabled bool) net.Listener {
+	if !enabled {
+		return listener
+	}
+
+	return &proxyprotocol.ListenerAdapter{
+		Listener: proxyproto.Listener{
+			Listener: listener,
+		},
+	}
+}
+
+// buildListeners builds every socket the proxy serves, first entry being the
+// bind-to group.
+//
+// The bind-to group keeps today's shape exactly: one MultiListener, one
+// proxy-protocol wrapper, one FakeTLS-only policy. A failure there is still
+// fatal. Each [[listener]] then gets its own socket, its own PROXY-protocol
+// decision and its own policy, and a bind failure there is logged and skipped:
+// the loopback port a panel allocated may have been taken since, and losing the
+// WEB backend must never take the public port down with it.
+func buildListeners(conf *config.Config, log mtglib.Logger) ([]servedListener, error) {
+	bindAddrs := conf.GetBindAddrs()
+	baseListeners := make([]net.Listener, 0, len(bindAddrs))
+
+	for _, addr := range bindAddrs {
+		l, err := utils.NewListener(addr, 0)
+		if err != nil {
+			for _, prev := range baseListeners {
+				prev.Close() //nolint: errcheck
+			}
+
+			return nil, fmt.Errorf("cannot start proxy on %s: %w", addr, err)
+		}
+
+		baseListeners = append(baseListeners, l)
+	}
+
+	var base net.Listener
+
+	if len(baseListeners) == 1 {
+		base = baseListeners[0]
+	} else {
+		base = utils.NewMultiListener(baseListeners...)
+	}
+
+	served := make([]servedListener, 0, 1+len(conf.GetListeners()))
+	served = append(served, servedListener{
+		raw: base,
+		// The global proxy-protocol-listener applies to bind-to ONLY: each
+		// [[listener]] carries its own key, otherwise the panel's single global
+		// toggle would make a loopback carrier that never sends a PROXY header
+		// be refused wholesale.
+		serve: maybeProxyProtocol(base, conf.ProxyProtocolListener.Get(false)),
+		// bind-to is permanently FakeTLS-only. There is deliberately no way to
+		// spell "dd on the public port" by editing an existing key.
+		policy: mtglib.DefaultListenerPolicy,
+	})
+
+	for _, lc := range conf.GetListeners() {
+		addr := lc.BindTo.Get("")
+
+		// Config.Validate already rejected a bad accept list, so this cannot
+		// fire from `mtg run`. Skipping rather than ignoring the error keeps a
+		// caller that never validated from binding a socket whose zero-value
+		// policy honours nothing at all.
+		policy, err := lc.Policy()
+		if err != nil {
+			log.WarningError("cannot use extra listener on "+addr, err)
+
+			continue
+		}
+
+		l, err := utils.NewListener(addr, 0)
+		if err != nil {
+			log.WarningError("cannot start extra listener on "+addr, err)
+
+			continue
+		}
+
+		served = append(served, servedListener{
+			raw:    l,
+			serve:  maybeProxyProtocol(l, policy.ProxyProtocol),
+			policy: policy,
+		})
+	}
+
+	return served, nil
+}
+
+// listenerReport describes every configured socket for the capability report on
+// GET /stats. It is nil when only bind-to is configured, so the report keeps its
+// current shape for every deployment that has no [[listener]].
+func listenerReport(conf *config.Config) []mtglib.ListenerJSON {
+	listeners := conf.GetListeners()
+	if len(listeners) == 0 {
+		return nil
+	}
+
+	bindAddrs := conf.GetBindAddrs()
+	report := make([]mtglib.ListenerJSON, 0, len(bindAddrs)+len(listeners))
+
+	for _, addr := range bindAddrs {
+		report = append(report, mtglib.ListenerJSON{
+			Bind:   addr,
+			Accept: mtglib.ModeSetOf(mtglib.SecretModeFakeTLS).Strings(),
+			Public: true,
+		})
+	}
+
+	for _, lc := range listeners {
+		modes := make([]mtglib.SecretMode, 0, len(lc.Accept))
+		for _, entry := range lc.Accept {
+			modes = append(modes, entry.Get())
+		}
+
+		report = append(report, mtglib.ListenerJSON{
+			Bind:   lc.BindTo.Get(""),
+			Accept: mtglib.ModeSetOf(modes...).Strings(),
+			Public: lc.Public.Get(false),
+		})
+	}
+
+	return report
+}
+
 func runProxy(conf *config.Config, version, configPath string) error { //nolint: funlen, cyclop
 	logger := makeLogger(conf)
 
@@ -407,7 +548,11 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 		EmitTraffic:    conf.Stats.StatsD.Enabled.Get(false) || conf.Stats.Prometheus.Enabled.Get(false),
 		PublicIPv4:     conf.PublicIPv4.Get(nil),
 		PublicIPv6:     conf.PublicIPv6.Get(nil),
+		// AdvertisedPort must keep naming the PUBLIC port for RPC_PROXY_REQ,
+		// never a [[listener]] one, so it stays the first bind-to port.
 		AdvertisedPort: int(conf.GetFirstBindPort()),
+		Listeners:      listenerReport(conf),
+		ListenerModes:  conf.GetListenerModes(),
 
 		ThrottleMaxConnections: conf.Throttle.MaxConnections.Get(0),
 		ThrottleCheckInterval:  conf.Throttle.CheckInterval.Get(5 * time.Second),
@@ -418,44 +563,23 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 		return fmt.Errorf("cannot create a proxy: %w", err)
 	}
 
-	bindAddrs := conf.GetBindAddrs()
-	listeners := make([]net.Listener, 0, len(bindAddrs))
-
-	for _, addr := range bindAddrs {
-		l, err := utils.NewListener(addr, 0)
-		if err != nil {
-			for _, prev := range listeners {
-				prev.Close() //nolint: errcheck
-			}
-
-			return fmt.Errorf("cannot start proxy on %s: %w", addr, err)
-		}
-
-		listeners = append(listeners, l)
-	}
-
-	var listener net.Listener
-
-	if len(listeners) == 1 {
-		listener = listeners[0]
-	} else {
-		listener = utils.NewMultiListener(listeners...)
-	}
-
-	if conf.ProxyProtocolListener.Get(false) {
-		listener = &proxyprotocol.ListenerAdapter{
-			Listener: proxyproto.Listener{
-				Listener: listener,
-			},
-		}
+	served, err := buildListeners(conf, logger)
+	if err != nil {
+		return err
 	}
 
 	ctx := utils.RootContext()
 
-	go proxy.Serve(listener) //nolint: errcheck
+	for _, sl := range served {
+		go proxy.ServeWithPolicy(sl.serve, sl.policy) //nolint: errcheck
+	}
 
 	<-ctx.Done()
-	listener.Close() //nolint: errcheck
+
+	for _, sl := range served {
+		sl.raw.Close() //nolint: errcheck
+	}
+
 	proxy.Shutdown()
 
 	return nil
