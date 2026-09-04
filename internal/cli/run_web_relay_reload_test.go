@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -245,11 +247,39 @@ func TestReloadPicksUpANewClient(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, origin.Profiles())
 
+	// bob is not served before the reload, and is after it. The count alone
+	// would be satisfied by a registry holding the right number of the wrong
+	// capabilities -- which is exactly the bug an earlier version of this
+	// fixture had.
 	writeReloadConfig(t, dir, nil, "", twoSecrets)
+	require.False(t, servesBridge(t, origin, path, "bob"), "an unconfigured client was already being served")
+
 	reloadWebProfiles(path, origin, structure, log)
 
 	require.Equal(t, 2, origin.Profiles(), "the added client never reached the running relay")
+	require.True(t, servesBridge(t, origin, path, "bob"), "the added client is counted but not served")
+	require.True(t, servesBridge(t, origin, path, "alice"), "the existing client stopped being served")
 	require.Empty(t, log.recorded(), "a clean reload must report nothing")
+}
+
+// servesBridge asks the origin for one named client's bridge page, deriving the
+// capability the way the client's own link carries it.
+func servesBridge(t *testing.T, origin *webrelay.Origin, configPath, name string) bool {
+	t.Helper()
+
+	conf, err := utils.ReadConfig(configPath)
+	require.NoError(t, err)
+
+	secret, found := conf.GetSecrets()[name]
+	require.True(t, found, "no secret named %s in the config", name)
+
+	capability, err := webrelay.Derive(webrelay.WebSecret(secret), conf.Web.Host.Get(""))
+	require.NoError(t, err)
+
+	recorder := httptest.NewRecorder()
+	origin.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/?bridge="+capability.String(), nil))
+
+	return recorder.Code == http.StatusOK && strings.Contains(recorder.Body.String(), "TPROXY_BOOT")
 }
 
 // A file that changed more than its secrets is refused whole, loudly, and the
