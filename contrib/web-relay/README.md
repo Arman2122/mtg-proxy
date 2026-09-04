@@ -134,6 +134,39 @@ separately for the client's own two fields.
 Changing the hostname invalidates every WEB link ever issued — the capability is
 derived from it — exactly like changing an `ee` secret's fronting domain.
 
+### 6. Adding and removing clients
+
+The relay reads the same config file as the proxy, and it re-reads the
+`[secrets]` table on **SIGHUP**:
+
+```bash
+kill -HUP "$(pidof mtg-proxy-web-relay)"
+```
+
+Under systemd, put it in the unit so `systemctl reload` works:
+
+```ini
+ExecReload=/bin/kill -HUP $MAINPID
+```
+
+Send it whenever a client is added or removed. Until you do, a new client's WEB
+link is answered by the cover site — which, from that client's side, is
+indistinguishable from the censorship this relay exists to get around.
+
+A reload only ever swaps the profile list. If anything else in `[web]` changed —
+the hostname, the bound address, the backend, the token key, the cover site, the
+limits — or if the backend listener's `proxy-protocol` setting changed, the
+relay logs that a restart is required and keeps running with what it has. It
+also keeps what it has if the file is unreadable, fails validation, or would
+leave it with no usable profile, so a half-written file cannot take a working
+relay off the air.
+
+Live sessions are not disturbed by a reload. Revoking a client is enforced by
+the proxy, which closes their connections when *it* reloads; the relay only
+gates the front door.
+
+Windows builds have no SIGHUP and no reload. Restart the relay there.
+
 ## Verifying it
 
 Everything below can be checked from a shell. What it cannot tell you is whether

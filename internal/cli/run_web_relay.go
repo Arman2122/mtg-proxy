@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,7 +52,7 @@ func (w *WebRelay) Run(_ *CLI, version string) error {
 		return fmt.Errorf("cannot init config: %w", err)
 	}
 
-	return runWebRelay(conf, version, w.Check)
+	return runWebRelay(conf, w.ConfigPath, version, w.Check)
 }
 
 // GenerateWebKey writes the relay's token signing key.
@@ -73,7 +76,7 @@ func (g *GenerateWebKey) Run(_ *CLI) error {
 	return nil
 }
 
-func runWebRelay(conf *config.Config, version string, checkOnly bool) error {
+func runWebRelay(conf *config.Config, configPath, version string, checkOnly bool) error {
 	if err := conf.ValidateWeb(); err != nil {
 		return err
 	}
@@ -81,6 +84,11 @@ func runWebRelay(conf *config.Config, version string, checkOnly bool) error {
 	log := makeLogger(conf).Named("web-relay")
 
 	origin, backendAddr, err := buildOrigin(conf, log)
+	if err != nil {
+		return err
+	}
+
+	structure, err := webStructure(conf)
 	if err != nil {
 		return err
 	}
@@ -126,7 +134,7 @@ func runWebRelay(conf *config.Config, version string, checkOnly bool) error {
 		BindInt("profiles", len(conf.GetSecrets())).
 		Info("web relay is running")
 
-	<-utils.RootContext().Done()
+	waitForShutdown(configPath, origin, structure, log)
 
 	ctx, cancel := context.WithTimeout(context.Background(), webShutdownTimeout)
 	defer cancel()
@@ -136,6 +144,129 @@ func runWebRelay(conf *config.Config, version string, checkOnly bool) error {
 	}
 
 	return nil
+}
+
+// waitForShutdown runs until the process is asked to stop, reloading profiles
+// on every SIGHUP in between.
+//
+// Reload exists because the panel is the source of truth for who may connect,
+// and it writes the config file before it tells the proxy: without this, adding
+// a client leaves the relay serving that client's own link to the cover site
+// until someone restarts it -- which is indistinguishable, from the client's
+// side, from the censorship the relay is there to get around.
+//
+// One goroutine, one signal at a time, so two reloads can never interleave.
+func waitForShutdown(configPath string, origin *webrelay.Origin, structure string, log mtglib.Logger) {
+	stop := utils.RootContext()
+
+	signals := reloadSignals()
+	if len(signals) == 0 {
+		<-stop.Done()
+
+		return
+	}
+
+	// Buffered: a HUP that arrives while one is being applied is remembered
+	// rather than dropped, and more than one pending reload is the same reload.
+	hup := make(chan os.Signal, 1)
+
+	signal.Notify(hup, signals...)
+	defer signal.Stop(hup)
+
+	for {
+		select {
+		case <-stop.Done():
+			return
+		case <-hup:
+			reloadWebProfiles(configPath, origin, structure, log)
+		}
+	}
+}
+
+// reloadWebProfiles re-reads the config file and swaps the profile set in.
+//
+// Every failure leaves the running set alone and says so. A relay that emptied
+// its registry because someone saved a broken file would serve the cover site
+// to every real user while reporting nothing wrong, and that failure is far
+// worse than a stale profile list.
+func reloadWebProfiles(configPath string, origin *webrelay.Origin, structure string, log mtglib.Logger) {
+	conf, err := utils.ReadConfig(configPath)
+	if err != nil {
+		log.WarningError("web relay reload: cannot read the config, keeping the current profiles", err)
+
+		return
+	}
+
+	// The same validation startup ran, so a reload can never accept a file that
+	// --check would refuse.
+	if err := conf.ValidateWeb(); err != nil {
+		log.WarningError("web relay reload: the config is unusable, keeping the current profiles", err)
+
+		return
+	}
+
+	next, err := webStructure(conf)
+	if err != nil {
+		log.WarningError("web relay reload: cannot read the backend listener, keeping the current profiles", err)
+
+		return
+	}
+
+	// Only the profile set is reloadable, and the rest is refused rather than
+	// half-applied. The host is baked into every capability the clients already
+	// hold, the token key has to outlive the tokens it signed, and the backend,
+	// the cover site and the bound address are what the process was built
+	// around. Applying some of a changed file and not the rest is how a relay
+	// ends up in a state no configuration describes.
+	if next != structure {
+		log.Warning("web relay reload: [web] changed in a way that needs a restart, profiles left unchanged")
+
+		return
+	}
+
+	secrets := orderedSecrets(conf)
+
+	if err := origin.SetSecrets(secrets); err != nil {
+		log.WarningError("web relay reload: the new profile set cannot be served, keeping the current one", err)
+
+		return
+	}
+
+	log.BindInt("profiles", len(secrets)).Info("web relay reloaded its profiles")
+}
+
+// webStructure renders everything about a relay that a reload must not change.
+//
+// It is every field of [web] -- the table holds no secrets, so all of it is
+// structural -- plus the one thing the relay reads from outside it: whether the
+// backend listener expects a PROXY header. A field added to ConfigWeb and not
+// added here would become silently reloadable, so a test asserts this covers
+// the struct.
+func webStructure(conf *config.Config) (string, error) {
+	listener, found := conf.WebBackendListener()
+	if !found {
+		return "", fmt.Errorf("[web] backend names no [[listener]]")
+	}
+
+	policy, err := listener.Policy()
+	if err != nil {
+		return "", fmt.Errorf("[web] backend listener: %w", err)
+	}
+
+	return strings.Join([]string{
+		conf.Web.Host.Get(""),
+		conf.Web.BindTo.Get(""),
+		conf.Web.Backend.Get(""),
+		conf.Web.TokenKey,
+		conf.Web.CoverDir,
+		conf.Web.CoverUpstream,
+		conf.Web.ClientIP.String(),
+		strconv.Itoa(int(conf.Web.MaxSessions.Get(0))),
+		strconv.Itoa(int(conf.Web.MaxStreams.Get(0))),
+		strconv.FormatInt(conf.Web.MaxPayload.Get(0), 10),
+		strconv.FormatInt(conf.Web.BatchBytes.Get(0), 10),
+		strconv.FormatBool(policy.ProxyProtocol),
+	}, "\x00"), nil
 }
 
 func buildOrigin(conf *config.Config, log mtglib.Logger) (*webrelay.Origin, string, error) {

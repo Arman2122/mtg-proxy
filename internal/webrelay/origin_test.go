@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -486,4 +487,157 @@ func TestClientAddressComesFromTheConfiguredSource(t *testing.T) {
 
 	require.NotNil(t, origin)
 	require.Nil(t, seen, "the resolver runs only for a carrier request")
+}
+
+// reloadOrigin builds an origin serving exactly the given secrets, plus the
+// cover site every non-recognition test needs.
+func reloadOrigin(t *testing.T, secrets ...mtglib.Secret) *Origin {
+	t.Helper()
+
+	signer, err := NewSigner(bytes.Repeat([]byte{7}, TokenKeySize))
+	require.NoError(t, err)
+
+	cover := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, coverMarker)
+	})
+
+	origin, err := NewOrigin(OriginOptions{
+		Host:    originHost,
+		Secrets: secrets,
+		Signer:  signer,
+		Cover:   cover,
+		Backend: newPipeBackend(),
+	})
+	require.NoError(t, err)
+
+	return origin
+}
+
+func webCapability(t *testing.T, secret mtglib.Secret) string {
+	t.Helper()
+
+	capability, err := Derive(WebSecret(secret), originHost)
+	require.NoError(t, err)
+
+	return capability.String()
+}
+
+// bridgeFor asks for one profile's page and reports whether the relay served it
+// rather than handing the request to the cover site.
+func bridgeFor(origin *Origin, capability string) bool {
+	recorder := httptest.NewRecorder()
+	origin.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/?bridge="+capability, nil))
+
+	return recorder.Code == http.StatusOK && !strings.Contains(recorder.Body.String(), coverMarker)
+}
+
+// A client added in the panel must become reachable without restarting the
+// relay. Until this worked, their own WEB link answered with the cover site --
+// which from the client's side is indistinguishable from the censorship the
+// relay exists to get around.
+func TestReloadAddsAndRemovesProfiles(t *testing.T) {
+	t.Parallel()
+
+	first := mtglib.Secret{Mode: mtglib.SecretModeFakeTLS, Host: "www.cloudflare.com"}
+	first.Key[0] = 1
+
+	second := first
+	second.Key[0] = 2
+
+	origin := reloadOrigin(t, first)
+
+	require.True(t, bridgeFor(origin, webCapability(t, first)))
+	require.False(t, bridgeFor(origin, webCapability(t, second)), "an unconfigured profile must get the cover site")
+
+	require.NoError(t, origin.SetSecrets([]mtglib.Secret{first, second}))
+	require.Equal(t, 2, origin.Profiles())
+	require.True(t, bridgeFor(origin, webCapability(t, second)), "the added profile is still not served")
+
+	// Removal is the same swap in the other direction. The relay only gates the
+	// front door; the streams a revoked client already holds are the proxy's to
+	// close, which it does on its own reload.
+	require.NoError(t, origin.SetSecrets([]mtglib.Secret{second}))
+	require.False(t, bridgeFor(origin, webCapability(t, first)), "the removed profile is still served")
+}
+
+// The rule that matters more than reloading at all: a set that cannot be served
+// is refused, and the relay keeps the one it has. Emptying the registry because
+// somebody saved a broken file would answer every real user with the cover site
+// while reporting nothing wrong.
+func TestReloadRefusesAnUnusableSetAndKeepsTheOldOne(t *testing.T) {
+	t.Parallel()
+
+	live := mtglib.Secret{Mode: mtglib.SecretModeFakeTLS, Host: "www.cloudflare.com"}
+	live.Key[0] = 1
+
+	duplicate := live
+	broken := mtglib.Secret{Mode: mtglib.SecretModeFakeTLS} // no key, no host
+
+	origin := reloadOrigin(t, live)
+	capability := webCapability(t, live)
+
+	for name, secrets := range map[string][]mtglib.Secret{
+		"an empty set":       nil,
+		"a duplicated key":   {live, duplicate},
+		"an invalid secret":  {live, broken},
+		"nothing but broken": {broken},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Error(t, origin.SetSecrets(secrets))
+			require.Equal(t, 1, origin.Profiles())
+			require.True(t, bridgeFor(origin, capability), "the live profile stopped being served")
+		})
+	}
+}
+
+// A reload lands while requests are in flight, and a request must see one set or
+// the other -- never half of a swap. Run under -race, this is what says the
+// snapshot taken at the top of ServeHTTP is doing its job.
+func TestReloadIsInvisibleToRequestsInFlight(t *testing.T) {
+	t.Parallel()
+
+	first := mtglib.Secret{Mode: mtglib.SecretModeFakeTLS, Host: "www.cloudflare.com"}
+	first.Key[0] = 1
+
+	second := first
+	second.Key[0] = 2
+
+	origin := reloadOrigin(t, first)
+	capability := webCapability(t, first)
+
+	done := make(chan struct{})
+
+	var waiting sync.WaitGroup
+
+	for range 8 {
+		waiting.Add(1)
+
+		go func() {
+			defer waiting.Done()
+
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				// first is in every set below, so it must be served every time.
+				if !bridgeFor(origin, capability) {
+					t.Error("a reload made a live profile unreachable")
+
+					return
+				}
+			}
+		}()
+	}
+
+	for range 200 {
+		require.NoError(t, origin.SetSecrets([]mtglib.Secret{first, second}))
+		require.NoError(t, origin.SetSecrets([]mtglib.Secret{first}))
+	}
+
+	close(done)
+	waiting.Wait()
 }

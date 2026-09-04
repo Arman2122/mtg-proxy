@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/internal/webrelay/frame"
@@ -96,13 +97,18 @@ type OriginOptions struct {
 // the three tiers exist to remove -- a prober would see one component's 404 and
 // another's, and could tell them apart by header order and timing.
 type Origin struct {
-	host     string
-	registry *Registry
-	signer   *Signer
-	bridge   *page.Bridge
-	cover    http.Handler
-	store    *store
-	welcome  []byte
+	host string
+
+	// registry is swapped whole by SetSecrets and never mutated in place, so a
+	// reload is invisible to a request already being served: every handler
+	// takes one snapshot and works from it.
+	registry atomic.Pointer[Registry]
+
+	signer  *Signer
+	bridge  *page.Bridge
+	cover   http.Handler
+	store   *store
+	welcome []byte
 
 	backend     Backend
 	limits      frame.Limits
@@ -123,12 +129,7 @@ func NewOrigin(opts OriginOptions) (*Origin, error) {
 		return nil, err
 	}
 
-	web := make([]mtglib.Secret, 0, len(opts.Secrets))
-	for _, secret := range opts.Secrets {
-		web = append(web, WebSecret(secret))
-	}
-
-	registry, err := NewRegistry(host, web)
+	registry, err := buildRegistry(host, opts.Secrets)
 	if err != nil {
 		return nil, err
 	}
@@ -151,9 +152,8 @@ func NewOrigin(opts OriginOptions) (*Origin, error) {
 		return nil, fmt.Errorf("cannot encode WELCOME: %w", err)
 	}
 
-	return &Origin{
+	origin := &Origin{
 		host:        host,
-		registry:    registry,
 		signer:      opts.Signer,
 		bridge:      bridge,
 		cover:       opts.Cover,
@@ -166,7 +166,57 @@ func NewOrigin(opts OriginOptions) (*Origin, error) {
 		clientIP:    opts.ClientIP,
 		log:         opts.Logger,
 		global:      newBudget(DefaultGlobalPendingBytes, DefaultGlobalPendingItems),
-	}, nil
+	}
+
+	origin.registry.Store(registry)
+
+	return origin, nil
+}
+
+// buildRegistry turns configured secrets into capabilities for one host. The
+// ee-to-dd re-spelling happens here rather than at either caller, so startup and
+// reload cannot derive different capabilities from the same file.
+func buildRegistry(host string, secrets []mtglib.Secret) (*Registry, error) {
+	web := make([]mtglib.Secret, 0, len(secrets))
+	for _, secret := range secrets {
+		web = append(web, WebSecret(secret))
+	}
+
+	return NewRegistry(host, web)
+}
+
+// SetSecrets replaces the profile set this origin serves, atomically.
+//
+// It is the whole of a reload. Nothing else about a running relay can change:
+// the host is baked into every capability and into the bridge page's own CSP,
+// the token key must outlive its tokens, and the backend and cover site are
+// what the process was built around. Those are restarts, and the caller is
+// responsible for refusing a file that changed one of them.
+//
+// A set that cannot be served is refused and the previous one stays live. The
+// alternative -- a relay that empties its registry because someone saved a
+// broken file -- serves the cover site to every real user, which looks exactly
+// like censorship working.
+//
+// Live sessions are deliberately untouched. A capability is spent at the front
+// door, and what a session carries afterwards is MTProto that the proxy
+// authenticates for itself: a secret revoked here is revoked there too, and the
+// proxy closes those connections. Duplicating that here would be a second
+// answer to a question already answered.
+func (o *Origin) SetSecrets(secrets []mtglib.Secret) error {
+	registry, err := buildRegistry(o.host, secrets)
+	if err != nil {
+		return err
+	}
+
+	o.registry.Store(registry)
+
+	return nil
+}
+
+// Profiles reports how many profiles the origin currently serves.
+func (o *Origin) Profiles() int {
+	return o.registry.Load().Len()
 }
 
 // ErrNoCoverSite means no handler was configured for unauthenticated requests.
@@ -175,13 +225,19 @@ func NewOrigin(opts OriginOptions) (*Origin, error) {
 var ErrNoCoverSite = errors.New("no cover site configured for the WEB relay origin")
 
 func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if o.serveCarrier(w, r) {
+	// One snapshot for the whole request. Taking it twice would let a reload
+	// land between the two tiers, and a request that missed tier one against
+	// the old set and tier two against the new would be handed to the cover
+	// site -- the single outcome the recognition rule exists to prevent.
+	registry := o.registry.Load()
+
+	if o.serveCarrier(w, r, registry) {
 		return
 	}
 
 	// Nothing usable. If anything authentic appears anywhere in the request's
 	// metadata, this is ours and stays ours.
-	if o.recognises(r) {
+	if o.recognises(r, registry) {
 		o.notFound(w)
 
 		return
@@ -192,10 +248,10 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // serveCarrier handles the request if it is authentic AND usable, reporting
 // whether it did.
-func (o *Origin) serveCarrier(w http.ResponseWriter, r *http.Request) bool {
+func (o *Origin) serveCarrier(w http.ResponseWriter, r *http.Request, registry *Registry) bool {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
-		return o.serveBridge(w, r)
+		return o.serveBridge(w, r, registry)
 	case r.Method == http.MethodPost && r.URL.Path == sessionPath:
 		return o.serveSessionCreate(w, r)
 	case r.Method == http.MethodDelete && r.URL.Path == sessionPath:
@@ -214,7 +270,7 @@ func (o *Origin) serveCarrier(w http.ResponseWriter, r *http.Request) bool {
 // duplicated one, an extra one alongside it, a padded spelling -- fails here and
 // is then classified by the recognition scan, so an authentic capability written
 // wrongly gets the local 404 and an unauthentic one gets the website.
-func (o *Origin) serveBridge(w http.ResponseWriter, r *http.Request) bool {
+func (o *Origin) serveBridge(w http.ResponseWriter, r *http.Request, registry *Registry) bool {
 	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil || len(query) != 1 {
 		return false
@@ -225,7 +281,7 @@ func (o *Origin) serveBridge(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 
-	profile, ok := o.registry.Lookup(values[0])
+	profile, ok := registry.Lookup(values[0])
 	if !ok {
 		return false
 	}
@@ -451,7 +507,7 @@ func (o *Origin) notFound(w http.ResponseWriter) {
 //
 // Bodies and trailers are never consumed, so classification cannot depend on
 // reading something the cover site still needs.
-func (o *Origin) recognises(r *http.Request) bool {
+func (o *Origin) recognises(r *http.Request, registry *Registry) bool {
 	found := false
 	atoms := 0
 
@@ -463,7 +519,7 @@ func (o *Origin) recognises(r *http.Request) bool {
 
 			// Both tests, never short-circuited on the first: a request should
 			// not be classifiable by how long the classification took.
-			authentic := o.registry.IsAuthentic(atom) || o.signer.IsAuthentic(atom)
+			authentic := registry.IsAuthentic(atom) || o.signer.IsAuthentic(atom)
 			found = found || authentic
 		}
 	}
