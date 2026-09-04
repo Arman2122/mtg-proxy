@@ -1,0 +1,123 @@
+name: Bug report
+description: Something behaves differently from what the documentation says it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        **Not a bug report?** Questions about setting it up, "is this supposed to work
+        like this", and ideas you want to talk through belong in
+        [Discussions](https://github.com/Arman2122/mtg-proxy/discussions) — you will
+        usually get a faster answer there.
+
+        **Found a security problem?** Do not open an issue. Follow
+        [SECURITY.md](https://github.com/Arman2122/mtg-proxy/blob/main/SECURITY.md)
+        and report it privately.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `mtg-proxy --version`, or the release tag you installed.
+      placeholder: v1.3.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Which entry path
+      description: Which door the affected client uses. Pick "several" if it is not specific to one.
+      options:
+        - FakeTLS (ee) on bind-to
+        - obfuscated2 (dd or plain) on a [[listener]]
+        - WEB proxy (relay + front proxy)
+        - Management API
+        - Several, or not transport-specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+      placeholder: |
+        I added a second secret and sent SIGHUP to the relay.
+        I expected the new client to connect.
+        It got the cover site instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The shortest sequence that shows the problem.
+      placeholder: |
+        1. Start with the config below
+        2. Run ...
+        3. Connect with ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: |
+        The relevant part of your config.toml.
+
+        **Remove your secrets, your api-token and your hostname before pasting.**
+        The structure is what matters — replace the values with placeholders.
+      render: toml
+      placeholder: |
+        bind-to = "0.0.0.0:443"
+
+        [[listener]]
+        bind-to = "127.0.0.1:2398"
+        accept = ["dd"]
+        proxy-protocol = true
+
+        [secrets]
+        alice = "ee...REDACTED..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant output from the proxy, and from the relay if the WEB transport is involved.
+        `debug = true` in the config makes these much more useful.
+
+        Check for secrets before pasting.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and architecture, and how you are running it.
+      placeholder: Ubuntu 24.04, amd64, systemd, behind Caddy
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: mtg-proxy doctor
+      description: |
+        Optional but often decisive for connectivity problems.
+
+        ```
+        mtg-proxy doctor /etc/mtg-proxy/config.toml
+        ```
+      render: text
+    validations:
+      required: false

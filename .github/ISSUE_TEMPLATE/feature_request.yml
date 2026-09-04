@@ -1,0 +1,57 @@
+name: Feature request
+description: Something the proxy should be able to do and cannot.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If you are not sure yet whether this is a good idea, or you want to talk
+        through an approach first, start in
+        [Discussions](https://github.com/Arman2122/mtg-proxy/discussions) instead.
+        An issue is for something you have already decided you want.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: |
+        The situation, not the solution. What are you actually trying to accomplish,
+        and what stops you today?
+      placeholder: |
+        I run a panel that provisions users automatically. When it adds a user I have
+        to restart the WEB relay, which drops everyone else's session for a moment.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: How you would like it to work. A config key, a flag, an endpoint — be concrete if you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: |
+        Workarounds you have already used, and why they are not enough. This is often the
+        most useful part of the request.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: compatibility
+    attributes:
+      label: Would this change existing behaviour
+      description: |
+        This project is a sidecar for other software, so release asset names, config keys
+        and the management API are contracts. Additive changes are much easier to accept.
+      options:
+        - Additive — nothing existing changes
+        - Changes a default
+        - Changes or removes an existing config key, API field or asset name
+        - I am not sure
+    validations:
+      required: true

@@ -1,0 +1,16 @@
+# Issues are for defects and concrete feature requests. Everything else has a
+# better home, and pointing at it here is what keeps the tracker usable.
+blank_issues_enabled: false
+contact_links:
+  - name: Question, or help setting it up
+    url: https://github.com/Arman2122/mtg-proxy/discussions/categories/q-a
+    about: Configuration help, "is this supposed to work like this", anything you are stuck on.
+  - name: Documentation
+    url: https://github.com/Arman2122/mtg-proxy/wiki
+    about: Installation, configuration reference, the WEB transport, troubleshooting.
+  - name: Report a security vulnerability
+    url: https://github.com/Arman2122/mtg-proxy/security/advisories/new
+    about: Report privately. Never in a public issue.
+  - name: Share an idea, or show what you built
+    url: https://github.com/Arman2122/mtg-proxy/discussions
+    about: Ideas you want to talk through before they become a request.
