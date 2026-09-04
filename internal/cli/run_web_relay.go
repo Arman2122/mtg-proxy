@@ -102,6 +102,7 @@ func runWebRelay(conf *config.Config, configPath, version string, checkOnly bool
 		fmt.Printf("  backend   %s\n", backendAddr)                          //nolint: forbidigo
 		fmt.Printf("  profiles  %d\n", len(conf.GetSecrets()))               //nolint: forbidigo
 		fmt.Printf("  client-ip %s\n", conf.Web.ClientIP.String())           //nolint: forbidigo
+		fmt.Printf("  stats     %s\n", conf.Web.StatsBindTo.Get("(off)"))    //nolint: forbidigo
 
 		return nil
 	}
