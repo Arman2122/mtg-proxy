@@ -97,6 +97,7 @@ type Config struct {
 	APIToken                    string                       `json:"apiToken"`
 	BindTo                      []TypeHostPort               `json:"bindTo"`
 	Listeners                   []ConfigListener             `json:"listeners"`
+	Web                         ConfigWeb                    `json:"web"`
 	ProxyProtocolListener       TypeBool                     `json:"proxyProtocolListener"`
 	PreferIP                    TypePreferIP                 `json:"preferIp"`
 	AutoUpdate                  TypeBool                     `json:"autoUpdate"`

@@ -32,6 +32,20 @@ type tomlConfig struct {
 		OnUnknownSecret string   `toml:"on-unknown-secret" json:"onUnknownSecret,omitempty"`
 		HandshakesPerIP uint     `toml:"handshakes-per-ip" json:"handshakesPerIp,omitempty"`
 	} `toml:"listener" json:"listeners,omitempty"`
+	Web struct {
+		Enabled           bool   `toml:"enabled"             json:"enabled,omitempty"`
+		Host              string `toml:"host"                json:"host,omitempty"`
+		BindTo            string `toml:"bind-to"             json:"bindTo,omitempty"`
+		Backend           string `toml:"backend"             json:"backend,omitempty"`
+		TokenKey          string `toml:"token-key"           json:"tokenKey,omitempty"`
+		CoverDir          string `toml:"cover-dir"           json:"coverDir,omitempty"`
+		CoverUpstream     string `toml:"cover-upstream"      json:"coverUpstream,omitempty"`
+		ClientIP          string `toml:"client-ip"           json:"clientIp,omitempty"`
+		MaxSessions       uint   `toml:"max-sessions"        json:"maxSessions,omitempty"`
+		MaxStreams        uint   `toml:"max-streams"         json:"maxStreams,omitempty"`
+		MaxFramePayload   string `toml:"max-frame-payload"   json:"maxFramePayload,omitempty"`
+		CarrierBatchBytes string `toml:"carrier-batch-bytes" json:"carrierBatchBytes,omitempty"`
+	} `toml:"web" json:"web"`
 	ProxyProtocolListener       bool   `toml:"proxy-protocol-listener" json:"proxyProtocolListener"`
 	PreferIP                    string `toml:"prefer-ip" json:"preferIp,omitempty"`
 	AutoUpdate                  bool   `toml:"auto-update" json:"autoUpdate,omitempty"`
