@@ -218,3 +218,50 @@ func TestReloadHandler(t *testing.T) {
 		assert.Equal(t, http.StatusInternalServerError, rec.Code)
 	})
 }
+
+// TestGovernanceReloadRevokesLiveStreamAcrossEntries runs revocation-by-hot-
+// reload over both doors, on real relaying connections rather than the fake
+// streams TestProxyReloadSecrets uses.
+//
+// closeStaleConns is keyed on the name in liveConns, and on the plaintext door
+// that name is only there because attribution precedes registration. A stream
+// filed under "" could never be found again, so removing a dd user from the
+// config would revoke nothing: the client would keep relaying until it chose to
+// leave.
+func TestGovernanceReloadRevokesLiveStreamAcrossEntries(t *testing.T) {
+	t.Parallel()
+
+	for _, ec := range govEntryCases() {
+		t.Run(ec.name, func(t *testing.T) {
+			t.Parallel()
+
+			alice := ec.secret(t)
+			bob := ec.secret(t)
+
+			h := ec.harness(t, map[string]Secret{"alice": alice, "bob": bob}, nil)
+
+			// One at a time: connect waits for its own dial on the single shared
+			// upstream listener.
+			aliceStream := ec.connect(t, h, "alice", alice.Key)
+			bobStream := ec.connect(t, h, "bob", bob.Key)
+
+			h.proxy.reloader = func() (SecretConfig, error) {
+				return SecretConfig{Secrets: map[string]Secret{"bob": bob}}, nil
+			}
+
+			require.NoError(t, h.proxy.ReloadSecrets())
+
+			// Catches closeStaleConns no longer reaching a removed user's live
+			// streams. Bounded, because a stream that is not revoked is still
+			// relaying: its handshake deadline was cleared on admission, so
+			// nothing else would ever end it.
+			require.True(t, govAwait(aliceStream.done, govDenyBudget),
+				"a removed secret's live stream must be closed by the reload")
+
+			assert.NoError(t, bobStream.ctx.Err(),
+				"a secret that survived the reload must keep its live streams")
+
+			bobStream.close()
+		})
+	}
+}
