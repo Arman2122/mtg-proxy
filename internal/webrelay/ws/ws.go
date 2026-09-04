@@ -396,7 +396,7 @@ func (c *Conn) writeFrame(opcode byte, payload []byte) error {
 
 	switch {
 	case len(payload) <= maxControlPayload:
-		header[1] = byte(len(payload))
+		header[1] = byte(len(payload)) //nolint:gosec // bounded by the case: at most 125
 	case len(payload) <= 0xFFFF:
 		header[1] = 126                                                      //nolint:gosec // header was made with len 2, cap 10
 		header = binary.BigEndian.AppendUint16(header, uint16(len(payload))) //nolint:gosec // bounded by the case

@@ -112,7 +112,9 @@ func generateServerHelloHandshakePayload(buf *bytes.Buffer, hello *ClientHello) 
 
 	// 20 - 0x20 (32) bytes of session ID follow
 	// e0 e1 ... fe ff - session ID copied from Client Hello
-	buf.WriteByte(byte(len(hello.SessionID)))
+	// The client hello's own single length byte sized this slice, so it is at
+	// most 255 and the length written back is the one that was read.
+	buf.WriteByte(byte(len(hello.SessionID))) //nolint:gosec // bounded by the parser
 	buf.Write(hello.SessionID)
 
 	binary.Write(buf, binary.BigEndian, hello.CipherSuite) //nolint: errcheck

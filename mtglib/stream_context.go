@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
@@ -12,10 +13,28 @@ import (
 )
 
 type streamContext struct {
-	ctx              context.Context
-	ctxCancel        context.CancelFunc
-	clientConn       essentials.Conn
-	telegramConn     essentials.Conn
+	ctx       context.Context
+	ctxCancel context.CancelFunc
+
+	// connMu guards the two sockets and the closed flag. Reach them through
+	// client/setClient and telegram/setTelegram, never directly.
+	//
+	// This stream's own goroutine writes them as the handshake proceeds: the
+	// client socket is re-wrapped up to three times on the way in, and the
+	// Telegram one does not exist at all until the dial returns. Close reads
+	// both -- and a secret reload calls Close from an entirely different
+	// goroutine, to revoke a stream that is still running.
+	//
+	// The lock is not only about the race detector. A Close that reads a nil
+	// telegramSocket a moment before the dial assigns one leaves that socket
+	// with nobody left to close it: the revocation silently does not happen,
+	// and the stream a reload was meant to kill keeps carrying traffic. The
+	// closed flag is what makes the two orderings equivalent.
+	connMu         sync.Mutex
+	clientSocket   essentials.Conn
+	telegramSocket essentials.Conn
+	closed         bool
+
 	streamID         string
 	dc               int
 	matchedSecretKey []byte
@@ -50,15 +69,80 @@ func (s *streamContext) Value(key any) any {
 	return s.ctx.Value(key)
 }
 
+// client returns the socket the client is currently speaking through: the raw
+// one early in the handshake, and whatever wraps it afterwards.
+func (s *streamContext) client() essentials.Conn {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+
+	return s.clientSocket
+}
+
+// setClient replaces the client socket, usually with a wrapper around the one
+// already there.
+//
+// A socket handed over after Close has run is closed here rather than stored.
+// Storing it would be worse than dropping it: nothing would ever close it, and
+// the stream a reload just revoked would still be holding a live connection.
+func (s *streamContext) setClient(conn essentials.Conn) {
+	s.connMu.Lock()
+	closed := s.closed
+
+	if !closed {
+		s.clientSocket = conn
+	}
+
+	s.connMu.Unlock()
+
+	if closed {
+		conn.Close() //nolint: errcheck // a socket nobody will ever read
+	}
+}
+
+// telegram returns the upstream socket, which is nil until the dial returns.
+func (s *streamContext) telegram() essentials.Conn {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+
+	return s.telegramSocket
+}
+
+// setTelegram records the upstream socket, or closes it if this stream has
+// already been revoked. This is the ordering the whole lock exists for.
+func (s *streamContext) setTelegram(conn essentials.Conn) {
+	s.connMu.Lock()
+	closed := s.closed
+
+	if !closed {
+		s.telegramSocket = conn
+	}
+
+	s.connMu.Unlock()
+
+	if closed {
+		conn.Close() //nolint: errcheck // a socket nobody will ever read
+	}
+}
+
+// Close revokes the stream. It is called by this stream's own goroutine on the
+// way out, and by a secret reload from another goroutine to kill a stream whose
+// secret is gone -- so it takes one snapshot under the lock and closes outside
+// it, and marks the stream closed so a socket assigned afterwards is closed
+// rather than orphaned.
 func (s *streamContext) Close() {
 	s.ctxCancel()
 
-	if s.clientConn != nil {
-		s.clientConn.Close() //nolint: errcheck
+	s.connMu.Lock()
+	s.closed = true
+	clientConn, telegramConn := s.clientSocket, s.telegramSocket
+	s.connMu.Unlock()
+
+	if clientConn != nil {
+		clientConn.Close() //nolint: errcheck
 	}
 
-	if s.telegramConn != nil {
-		s.telegramConn.Close() //nolint: errcheck
+	if telegramConn != nil {
+		telegramConn.Close() //nolint: errcheck
 	}
 }
 
@@ -66,7 +150,7 @@ func (s *streamContext) Close() {
 // It runs inside newStreamContext BEFORE `defer ctx.Close()` is registered, so
 // the forced assert it used to be leaked the socket on the way out.
 func (s *streamContext) ClientIP() net.IP {
-	ip, _ := acceptedClientIP(s.clientConn.RemoteAddr())
+	ip, _ := acceptedClientIP(s.client().RemoteAddr())
 
 	return ip
 }
@@ -80,10 +164,10 @@ func newStreamContext(ctx context.Context, logger Logger, clientConn essentials.
 
 	ctx, cancel := context.WithCancel(ctx)
 	streamCtx := &streamContext{
-		ctx:        ctx,
-		ctxCancel:  cancel,
-		clientConn: clientConn,
-		streamID:   base64.RawURLEncoding.EncodeToString(connIDBytes),
+		ctx:          ctx,
+		ctxCancel:    cancel,
+		clientSocket: clientConn,
+		streamID:     base64.RawURLEncoding.EncodeToString(connIDBytes),
 		// Default to today's tag so any path that forgets to set one emits
 		// exactly the bytes this proxy has always emitted.
 		connTag: obfuscation.TagPaddedIntermediate,

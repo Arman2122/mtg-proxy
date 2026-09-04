@@ -148,7 +148,7 @@ func peekTag(raw *[hfLen]byte, secret []byte) ConnectionTag {
 func incrCounterBE(ctr *[aes.BlockSize]byte, n uint64) {
 	for i := len(ctr) - 1; i >= 0 && n > 0; i-- {
 		sum := uint64(ctr[i]) + n&0xff
-		ctr[i] = byte(sum)
+		ctr[i] = byte(sum) //nolint:gosec // the low byte is the digit; the carry is kept in n below
 		n = n>>8 + sum>>8
 	}
 }

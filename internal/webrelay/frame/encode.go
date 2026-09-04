@@ -21,9 +21,9 @@ func (f Frame) appendTo(dst []byte, lim Limits, dir Direction) ([]byte, error) {
 	// Safe: validate bounded the id at MaxStreamID, so the u24 field holds it.
 	header := [HeaderSize]byte{
 		byte(f.Type),
-		byte(f.StreamID >> 16),
-		byte(f.StreamID >> 8),
-		byte(f.StreamID),
+		byte(f.StreamID >> 16), //nolint:gosec // validate bounded the id at MaxStreamID
+		byte(f.StreamID >> 8),  //nolint:gosec // same
+		byte(f.StreamID),       //nolint:gosec // same
 	}
 	// Safe: validate bounded the length at lim's payload cap, itself at most
 	// MaxPayloadSize.

@@ -1055,7 +1055,7 @@ func TestPolicyConnIsUnwrapped(t *testing.T) {
 	require.NotNil(t, stream)
 
 	h.proxy.liveMu.Lock()
-	_, wrapped := stream.clientConn.(policyConn)
+	_, wrapped := stream.client().(policyConn)
 	h.proxy.liveMu.Unlock()
 
 	assert.False(t, wrapped, "policyConn must not survive into the stream context")

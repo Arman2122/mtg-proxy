@@ -462,15 +462,66 @@ func (c *Config) GetFirstBindPort() uint {
 	return c.BindTo[0].Port
 }
 
+// redactedValue replaces every credential in the rendering below. It is a fixed
+// string rather than an empty one so a reader can tell "not configured" from
+// "not shown".
+const redactedValue = "[redacted]"
+
+// String renders the configuration for a log line, with the credentials taken
+// out.
+//
+// Its one caller is a Debug log, and it used to serialise the struct verbatim:
+// switching debug on wrote every client's secret and the management API token
+// into the operator's log file, where they outlive the process and are read by
+// whatever ships the logs. Names are kept, because knowing which secrets are
+// configured is the entire value of that line, and values are not.
 func (c *Config) String() string {
+	fields := map[string]any{}
+
+	// The intermediate holds the real values and never leaves this function.
+	//nolint:gosec // G117: every credential is replaced below, before returning
+	raw, err := json.Marshal(c)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		panic(err)
+	}
+
+	redactConfigCredentials(fields)
+
 	buf := &bytes.Buffer{}
 	encoder := json.NewEncoder(buf)
 
 	encoder.SetEscapeHTML(false)
 
-	if err := encoder.Encode(c); err != nil {
+	if err := encoder.Encode(fields); err != nil {
 		panic(err)
 	}
 
 	return buf.String()
+}
+
+// redactConfigCredentials blanks the values that authenticate somebody, in
+// place. The keys are the JSON names of Config's own fields; a field added to
+// Config that carries a credential has to be added here too, which is what
+// TestConfigStringRedactsEveryCredential is for.
+func redactConfigCredentials(fields map[string]any) {
+	for _, key := range []string{"secret", "apiToken"} {
+		if _, found := fields[key]; found {
+			fields[key] = redactedValue
+		}
+	}
+
+	// The named secrets keep their names: which clients exist is the reason to
+	// log the configuration at all, and the key is not the credential.
+	named, ok := fields["secrets"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	for name := range named {
+		named[name] = redactedValue
+	}
 }

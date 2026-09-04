@@ -136,7 +136,7 @@ report is "no IP", not a crash. It reaches the logger as <nil> and the policy
 layer as an IP that matches nothing.
 */
 func TestAStreamContextReportsNoClientIPRatherThanPanicking(t *testing.T) {
-	ctx := &streamContext{clientConn: connWithAddr{addr: &net.UnixAddr{Net: "unix", Name: "/tmp/x"}}}
+	ctx := &streamContext{clientSocket: connWithAddr{addr: &net.UnixAddr{Net: "unix", Name: "/tmp/x"}}}
 
 	ip := ctx.ClientIP()
 	if ip != nil {
@@ -147,7 +147,7 @@ func TestAStreamContextReportsNoClientIPRatherThanPanicking(t *testing.T) {
 		t.Fatalf("String() on the reported IP = %q", s)
 	}
 
-	real := &streamContext{clientConn: connWithAddr{addr: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 1}}}
+	real := &streamContext{clientSocket: connWithAddr{addr: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 1}}}
 	if got := real.ClientIP(); !got.Equal(net.IPv4(203, 0, 113, 7)) {
 		t.Fatalf("an ordinary client lost its IP: %v", got)
 	}

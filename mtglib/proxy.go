@@ -276,7 +276,7 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	ctx := newStreamContext(p.ctx, p.logger, conn)
 	defer ctx.Close()
 
-	if err := ctx.clientConn.SetDeadline(time.Now().Add(p.handshakeTimeout)); err != nil {
+	if err := ctx.client().SetDeadline(time.Now().Add(p.handshakeTimeout)); err != nil {
 		ctx.logger.WarningError("cannot set handshake timeout", err)
 		return
 	}
@@ -332,14 +332,14 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	// belongs to this path and no other, and so does the obfuscated handshake
 	// that has to be read back out through it.
 	if ctx.entry == entryFakeTLS {
-		clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
+		clientConn, err := p.doppelGanger.NewConn(ctx.client())
 		if err != nil {
 			ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
 			return
 		}
 		defer clientConn.Stop()
 
-		ctx.clientConn = clientConn
+		ctx.setClient(clientConn)
 
 		if err := p.doObfuscatedHandshake(ctx); err != nil {
 			ctx.logger.InfoError("obfuscated handshake is failed", err)
@@ -347,7 +347,7 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 		}
 	}
 
-	if err := ctx.clientConn.SetDeadline(time.Time{}); err != nil {
+	if err := ctx.client().SetDeadline(time.Time{}); err != nil {
 		ctx.logger.WarningError("cannot set deadline", err)
 		return
 	}
@@ -362,8 +362,8 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 	relay.Relay(
 		ctx,
 		ctx.logger.Named("relay"),
-		connIdleTimeout{Conn: ctx.telegramConn, tracker: tracker},
-		newCountingConn(connIdleTimeout{Conn: ctx.clientConn, tracker: tracker}, p.stats, ctx.secretName),
+		connIdleTimeout{Conn: ctx.telegram(), tracker: tracker},
+		newCountingConn(connIdleTimeout{Conn: ctx.client(), tracker: tracker}, p.stats, ctx.secretName),
 	)
 }
 
@@ -750,7 +750,7 @@ func (p *Proxy) startUsagePersistence(ctx context.Context) {
 }
 
 func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
-	rewind := newConnRewind(ctx.clientConn)
+	rewind := newConnRewind(ctx.client())
 
 	// Read the active secret snapshot once so a concurrent ReloadSecrets swap
 	// cannot desync the key list, hostnames and matched index mid-handshake.
@@ -808,12 +808,12 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	gangerNoise := p.doppelGanger.NoiseParams()
 	noiseParams := fake.NoiseParams{Mean: gangerNoise.Mean, Jitter: gangerNoise.Jitter}
 
-	if err := fake.SendServerHello(ctx.clientConn, set.secrets[idx].Key[:], result.Hello, noiseParams); err != nil {
+	if err := fake.SendServerHello(ctx.client(), set.secrets[idx].Key[:], result.Hello, noiseParams); err != nil {
 		p.logger.InfoError("cannot send welcome packet", err)
 		return false
 	}
 
-	ctx.clientConn = tls.New(ctx.clientConn, true, false)
+	ctx.setClient(tls.New(ctx.client(), true, false))
 
 	return true
 }
@@ -866,7 +866,7 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 		p.obfsStats.OnObfuscatedTrial()
 	}
 
-	res, err := obfuscation.MatchHandshake(ctx.clientConn, keys, policy.Tags())
+	res, err := obfuscation.MatchHandshake(ctx.client(), keys, policy.Tags())
 
 	switch {
 	case err != nil && !errors.Is(err, obfuscation.ErrNoMatchingSecret):
@@ -904,7 +904,7 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 
 	ctx.dc = res.DC
 	ctx.connTag = res.Tag
-	ctx.clientConn = res.Conn
+	ctx.setClient(res.Conn)
 	ctx.logger = ctx.logger.BindInt("dc", res.DC).BindStr("conn_tag", res.Tag.String())
 
 	return true
@@ -953,7 +953,7 @@ func (p *Proxy) denyObfuscated(ctx *streamContext, policy ListenerPolicy) bool {
 	p.obfsStats.OnObfuscatedDrainStart()
 	defer p.obfsStats.OnObfuscatedDrainEnd()
 
-	io.CopyN(io.Discard, ctx.clientConn, obfuscatedDrainBytes) //nolint: errcheck
+	io.CopyN(io.Discard, ctx.client(), obfuscatedDrainBytes) //nolint: errcheck
 
 	return false
 }
@@ -985,14 +985,14 @@ func (p *Proxy) doObfuscatedHandshake(ctx *streamContext) error {
 
 	// The FakeTLS entry honours padded-intermediate and nothing else, exactly as
 	// it always has: ee clients send 0xdddddddd.
-	dc, tag, conn, err := obfs.ReadHandshake(ctx.clientConn, obfuscation.TagSetOf(obfuscation.TagPaddedIntermediate))
+	dc, tag, conn, err := obfs.ReadHandshake(ctx.client(), obfuscation.TagSetOf(obfuscation.TagPaddedIntermediate))
 	if err != nil {
 		return fmt.Errorf("cannot process client handshake: %w", err)
 	}
 
 	ctx.dc = dc
 	ctx.connTag = tag
-	ctx.clientConn = conn
+	ctx.setClient(conn)
 	ctx.logger = ctx.logger.BindInt("dc", dc)
 
 	return nil
@@ -1081,7 +1081,7 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 		return fmt.Errorf("cannot perform server handshake: %w", err)
 	}
 
-	ctx.telegramConn = p.wrapTraffic(tgConn, ctx)
+	ctx.setTelegram(p.wrapTraffic(tgConn, ctx))
 
 	telegramHost, _, err := net.SplitHostPort(foundAddr.Address)
 	if err != nil {
@@ -1101,12 +1101,12 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 }
 
 // doMiddleProxyCall dials a Telegram middle proxy for the stream's DC and sets
-// ctx.telegramConn to an RPC stream that carries the client's traffic together
-// with the advertising tag. It returns an error (leaving ctx.telegramConn
-// unset) if the middle proxy cannot be reached, so the caller can fall back to
-// a direct connection.
+// the stream's upstream socket to an RPC stream that carries the client's
+// traffic together with the advertising tag. It returns an error (leaving that
+// socket unset) if the middle proxy cannot be reached, so the caller can fall
+// back to a direct connection.
 func (p *Proxy) doMiddleProxyCall(ctx *streamContext) error {
-	clientAddr, _ := ctx.clientConn.RemoteAddr().(*net.TCPAddr)
+	clientAddr, _ := ctx.client().RemoteAddr().(*net.TCPAddr)
 
 	stream, middleIP, err := p.middleProxy.DialProxyStream(p.network, middleproxy.DialParams{
 		DC:             ctx.dc,
@@ -1122,7 +1122,7 @@ func (p *Proxy) doMiddleProxyCall(ctx *streamContext) error {
 		return fmt.Errorf("cannot dial middle proxy: %w", err)
 	}
 
-	ctx.telegramConn = p.wrapTraffic(stream, ctx)
+	ctx.setTelegram(p.wrapTraffic(stream, ctx))
 
 	p.eventStream.Send(ctx, NewEventConnectedToDC(ctx.streamID, middleIP, ctx.dc))
 
@@ -1156,7 +1156,7 @@ func (p *Proxy) doDomainFrontingForHost(ctx *streamContext, conn *connRewind, ho
 	frontConn := essentials.WrapNetConn(fConn)
 
 	if p.domainFrontingProxyProtocol {
-		frontConn = newConnProxyProtocol(ctx.clientConn, frontConn)
+		frontConn = newConnProxyProtocol(ctx.client(), frontConn)
 	}
 
 	frontConn = p.wrapTraffic(frontConn, ctx)

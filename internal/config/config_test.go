@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -203,4 +204,51 @@ func (suite *ConfigTestSuite) TestParseMinimalNoAdTag() {
 func TestConfig(t *testing.T) {
 	t.Parallel()
 	suite.Run(t, &ConfigTestSuite{})
+}
+
+// The one caller of Config.String is a Debug log line, and a log file outlives
+// the process and is read by whatever ships it. Every credential in the file has
+// to be gone from that string, and the names have to survive -- knowing which
+// clients are configured is the reason to log the configuration at all.
+//
+// The secret values are matched as substrings of the whole rendering rather than
+// by key, so a credential that reappears under a field nobody thought about
+// still fails this.
+func TestConfigStringRedactsEveryCredential(t *testing.T) {
+	t.Parallel()
+
+	const (
+		aliceSecret = "7oe1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"
+		bobSecret   = "7ni1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"
+		apiToken    = "s3cr3t-management-token"
+	)
+
+	conf, err := config.Parse([]byte(`
+secret = "` + aliceSecret + `"
+bind-to = "0.0.0.0:3128"
+api-token = "` + apiToken + `"
+
+[secrets]
+alice = "` + aliceSecret + `"
+bob = "` + bobSecret + `"
+`))
+	require.NoError(t, err)
+
+	rendered := conf.String()
+
+	// The hex spelling is what a Secret marshals to, so both are checked: the
+	// input spelling and the one the encoder would actually emit.
+	for _, credential := range []string{
+		aliceSecret,
+		bobSecret,
+		apiToken,
+		conf.Secret.String(),
+		conf.Secrets["bob"].String(),
+	} {
+		require.NotContains(t, rendered, credential, "a credential reached the log rendering")
+	}
+
+	require.Contains(t, rendered, "alice", "the secret names must survive redaction")
+	require.Contains(t, rendered, "bob")
+	require.Contains(t, rendered, "0.0.0.0:3128", "ordinary settings must survive redaction")
 }

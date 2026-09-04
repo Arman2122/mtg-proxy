@@ -231,7 +231,10 @@ func (p *Proxy) startAPIServer(ctx context.Context, bindTo, token string) {
 		}
 	}()
 
-	go func() {
+	// G118: this goroutine's whole job starts when ctx is already cancelled, so
+	// the request-scoped context it is told to use is exactly the one that must
+	// not be used here. See the comment on Shutdown below.
+	go func() { //nolint:gosec // the deadline is deliberately independent of ctx
 		<-ctx.Done()
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second) //nolint: mnd

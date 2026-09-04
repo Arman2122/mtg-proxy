@@ -159,6 +159,9 @@ func Parse(rawData []byte) (*Config, error) {
 		tomlConf.BindTo = strs
 	}
 
+	// G117: the buffer is decoded back into conf three lines down and never
+	// leaves this function. This is the TOML-to-struct pipeline, not output.
+	//nolint:gosec // an in-memory round trip
 	if err := jsonEncoder.Encode(tomlConf); err != nil {
 		panic(err)
 	}
