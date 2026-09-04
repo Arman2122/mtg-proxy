@@ -54,6 +54,11 @@ FakeTLS is the default and every client speaks it. WEB needs Telegram Desktop
 one whose TLS is not an imitation. See
 [WEB proxy transport](#web-proxy-transport).
 
+**[Documentation](https://github.com/Arman2122/mtg-proxy/wiki)** — installation,
+configuration reference, the WEB transport, monitoring, security and
+troubleshooting. **[Discussions](https://github.com/Arman2122/mtg-proxy/discussions)**
+for questions. **[Contributing](CONTRIBUTING.md)** if you want to send a change.
+
 ## Table of contents
 
 - [How a client reaches it](#how-a-client-reaches-it)
