@@ -160,7 +160,18 @@ curl http://127.0.0.1:9090/stats
   "started_at": "2026-03-29T10:30:00Z",
   "uptime_seconds": 3600,
   "total_connections": 15,
-  "features": ["faketls", "quota-reset", "secrets-api"],
+  "features": ["faketls", "listeners", "quota-reset", "secret-modes", "secrets-api"],
+  "listeners": [
+    { "bind": "0.0.0.0:443", "accept": ["ee"], "public": true },
+    { "bind": "127.0.0.1:2398", "accept": ["dd", "plain"], "public": false }
+  ],
+  "obfuscated": {
+    "trials": 412,
+    "misses": 7,
+    "denied": 7,
+    "draining": 0,
+    "rate_limited": 0
+  },
   "users": {
     "alice": {
       "connections": 8,
@@ -178,6 +189,17 @@ is included only when [throttling](#connection-throttling) is configured, and a
 user's `quota`, `quota_remaining`, `quota_reset`, `expires_at` and `disabled`
 fields appear only when that user has the corresponding
 [limit](#per-user-quotas-expiry--disable) set.
+
+`listeners` and `obfuscated` appear only when at least one
+[`[[listener]]`](#extra-listeners-listener) is configured — a deployment that
+serves `bind-to` alone sees exactly the response it saw before. `listeners`
+reports what each socket accepts; `obfuscated` counts the trial-decryption entry
+(`trials` connections tried, `misses` matched by no secret, `denied` refused for
+any reason, `rate_limited` turned away by the per-IP budget, and `draining` as a
+live gauge of refused connections currently being drained). A user also gains
+`ad_tag_skipped` once one of its ad-tagged streams took the direct path because
+its transport has no middle-proxy reframer — see
+[Sponsored channel](#sponsored-channel-ad-tag).
 
 `features` is a sorted list of capability names this build supports, meant to be
 read before a capability is used — it is how a panel can tell an older binary
@@ -216,7 +238,7 @@ at runtime, without editing the file or restarting:
 
 | Method & path | Action |
 |---|---|
-| `GET /secrets` | List secrets (`name`, `secret`, `host`, `ad_tag`, `effective_ad_tag`, plus `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled` when set). |
+| `GET /secrets` | List secrets (`name`, `secret`, `host`, `mode`, `ad_tag`, `effective_ad_tag`, plus `unserved` and `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled` when set). |
 | `POST /secrets` | Add or update one: `{"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?}`. |
 | `PUT /secrets` | Replace the whole set: `{"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?}},"ad_tag"?}`. |
 | `DELETE /secrets/{name}` | Remove one (`404` if unknown, `409` if it is the last one). |
@@ -227,6 +249,14 @@ at runtime, without editing the file or restarting:
 
 These go through the same atomic-swap machinery as `/reload`: a changed secret
 key closes that user's connections, while an ad-tag-only change does not.
+
+`mode` is the wire form the secret serialises to (`ee`, `dd` or `plain`), and
+`unserved` is `true` when no configured listener honours that form — a `dd` or
+`plain` secret on a proxy with no [`[[listener]]`](#extra-listeners-listener).
+Such a secret is stored and valid, it just has no door; that is deliberately not
+an error, so one odd client can never take an inbound offline. The request
+bodies carry no mode field: the mode rides inside the secret string itself, so
+these routes are unchanged.
 
 Direct API mutations are **in-memory only** — a later `POST /reload` (or a
 restart) re-reads the config file and overrides them. Treat the file as the

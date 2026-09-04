@@ -33,6 +33,10 @@ type secretStats struct {
 	// periodStart is the unix-nano start of the current quota period, used to
 	// detect monthly rollovers. 0 means "not started yet".
 	periodStart atomic.Int64
+
+	// adTagSkipped counts ad-tagged streams that fell back to the direct path
+	// because their transport is not re-framable for the middle proxy.
+	adTagSkipped atomic.Int64
 }
 
 // rolloverIfNeeded zeroes quotaUsed when the monthly quota period has elapsed.
@@ -129,6 +133,12 @@ func (s *ProxyStats) AddBytesIn(name string, n int64) {
 // AddBytesOut adds to the bytes-out counter for the given secret.
 func (s *ProxyStats) AddBytesOut(name string, n int64) {
 	s.getOrCreate(name).bytesOut.Add(n)
+}
+
+// OnAdTagSkipped counts one ad-tagged stream that could not be routed through
+// the middle proxy and went direct instead, losing only its sponsored channel.
+func (s *ProxyStats) OnAdTagSkipped(name string) {
+	s.getOrCreate(name).adTagSkipped.Add(1)
 }
 
 // UpdateLastSeen sets the last-seen timestamp for the given secret to now.
@@ -362,8 +372,16 @@ const (
 	// FeatureFakeTLS means the proxy speaks the FakeTLS (obfuscated) handshake.
 	FeatureFakeTLS = "faketls"
 
+	// FeatureListeners means the [[listener]] config table is honoured: extra
+	// sockets can be declared, and /stats reports what each one accepts.
+	FeatureListeners = "listeners"
+
 	// FeatureQuotaReset means POST /secrets/{name}/reset-quota is served.
 	FeatureQuotaReset = "quota-reset"
+
+	// FeatureSecretModes means the dd and plain secret forms parse and serve, so
+	// a panel may hand out a link in any of the three wire forms.
+	FeatureSecretModes = "secret-modes"
 
 	// FeatureSecretsAPI means the GET/PUT/POST/DELETE /secrets routes are served.
 	FeatureSecretsAPI = "secrets-api"
@@ -373,18 +391,50 @@ const (
 // sorted so the response is byte-stable across restarts.
 var supportedFeatures = []string{
 	FeatureFakeTLS,
+	FeatureListeners,
 	FeatureQuotaReset,
+	FeatureSecretModes,
 	FeatureSecretsAPI,
 }
 
 // StatsResponse is the JSON response for the stats endpoint.
 type StatsResponse struct {
-	StartedAt        time.Time                `json:"started_at"`
-	UptimeSeconds    int64                    `json:"uptime_seconds"`
-	TotalConnections int64                    `json:"total_connections"`
-	Features         []string                 `json:"features"`
-	Throttle         *ThrottleJSON            `json:"throttle,omitempty"`
-	Users            map[string]UserStatsJSON `json:"users"`
+	StartedAt        time.Time     `json:"started_at"`
+	UptimeSeconds    int64         `json:"uptime_seconds"`
+	TotalConnections int64         `json:"total_connections"`
+	Features         []string      `json:"features"`
+	Throttle         *ThrottleJSON `json:"throttle,omitempty"`
+
+	// Listeners and Obfuscated describe the extra obfuscated2 entry. Both are
+	// omitted when no [[listener]] is configured, so a deployment that never
+	// declared one keeps a byte-identical response.
+	Listeners  []ListenerJSON  `json:"listeners,omitempty"`
+	Obfuscated *ObfuscatedJSON `json:"obfuscated,omitempty"`
+
+	Users map[string]UserStatsJSON `json:"users"`
+}
+
+// ObfuscatedJSON is the obfuscated2 entry counter block on GET /stats. Draining
+// is a live gauge, not a total: it is how many refused connections are sitting
+// in a bounded drain right now.
+type ObfuscatedJSON struct {
+	Trials      int64 `json:"trials"`
+	Misses      int64 `json:"misses"`
+	Denied      int64 `json:"denied"`
+	Draining    int64 `json:"draining"`
+	RateLimited int64 `json:"rate_limited"`
+}
+
+// obfuscatedJSONOf snapshots the counters. It takes a pointer because
+// obfuscatedCounters holds atomics and must never be copied by value.
+func obfuscatedJSONOf(c *obfuscatedCounters) *ObfuscatedJSON {
+	return &ObfuscatedJSON{
+		Trials:      c.trials.Load(),
+		Misses:      c.misses.Load(),
+		Denied:      c.denied.Load(),
+		Draining:    c.draining.Load(),
+		RateLimited: c.rateLimited.Load(),
+	}
 }
 
 // ThrottleJSON is the throttle portion of the stats JSON response.
@@ -410,6 +460,12 @@ type UserStatsJSON struct {
 	QuotaReset     string     `json:"quota_reset,omitempty"`
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 	Disabled       bool       `json:"disabled,omitempty"`
+
+	// AdTagSkipped counts streams that carried an ad tag but took the direct
+	// path anyway because their transport has no middle-proxy reframer. An
+	// operator who monetises through @MTProxybot has to be able to see this: a
+	// silent skip is a revenue bug nobody can diagnose.
+	AdTagSkipped int64 `json:"ad_tag_skipped,omitempty"`
 }
 
 // buildResponse assembles the base stats response (runtime counters and throttle
@@ -432,11 +488,12 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 		}
 
 		users[name] = UserStatsJSON{
-			Connections: conns,
-			BytesIn:     st.bytesIn.Load(),
-			BytesOut:    st.bytesOut.Load(),
-			LastSeen:    lastSeenPtr,
-			QuotaUsed:   st.quotaUsed.Load(),
+			Connections:  conns,
+			BytesIn:      st.bytesIn.Load(),
+			BytesOut:     st.bytesOut.Load(),
+			LastSeen:     lastSeenPtr,
+			QuotaUsed:    st.quotaUsed.Load(),
+			AdTagSkipped: st.adTagSkipped.Load(),
 		}
 	}
 	s.mu.RUnlock()

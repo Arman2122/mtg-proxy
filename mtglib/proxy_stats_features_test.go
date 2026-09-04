@@ -43,14 +43,18 @@ func TestStatsFeatures(t *testing.T) {
 		var resp StatsResponse
 		require.NoError(t, json.Unmarshal(serveStats(t, NewProxyStats()).Body.Bytes(), &resp))
 
-		assert.Equal(t, []string{FeatureFakeTLS, FeatureQuotaReset, FeatureSecretsAPI}, resp.Features)
+		assert.Equal(t,
+			[]string{FeatureFakeTLS, FeatureListeners, FeatureQuotaReset, FeatureSecretModes, FeatureSecretsAPI},
+			resp.Features)
 	})
 
 	t.Run("the capability names are the strings downstream matches on", func(t *testing.T) {
 		t.Parallel()
 
 		assert.Equal(t, "faketls", FeatureFakeTLS)
+		assert.Equal(t, "listeners", FeatureListeners)
 		assert.Equal(t, "quota-reset", FeatureQuotaReset)
+		assert.Equal(t, "secret-modes", FeatureSecretModes)
 		assert.Equal(t, "secrets-api", FeatureSecretsAPI)
 	})
 
@@ -71,7 +75,9 @@ func TestStatsFeatures(t *testing.T) {
 
 		features, ok := raw["features"].([]any)
 		require.True(t, ok, "features must be a JSON array")
-		assert.Equal(t, []any{"faketls", "quota-reset", "secrets-api"}, features)
+		assert.Equal(t,
+			[]any{"faketls", "listeners", "quota-reset", "secret-modes", "secrets-api"},
+			features)
 		// Asserted independently of the literal above, so appending a capability
 		// out of order cannot be "fixed" by editing the expectation to match.
 		assert.True(t, slices.IsSorted(supportedFeatures))
@@ -86,7 +92,8 @@ func TestStatsFeatures(t *testing.T) {
 		require.Len(t, first.Features, len(supportedFeatures))
 		first.Features[0] = "tampered"
 
-		assert.Equal(t, []string{FeatureFakeTLS, FeatureQuotaReset, FeatureSecretsAPI},
+		assert.Equal(t,
+			[]string{FeatureFakeTLS, FeatureListeners, FeatureQuotaReset, FeatureSecretModes, FeatureSecretsAPI},
 			stats.buildResponse().Features)
 	})
 
@@ -99,7 +106,9 @@ func TestStatsFeatures(t *testing.T) {
 
 		var resp StatsResponse
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
-		assert.Equal(t, []string{FeatureFakeTLS, FeatureQuotaReset, FeatureSecretsAPI}, resp.Features)
+		assert.Equal(t,
+			[]string{FeatureFakeTLS, FeatureListeners, FeatureQuotaReset, FeatureSecretModes, FeatureSecretsAPI},
+			resp.Features)
 	})
 }
 

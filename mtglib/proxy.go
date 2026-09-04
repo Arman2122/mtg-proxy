@@ -1022,6 +1022,7 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 			// mode is a silently corrupted stream to Telegram, an abridged
 			// client takes the direct path: it loses the sponsored channel, not
 			// its connection.
+			p.stats.OnAdTagSkipped(ctx.secretName)
 			ctx.logger.BindStr("conn_tag", ctx.connTag.String()).
 				Info("advertising is not supported for this transport; using direct connection")
 		default:
@@ -1105,6 +1106,8 @@ func (p *Proxy) doMiddleProxyCall(ctx *streamContext) error {
 		PublicIPv6:     p.ourIPv6,
 		AdvertisedPort: p.advertisedPort,
 		AdTag:          *ctx.adTag,
+
+		PaddedIntermediate: ctx.connTag == obfuscation.TagPaddedIntermediate,
 	})
 	if err != nil {
 		return fmt.Errorf("cannot dial middle proxy: %w", err)

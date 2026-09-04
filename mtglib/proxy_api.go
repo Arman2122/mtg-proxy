@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"time"
 )
 
@@ -30,6 +31,16 @@ type SecretInfo struct {
 	QuotaReset     string     `json:"quota_reset,omitempty"`
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 	Disabled       bool       `json:"disabled,omitempty"`
+
+	// Mode is the wire form this secret serialises to: "ee", "dd" or "plain".
+	Mode string `json:"mode"`
+
+	// Unserved is true when no configured listener can serve this secret's form:
+	// a dd or plain secret on a proxy with no [[listener]]. The secret is stored
+	// and valid, it just has no door. It is NOT an error -- one odd client must
+	// never take an inbound offline -- but it is the thing an operator needs to
+	// see.
+	Unserved bool `json:"unserved,omitempty"`
 }
 
 // SnapshotSecrets returns the active secret set as a name-sorted list, exposing
@@ -39,11 +50,20 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 	set := p.secrets.Load()
 	out := make([]SecretInfo, len(set.names))
 
+	// The same containment test NewProxy uses for its startup warning, so
+	// /secrets and the log can never disagree: served means every transport a
+	// client of this form might pick is honoured, not merely that some
+	// obfuscated listener exists.
+	listenerTags := p.listenerModes.Tags()
+
 	for i, name := range set.names {
+		secret := set.secrets[i]
 		info := SecretInfo{
-			Name:   name,
-			Secret: set.secrets[i].Base64(),
-			Host:   set.secrets[i].Host,
+			Name:     name,
+			Secret:   secret.Base64(),
+			Host:     secret.Host,
+			Mode:     secret.Mode.String(),
+			Unserved: !secret.Hosted() && !listenerTags.Covers(ModeSetOf(secret.Mode).Tags()),
 		}
 
 		if set.adTags[i] != nil {
@@ -286,6 +306,23 @@ func (p *Proxy) handleGetSecrets(w http.ResponseWriter, _ *http.Request) {
 // disabled) taken from the active secret snapshot.
 func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 	resp := p.stats.buildResponse()
+
+	// The listener report and the obfuscated2 counters live on Proxy, not on
+	// ProxyStats, so they are overlaid here. Cloned for the same reason Features
+	// is: a caller must not be able to mutate the shared slice through a
+	// response. The inner Accept has to be cloned too -- a slices.Clone alone
+	// leaves it aliased to the proxy's own report. A nil clone stays nil and the
+	// field stays omitted.
+	resp.Listeners = slices.Clone(p.listeners)
+	for i := range resp.Listeners {
+		resp.Listeners[i].Accept = slices.Clone(resp.Listeners[i].Accept)
+	}
+
+	// Only a configured [[listener]] can make these counters mean anything, and
+	// their absence is what keeps an untouched deployment's /stats identical.
+	if !p.listenerModes.Empty() {
+		resp.Obfuscated = obfuscatedJSONOf(&p.obfsStats)
+	}
 
 	set := p.secrets.Load()
 	for i, name := range set.names {
