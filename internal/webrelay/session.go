@@ -445,7 +445,9 @@ func (s *session) perform(act action) error {
 // holding the last DATA of a response would be delivered ahead of it, and the
 // client tombstones the id the moment it sees a CLOSE: the tail would be
 // dropped. Ordering that depends on which goroutine happened to be scheduled is
-// not ordering, so only closeStream queues one, and only the pump calls it.
+// not ordering, so a stream that was opened is closed through closeStream, and
+// the pump is what calls it -- or start, when the dial failed and there never
+// was a pump. An OPEN refused before either exists is answered in perform.
 func (s *session) streamEnded(st *stream) {
 	st.close()
 }
