@@ -14,13 +14,13 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/beevik/ntp"
 	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/internal/config"
 	"github.com/Arman2122/mtg-proxy/internal/utils"
 	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/Arman2122/mtg-proxy/mtglib/dcprobe"
 	"github.com/Arman2122/mtg-proxy/network/v2"
+	"github.com/beevik/ntp"
 )
 
 var (

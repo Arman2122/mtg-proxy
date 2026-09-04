@@ -9,8 +9,8 @@
 package main
 
 import (
-	"github.com/alecthomas/kong"
 	"github.com/Arman2122/mtg-proxy/internal/cli"
+	"github.com/alecthomas/kong"
 )
 
 func main() {

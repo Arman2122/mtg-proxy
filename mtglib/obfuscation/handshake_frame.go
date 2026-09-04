@@ -60,7 +60,12 @@ func (h *handshakeFrame) dcSlice() []byte {
 }
 
 func (h *handshakeFrame) dc() int {
-	idx := int16(binary.LittleEndian.Uint16(h.dcSlice()))
+	// G115: not a narrowing conversion. The DC index is a SIGNED 16-bit
+	// wire field -- Telegram uses negatives for media DCs -- and this is
+	// the two's-complement reinterpretation the protocol specifies. The
+	// write side in generateHandshake is its exact inverse. Golden-trace
+	// path: annotate, do not restructure.
+	idx := int16(binary.LittleEndian.Uint16(h.dcSlice())) //nolint:gosec
 
 	switch {
 	case idx > 0:
@@ -108,7 +113,8 @@ func generateHandshake(dc int, tag ConnectionTag) handshakeFrame {
 		// The rejections above concern the frame's LEADING plaintext noise and
 		// are orthogonal to the transport stamped here at offset 56.
 		copy(frame.connectionType(), tag[:])
-		binary.LittleEndian.PutUint16(frame.dcSlice(), uint16(dc))
+		// G115: inverse of the int16 read in dc(); see the note there.
+		binary.LittleEndian.PutUint16(frame.dcSlice(), uint16(dc)) //nolint:gosec
 
 		return frame
 	}

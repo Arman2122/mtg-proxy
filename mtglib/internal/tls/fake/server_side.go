@@ -75,7 +75,9 @@ func generateServerHello(buf *bytes.Buffer, hello *ClientHello) {
 	// 03 03 - legacy protocol version of "3,3" (TLS 1.2)
 	buf.Write(tls.TLSVersion[:])
 	// 00 7a - 0x7A (122) bytes of handshake message follows
-	binary.Write(buf, binary.BigEndian, uint16(payload.Len())) //nolint: errcheck
+	// G115: payload is the ServerHello this function just generated -- a
+	// fixed 122 bytes, not anything the client influences.
+	binary.Write(buf, binary.BigEndian, uint16(payload.Len())) //nolint: errcheck,gosec
 
 	payload.WriteTo(buf) //nolint: errcheck
 }
@@ -92,7 +94,9 @@ func generateServerHelloPayload(buf *bytes.Buffer, hello *ClientHello) {
 	// 00 00 76 - 0x76 (118) bytes of server hello data follows
 	buf.WriteByte(TypeHandshakeServer)
 	// 00 00 76 - 0x76 (118) bytes of server hello data follows
-	binary.BigEndian.PutUint32(data[:], uint32(payload.Len()))
+	// G115: same locally generated ServerHello payload as above. Only
+	// data[1:] is written, so this is really a uint24.
+	binary.BigEndian.PutUint32(data[:], uint32(payload.Len())) //nolint:gosec
 	buf.Write(data[1:])
 
 	payload.WriteTo(buf) //nolint: errcheck

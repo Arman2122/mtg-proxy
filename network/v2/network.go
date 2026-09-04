@@ -37,7 +37,14 @@ func (n *network) DialContext(ctx context.Context, network, address string) (ess
 		return nil, err
 	}
 
-	tcpConn := conn.(*net.TCPConn)
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		// Unreachable: the network is tcp/tcp4/tcp6, checked above, and
+		// net.Dialer returns a *net.TCPConn for all three. The socket options
+		// below are TCP-specific, so a connection that is not TCP skips them
+		// rather than killing the dial path.
+		return essentials.WrapNetConn(conn), nil
+	}
 
 	return tcpConn, setCommonSocketOptions(tcpConn, n.keepAliveConfig, n.tcpNotSentLowat)
 }

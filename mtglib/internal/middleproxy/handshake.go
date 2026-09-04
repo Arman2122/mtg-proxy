@@ -29,7 +29,9 @@ func newNonceRequest(proxySecret []byte) (*nonceRequest, error) {
 	copy(keySelector, proxySecret)
 
 	timestamp := time.Now().Truncate(time.Second).Unix() % 4294967296
-	binary.LittleEndian.PutUint32(cryptoTS, uint32(timestamp))
+	// G115: the line above already reduced timestamp mod 2**32, which is
+	// precisely the truncation gosec is warning about.
+	binary.LittleEndian.PutUint32(cryptoTS, uint32(timestamp)) //nolint:gosec
 
 	return &nonceRequest{keySelector: keySelector, cryptoTS: cryptoTS, nonce: nonce}, nil
 }

@@ -17,7 +17,10 @@ import (
 )
 
 const (
-	secretURL     = "https://core.telegram.org/getProxySecret"
+	// G101: a public Telegram endpoint, not a credential. gosec matches the
+	// identifier, not the value. The proxy secret this URL RETURNS is held
+	// only in memory, in middleproxy.Manager.
+	secretURL     = "https://core.telegram.org/getProxySecret" //nolint:gosec
 	configURLv4   = "https://core.telegram.org/getProxyConfig"
 	configURLv6   = "https://core.telegram.org/getProxyConfigV6"
 	refreshPeriod = time.Hour

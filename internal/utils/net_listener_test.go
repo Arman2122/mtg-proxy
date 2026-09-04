@@ -137,9 +137,7 @@ func (suite *MultiListenerTestSuite) TestConcurrentAccept() {
 
 	for _, l := range listeners {
 		for range connsPerListener {
-
 			wg.Go(func() {
-
 				conn, err := net.Dial("tcp", l.Addr().String())
 				if err != nil {
 					return

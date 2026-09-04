@@ -263,14 +263,14 @@ func (s *ProxyStats) CanConnect(name string) bool {
 	}
 
 	s.throttleMu.RLock()
-	cap, hasCap := s.throttleCaps[name]
+	userCap, hasCap := s.throttleCaps[name]
 	s.throttleMu.RUnlock()
 
 	if !hasCap {
 		return true
 	}
 
-	return s.getOrCreate(name).connections.Load() < cap
+	return s.getOrCreate(name).connections.Load() < userCap
 }
 
 // startThrottleLoop runs a background goroutine that recomputes per-user

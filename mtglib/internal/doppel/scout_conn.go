@@ -40,6 +40,9 @@ func (s *ScoutConn) Read(p []byte) (int, error) {
 		s.rawBuf.Write([]byte{recordType})
 		s.rawBuf.Write(tls.TLSVersion[:])
 
+		// G115: tls.ReadRecord returns int64(binary.BigEndian.Uint16(...)),
+		// so length is 0..65535 by construction and round-trips exactly.
+		//nolint:gosec
 		if err := binary.Write(s.rawBuf, binary.BigEndian, uint16(length)); err != nil {
 			return 0, err
 		}

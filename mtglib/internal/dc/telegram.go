@@ -23,8 +23,12 @@ func (t *Telegram) GetAddresses(dc int) []Addr {
 		return t.view.getV6(dc)
 	case preferIPPreferIPv4:
 		return append(t.view.getV4(dc), t.view.getV6(dc)...)
+	case preferIPPreferIPv6:
+		return append(t.view.getV6(dc), t.view.getV4(dc)...)
 	}
 
+	// Same order as preferIPPreferIPv6: it is both the documented default and
+	// the answer for a preferIP value outside the enum.
 	return append(t.view.getV6(dc), t.view.getV4(dc)...)
 }
 

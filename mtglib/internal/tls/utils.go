@@ -43,6 +43,9 @@ func WriteRecordInPlace(w io.Writer, buf []byte, payloadLen int) error {
 	copy(buf[SizeRecordType:SizeRecordType+SizeVersion], TLSVersion[:])
 	binary.BigEndian.PutUint16(
 		buf[SizeRecordType+SizeVersion:SizeRecordType+SizeVersion+SizeSize],
+		//nolint:gosec // G115: guarded by the MaxRecordPayloadSize check at
+		// the top of this function (16379), and both callers pass a len() or
+		// a Read count, so payloadLen is 0..16379.
 		uint16(payloadLen),
 	)
 

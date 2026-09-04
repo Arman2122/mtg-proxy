@@ -211,7 +211,9 @@ func parseProxyResponse(packet []byte) (proxyResponseType, []byte, error) {
 // stream.
 func frameIntermediate(payload []byte) []byte {
 	out := make([]byte, 4+len(payload))
-	binary.LittleEndian.PutUint32(out[:4], uint32(len(payload)))
+	// G115: payload comes from parseProxyResponse over a frame readPacket
+	// already clamped to frameMaxMessageLength (16 MiB).
+	binary.LittleEndian.PutUint32(out[:4], uint32(len(payload))) //nolint:gosec
 	copy(out[4:], payload)
 
 	return out
@@ -224,7 +226,8 @@ func encodeIPPort(addr *net.TCPAddr) []byte {
 
 	if addr != nil {
 		copy(out[:16], addr.IP.To16())
-		binary.LittleEndian.PutUint32(out[16:], uint32(addr.Port))
+		// G115: kernel-supplied TCP port, 0..65535.
+		binary.LittleEndian.PutUint32(out[16:], uint32(addr.Port)) //nolint:gosec
 	}
 
 	return out

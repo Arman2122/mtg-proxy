@@ -331,7 +331,6 @@ func TestStatsListenerOverlayShape(t *testing.T) {
 			"rate_limited": float64(5),
 		}, obfuscated)
 	})
-
 }
 
 // TestStatsAdTagSkipped covers the per-user counter behind the abridged

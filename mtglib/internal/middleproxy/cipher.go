@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/md5" //nolint: gosec // required by the Telegram middle-proxy key schedule
+	"crypto/md5"  //nolint: gosec // required by the Telegram middle-proxy key schedule
 	"crypto/sha1" //nolint: gosec // required by the Telegram middle-proxy key schedule
 	"encoding/binary"
 	"net"
@@ -61,7 +61,9 @@ func deriveKey(purpose cipherPurpose, req *nonceRequest, resp *nonceResponse, cl
 
 	var port [2]byte
 
-	binary.LittleEndian.PutUint16(port[:], uint16(client.Port))
+	// G115: net.TCPAddr.Port is an int holding a kernel-supplied TCP port,
+	// 0..65535. Same for remote.Port below.
+	binary.LittleEndian.PutUint16(port[:], uint16(client.Port)) //nolint:gosec
 	message.Write(port[:])
 
 	switch purpose {
@@ -74,7 +76,7 @@ func deriveKey(purpose cipherPurpose, req *nonceRequest, resp *nonceResponse, cl
 	}
 
 	message.Write(clientIPv4)
-	binary.LittleEndian.PutUint16(port[:], uint16(remote.Port))
+	binary.LittleEndian.PutUint16(port[:], uint16(remote.Port)) //nolint:gosec // G115: see above
 	message.Write(port[:])
 	message.Write(secret)
 	message.Write(resp.nonce)

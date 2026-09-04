@@ -108,10 +108,12 @@ func (f *fragmentedHandshakeReader) parseNextFragment() error {
 	}
 
 	if header[0] != tls.TypeHandshake {
-		return fmt.Errorf("unexpected record type %#x", header[0])
+		// G602 false positive: header is [1+2+2]byte and 0 is a constant.
+		return fmt.Errorf("unexpected record type %#x", header[0]) //nolint:gosec
 	}
 
-	if header[1] != 3 || header[2] != 1 {
+	// G602 false positive: header is [1+2+2]byte; 1 and 2 are constants.
+	if header[1] != 3 || header[2] != 1 { //nolint:gosec
 		return fmt.Errorf("unexpected protocol version %#x %#x", header[1], header[2])
 	}
 

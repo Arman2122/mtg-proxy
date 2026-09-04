@@ -8,9 +8,9 @@ import (
 	"net/url"
 	"strings"
 
-	socks5 "github.com/armon/go-socks5"
 	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/network"
+	socks5 "github.com/armon/go-socks5"
 	"github.com/mccutchen/go-httpbin/httpbin"
 	"github.com/stretchr/testify/mock"
 )

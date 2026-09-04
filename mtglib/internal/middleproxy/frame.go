@@ -90,7 +90,10 @@ func (f *frameConn) writePacket(msg []byte) error {
 
 	buf := &bytes.Buffer{}
 
-	binary.Write(buf, binary.LittleEndian, uint32(messageLength)) //nolint: errcheck
+	// G115: messageLength is 12+len(msg) for a message this process just
+	// assembled; readPacket rejects anything above frameMaxMessageLength
+	// (16 MiB) on the way in, and nothing here builds a larger one.
+	binary.Write(buf, binary.LittleEndian, uint32(messageLength)) //nolint: errcheck,gosec
 	binary.Write(buf, binary.LittleEndian, f.writeSeqNo)          //nolint: errcheck
 	buf.Write(msg)
 
@@ -129,7 +132,11 @@ func (f *frameConn) readPacket() ([]byte, error) {
 		return nil, fmt.Errorf("cannot read frame body: %w", err)
 	}
 
-	seqNo := int32(binary.LittleEndian.Uint32(rest[:4]))
+	// G115: not a narrowing conversion. The middleproxy sequence number is
+	// a SIGNED 32-bit wire field, and this is the two's-complement
+	// reinterpretation the protocol specifies. Do not "fix" it -- the
+	// golden trace test pins these bytes.
+	seqNo := int32(binary.LittleEndian.Uint32(rest[:4])) //nolint:gosec
 	if seqNo != f.readSeqNo {
 		return nil, fmt.Errorf("unexpected sequence number %d (want %d)", seqNo, f.readSeqNo)
 	}

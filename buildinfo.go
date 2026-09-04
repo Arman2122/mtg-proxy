@@ -62,6 +62,8 @@ func getVersion() string {
 
 	io.WriteString(hasher, buildInfo.Path) //nolint: errcheck
 
+	//nolint:gosec // G115: len() of the module list the linker baked in, a
+	// three-digit number decided at build time. Not reachable from input.
 	binary.Write(hasher, binary.LittleEndian, uint64(1+len(buildInfo.Deps))) //nolint: errcheck
 
 	sort.Slice(buildInfo.Deps, func(i, j int) bool {

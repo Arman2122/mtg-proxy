@@ -5,8 +5,8 @@ import (
 	"math/rand/v2"
 	"runtime"
 
-	"github.com/OneOfOne/xxhash"
 	"github.com/Arman2122/mtg-proxy/mtglib"
+	"github.com/OneOfOne/xxhash"
 )
 
 // EventStream is a default implementation of the [mtglib.EventStream]
@@ -38,7 +38,9 @@ func (e EventStream) Send(ctx context.Context, evt mtglib.Event) {
 	select {
 	case <-ctx.Done():
 	case <-e.ctx.Done():
-	case e.chans[chanNo%uint32(len(e.chans))] <- evt:
+	// G115: len(e.chans) is the shard count fixed at construction from
+	// runtime.NumCPU(); it never approaches MaxUint32.
+	case e.chans[chanNo%uint32(len(e.chans))] <- evt: //nolint:gosec
 	}
 }
 

@@ -31,7 +31,13 @@ run = [
 
 [tasks.lint]
 description = "Run linter"
-run = "golangci-lint run"
+# `config verify` first: .golangci.yml is schema-checked, so a typo in a
+# linter name or an exclusion key fails loudly here instead of silently
+# turning a check off. `run` then gates on 0 issues.
+run = [
+    "golangci-lint config verify",
+    "golangci-lint run"
+]
 
 [tasks.vuln]
 description = "Test for vulnerabilities"
@@ -92,4 +98,8 @@ run = "pkgsite -http 0.0.0.0:10000"
 [tasks.fmt]
 description = "Reformat source code"
 sources = ["**/*.go"]
-run = "gofumpt -w --extra ."
+# golangci-lint now ENFORCES gofumpt (formatters.gofumpt.extra-rules in
+# .golangci.yml), so formatting is applied with the same binary that gates
+# it. Shelling out to a separately-pinned `gofumpt = latest` risked the two
+# disagreeing, which reads as a lint failure nobody can reproduce locally.
+run = "golangci-lint fmt"

@@ -96,13 +96,16 @@ func Probe(ctx context.Context, conn net.Conn, dc int) (time.Duration, error) {
 	msg := make([]byte, 8+8+4+len(tlBody))
 	// auth_key_id = 0 (already zeroed by make)
 	binary.LittleEndian.PutUint64(msg[8:16], generateMessageID())
-	binary.LittleEndian.PutUint32(msg[16:20], uint32(len(tlBody)))
+	// G115: tlBody is make([]byte, 4+16); its length is a compile-time 20.
+	binary.LittleEndian.PutUint32(msg[16:20], uint32(len(tlBody))) //nolint:gosec
 	copy(msg[20:], tlBody)
 
 	// 4. wrap in a padded-intermediate frame: length(LE) + msg.
 	// Padding is allowed [0..15] but not required when len(msg) % 4 == 0.
 	frame := make([]byte, 4+len(msg))
-	binary.LittleEndian.PutUint32(frame[:4], uint32(len(msg)))
+	// G115: msg is make([]byte, 8+8+4+len(tlBody)) with len(tlBody)==20, so
+	// a compile-time 40.
+	binary.LittleEndian.PutUint32(frame[:4], uint32(len(msg))) //nolint:gosec
 	copy(frame[4:], msg)
 
 	start := time.Now()
@@ -151,7 +154,10 @@ func Probe(ctx context.Context, conn net.Conn, dc int) (time.Duration, error) {
 // server time, with the lower 2 bits cleared (client-to-server requests).
 // See https://core.telegram.org/mtproto/description#message-identifier-msg-id.
 func generateMessageID() uint64 {
-	nano := uint64(time.Now().UnixNano())
+	// G115: UnixNano is negative only before 1970 and overflows int64 in
+	// 2262. The two's-complement reinterpretation is what MTProto's msg_id
+	// derivation wants in either case.
+	nano := uint64(time.Now().UnixNano()) //nolint:gosec
 	sec := nano / 1_000_000_000
 	nsInSec := nano % 1_000_000_000
 	subsec := (nsInSec << 32) / 1_000_000_000

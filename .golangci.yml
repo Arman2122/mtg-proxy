@@ -1,8 +1,121 @@
 version: "2"
 
+run:
+  # contextcheck and gosec both build a call graph; the default 1m is not
+  # enough for 29 packages on a cold cache.
+  timeout: 5m
+
+issues:
+  # These two are the difference between a gate and a decoration.
+  #
+  # golangci-lint defaults to max-issues-per-linter: 50 and max-same-issues: 3,
+  # which silently TRUNCATE the report. Worse, packages are analysed in
+  # parallel, so the surviving 50 differ from run to run: three consecutive
+  # `gosec` runs on this tree each printed 50 findings and each printed a
+  # DIFFERENT 50. The real count was 326. Under a cap, "0 issues" only means
+  # "nothing got past the cap", and a newly-introduced bug can hide behind a
+  # pre-existing one with the same message. Both are lifted to unlimited.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
 linters:
+  # errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+
+  enable:
+    # ---- the families this codebase has actually shipped bugs in ----------
+    #
+    # gosec: integer conversion and overflow on parsed lengths (G115) and
+    #   slice indexing (G602). Deliberately scoped -- see settings.gosec and
+    #   the exclusion rules below; every exclusion is justified where it sits.
+    - gosec
+    # forcetypeassert: the "forced assertion" family. 9e846be's parent commits
+    #   fixed three of these on the connection path, one of which killed the
+    #   process on a crafted PROXY header. There are 7 more in non-test code.
+    - forcetypeassert
+    # errorlint: errors compared with == instead of errors.Is, and %v where
+    #   %w was meant. Clean today; this keeps it that way.
+    - errorlint
+    # nilerr / nilnesserr: returning nil after checking a non-nil error, i.e.
+    #   the swallowed-error family.
+    - nilerr
+    - nilnesserr
+    # makezero: append to a slice declared with a non-zero length -- the
+    #   classic way a length taken off the wire turns into a buffer of zeros
+    #   followed by the real data.
+    - makezero
+    # noctx / contextcheck / fatcontext: network calls with no context and so
+    #   no deadline, and contexts that do not inherit from their caller.
+    - noctx
+    - contextcheck
+    - fatcontext
+    # bodyclose: leaked HTTP response bodies (blocklist downloads, the
+    #   Telegram config fetcher, the panel-facing API).
+    - bodyclose
+    # unconvert: a conversion that does nothing usually means the author
+    #   thought the operand had a different width than it has.
+    - unconvert
+    # durationcheck: time.Duration multiplied by a time.Duration.
+    - durationcheck
+
+    # ---- cheap correctness ratchets, all clean at HEAD --------------------
+    - asasalint
+    - bidichk # trojan-source: bidi overrides in a censorship-circumvention tool
+    - copyloopvar
+    - errchkjson
+    - exhaustive
+    - gocheckcompilerdirectives
+    - iface
+    - predeclared
+    - reassign # a dependency reassigning os.Stdout / http.DefaultClient
+    - usestdlibvars
+    - wastedassign
+
+  settings:
+    govet:
+      enable:
+        # Reports a nil dereference or a condition that is always true/false
+        # because of a preceding nil check. Not on by default.
+        - nilness
+        # NOT shadow: all 11 of its hits here are the idiomatic
+        # `if err := f(); err != nil` inside a function that already has an
+        # `err`, which is correct Go and the dominant style in this tree.
+
+    exhaustive:
+      # This tree writes `default: // SecretModeFakeTLS` to mean "and the last
+      # case". Without this the linter reports four such switches, and
+      # "fixing" them would mean rewriting the FakeTLS secret encoder.
+      default-signifies-exhaustive: true
+
+    gosec:
+      excludes:
+        # G104 duplicates errcheck, which is already enabled -- and it does
+        # not honour the ~200 `//nolint: errcheck` annotations this tree
+        # already carries, so it reported 232 findings that errcheck itself
+        # deliberately passes. One error-checking linter, not two.
+        - G104
+        # G102 "binds to all network interfaces". Binding 0.0.0.0:443 is the
+        # entire product. There is no version of this proxy that does not.
+        - G102
+        # G107 "http request with a variable url". Every URL this process
+        # fetches is a variable by design: the FireHOL blocklist mirrors, the
+        # Telegram proxy-secret and proxy-config endpoints, and the
+        # doppelganger cover hosts all come from config. G107 cannot tell
+        # those from an SSRF sink, and there is no user-supplied-URL sink here.
+        - G107
+        # G304 "file inclusion via variable". Reading a TOML config, an IP
+        # blocklist and the usage-state file from paths the operator passed on
+        # the command line is what the binary is for. The operator already has
+        # the filesystem; there is no privilege boundary to cross.
+        - G304
+
   exclusions:
+    # A path or text regex that matches nothing is a silent hole in the gate.
+    # This makes golangci-lint say so.
+    warn-unused: true
+
     rules:
+      # ==== pre-existing =================================================
       # Benchmark harnesses intentionally ignore error returns on
       # best-effort operations (Close, Write, Fprintf, ...).
       - path: benchmarks/
@@ -12,3 +125,120 @@ linters:
         linters:
           - errcheck
           - ineffassign
+
+      # ==== test and benchmark code ======================================
+
+      # 39 of the 49 forcetypeassert hits and 36 of the 46 noctx hits are in
+      # tests. `args.Get(0).([]byte)` is the canonical testify mock idiom and
+      # a panic there is a failed test, not a downed proxy; a test dialling a
+      # listener it opened three lines earlier does not need a deadline.
+      # `real` and `cap` as table-test variable names are likewise harmless.
+      # internal/testlib is test-support code -- testify mocks and fixtures,
+      # imported only from _test.go files -- so it belongs in this group even
+      # though its filenames do not end in _test.go.
+      - path: (_test\.go|^benchmarks/|^internal/testlib/)
+        linters:
+          - forcetypeassert
+          - noctx
+          - fatcontext
+          - predeclared
+
+      # Test fixtures hardcode secrets, bind to 0.0.0.0, dial with
+      # InsecureSkipVerify, seed math/rand for reproducibility, read golden
+      # files by computed path, and cast literal lengths into wire fields.
+      # All of that is the fixture doing its job. G115 in particular stays
+      # live in non-test code, which is where a truncated length matters.
+      #
+      # This also covers the one G114 (http.Serve with no timeouts): it fires
+      # only on the pprof endpoint in benchmarks/cmd/relay, a local load
+      # generator. A future http.Serve in the daemon is outside this path and
+      # still trips it.
+      - path: (_test\.go|^benchmarks/)
+        linters:
+          - gosec
+
+      # ==== gosec G115, the config-scalar family =========================
+
+      # This tree types non-negative configuration scalars as `uint` so the
+      # TOML/flag parser rejects a negative, then converts at the API
+      # boundary where the stdlib wants `int`. Seventeen sites, every one of
+      # them a port, a worker count, a keepalive probe count, a
+      # TCP_NOTSENT_LOWAT byte watermark or a max-connection cap -- all
+      # bounded far below MaxInt32, none of them a quantity that scales with
+      # traffic. Scoped by the conversion's SHAPE rather than by package, so
+      # every other width pair stays live everywhere:
+      #   int64 -> uint, int -> uint16, uint16 -> int16, uint32 -> int32, ...
+      # are all still reported, including in these same files.
+      - linters:
+          - gosec
+        text: 'G115: integer overflow conversion uint -> int(64)?$'
+
+      # ==== gosec G404, the non-cryptographic randomness family ==========
+
+      # Eight sites across four files, none of which produces a key, a nonce,
+      # an IV or a secret. They pick an event-stream shard, a doppelganger
+      # sampling decision, a FakeTLS padding size and a SOCKS5 backend. The
+      # global math/rand/v2 source is ChaCha8 seeded from OS entropy, so it
+      # is not even weak; it is simply not the crypto/rand API. Every value
+      # that IS security-relevant in this process -- obfuscation keys, the
+      # handshake frame, TLS randoms -- already reads crypto/rand, and G404
+      # stays live to catch the first one that stops.
+      - path: (events/event_stream\.go|mtglib/internal/doppel/stats\.go|mtglib/internal/tls/fake/server_side\.go|network/load_balanced_socks5\.go)
+        text: "G404"
+        linters:
+          - gosec
+
+      # ==== known findings, deliberately NOT fixed here ==================
+      # Each of the three below is a real finding, not a false positive.
+      # They are excluded rather than annotated in the source because a
+      # `//nolint` needs a justification the author can stand behind, and
+      # "this is a bug we have not fixed" is not one. Each needs its own
+      # commit and its own regression test; this commit only turns linters
+      # on and must stay behaviour-preserving.
+
+      # TODO(security): G112 -- neither http.Server sets ReadHeaderTimeout,
+      # so a client that opens a connection and dribbles header bytes holds a
+      # goroutine indefinitely. mtglib/proxy_api.go is the panel-facing
+      # control API and stats/prometheus.go is the metrics endpoint; both are
+      # reachable from wherever the operator binds them. Path-scoped, so a
+      # third http.Server built anywhere else still fails the gate.
+      - path: (mtglib/proxy_api\.go|stats/prometheus\.go)
+        text: "G112"
+        linters:
+          - gosec
+
+      # TODO(security): G115 -- `uint(t.Value)` narrows an int64 byte count
+      # to `uint`, which is 32 bits on the linux/386, linux/arm and
+      # windows/386 targets this project ships prebuilt binaries for. A
+      # per-secret traffic quota above 4 GiB silently wraps: 5 GiB becomes
+      # 1 GiB, with no parse error and no log line. The parser rejects
+      # negatives but has no upper bound. Needs a bound in Set() plus a
+      # 32-bit test, not a cast.
+      - path: internal/config/type_bytes\.go
+        text: "G115"
+        linters:
+          - gosec
+
+      # TODO(security): G115 -- `uint16(1+3+length)` where `length` is the
+      # 24-bit handshake length an unauthenticated client just sent. Above
+      # 65531 the record-length field written into the ClientHello copy
+      # wraps, and the same `length` then drives an io.CopyN into two
+      # in-memory bytes.Buffers with no io.LimitReader anywhere above it, so
+      # a connection can be made to buffer ~16 MiB twice before a single
+      # HMAC has been checked. The attacker must send those bytes, so the
+      # amplification is roughly 2x rather than unbounded, and
+      # handshakeTimeout bounds how long it takes -- but not how much memory
+      # it costs. Needs a clamp to MaxRecordSize plus a fuzz case.
+      - path: mtglib/internal/tls/fake/utils\.go
+        text: "G115"
+        linters:
+          - gosec
+
+formatters:
+  enable:
+    # Enforced here rather than remembered: `mise run fmt` already shells out
+    # to `gofumpt -w --extra`, so the linter and the task now agree.
+    - gofumpt
+  settings:
+    gofumpt:
+      extra-rules: true

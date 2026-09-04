@@ -48,7 +48,6 @@ func runStressTest(b *testing.B, numConns, dataPerConn int, getBuf func() []byte
 	// Launch all connections concurrently
 	for range numConns {
 		wg.Go(func() {
-
 			serverConn, clientConn := net.Pipe()
 
 			// Writer goroutine: send data

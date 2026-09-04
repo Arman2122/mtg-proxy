@@ -215,7 +215,13 @@ func (p *Proxy) startAPIServer(ctx context.Context, bindTo, token string) {
 		Handler: p.buildAPIHandler(token),
 	}
 
-	ln, err := net.Listen("tcp", bindTo)
+	// Background, not ctx, and contextcheck is told so deliberately.
+	// net.Listen never took a context; ListenConfig is spelled out here only
+	// to satisfy noctx. Binding the socket to the proxy's lifetime context
+	// would be a real change -- a ctx already cancelled during startup would
+	// turn a successful bind into a silently skipped API server -- and that
+	// belongs in its own commit.
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", bindTo) //nolint:contextcheck
 	if err != nil {
 		p.logger.WarningError("cannot start management API listener", err)
 
@@ -234,7 +240,11 @@ func (p *Proxy) startAPIServer(ctx context.Context, bindTo, token string) {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second) //nolint: mnd
 		defer cancel()
 
-		srv.Shutdown(shutdownCtx) //nolint: errcheck
+		// contextcheck wants shutdownCtx derived from ctx. It must not be:
+		// ctx is already cancelled by the time this line runs, so an
+		// inherited context would abort the graceful shutdown instantly and
+		// cut every in-flight API response.
+		srv.Shutdown(shutdownCtx) //nolint: errcheck,contextcheck
 	}()
 
 	authState := "unauthenticated"
@@ -670,7 +680,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 func writeJSON(w http.ResponseWriter, code int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(body) //nolint: errcheck
+	json.NewEncoder(w).Encode(body) //nolint: errcheck,errchkjson
 }
 
 func httpError(w http.ResponseWriter, code int, err error) {

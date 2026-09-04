@@ -48,8 +48,15 @@ func (c Conn) Write(p []byte) (int, error) {
 }
 
 func (c Conn) start() {
-	bp := doppelBufPool.Get().(*[]byte)
+	bp, ok := doppelBufPool.Get().(*[]byte)
+	if !ok {
+		// Unreachable: doppelBufPool.New only ever returns a *[]byte.
+		b := make([]byte, tls.MaxRecordSize)
+		bp = &b
+	}
+
 	buf := *bp
+
 	defer doppelBufPool.Put(bp)
 
 	timer := time.NewTimer(c.p.stats.Delay())

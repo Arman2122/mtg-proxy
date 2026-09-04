@@ -61,8 +61,18 @@ func NewProxyNetwork(base mtglib.Network, proxyURL *url.URL) (*proxyNetwork, err
 		return nil, fmt.Errorf("cannot build proxy dialer: %w", err)
 	}
 
+	client, ok := socks.(proxy.ContextDialer)
+	if !ok {
+		// golang.org/x/net/proxy returns a ContextDialer for socks5, the only
+		// scheme this build registers. Reporting it beats asserting it: the
+		// scheme comes from operator config, and RegisterDialerType lets a
+		// future scheme in. The URL itself is not echoed -- it carries the
+		// proxy credentials.
+		return nil, fmt.Errorf("proxy dialer for scheme %q does not support contexts", proxyURL.Scheme)
+	}
+
 	return &proxyNetwork{
 		Network: base,
-		client:  socks.(proxy.ContextDialer),
+		client:  client,
 	}, nil
 }
