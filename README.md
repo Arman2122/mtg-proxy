@@ -32,7 +32,9 @@ SOCKS5 proxy chaining, IP blocklists and allowlists, Prometheus and statsd metri
 ## Table of contents
 
 - [Quick start](#quick-start)
+- [Verifying a download](#verifying-a-download)
 - [Running with Docker](#running-with-docker)
+  - [Running the container as a non-root user](#running-the-container-as-a-non-root-user)
 - [Features](#features)
   - [Multiple secrets](#multiple-secrets)
   - [Per-user stats API](#per-user-stats-api)
@@ -51,8 +53,9 @@ SOCKS5 proxy chaining, IP blocklists and allowlists, Prometheus and statsd metri
 
 ## Quick start
 
-Download a binary from [Releases](https://github.com/Arman2122/mtg-proxy/releases),
-or build from source (requires Go 1.26+):
+Download a binary from [Releases](https://github.com/Arman2122/mtg-proxy/releases)
+— then [verify it](#verifying-a-download), especially if you are packaging it
+for other people — or build from source (requires Go 1.26+):
 
 ```console
 git clone https://github.com/Arman2122/mtg-proxy.git
@@ -100,6 +103,59 @@ Then print the connection links and QR codes for your users:
 mtg-proxy access /etc/mtg/config.toml
 ```
 
+## Verifying a download
+
+Every release publishes, alongside the ten platform archives:
+
+- `mtg-proxy-<version>-checksums.txt` — one SHA-256 line per asset;
+- `mtg-proxy-<version>-sbom.spdx.json` — an SPDX SBOM of the module graph the
+  binaries were built from;
+- a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds)
+  covering every one of those files, including the checksums file itself.
+
+**Checksum** — catches a truncated download, a mangled CDN object or a
+mismatched version. Fetch the checksums file next to the archive and run:
+
+```console
+VERSION=1.2.3
+PKG=mtg-proxy-${VERSION}-linux-amd64
+
+curl -sfLO "https://github.com/Arman2122/mtg-proxy/releases/download/v${VERSION}/${PKG}.tar.gz"
+curl -sfLO "https://github.com/Arman2122/mtg-proxy/releases/download/v${VERSION}/mtg-proxy-${VERSION}-checksums.txt"
+sha256sum -c --ignore-missing "mtg-proxy-${VERSION}-checksums.txt"
+```
+
+`--ignore-missing` checks whichever listed files you actually downloaded, and
+exits non-zero if none of them matched.
+
+**Provenance** — catches a replaced asset. The checksums file is served from
+the same origin as the archive, so anyone who can swap one can swap the other;
+only the attestation is signed. It needs the [`gh`](https://cli.github.com) CLI
+(already present on GitHub Actions runners) and no secret:
+
+```console
+gh attestation verify "${PKG}.tar.gz" \
+    --repo Arman2122/mtg-proxy \
+    --signer-workflow Arman2122/mtg-proxy/.github/workflows/go.yml
+```
+
+`--signer-workflow` is the part that matters: without it, any workflow in the
+repository that can mint an OIDC token would satisfy the check.
+
+The container image carries the same attestation. Verify a released tag rather
+than `latest` — attestation started with the release below, so an older image
+still sitting under a floating tag has none to check:
+
+```console
+gh attestation verify oci://ghcr.io/arman2122/mtg-proxy:${VERSION} \
+    --repo Arman2122/mtg-proxy \
+    --signer-workflow Arman2122/mtg-proxy/.github/workflows/docker-publish.yml
+```
+
+If you package mtg-proxy for others — a panel, a distribution, an installer —
+please run at least the checksum, and preferably the attestation, and fail the
+build when it does not match.
+
 ## Running with Docker
 
 The image is published to the GitHub Container Registry and ships a working
@@ -112,7 +168,7 @@ docker run -d --name mtg -p 443:443 \
     -e SECRET_HOST=storage.googleapis.com \
     -e TAG=3f40462915a3e6026a4d790127b95ded \
     -e MTG_BIND_TO=0.0.0.0:443 \
-    ghcr.io/Arman2122/mtg-proxy:latest
+    ghcr.io/arman2122/mtg-proxy:latest
 ```
 
 To run with a full config file instead, mount it over the bundled default at
@@ -121,10 +177,43 @@ To run with a full config file instead, mount it over the bundled default at
 ```console
 docker run -d --name mtg -p 443:443 \
     -v /etc/mtg/config.toml:/config/config.toml:ro \
-    ghcr.io/Arman2122/mtg-proxy:latest
+    ghcr.io/arman2122/mtg-proxy:latest
 ```
 
 See [Environment variables](#environment-variables) for the full list.
+
+`:latest` tracks the newest tagged release. Every push to `main` is published
+too, but only under its `sha-<commit>` tag, so `latest` never means "whatever
+landed an hour ago". Pin to `:1.2.3` if you want a specific build, and verify
+it with the command in [Verifying a download](#verifying-a-download).
+
+### Running the container as a non-root user
+
+The image runs as root, because dropping privileges by default would break two
+common setups on the next `docker pull`. If neither applies to you — and for a
+process parsing hostile input off port 443, it is worth checking — add
+`--user 65534:65534`:
+
+```console
+docker run -d --name mtg -p 443:443 --user 65534:65534 \
+    -v /etc/mtg/config.toml:/config/config.toml:ro \
+    ghcr.io/arman2122/mtg-proxy:latest
+```
+
+The two things to check first:
+
+- **The config must be readable by uid 65534.** A root-owned `0600` config —
+  a reasonable thing to do with a file full of secrets — cannot be read after
+  the switch, and the proxy exits at startup. `0640` with a matching group, or
+  `0644` on a file whose directory is not world-traversable, both work.
+- **Binding a port below 1024 inside the container.** Docker sets
+  `net.ipv4.ip_unprivileged_port_start=0` in containers by default, so
+  `MTG_BIND_TO=0.0.0.0:443` still works. Kubernetes and some other runtimes do
+  not: there, bind a high port inside (`MTG_BIND_TO=0.0.0.0:8443`) and publish
+  it as 443 outside, or set the sysctl yourself.
+
+If you set `usage-state-file`, its directory must also be writable by uid
+65534.
 
 ## Features
 

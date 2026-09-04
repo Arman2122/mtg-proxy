@@ -1,7 +1,8 @@
 name: Release
 
+# Least privilege by default; the publishing job widens this for itself.
 permissions:
-  contents: write
+  contents: read
 
 on:
   push:
@@ -14,6 +15,8 @@ jobs:
     name: Build ${{ matrix.platform }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -72,6 +75,10 @@ jobs:
             echo "version=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
+      # -buildvcs=false: with it on, Go stamps vcs.modified from the build tree,
+      # and the Dockerfile builds from a context .dockerignore strips files from
+      # -- so the image would report "[dirty]" and the tarball would not, for
+      # byte-identical source. Off in both, the two are comparable.
       - name: Build
         env:
           CGO_ENABLED: "0"
@@ -83,7 +90,7 @@ jobs:
           if [[ "${{ matrix.goos }}" == "windows" ]]; then
             BIN=mtg-proxy.exe
           fi
-          go build -trimpath -mod=readonly \
+          go build -trimpath -mod=readonly -buildvcs=false \
             -ldflags "-s -w -X main.version=${{ steps.version.outputs.version }}" \
             -o "build/${BIN}" .
 
@@ -101,6 +108,31 @@ jobs:
           fi
           rm -r "${PKG}"
 
+      # Generated HERE, on a leg holding only contents: read, and carried to the
+      # release job as an artifact like everything else.
+      #
+      # anchore/sbom-action does not vendor syft: it downloads and executes
+      # install.sh from raw.githubusercontent.com at run time. Pinning the
+      # action's SHA does not pin that script, because the syft tag it fetches
+      # can be force-moved. Running it in the release job -- the only one holding
+      # contents: write AND id-token: write AND attestations: write -- would let
+      # whoever moved that tag mint a valid attestation over a substituted asset,
+      # which is the exact property an attestation exists to rule out.
+      #
+      # Not fail-closed: a release that cannot ship because raw.githubusercontent
+      # is slow is real harm for a censorship-circumvention tool, and a missing
+      # SBOM is not.
+      - name: Generate SBOM
+        if: matrix.platform == 'linux-amd64'
+        continue-on-error: true
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/mtg-proxy-${{ steps.version.outputs.version }}-sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -111,10 +143,24 @@ jobs:
   release:
     name: Publish release
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # Sigstore OIDC identity for the provenance attestation
+      attestations: write # store the attestation against this repository
+    # No checkout. This job needs no source, and actions/checkout persists the
+    # GITHUB_TOKEN into .git/config by default -- writing a contents: write
+    # credential into a workspace that then has third-party tooling run over it.
     steps:
+      - name: Resolve version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # The SBOM was built on the linux-amd64 leg and rides in with the rest, so
+      # it is checksummed and attested alongside them rather than being a loose
+      # asset nobody can verify.
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
@@ -123,11 +169,31 @@ jobs:
 
       - name: Generate checksums
         run: |
+          set -eu
           cd dist
-          sha256sum -- * > "mtg-proxy-${GITHUB_REF_NAME#v}-checksums.txt"
+          # Written outside dist first: the glob must not pick up the file it
+          # is producing.
+          sha256sum -- * > "${RUNNER_TEMP}/checksums.txt"
+          mv "${RUNNER_TEMP}/checksums.txt" \
+            "mtg-proxy-${{ steps.version.outputs.version }}-checksums.txt"
+          cat "mtg-proxy-${{ steps.version.outputs.version }}-checksums.txt"
+
+      # Signed provenance tying every published file to this workflow, this
+      # commit and this run. A checksums file lives on the same origin as the
+      # archives, so it proves nothing against whoever can replace both; this
+      # does. Consumers verify with:
+      #   gh attestation verify <file> --repo Arman2122/mtg-proxy \
+      #     --signer-workflow Arman2122/mtg-proxy/.github/workflows/go.yml
+      #
+      # Deliberately before the release is created: if attestation fails there
+      # is no release, rather than a release nobody can verify.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/*'
 
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
           generate_release_notes: true

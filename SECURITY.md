@@ -25,6 +25,76 @@ I will acknowledge within a few days and tell you plainly whether I can fix it,
 how long I expect it to take, and when I intend to disclose. If I cannot fix
 something, I will say so rather than leave the report open.
 
+## Verifying a release
+
+The people who run this proxy are, by design, people whose network is hostile
+to them. A binary they cannot verify is a binary someone else can choose. Every
+release therefore carries three things, and this section is the exact command
+for each.
+
+Set `VERSION` to the release without its leading `v`, and `PKG` to the archive
+you want:
+
+```console
+VERSION=1.2.3
+PKG=mtg-proxy-${VERSION}-linux-amd64
+BASE=https://github.com/Arman2122/mtg-proxy/releases/download/v${VERSION}
+```
+
+**1. Checksums.** `mtg-proxy-<version>-checksums.txt` holds one SHA-256 line
+per published asset.
+
+```console
+curl -sfLO "${BASE}/${PKG}.tar.gz"
+curl -sfLO "${BASE}/mtg-proxy-${VERSION}-checksums.txt"
+sha256sum -c --ignore-missing "mtg-proxy-${VERSION}-checksums.txt"
+```
+
+This catches a truncated transfer, a stale CDN object and a version mismatch.
+It does **not** catch a deliberate substitution: the checksums file is served
+from the same origin as the archive, so whoever can replace one can replace the
+other. Which is what the next check is for.
+
+**2. Build provenance.** Every release asset — the ten archives, the SBOM and
+the checksums file itself — is covered by a signed in-toto attestation binding
+it to this repository, this commit and the workflow run that produced it. It is
+recorded in Sigstore's public transparency log, so it cannot be quietly
+withdrawn or backdated.
+
+```console
+gh attestation verify "${PKG}.tar.gz" \
+    --repo Arman2122/mtg-proxy \
+    --signer-workflow Arman2122/mtg-proxy/.github/workflows/go.yml
+```
+
+`--signer-workflow` is not optional in spirit. Without it the check accepts an
+attestation from *any* workflow in this repository that can mint an OIDC token,
+which is a materially weaker claim than "this came out of the release build".
+
+The container image is attested the same way:
+
+```console
+gh attestation verify oci://ghcr.io/arman2122/mtg-proxy:${VERSION} \
+    --repo Arman2122/mtg-proxy \
+    --signer-workflow Arman2122/mtg-proxy/.github/workflows/docker-publish.yml
+```
+
+`gh` needs no secret for a public repository; in GitHub Actions, set
+`GH_TOKEN: ${{ github.token }}` on the step.
+
+**3. SBOM.** `mtg-proxy-<version>-sbom.spdx.json` is an SPDX 2.3 document
+describing the Go module graph the release was built from. Use it to answer
+"is this affected?" when an advisory lands, without re-deriving the dependency
+set from a tag.
+
+### If you redistribute mtg-proxy
+
+If you package these binaries into something else — a panel, an installer, a
+distribution — please verify before you unpack, and **fail the build** when
+verification fails rather than warning. An unverified `curl | tar` in a release
+pipeline turns a single compromised asset into a root-owned binary on every one
+of your users' servers, and neither you nor they will see it happen.
+
 ## Scope
 
 This proxy's threat model is a network observer who wants to identify or block

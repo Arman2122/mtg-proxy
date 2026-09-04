@@ -1,19 +1,14 @@
 name: Vulnerability checks
 
 permissions:
-  actions: read
-  checks: read
   contents: read
-  deployments: read
-  issues: read
-  discussions: read
-  pull-requests: read
-  repository-projects: read
-  security-events: read
-  statuses: read
 
 on:
   push:
+    branches:
+      - main
+    tags:
+      - v*
   pull_request:
   schedule: # daily at 10:22 UTC
     - cron: '22 10 * * *'
@@ -23,19 +18,31 @@ jobs:
   vuln:
     name: Test vulnerabilities
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-    - name: Checkout
-      uses: actions/checkout@v7
-      with:
-        submodules: recursive
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
-    - name: Setup Go
-      uses: actions/setup-go@v6
-      with:
-        go-version-file: go.mod
-        check-latest: true
-        cache: true
+      # mise, not `go run golang.org/x/vuln/cmd/govulncheck@latest`: the old
+      # form pulled and executed an unpinned tool over this repository's source
+      # on every run, including the nightly one. mise.lock pins the version, and
+      # it is the same version `mise run vuln` uses locally. The vulnerability
+      # database itself is still fetched live, so pinning the tool does not
+      # freeze what it knows about.
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        name: Install mise
 
-    - name: Check for vulnerabilities
-      run: |
-        go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Cache Go modules and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Check for vulnerabilities
+        run: mise tasks run vuln

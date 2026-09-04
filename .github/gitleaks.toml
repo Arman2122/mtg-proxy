@@ -1,0 +1,36 @@
+# gitleaks configuration for mtg-proxy.
+#
+# The default rule set is kept in full; this file only carves out the places
+# where a high-entropy string is the point rather than an accident.
+#
+# An MTProto secret is a hex or base64 blob, so gitleaks' generic-api-key rule
+# fires on every example one. This repository publishes example secrets
+# deliberately - in the README, in example.config.toml, in table-driven tests
+# and in golden fixtures - and every one of them is a value an attacker already
+# has. Allowlisting them by path keeps the rule armed everywhere a real
+# credential could plausibly land: all non-test Go source, the workflows, the
+# Dockerfile and contrib/.
+#
+# Verified against gitleaks 8.30.1: with this config the tree scans clean.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Published example secrets, documentation and test fixtures"
+# Paths are matched with '/' on Linux and '\' on Windows, hence [\\/].
+paths = [
+  '''(^|[\\/])README\.md$''',
+  '''(^|[\\/])example\.config\.toml$''',
+  '''(^|[\\/])testdata([\\/]|$)''',
+  '''_test\.go$''',
+]
+
+[[allowlists]]
+description = "Obvious placeholder credentials in documentation and defaults"
+regexTarget = "match"
+stopwords = [
+  "change-me",
+  "changeme",
+  "your-token-here",
+]

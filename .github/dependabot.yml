@@ -1,0 +1,36 @@
+version: 2
+
+# A SHA-pinned action and a digest-pinned base image are only as good as the
+# thing that refreshes them; without this they rot into "pinned to a version
+# with a known CVE". Dependabot rewrites both the digest and the trailing
+# `# vX.Y.Z` comment, so the pins stay readable.
+#
+# Not covered here, and therefore hand-maintained:
+#   - the gitleaks version and sha256 in .github/workflows/ci.yaml
+#   - Go tool versions in .mise.toml / mise.lock (`mise run update`)
+#   - Go module dependencies, which this project updates deliberately rather
+#     than one pull request at a time.
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    # Patch and digest bumps only, on purpose. The base image tracks the Go
+    # MINOR line named in go.mod so the image and the release binaries are the
+    # same program; a patch bump keeps them together (the release job resolves
+    # go.mod with check-latest, so it moves too), while a 1.27 bump here would
+    # put them on different lines. Move go.mod first, then let this follow.
+    ignore:
+      - dependency-name: "golang"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor

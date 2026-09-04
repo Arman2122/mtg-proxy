@@ -1,16 +1,7 @@
 name: CI
 
 permissions:
-  actions: read
-  checks: read
   contents: read
-  deployments: read
-  issues: read
-  discussions: read
-  pull-requests: read
-  repository-projects: read
-  security-events: read
-  statuses: read
 
 on:
   push:
@@ -41,7 +32,7 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         name: Install mise
 
       - name: Cache Go modules and build
@@ -58,7 +49,7 @@ jobs:
         run: mise tasks run covtest
 
       - name: Collect coverage
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: ./coverage.txt
 
@@ -72,7 +63,7 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         name: Install mise
 
       - name: Cache Go modules and build
@@ -85,9 +76,42 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
+      # The build cache above is keyed on go.sum, so once it is saved for a
+      # given go.sum it is never written again - which means the fuzz corpus
+      # inside it would freeze and every run would start from the committed
+      # seeds. This restores/saves $GOCACHE/fuzz under its own always-changing
+      # key so interesting inputs accumulate across runs. It is restored after
+      # the build cache so it wins on the overlapping path.
+      - name: Restore fuzz corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/go-build/fuzz
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-
+
       - name: Run fuzzing
         run: mise tasks run 'test:fuzz:*'
 
+      # A failing fuzz target writes the reproducer into the package's
+      # testdata/fuzz directory. Without this the crash is only a log line.
+      - name: Upload fuzz reproducers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-reproducers
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # if: always() - a crash is exactly the run whose corpus is worth keeping,
+      # and the cache action's own post step does not run on failure.
+      - name: Save fuzz corpus
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/go-build/fuzz
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
 
   lint:
     name: Lint
@@ -99,7 +123,7 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         name: Install mise
 
       - name: Cache Go modules and build
@@ -114,3 +138,188 @@ jobs:
 
       - name: Run linter
         run: mise tasks run lint
+
+  # The release workflow builds ten platforms, but only on a tag. Without this
+  # job a target that stops compiling is found at release time, on the one run
+  # that must not fail. This is the same target list as .github/workflows/go.yml
+  # and must be kept in step with it.
+  #
+  # setup-go with go-version-file, not mise: this job exists to mirror the
+  # release toolchain, so it has to be the same toolchain the release uses.
+  cross-build:
+    name: Cross build
+    runs-on: ubuntu-latest
+    # Ten targets, each rebuilding the standard library for a new GOOS/GOARCH.
+    # On a cold cache that is minutes per target, not seconds.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build every release target
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -eu
+          # goos/goarch, optionally /goarm.
+          targets="
+            linux/amd64
+            linux/386
+            linux/arm64
+            linux/arm/5
+            linux/arm/6
+            linux/arm/7
+            linux/s390x
+            windows/amd64
+            windows/386
+            windows/arm64
+          "
+          failed=""
+          errlog="${RUNNER_TEMP:-.}/cross-build.err"
+          for target in $targets; do
+            goos="${target%%/*}"
+            rest="${target#*/}"
+            goarch="${rest%%/*}"
+            goarm=""
+            case "$rest" in
+              */*) goarm="${rest#*/}" ;;
+            esac
+            printf '%-18s ' "$target"
+            # go build with several packages compiles and discards the results,
+            # which is all we want here: does it still build.
+            if GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" go build ./... 2>"$errlog"; then
+              echo "ok"
+            else
+              echo "FAILED"
+              sed 's/^/    /' "$errlog"
+              echo "::error::cross build failed for $target"
+              failed="$failed $target"
+            fi
+          done
+          rm -f "$errlog"
+          if [ -n "$failed" ]; then
+            echo "failing targets:$failed"
+            exit 1
+          fi
+
+  # Supply-chain hygiene on the module graph and on the tree itself. Cheap,
+  # and it catches the two mistakes that have actually happened here: an
+  # untidy go.mod, and a compiled binary committed by accident.
+  hygiene:
+    name: Repo hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Module integrity
+        run: |
+          set -eu
+          # download first: verify checks what is in the module cache, and a
+          # cold cache would make it vacuously succeed.
+          go mod download
+          go mod verify
+          # -diff prints the change and exits non-zero instead of rewriting.
+          go mod tidy -diff
+
+      - name: No committed binaries, no oversized files
+        run: |
+          set -eu
+          # 4b825dc... is git's empty tree; diffing it against HEAD lists every
+          # tracked file with no base-ref guessing, identically on push and on
+          # pull_request, and marks binary files as "-\t-".
+          empty_tree=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+          # default.pgo is the one binary this repository expects to carry
+          # (see .gitattributes).
+          allowed_binaries='^default\.pgo$'
+          max_bytes=1048576
+
+          status=0
+
+          binaries="$(
+            git diff --numstat "$empty_tree" HEAD \
+              | awk -F'\t' '$1 == "-" && $2 == "-" { print $3 }' \
+              | grep -Ev "$allowed_binaries" || true
+          )"
+          if [ -n "$binaries" ]; then
+            echo "$binaries" | while IFS= read -r f; do
+              echo "::error file=$f::binary file is tracked in git"
+            done
+            status=1
+          fi
+
+          oversized="$(
+            git ls-tree -r -l HEAD \
+              | awk -F'\t' -v max="$max_bytes" '{
+                  split($1, meta, " ")
+                  if (meta[4] + 0 > max) { print meta[4] "\t" $2 }
+                }'
+          )"
+          if [ -n "$oversized" ]; then
+            echo "$oversized" | while IFS="$(printf '\t')" read -r size f; do
+              echo "::error file=$f::tracked file is $size bytes, over the $max_bytes byte limit"
+            done
+            status=1
+          fi
+
+          exit "$status"
+
+  # gitleaks is run from its release binary with a verified digest rather than
+  # through the marketplace action: one less third party in the pipeline, no
+  # licence question for the action, and it is the same download-then-verify
+  # shape this project asks its own consumers to use.
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install gitleaks
+        run: |
+          set -eu
+          archive="${RUNNER_TEMP}/gitleaks.tar.gz"
+          curl --silent --show-error --fail --location \
+            --retry 5 --retry-all-errors --retry-delay 3 \
+            --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict -
+          mkdir -p "${RUNNER_TEMP}/gitleaks"
+          # Member layout verified against v8.30.1: LICENSE, README.md,
+          # gitleaks - all at the archive root, gitleaks stored mode 0755.
+          tar -xzf "$archive" -C "${RUNNER_TEMP}/gitleaks" gitleaks
+          chmod +x "${RUNNER_TEMP}/gitleaks/gitleaks"
+
+      # Scanned outside the work tree so gitleaks never scans itself.
+      - name: Scan the work tree
+        run: |
+          "${RUNNER_TEMP}/gitleaks/gitleaks" dir . \
+            --config .github/gitleaks.toml \
+            --no-banner \
+            --redact \
+            --exit-code 2

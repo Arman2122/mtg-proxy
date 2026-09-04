@@ -1,8 +1,27 @@
+# NOTE: .git is deliberately NOT ignored. The build stage derives the version
+# string from `git describe`, and excluding .git here would silently turn every
+# published image's version into "dev".
+#
+# For the same reason, nothing TRACKED may be ignored either. Go stamps
+# vcs.modified by comparing the build tree against .git, so stripping a tracked
+# file makes every image report "[dirty]" while the release tarball built from
+# the same commit does not -- and buildinfo.go prints that suffix. `.github/`,
+# `*.md` and `.gitignore` used to be here and cost 11 tracked files; the context
+# they save is a few kilobytes of text.
+
 vendor/
 tags
-.github/
 .bin/
-*.md
-mtg
-.gitignore
 run.sh
+
+# Build output. `mtg` is the pre-rename binary name; the current one is
+# mtg-proxy, and the release workflow also produces mtg-proxy-<version>-*
+# archives and a dist/ directory. Copying a host-built binary into the build
+# context is how a stale or foreign artifact ends up in an image.
+mtg
+mtg-proxy
+mtg-proxy-*
+dist/
+*.exe
+*.test
+coverage.txt
