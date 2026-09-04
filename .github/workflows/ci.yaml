@@ -56,6 +56,49 @@ jobs:
         with:
           files: ./coverage.txt
 
+  browser:
+    name: Browser harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: test/webbridge/package-lock.json
+
+      - name: Install the harness
+        working-directory: test/webbridge
+        run: npm ci
+
+      # Only the headless shell: the harness never needs a headed browser, and
+      # the full download is several times the size for nothing.
+      - name: Install Chromium
+        working-directory: test/webbridge
+        run: npx playwright install --with-deps chromium-headless-shell
+
+      # CI is set for every step here, and the test turns its own skips into
+      # failures when it sees that. Without it a missing browser would skip,
+      # and a skip on a dashboard is indistinguishable from a pass -- which is
+      # how this harness protected nothing for two releases.
+      - name: Run the bridge in a real browser
+        env:
+          CI: "true"
+        run: go test ./internal/webrelay/page/ -run TestBridgeInABrowser -count=1 -v
+
   fuzz:
     name: Fuzzing
     runs-on: ubuntu-latest
