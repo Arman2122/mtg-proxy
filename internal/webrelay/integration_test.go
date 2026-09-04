@@ -23,15 +23,12 @@ import (
 // masks what it sends, because the server refuses anything else, and reassembles
 // nothing, because the relay never fragments.
 type wsClient struct {
-	// testing.TB rather than *testing.T so the benchmark can drive the same
-	// carrier the integration test does. A throughput number measured through a
-	// second, simpler client would be measuring that client.
-	t    testing.TB
+	t    *testing.T
 	conn net.Conn
 	r    *bufio.Reader
 }
 
-func dialCarrier(t testing.TB, server *httptest.Server, token string) *wsClient {
+func dialCarrier(t *testing.T, server *httptest.Server, token string) *wsClient {
 	t.Helper()
 
 	address := strings.TrimPrefix(server.URL, "http://")
