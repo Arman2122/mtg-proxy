@@ -1,5 +1,10 @@
 # mtg-proxy
 
+[![CI](https://github.com/Arman2122/mtg-proxy/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/Arman2122/mtg-proxy/actions/workflows/ci.yaml)
+[![Release](https://img.shields.io/github/v/release/Arman2122/mtg-proxy?sort=semver)](https://github.com/Arman2122/mtg-proxy/releases/latest)
+[![Go](https://img.shields.io/github/go-mod/go-version/Arman2122/mtg-proxy)](go.mod)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 A fast, censorship-resistant [Telegram MTProto proxy](https://core.telegram.org/mtproto)
 built to serve many users from one process.
 
@@ -32,8 +37,26 @@ Everything underneath — FakeTLS, domain fronting, the doppelganger traffic mim
 SOCKS5 proxy chaining, IP blocklists and allowlists, Prometheus and statsd metrics
 — is upstream's and behaves as upstream documents it.
 
+## How a client reaches it
+
+Three entry paths, all sharing one set of users. A secret is sixteen key bytes;
+the prefix only tells the *client* which door to knock on, so the same person
+keeps one name, one quota bucket and one set of counters whichever they use.
+
+| | door | secret form | what a network in between sees |
+|---|---|---|---|
+| **FakeTLS** | `bind-to`, normally `:443` | `ee…` | a real-looking TLS handshake to your fronting domain |
+| **obfuscated2** | a `[[listener]]` | `dd…` or bare hex | a nondescript TCP stream, fingerprintable as an MTProto proxy — keep it on loopback |
+| **WEB** | your own hostname over HTTPS | `dd…` | a browser loading a page and opening a WebSocket, over genuine TLS |
+
+FakeTLS is the default and every client speaks it. WEB needs Telegram Desktop
+7.1.2 or later, a hostname you control and a real certificate, and it is the only
+one whose TLS is not an imitation. See
+[WEB proxy transport](#web-proxy-transport).
+
 ## Table of contents
 
+- [How a client reaches it](#how-a-client-reaches-it)
 - [Quick start](#quick-start)
 - [Verifying a download](#verifying-a-download)
 - [Running with Docker](#running-with-docker)
@@ -324,6 +347,11 @@ Responses: `200 {"status":"ok"}` on success; `500` if the config cannot be read
 (the current set stays active); `503` when the proxy was started without a config
 file (`simple-run`); `405` for a non-POST request.
 
+The WEB relay is a second process and does not share this listener; it reloads
+the same `[secrets]` table on `SIGHUP` instead — see
+[WEB proxy transport](#web-proxy-transport). A deployment running both reloads
+both.
+
 ### Secrets & ad-tag management API
 
 The same listener exposes CRUD endpoints so you can manage secrets and the ad-tag
@@ -552,10 +580,31 @@ a credential the relay minted gets it — on every path, including the API ones
 — and nothing ships as a default, because a starter page many operators
 installed would be a better signature than anything the protocol leaks.
 
+**Adding and removing users without a restart.** The relay re-reads the
+`[secrets]` table on `SIGHUP` and swaps its profile set atomically:
+
+```console
+systemctl reload mtg-proxy-web-relay        # or: kill -HUP <pid>
+```
+
+Live sessions keep running, a newly added secret is recognised on its next page
+load, and a removed one stops being recognised. Only the secret set is
+reloadable: any other change under `[web]`, or to the backend listener's
+`proxy-protocol`, is refused whole with `restart required` rather than
+half-applied. A reload that cannot read or validate the file keeps the running
+set — an emptied registry would serve the cover site to every real user while
+reporting nothing wrong. Windows has no `SIGHUP`, so restart the relay there.
+
 [contrib/web-relay/](contrib/web-relay/README.md) is the deployment: the Caddy
 vhost, the four hops that have to carry the client's address, and the acceptance
 checklist for a real client. `/stats` advertises `web-relay` in `features` when a
 binary can serve this.
+
+> **What this has been tried against.** Telegram Desktop 7.1.2 on Windows, end
+> to end through Caddy, with both connection types working from the same config.
+> The other client platforms and the `tg://webproxy` link format have not been
+> through the checklist yet, so treat `mtg-proxy access`'s printed hostname and
+> secret as the reliable way to configure a client.
 
 ### Public IP override
 
