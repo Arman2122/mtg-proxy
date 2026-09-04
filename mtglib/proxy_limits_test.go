@@ -531,6 +531,152 @@ func TestGovernanceThrottleAcrossEntries(t *testing.T) {
 				return ok && thr.SecretName == "alice"
 			})
 			assert.Equal(t, 1, throttled, "the throttle refusal must name the matched secret")
+
+			// A refusal must leave the counter exactly where it found it. The
+			// two ways to get this wrong are both self-amplifying and neither is
+			// visible anywhere else: crediting OnConnect before the gate locks
+			// the user out permanently once they reach the cap, and releasing on
+			// the deny path drives the count negative, which reads as "under the
+			// cap" forever and silently disables the throttle for good.
+			assert.Equal(t, int64(0), h.proxy.stats.users["alice"].connections.Load(),
+				"a throttled refusal must not move the connection count")
+		})
+	}
+}
+
+// TestGovernanceQuotaResetPolicyAcrossEntries pins that the admission gate
+// meters usage under the secret's OWN reset policy. checkLimits reads the live
+// counter through QuotaUsed(name, lim.QuotaReset), and that second argument is
+// the only thing that rolls a monthly period over at the moment a client asks
+// to be let in.
+//
+// Hardcode it to QuotaResetNone and a monthly user whose usage predates the
+// boundary is refused at the start of the new period -- for up to
+// usageFlushInterval, until the persistence loop's rolloverAllQuotas catches up.
+// Hardcode it the other way and a lifetime quota silently replenishes every
+// month. Neither is visible from a table of limits alone: it takes a stale
+// period start and a real connection attempt, which is what the two rows below
+// are.
+func TestGovernanceQuotaResetPolicyAcrossEntries(t *testing.T) {
+	t.Parallel()
+
+	policyCases := []struct {
+		name         string
+		reset        QuotaReset
+		wantAdmitted bool
+	}{
+		{"monthly rolls the stale period over", QuotaResetMonthly, true},
+		{"none keeps a lifetime allowance spent", QuotaResetNone, false},
+	}
+
+	for _, ec := range govEntryCases() {
+		for _, pc := range policyCases {
+			t.Run(ec.name+"/"+pc.name, func(t *testing.T) {
+				t.Parallel()
+
+				secret := ec.secret(t)
+				h := ec.harness(t,
+					map[string]Secret{"alice": secret},
+					map[string]SecretLimits{"alice": {QuotaBytes: 100, QuotaReset: pc.reset}})
+
+				h.proxy.stats.mu.RLock()
+				aliceStats := h.proxy.stats.users["alice"]
+				h.proxy.stats.mu.RUnlock()
+
+				// Spent, and spent in the PREVIOUS calendar month. Anchored to the
+				// first of this month rather than now.AddDate(0, -1, 0), which
+				// normalises the 31st back into the same month and would leave the
+				// row green for the wrong reason a few days a year.
+				now := time.Now()
+				firstOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.Local)
+
+				aliceStats.quotaUsed.Store(500)
+				aliceStats.periodStart.Store(firstOfMonth.AddDate(0, 0, -1).UnixNano())
+
+				if !pc.wantAdmitted {
+					client, done := h.dialProxy(t, ec.policy)
+					ec.openEntry(t, client, secret.Key)
+
+					require.True(t, govAwait(done, govDenyBudget),
+						"a spent lifetime quota must still deny, however old the usage is")
+
+					return
+				}
+
+				// connect only returns once the stream is registered and dialled,
+				// so reaching it IS the admission. A dropped reset policy denies
+				// instead, and the stream never gets as far as the upstream accept.
+				stream := ec.connect(t, h, "alice", secret.Key)
+				defer stream.close()
+
+				// And the admission came from a real rollover, not from a ceiling
+				// that was never consulted: the new period starts from zero.
+				assert.Zero(t, aliceStats.quotaUsed.Load(),
+					"the new quota period must start with the counter cleared")
+			})
+		}
+	}
+}
+
+// TestGovernanceCountsConnectionsAcrossEntries runs the per-user connection
+// accounting over both doors. admit() keys OnConnect, UpdateLastSeen and the
+// live-connection registry on the name the door matched, and release() undoes
+// the first two on the way out.
+//
+// The counter is what the fair-share throttle divides its budget by and what
+// /stats reports as a live gauge, so a stream billed to the "" bucket or to the
+// wrong user is a throttle that protects nobody and a panel that shows an idle
+// proxy under load. A second configured user is present and must stay at zero:
+// "somebody was counted" is not the property, "the matched user and only the
+// matched user" is.
+func TestGovernanceCountsConnectionsAcrossEntries(t *testing.T) {
+	t.Parallel()
+
+	for _, ec := range govEntryCases() {
+		t.Run(ec.name, func(t *testing.T) {
+			t.Parallel()
+
+			target := ec.secret(t)
+			other := ec.secret(t)
+
+			h := ec.harness(t, map[string]Secret{"alice": target, "bob": other}, nil)
+
+			// Resolved before the stream runs: accounting billed to a name that has
+			// no entry yet writes the users map, and an unlocked read here would
+			// surface as a data race instead of the assertion going red.
+			h.proxy.stats.mu.RLock()
+			aliceStats := h.proxy.stats.users["alice"]
+			bobStats := h.proxy.stats.users["bob"]
+			h.proxy.stats.mu.RUnlock()
+
+			stream := ec.connect(t, h, "alice", target.Key)
+
+			assert.Equal(t, int64(1), aliceStats.connections.Load(),
+				"an admitted stream must be counted against the user this door matched")
+			assert.Equal(t, int64(0), bobStats.connections.Load(),
+				"and against no other configured user")
+
+			lastSeen, ok := aliceStats.lastSeen.Load().(time.Time)
+			require.True(t, ok)
+			assert.False(t, lastSeen.IsZero(),
+				"admission must stamp the matched user as seen, not some other bucket")
+
+			h.proxy.stats.mu.RLock()
+			_, unnamed := h.proxy.stats.users[""]
+			h.proxy.stats.mu.RUnlock()
+			assert.False(t, unnamed, "no accounting may land in the empty-name bucket")
+
+			// close waits for ServeConn to return, so the deferred release has run
+			// by the time these read.
+			stream.close()
+
+			assert.Equal(t, int64(0), aliceStats.connections.Load(),
+				"release must give the connection back, or every stream leaks a count")
+
+			h.proxy.liveMu.Lock()
+			assert.Empty(t, h.proxy.liveConns["alice"],
+				"and must unregister the stream, or hot-reload revocation chases dead streams")
+			h.proxy.liveMu.Unlock()
 		})
 	}
 }
