@@ -634,9 +634,18 @@ func TestAdTagAdvertisedStreamCarriesTheClientAndItsParams(t *testing.T) {
 			// The wrap: EventTraffic exists only because doMiddleProxyCall passed
 			// the middle-proxy stream through wrapTraffic, and it is attributed by
 			// the stream ID this user's connection was given.
-			assert.Positive(t, trafficEvents(h.events, stream.streamID, false),
+			//
+			// Polled, not read once: connTraffic sends its event AFTER the
+			// underlying Write returns, so the read that satisfied the round trip
+			// above can win the race against it. Asserting immediately made this
+			// test fail roughly one run in two.
+			require.Eventually(t, func() bool {
+				return trafficEvents(h.events, stream.streamID, false) > 0
+			}, 3*time.Second, 5*time.Millisecond,
 				"the client's bytes towards the middle proxy must be counted")
-			assert.Positive(t, trafficEvents(h.events, stream.streamID, true),
+			require.Eventually(t, func() bool {
+				return trafficEvents(h.events, stream.streamID, true) > 0
+			}, 3*time.Second, 5*time.Millisecond,
 				"the middle proxy's bytes towards the client must be counted")
 
 			// The connected-to-DC event reports the middle proxy that was reached,
