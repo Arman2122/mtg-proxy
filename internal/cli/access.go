@@ -25,7 +25,12 @@ type accessResponse struct {
 	IPv6    *accessResponseURLs             `json:"ipv6,omitempty"`
 	Secret  accessResponseSecret            `json:"secret"`
 	Secrets map[string]accessResponseSecret `json:"secrets,omitempty"`
-	Web     *accessResponseWeb              `json:"web,omitempty"`
+
+	// Listeners is omitted entirely when no [[listener]] is configured, so a
+	// deployment that never declared one gets the output it always got.
+	Listeners []accessResponseListener `json:"listeners,omitempty"`
+
+	Web *accessResponseWeb `json:"web,omitempty"`
 }
 
 // accessResponseWeb is how a client reaches this proxy over the WEB transport.
@@ -65,6 +70,48 @@ type accessResponseWebSecret struct {
 	TgURL string `json:"tg_url"` //nolint: tagliatelle
 
 	TgQrCode string `json:"tg_qrcode"` //nolint: tagliatelle
+}
+
+// accessResponseListener is one [[listener]] and the links that reach it.
+//
+// The links are separate from the top-level ipv4/ipv6 pair because they are not
+// the same offer: bind-to is FakeTLS and always hands out an ee secret, while a
+// listener hands out the wire form that socket accepts. The same user appears
+// in both, with the same sixteen key bytes spelled two ways, and that is the
+// point -- one account, three doors.
+type accessResponseListener struct {
+	BindTo string   `json:"bind_to"` //nolint: tagliatelle
+	Accept []string `json:"accept"`
+	Public bool     `json:"public"`
+
+	// Unreachable says why this listener has no links, and is set for exactly
+	// one reason: it is bound to loopback. That is not a misconfiguration --
+	// it is what a WEB relay backend is supposed to look like -- so it is
+	// reported rather than warned about.
+	Unreachable string `json:"unreachable,omitempty"`
+
+	IPv4 *accessResponseListenerURLs `json:"ipv4,omitempty"`
+	IPv6 *accessResponseListenerURLs `json:"ipv6,omitempty"`
+}
+
+// accessResponseListenerURLs is one address family's view of one listener.
+type accessResponseListenerURLs struct {
+	IP   string `json:"ip"`
+	Port uint   `json:"port"`
+
+	// Secrets is keyed by user name, then by wire form: a listener accepting
+	// both dd and plain offers each user a link in each, because which one a
+	// given client will take is the client's business.
+	Secrets map[string]map[string]accessResponseModeURLs `json:"secrets"`
+}
+
+// accessResponseModeURLs is one user's link in one wire form on one listener.
+type accessResponseModeURLs struct {
+	Secret    string `json:"secret"`
+	TgURL     string `json:"tg_url"`     //nolint: tagliatelle
+	TgQrCode  string `json:"tg_qrcode"`  //nolint: tagliatelle
+	TmeURL    string `json:"tme_url"`    //nolint: tagliatelle
+	TmeQrCode string `json:"tme_qrcode"` //nolint: tagliatelle
 }
 
 type accessResponseURLs struct {
@@ -162,6 +209,8 @@ func (a *Access) Run(cli *CLI, version string) error {
 
 	wg.Wait()
 
+	resp.Listeners = makeListenerAccess(conf, secrets, sortedNames, resp.IPv4, resp.IPv6)
+
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetEscapeHTML(false)
 	encoder.SetIndent("", "  ")
@@ -225,6 +274,161 @@ func (a *Access) makeURLs(conf *config.Config, ip net.IP) *accessResponseURLs {
 			RawQuery: urlQuery,
 		}).String(),
 	}
+	rv.TgQrCode = utils.MakeQRCodeURL(rv.TgURL)
+	rv.TmeQrCode = utils.MakeQRCodeURL(rv.TmeURL)
+
+	return rv
+}
+
+// makeListenerAccess builds the links for every configured [[listener]].
+//
+// It exists because bind-to is not the only door any more and access only ever
+// described that one: it prints the ee secret against the FakeTLS port, which
+// is the one form a client arriving on an obfuscated2 socket will not take. An
+// operator who added a listener had no way to hand a user a link for it.
+//
+// The addresses come from the already-resolved ipv4/ipv6 blocks rather than
+// being looked up again -- the public address of the host does not depend on
+// which of its sockets is being described, and resolving it twice would mean
+// two trips to a remote service for one command.
+func makeListenerAccess(
+	conf *config.Config, secrets map[string]mtglib.Secret, names []string,
+	ipv4, ipv6 *accessResponseURLs,
+) []accessResponseListener {
+	if len(conf.Listeners) == 0 {
+		return nil
+	}
+
+	rv := make([]accessResponseListener, 0, len(conf.Listeners))
+
+	for _, listener := range conf.Listeners {
+		bindTo := listener.BindTo.Get("")
+
+		entry := accessResponseListener{
+			BindTo: bindTo,
+			Accept: make([]string, 0, len(listener.Accept)),
+			Public: listener.Public.Get(false),
+		}
+
+		for _, mode := range listener.Accept {
+			entry.Accept = append(entry.Accept, mode.String())
+		}
+
+		port, loopback := listenerPort(bindTo)
+
+		switch {
+		case port == 0:
+			entry.Unreachable = "this listener has no port to advertise"
+		case loopback:
+			// The expected case for a WEB relay backend, and the reason this
+			// says what it says rather than nothing: an operator seeing no
+			// links here should know it is by design.
+			entry.Unreachable = "bound to loopback, so it is reachable only from this host " +
+				"(a WEB relay backend is meant to look like this)"
+		default:
+			entry.IPv4 = makeListenerURLs(listener, secrets, names, ipv4, port)
+			entry.IPv6 = makeListenerURLs(listener, secrets, names, ipv6, port)
+		}
+
+		rv = append(rv, entry)
+	}
+
+	return rv
+}
+
+// listenerPort pulls the port out of a listener's bind-to, and says whether the
+// address it is bound to can be reached from anywhere but this host.
+func listenerPort(bindTo string) (uint, bool) {
+	host, port, err := net.SplitHostPort(bindTo)
+	if err != nil {
+		return 0, false
+	}
+
+	portNo, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return 0, false
+	}
+
+	ip := net.ParseIP(host)
+
+	return uint(portNo), ip != nil && ip.IsLoopback()
+}
+
+// makeListenerURLs builds one address family's links for one listener, in every
+// wire form that socket accepts.
+func makeListenerURLs(
+	listener config.ConfigListener, secrets map[string]mtglib.Secret, names []string,
+	family *accessResponseURLs, port uint,
+) *accessResponseListenerURLs {
+	if family == nil || family.IP == nil {
+		return nil
+	}
+
+	rv := &accessResponseListenerURLs{
+		IP:      family.IP.String(),
+		Port:    port,
+		Secrets: make(map[string]map[string]accessResponseModeURLs, len(names)),
+	}
+
+	for _, name := range names {
+		secret := secrets[name]
+		forms := make(map[string]accessResponseModeURLs, len(listener.Accept))
+
+		for _, mode := range listener.Accept {
+			// The same sixteen key bytes, spelled the way this socket expects.
+			// A secret is not re-issued to be offered here: the prefix is a
+			// statement about the door, not about the account.
+			var text string
+
+			switch mode.Get() {
+			case mtglib.SecretModeDD:
+				text = secret.DDHex()
+			case mtglib.SecretModePlain:
+				text = secret.PlainHex()
+			case mtglib.SecretModeFakeTLS:
+				// Not reachable: a [[listener]] rejects "ee" at config
+				// validation, because one socket never serves both entry
+				// paths. Skipped rather than guessed at.
+				continue
+			default:
+				continue
+			}
+
+			forms[mode.String()] = makeModeURLs(rv.IP, port, text)
+		}
+
+		if len(forms) > 0 {
+			rv.Secrets[name] = forms
+		}
+	}
+
+	return rv
+}
+
+// makeModeURLs renders one link, in both the tg:// and t.me spellings.
+func makeModeURLs(ip string, port uint, secret string) accessResponseModeURLs {
+	values := url.Values{}
+	values.Set("server", ip)
+	values.Set("port", strconv.Itoa(int(port)))
+	values.Set("secret", secret)
+
+	query := values.Encode()
+
+	rv := accessResponseModeURLs{
+		Secret: secret,
+		TgURL: (&url.URL{
+			Scheme:   "tg",
+			Host:     "proxy",
+			RawQuery: query,
+		}).String(),
+		TmeURL: (&url.URL{
+			Scheme:   "https",
+			Host:     "t.me",
+			Path:     "proxy",
+			RawQuery: query,
+		}).String(),
+	}
+
 	rv.TgQrCode = utils.MakeQRCodeURL(rv.TgURL)
 	rv.TmeQrCode = utils.MakeQRCodeURL(rv.TmeURL)
 

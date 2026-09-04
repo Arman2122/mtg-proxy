@@ -276,7 +276,7 @@ curl http://127.0.0.1:9090/stats
   "started_at": "2026-03-29T10:30:00Z",
   "uptime_seconds": 3600,
   "total_connections": 15,
-  "features": ["faketls", "listeners", "quota-reset", "secret-modes", "secrets-api"],
+  "features": ["client-ips", "faketls", "listeners", "quota-reset", "secret-modes", "secrets-api"],
   "listeners": [
     { "bind": "0.0.0.0:443", "accept": ["ee"], "public": true },
     { "bind": "127.0.0.1:2398", "accept": ["dd", "plain"], "public": false }
@@ -321,6 +321,38 @@ its transport has no middle-proxy reframer — see
 read before a capability is used — it is how a panel can tell an older binary
 from a newer one without parsing version strings. Names are a public contract:
 existing ones are never renamed or removed, and new ones are only ever appended.
+
+#### Client addresses
+
+Off by default. With `track-client-ips = true`, each user also reports the
+addresses behind their connections:
+
+```json
+"alice": {
+  "connections": 2,
+  "connected_ips": ["198.51.100.7", "203.0.113.44"],
+  "last_ip": "203.0.113.44"
+}
+```
+
+`connected_ips` is the set of distinct addresses holding a live connection right
+now, sorted and deduplicated — it is derived from the connection registry rather
+than counted separately, so it cannot drift from `connections` beside it, and an
+entry disappears when its connection ends. `last_ip` is the most recent admitted
+connection's address and outlives that connection.
+
+**Why this is off by default.** This is a circumvention proxy: the people using
+it are frequently the reason it exists, and an operator's answer to "who
+connected from where" is also the answer available to whoever ends up with the
+server. `connected_ips` adds no retention — those addresses are already held for
+the life of the connection — but `last_ip` outlives the connection it came from,
+so a deployment that never asks for either never accumulates one. Neither is
+written to disk in any form; `usage-state-file` persists quota counters alone, so
+no address survives a restart.
+
+Behind a front proxy, both report what the PROXY header carried — the client's
+real address — which is what makes them useful for a WEB deployment. See
+[`proxy-protocol-listener`](#extra-listeners-listener).
 
 ### Hot secret reload
 
@@ -694,6 +726,43 @@ Secrets are not per-listener. A secret is 16 key bytes, and the same key is vali
 in all three wire forms; the prefix only tells the *client* how to connect. So an
 existing `ee` user keeps one name, one quota bucket and one set of stats whichever
 door they arrive through — nothing needs to be re-issued.
+
+`mtg-proxy access` prints a `listeners` array alongside the usual links, with a
+ready-to-use link per user per accepted form:
+
+```json
+"listeners": [
+  {
+    "bind_to": "0.0.0.0:8444",
+    "accept": ["dd"],
+    "public": true,
+    "ipv4": {
+      "ip": "203.0.113.9",
+      "port": 8444,
+      "secrets": {
+        "alice": {
+          "dd": {
+            "secret": "dd367a189aee18fa31c190054efd4a8e95",
+            "tg_url": "tg://proxy?port=8444&secret=dd367a…&server=203.0.113.9"
+          }
+        }
+      }
+    }
+  },
+  {
+    "bind_to": "127.0.0.1:2398",
+    "accept": ["dd"],
+    "public": false,
+    "unreachable": "bound to loopback, so it is reachable only from this host (a WEB relay backend is meant to look like this)"
+  }
+]
+```
+
+The secret in each link is the user's own sixteen key bytes, spelled the way that
+socket expects — so handing someone a `dd` link does not create a second account,
+and their quota, counters and limits are the ones they already had. A loopback
+listener gets no links and says why: that is the shape of a WEB relay backend,
+not a misconfiguration.
 
 > **TOML ordering.** `[[listener]]` is an array of tables, so every top-level key
 > written after it belongs to the listener rather than to the global scope — the

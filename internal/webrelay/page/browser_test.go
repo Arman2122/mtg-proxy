@@ -29,7 +29,15 @@ const harnessDir = "../../../test/webbridge"
 //
 // It skips rather than fails when the harness is not installed, because it needs
 // Node and a browser download that a plain `go test` has no business demanding.
-// Install it with `npm install` in test/webbridge. CI runs it as its own job.
+// Install it with `npm install` in test/webbridge.
+//
+// NOTHING RUNS THIS AUTOMATICALLY. No workflow installs Node or a browser, so
+// in CI it skips, every time, silently -- a skip is not a failure and the job
+// stays green. This comment used to claim CI ran it as its own job, which was
+// never true, and the claim is worse than the gap: it is why the accept-key
+// defect in v1.1.2 was looked for everywhere except the one layer that had
+// never actually executed. Run it by hand before shipping a change to the
+// bridge, and read a green build as saying nothing about this file.
 func TestBridgeInABrowser(t *testing.T) {
 	t.Parallel()
 
