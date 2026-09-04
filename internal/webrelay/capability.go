@@ -59,6 +59,14 @@ const bridgeContextLabel = "tdesktop-web-proxy-bridge-v1\n"
 // a bridge query: 32 bytes of HMAC-SHA256 in unpadded base64url.
 const CapabilityLength = 43
 
+// MaxProfiles bounds the configured profile set. Every request scans the whole
+// set without breaking early -- that is what keeps the scan constant-time -- so
+// the set length is per-request work an operator chooses, and an unbounded one
+// would turn a config edit into a slow-loris amplifier. The ceiling is far above
+// any real inbound: a scan of this many 32-byte comparisons is tens of
+// microseconds.
+const MaxProfiles = 4096
+
 var (
 	// ErrInvalidHost means the hostname is not the canonical form both sides
 	// must agree on before they derive anything.
@@ -71,6 +79,18 @@ var (
 	// ErrCapabilityCollision means two configured profiles derive the same
 	// capability, so a request could not name one of them.
 	ErrCapabilityCollision = errors.New("two profiles derive the same bridge capability")
+
+	// ErrNoProfiles means the profile set is empty. A registry that can match
+	// nothing answers every request with the cover site, which looks exactly
+	// like a working relay whose clients all typed the wrong hostname.
+	ErrNoProfiles = errors.New("no WEB proxy profiles configured")
+
+	// ErrTooManyProfiles means the profile set is above MaxProfiles.
+	ErrTooManyProfiles = errors.New("more WEB proxy profiles than the maximum")
+
+	// ErrInvalidSecret means the secret is not a usable one -- in practice an
+	// empty key, whose capability anyone could derive without knowing anything.
+	ErrInvalidSecret = errors.New("secret is not valid")
 )
 
 // hostProfile is the IDNA profile used for canonicalisation. Lookup mapping
@@ -191,7 +211,9 @@ func Derive(secret mtglib.Secret, host string) (Capability, error) {
 
 	// A WEB-capable client refuses an ee secret outright, before any network
 	// activity, so deriving one would only produce a capability nothing can
-	// present. WEB profiles are dd or plain.
+	// present. WEB profiles are dd or plain. Checked before the key, so an
+	// operator who configured the wrong FORM is told that, which is the
+	// actionable half of the two.
 	var key []byte
 
 	switch secret.Mode {
@@ -202,6 +224,15 @@ func Derive(secret mtglib.Secret, host string) (Capability, error) {
 	default: // mtglib.SecretModeFakeTLS
 		return Capability{}, fmt.Errorf("%w: %s (WEB accepts dd or plain)",
 			ErrUnsupportedSecretMode, secret.Mode)
+	}
+
+	// An all-zero key is the one Secret a caller can hold by accident -- an
+	// unparsed field, a zero struct -- and its capability is derivable by
+	// anyone, since the key is the only secret input. Refused here rather than
+	// in the registry so no path can reach the HMAC with it.
+	if !secret.Valid() {
+		return Capability{}, fmt.Errorf("%w: %s secret with an empty key",
+			ErrInvalidSecret, secret.Mode)
 	}
 
 	mac := hmac.New(sha256.New, key)
@@ -282,10 +313,33 @@ type Registry struct {
 	capabilities []Capability
 }
 
+// WebSecret re-expresses a secret's key in the one form a WEB client can hold.
+// The three forms are spellings of the same 16 bytes, so a panel that mints ee
+// secrets needs no second credential: this is the same key, told to the client
+// as dd.
+//
+// dd rather than plain, deliberately. Both are accepted by the client, but the
+// dd form makes every stream padded-intermediate, which is the transport the
+// ad-tag path supports -- a plain WEB client with an ad tag would silently lose
+// its sponsored channel.
+func WebSecret(secret mtglib.Secret) mtglib.Secret {
+	return mtglib.Secret{Key: secret.Key, Mode: mtglib.SecretModeDD}
+}
+
 // NewRegistry derives a capability for every profile secret against one public
 // hostname, in the caller's order. Collisions are rejected because a request
 // carrying that capability could not name a single profile.
+//
+// Pass secrets through [WebSecret] first unless they are already dd or plain:
+// Derive refuses an ee secret, because the client refuses one too.
 func NewRegistry(host string, secrets []mtglib.Secret) (*Registry, error) {
+	switch {
+	case len(secrets) == 0:
+		return nil, ErrNoProfiles
+	case len(secrets) > MaxProfiles:
+		return nil, fmt.Errorf("%w: %d, maximum %d", ErrTooManyProfiles, len(secrets), MaxProfiles)
+	}
+
 	registry := &Registry{capabilities: make([]Capability, 0, len(secrets))}
 
 	for i, secret := range secrets {

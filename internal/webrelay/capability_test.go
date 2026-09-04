@@ -292,13 +292,49 @@ func (suite *RegistryTestSuite) TestLookupMisses() {
 	}
 }
 
-func (suite *RegistryTestSuite) TestEmptyRegistry() {
-	registry, err := webrelay.NewRegistry(vectorHost, nil)
-	suite.Require().NoError(err)
-	suite.Equal(0, registry.Len())
+// An empty set is refused rather than tolerated. A registry that matches
+// nothing serves the cover site to every request, which is indistinguishable
+// from a correctly running relay whose users all typed the wrong hostname --
+// the one failure mode of this whole transport with no client-side diagnostic.
+func (suite *RegistryTestSuite) TestEmptyRegistryRejected() {
+	for _, secrets := range [][]mtglib.Secret{nil, {}} {
+		_, err := webrelay.NewRegistry(vectorHost, secrets)
+		suite.Require().ErrorIs(err, webrelay.ErrNoProfiles)
+	}
+}
 
-	_, ok := registry.Lookup(vectorPlainBridge)
-	suite.False(ok)
+// The scan never breaks early, so the profile count is per-request work.
+func (suite *RegistryTestSuite) TestProfileCountIsBounded() {
+	_, err := webrelay.NewRegistry(vectorHost, suite.secrets(webrelay.MaxProfiles+1))
+	suite.Require().ErrorIs(err, webrelay.ErrTooManyProfiles)
+}
+
+// A zero key derives a capability from public information alone.
+func (suite *RegistryTestSuite) TestZeroKeyRejected() {
+	for _, mode := range []mtglib.SecretMode{mtglib.SecretModeDD, mtglib.SecretModePlain} {
+		_, err := webrelay.Derive(mtglib.Secret{Mode: mode}, vectorHost)
+		suite.Require().ErrorIs(err, webrelay.ErrInvalidSecret)
+	}
+
+	_, err := webrelay.NewRegistry(vectorHost, []mtglib.Secret{{Mode: mtglib.SecretModeDD}})
+	suite.Require().ErrorIs(err, webrelay.ErrInvalidSecret)
+}
+
+// WebSecret keeps the key and changes only how the client is told to spell it,
+// which is what lets a panel that mints ee secrets serve WEB with no second
+// credential. It must land on the dd vector, not the plain one.
+func (suite *RegistryTestSuite) TestWebSecretIsTheDDSpellingOfTheSameKey() {
+	source := vectorSecret(suite.T(), mtglib.SecretModeFakeTLS)
+	source.Host = "www.cloudflare.com"
+
+	web := webrelay.WebSecret(source)
+	suite.Equal(source.Key, web.Key)
+	suite.Equal(mtglib.SecretModeDD, web.Mode)
+	suite.Empty(web.Host)
+
+	capability, err := webrelay.Derive(web, vectorHost)
+	suite.Require().NoError(err)
+	suite.Equal(vectorDDBridge, capability.String())
 }
 
 func (suite *RegistryTestSuite) TestCollisionRejected() {
@@ -569,11 +605,19 @@ func (suite *RecognitionTestSuite) TestQueryPlusManglingStaysAuthentic() {
 	suite.True(registry.IsAuthentic(mangled))
 }
 
-func (suite *RecognitionTestSuite) TestEmptyRegistryRecognisesNothing() {
-	registry, err := webrelay.NewRegistry(vectorHost, nil)
+// A registry holding one unrelated profile recognises no spelling of a
+// capability it was not given. This is the tier-three path -- unauthentic input
+// reaches the cover site -- and it must not widen just because the lenient
+// decoder accepted the string.
+func (suite *RecognitionTestSuite) TestAStrangerIsRecognisedInNoSpelling() {
+	registry, err := webrelay.NewRegistry(vectorHost, []mtglib.Secret{
+		vectorSecret(suite.T(), mtglib.SecretModeDD),
+	})
 	suite.Require().NoError(err)
+
 	suite.False(registry.IsAuthentic(vectorPlainBridge))
 	suite.False(registry.IsAuthentic(vectorPlainBridge + "="))
+	suite.False(registry.IsAuthentic(strings.ReplaceAll(vectorPlainBridge, "_", "/")))
 }
 
 func TestRecognition(t *testing.T) {
