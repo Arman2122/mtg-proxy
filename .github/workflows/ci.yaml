@@ -90,13 +90,14 @@ jobs:
         working-directory: test/webbridge
         run: npx playwright install --with-deps chromium-headless-shell
 
-      # CI is set for every step here, and the test turns its own skips into
-      # failures when it sees that. Without it a missing browser would skip,
-      # and a skip on a dashboard is indistinguishable from a pass -- which is
-      # how this harness protected nothing for two releases.
+      # This variable, and not CI, is what turns the test's skips into
+      # failures. Every job in a run has CI set, including the one that tests
+      # the whole tree without a browser -- keying on it would fail that job
+      # for honestly skipping. Only this job installed a browser, so only here
+      # is a missing one a defect.
       - name: Run the bridge in a real browser
         env:
-          CI: "true"
+          MTG_REQUIRE_BROWSER_HARNESS: "1"
         run: go test ./internal/webrelay/page/ -run TestBridgeInABrowser -count=1 -v
 
   fuzz:

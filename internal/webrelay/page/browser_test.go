@@ -31,23 +31,26 @@ const harnessDir = "../../../test/webbridge"
 // Node and a browser download that a plain `go test` has no business demanding.
 // Install it with `npm install` in test/webbridge.
 //
-// Locally it SKIPS when the harness is not installed, because a plain `go test`
-// has no business demanding Node and a browser download. Under CI it does the
-// opposite and FAILS, because a skip there is indistinguishable from a pass and
-// that is not a theoretical concern: for the whole of v1.1.0 and v1.1.1 no
-// workflow installed a browser, this test skipped silently on every run, and
-// the accept-key defect it exists to catch shipped twice. An environment that
-// sets CI has asked for the real thing.
+// It SKIPS when the harness is not installed, because a plain `go test ./...`
+// has no business demanding Node and a browser download -- and that is as true
+// of the CI job that runs the whole tree as it is of a laptop.
+//
+// The one place it must not skip is the job that exists to run it, and that job
+// says so by setting MTG_REQUIRE_BROWSER_HARNESS. There the same conditions
+// become failures, because a skip on a dashboard is indistinguishable from a
+// pass: for the whole of v1.1.0 and v1.1.1 nothing installed a browser, this
+// test skipped silently on every run, and the accept-key defect it exists to
+// catch shipped twice.
 func TestBridgeInABrowser(t *testing.T) {
 	t.Parallel()
 
 	node, err := exec.LookPath("node")
 	if err != nil {
-		skipUnlessCI(t, "node is not installed; see test/webbridge/README.md")
+		requireHarness(t, "node is not installed; see test/webbridge/README.md")
 	}
 
 	if _, err := os.Stat(filepath.Join(harnessDir, "node_modules")); err != nil {
-		skipUnlessCI(t, "browser harness is not installed; run `npm install` in test/webbridge")
+		requireHarness(t, "browser harness is not installed; run `npm install` in test/webbridge")
 	}
 
 	bridge, err := page.New("proxy.example.test")
@@ -88,26 +91,27 @@ func TestBridgeInABrowser(t *testing.T) {
 	// the page failing, which is the whole point of the test.
 	var exit *exec.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == 2 {
-		skipUnlessCI(t,
+		requireHarness(t,
 			"no usable browser: run `npx playwright install chromium-headless-shell` in test/webbridge")
 	}
 
 	require.NoError(t, err, "the bridge page failed in a real browser")
 }
 
-// skipUnlessCI skips a missing harness locally and fails it under CI.
+// requireHarness skips when the browser harness is merely absent, and fails when
+// something has declared that it must be there.
 //
-// The asymmetry is the point. Locally, demanding Node and a browser download
-// from anyone running `go test ./...` would be rude. Under CI the harness is
-// installed on purpose, so its absence means the job is not running what it
-// believes it is running -- and a silent skip there reads as a pass on every
-// dashboard, which is exactly how this test managed to protect nothing through
-// two releases.
-func skipUnlessCI(t *testing.T, reason string) {
+// Deliberately NOT keyed on CI. Every job in a GitHub Actions run has CI set,
+// including the one that runs the whole tree without installing a browser, so
+// using it would turn an honest skip into a failure in a job that never asked
+// for the harness. Only the job built to run it sets
+// MTG_REQUIRE_BROWSER_HARNESS, and only there is a missing browser a defect
+// rather than a fact.
+func requireHarness(t *testing.T, reason string) {
 	t.Helper()
 
-	if os.Getenv("CI") != "" {
-		t.Fatalf("the browser harness must run in CI, but %s", reason)
+	if os.Getenv("MTG_REQUIRE_BROWSER_HARNESS") != "" {
+		t.Fatalf("this job exists to run the browser harness, but %s", reason)
 	}
 
 	t.Skip(reason)
