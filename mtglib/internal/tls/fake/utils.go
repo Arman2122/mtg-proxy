@@ -12,9 +12,31 @@ import (
 
 const (
 	maxFragmentsCount = 10
+
+	// RFC 5246 6.2.1: a TLSPlaintext fragment MUST NOT exceed 2^14 bytes, and
+	// the length field excludes the 5 byte header. Both bounds are checked
+	// before the length they carry drives any buffering: this is a
+	// pre-authentication path on the public listener.
+	maxRecordPayload = tls.MaxRecordSize
+
+	// A handshake message MAY span fragments, so the hello bound is not the
+	// record bound. 65531 is where uint16(1+3+length) below would wrap.
+	//
+	// Not tightened to one record, even though a real hello is ~517 bytes: on
+	// this path a failed handshake is relayed to the cover site, and
+	// ReadClientHelloMulti still reports the matched SNI when only the digest
+	// failed. Rejecting a 20 KiB hello earlier than a wrong secret would front
+	// it to a DIFFERENT host, so two connections would tell a prober this is an
+	// MTProto proxy -- with no secret needed. Parity with the wrong-secret path
+	// is worth the buffer.
+	maxClientHelloSize = 65531
 )
 
-var ErrTooManyFragments = errors.New("too many fragments")
+var (
+	ErrTooManyFragments = errors.New("too many fragments")
+	ErrRecordTooLarge   = errors.New("record is too large")
+	ErrHelloTooLarge    = errors.New("client hello is too large")
+)
 
 // https://datatracker.ietf.org/doc/html/rfc5246#section-6.2.1
 // client hello can be fragmented in a series of packets:
@@ -118,6 +140,12 @@ func (f *fragmentedHandshakeReader) parseNextFragment() error {
 	}
 
 	length := int64(binary.BigEndian.Uint16(header[3:]))
+	if length > maxRecordPayload {
+		// Refuse before io.CopyN buffers it: this bounds the first fragment,
+		// which is read before the handshake length is even visible.
+		return fmt.Errorf("%w: %d bytes", ErrRecordTooLarge, length)
+	}
+
 	_, err := io.CopyN(&f.buf, f.r, length)
 
 	return err
@@ -139,6 +167,13 @@ func parseClientHello(r io.Reader) (*bytes.Buffer, *bytes.Buffer, error) {
 	header[0] = 0
 	length := int64(binary.BigEndian.Uint32(header[:]))
 
+	if length > maxClientHelloSize {
+		// An unauthenticated 24-bit length reaching 16 MiB would otherwise be
+		// copied into two buffers below before any HMAC is computed, and above
+		// 65531 it also wraps the uint16 record length written into the copy.
+		return nil, nil, fmt.Errorf("%w: %d bytes", ErrHelloTooLarge, length)
+	}
+
 	clientHelloCopy := &bytes.Buffer{}
 	clientHelloCopy.Write([]byte{tls.TypeHandshake, 3, 1})
 	binary.Write( //nolint: errcheck
@@ -146,6 +181,10 @@ func parseClientHello(r io.Reader) (*bytes.Buffer, *bytes.Buffer, error) {
 		binary.BigEndian,
 		// 1 for handshake type
 		// 3 for handshake length
+		//
+		//nolint:gosec // G115: guarded by the maxClientHelloSize check above
+		// (65531), and the value is non-negative because it comes from a
+		// uint32 of three bytes, so this is 4..65535 and cannot wrap.
 		uint16(1+3+length),
 	)
 	clientHelloCopy.WriteByte(TypeHandshakeClient)

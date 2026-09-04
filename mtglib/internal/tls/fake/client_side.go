@@ -220,8 +220,11 @@ func parseSNI(r io.Reader) ([]string, error) {
 
 	extensionsLength := int64(binary.BigEndian.Uint16(header[:]))
 	buf := &bytes.Buffer{}
-	buf.Grow(int(extensionsLength))
 
+	// No Grow on this length. It is 2 unauthenticated bytes off the wire, so
+	// Grow would allocate up to 64 KiB for a 60-byte connection that then fails
+	// -- a ~1300x pre-auth amplification. CopyN grows the buffer to what really
+	// arrives, and r is already bounded by the caller's hello limit.
 	if _, err := io.CopyN(buf, r, extensionsLength); err != nil {
 		return nil, fmt.Errorf("cannot read extensions: %w", err)
 	}

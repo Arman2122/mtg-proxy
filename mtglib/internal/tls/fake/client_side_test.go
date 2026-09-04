@@ -605,7 +605,9 @@ func (s *ParseClientHelloFragmentedTestSuite) TestReassemblyErrors() {
 				buf.Write(handshakePayload)
 				return buf.Bytes()
 			},
-			errMsg: "cannot read record header",
+			// Used to surface only as an EOF on the next record header; the
+			// length is now rejected outright before anything is buffered.
+			errMsg: "client hello is too large",
 		},
 		{
 			name: "truncated continuation record header",

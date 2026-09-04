@@ -32,6 +32,9 @@ func FuzzReadClientHello(f *testing.F) {
 	require.NoError(f, err)
 
 	f.Add(seed[:])
+	// a record header announcing a 16 MiB handshake: the length is refused
+	// before it can drive any buffering.
+	f.Add([]byte{0x16, 3, 1, 0, 4, 0x01, 0xFF, 0xFF, 0xFF})
 
 	f.Fuzz(func(t *testing.T, value []byte) {
 		r := &connMock{
