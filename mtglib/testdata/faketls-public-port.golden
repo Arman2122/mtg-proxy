@@ -1,0 +1,39 @@
+# mtg-proxy -- ee / FakeTLS public-port wire trace.
+#
+# Regenerate:  MTG_UPDATE_GOLDEN=1 go test ./mtglib/ -run Golden
+# Never regenerate to make a red test green: a diff here means the public :443
+# port emits something different from what deployed clients have always seen.
+#
+# <masked> fields are the ones no test can freeze without a production seam.
+# random:    recomputed per run as HMAC-SHA256(secret, client random || flight)
+#            by assertFakeTLSDigest.
+# key-share: length pinned by the flight.1.length line; the value is entropy, so
+#            it is asserted to differ across two connections (and to be non-zero)
+#            by TestGoldenFakeTLSEntropyVariesPerConnection instead.
+probe.cover-received 6e6f74206120636c69656e742068656c6c6f20617420616c6c
+probe.client-received 485454502f312e3120323030204f4b0d0a0d0a636f76657220736974650a
+probe.fronting-events 1
+flight.1.type 16
+flight.1.version 0303
+flight.1.length 122
+flight.1.handshake-type 02
+flight.1.handshake-length 000076
+flight.1.server-version 0303
+flight.1.random <masked:32> faketls-digest
+flight.1.session-id-length 32
+flight.1.session-id 1111111111111111111111111111111111111111111111111111111111111111
+flight.1.cipher-suite 1301
+flight.1.suffix 00002e002b0002030400330024001d0020
+flight.1.key-share <masked:32> x25519
+flight.2.type 14
+flight.2.version 0303
+flight.2.length 1
+flight.2.payload 01
+flight.3.type 17
+flight.3.version 0303
+flight.3.length-range 2500..4699
+telegram.frame.dc 4
+telegram.frame.tag dddddddd
+relay.record-types 17
+relay.record-versions 0303
+relay.total-payload-bytes 128
