@@ -189,7 +189,10 @@ func (s *stream) drainUplink() {
 
 		// Only now. The whole point of the ordering is that credit follows the
 		// write, so a backend that is not draining cannot be hidden from the
-		// client by a queue on this side.
+		// client by a queue on this side. The byte count follows the same rule:
+		// a byte still sitting in this queue has not gone anywhere.
+		s.session.counters.addBytesUp(len(payload))
+
 		size := uint32(len(payload)) //nolint:gosec // a frame payload is bounded at 1 MiB
 
 		s.recvMu.Lock()
@@ -287,11 +290,17 @@ func (s *stream) refund(n int) {
 // does not block, and would overtake it. Queueing it after the loop makes the
 // ordering a property of the code path instead of the scheduler.
 func (s *stream) pump() {
+	// Counted here rather than at OPEN: a stream that never got a backend is
+	// not one this relay is carrying, and pairing the increment with the
+	// deferred decrement in the same function is what stops the gauge drifting.
+	s.session.counters.onStreamOpened()
+
 	defer func() {
 		// close() first, so the uplink goroutine stops before the client is
 		// told, then the CLOSE itself.
 		s.close()
 		s.session.closeStream(s.id)
+		s.session.counters.onStreamClosed()
 	}()
 
 	chunk := s.session.limits.EffectivePayload()
@@ -325,6 +334,8 @@ func (s *stream) pump() {
 			if pushErr := s.session.out.PushData(frame.NewData(s.id, payload)); pushErr != nil {
 				return
 			}
+
+			s.session.counters.addBytesDown(n)
 		} else {
 			s.refund(allowed)
 		}

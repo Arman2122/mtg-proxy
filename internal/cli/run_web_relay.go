@@ -83,7 +83,9 @@ func runWebRelay(conf *config.Config, configPath, version string, checkOnly bool
 
 	log := makeLogger(conf).Named("web-relay")
 
-	origin, backendAddr, err := buildOrigin(conf, log)
+	counters := webrelay.NewCounters(time.Now())
+
+	origin, backendAddr, err := buildOrigin(conf, counters, log)
 	if err != nil {
 		return err
 	}
@@ -128,13 +130,28 @@ func runWebRelay(conf *config.Config, configPath, version string, checkOnly bool
 		}
 	}()
 
+	// A SECOND socket, deliberately. The origin above is published to the
+	// internet by a front proxy, and everything on it that is not a client this
+	// relay minted a credential for is answered by the cover site -- so an
+	// endpoint there would be a fingerprint no matter how it was gated.
+	// ValidateWeb has already refused any address that is not loopback.
+	statsServer, err := startStatsServer(conf, origin, log)
+	if err != nil {
+		return err
+	}
+
+	if statsServer != nil {
+		defer shutdownStatsServer(statsServer, log)
+	}
+
 	log.BindStr("host", conf.Web.Host.Get("")).
 		BindStr("listen", conf.Web.BindTo.Get("")).
 		BindStr("backend", backendAddr).
+		BindStr("stats", conf.Web.StatsBindTo.Get("(off)")).
 		BindInt("profiles", len(conf.GetSecrets())).
 		Info("web relay is running")
 
-	waitForShutdown(configPath, origin, structure, log)
+	waitForShutdown(configPath, origin, counters, structure, log)
 
 	ctx, cancel := context.WithTimeout(context.Background(), webShutdownTimeout)
 	defer cancel()
@@ -156,7 +173,10 @@ func runWebRelay(conf *config.Config, configPath, version string, checkOnly bool
 // side, from the censorship the relay is there to get around.
 //
 // One goroutine, one signal at a time, so two reloads can never interleave.
-func waitForShutdown(configPath string, origin *webrelay.Origin, structure string, log mtglib.Logger) {
+func waitForShutdown(
+	configPath string, origin *webrelay.Origin, counters *webrelay.Counters,
+	structure string, log mtglib.Logger,
+) {
 	stop := utils.RootContext()
 
 	signals := reloadSignals()
@@ -178,7 +198,7 @@ func waitForShutdown(configPath string, origin *webrelay.Origin, structure strin
 		case <-stop.Done():
 			return
 		case <-hup:
-			reloadWebProfiles(configPath, origin, structure, log)
+			reloadWebProfiles(configPath, origin, counters, structure, log)
 		}
 	}
 }
@@ -189,7 +209,10 @@ func waitForShutdown(configPath string, origin *webrelay.Origin, structure strin
 // its registry because someone saved a broken file would serve the cover site
 // to every real user while reporting nothing wrong, and that failure is far
 // worse than a stale profile list.
-func reloadWebProfiles(configPath string, origin *webrelay.Origin, structure string, log mtglib.Logger) {
+func reloadWebProfiles(
+	configPath string, origin *webrelay.Origin, counters *webrelay.Counters,
+	structure string, log mtglib.Logger,
+) {
 	conf, err := utils.ReadConfig(configPath)
 	if err != nil {
 		log.WarningError("web relay reload: cannot read the config, keeping the current profiles", err)
@@ -200,6 +223,7 @@ func reloadWebProfiles(configPath string, origin *webrelay.Origin, structure str
 	// The same validation startup ran, so a reload can never accept a file that
 	// --check would refuse.
 	if err := conf.ValidateWeb(); err != nil {
+		counters.OnReload(time.Now(), err)
 		log.WarningError("web relay reload: the config is unusable, keeping the current profiles", err)
 
 		return
@@ -207,6 +231,7 @@ func reloadWebProfiles(configPath string, origin *webrelay.Origin, structure str
 
 	next, err := webStructure(conf)
 	if err != nil {
+		counters.OnReload(time.Now(), err)
 		log.WarningError("web relay reload: cannot read the backend listener, keeping the current profiles", err)
 
 		return
@@ -219,21 +244,83 @@ func reloadWebProfiles(configPath string, origin *webrelay.Origin, structure str
 	// around. Applying some of a changed file and not the rest is how a relay
 	// ends up in a state no configuration describes.
 	if next != structure {
+		counters.OnReload(time.Now(), errRestartRequired)
 		log.Warning("web relay reload: [web] changed in a way that needs a restart, profiles left unchanged")
 
 		return
 	}
 
-	secrets := orderedSecrets(conf)
+	names, secrets := orderedSecrets(conf)
 
 	if err := origin.SetSecrets(secrets); err != nil {
+		counters.OnReload(time.Now(), err)
 		log.WarningError("web relay reload: the new profile set cannot be served, keeping the current one", err)
 
 		return
 	}
 
+	counters.SetProfiles(names)
+	counters.OnReload(time.Now(), nil)
+
 	log.BindInt("profiles", len(secrets)).Info("web relay reloaded its profiles")
 }
+
+// startStatsServer brings up the relay's own counters socket, or nothing when
+// no address is configured.
+//
+// A failure to bind here is fatal, unlike an extra [[listener]] on the proxy.
+// The reasoning is opposite: there, losing one socket must not take the public
+// port down, because clients are on it. Here, an operator asked for
+// observability and would otherwise get a relay that runs while silently
+// reporting nothing -- which is the state this whole feature exists to end.
+func startStatsServer(
+	conf *config.Config, origin *webrelay.Origin, log mtglib.Logger,
+) (*http.Server, error) {
+	addr := conf.Web.StatsBindTo.Get("")
+	if addr == "" {
+		return nil, nil //nolint: nilnil // "no server" is not an error
+	}
+
+	// The same helper every other socket in this process is built with, so the
+	// stats listener gets the project's TCP options rather than the runtime
+	// defaults, and the linter's ban on a bare net.Listen holds here too.
+	listener, err := utils.NewListener(addr, 0)
+	if err != nil {
+		return nil, fmt.Errorf("cannot bind the web relay stats address %s: %w", addr, err)
+	}
+
+	server := &http.Server{
+		Handler:           origin.StatsHandler(time.Now),
+		ReadHeaderTimeout: webReadHeaderTimeout,
+		ReadTimeout:       webReadTimeout,
+		IdleTimeout:       webIdleTimeout,
+	}
+
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.WarningError("web relay stats server stopped", err)
+		}
+	}()
+
+	return server, nil
+}
+
+// shutdownStatsServer stops the counters socket on the way out.
+func shutdownStatsServer(server *http.Server, log mtglib.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), webShutdownTimeout)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.WarningError("cannot shut the web relay stats server down", err)
+	}
+}
+
+// errRestartRequired is what a reload records when the file changed in a way
+// only a restart can apply. It is never returned to a caller -- it exists so
+// the refusal lands in the failure counter, because an operator watching that
+// number has to be able to tell "my SIGHUP did nothing" from "my SIGHUP was
+// never delivered".
+var errRestartRequired = errors.New("[web] changed in a way that needs a restart")
 
 // webStructure renders everything about a relay that a reload must not change.
 //
@@ -265,11 +352,17 @@ func webStructure(conf *config.Config) (string, error) {
 		strconv.Itoa(int(conf.Web.MaxStreams.Get(0))),
 		strconv.FormatInt(conf.Web.MaxPayload.Get(0), 10),
 		strconv.FormatInt(conf.Web.BatchBytes.Get(0), 10),
+		// Structural: it is a socket bound once at startup, and moving it means
+		// binding a different one. A reload that accepted a new address would
+		// report success while the counters went on answering at the old one.
+		conf.Web.StatsBindTo.Get(""),
 		strconv.FormatBool(policy.ProxyProtocol),
 	}, "\x00"), nil
 }
 
-func buildOrigin(conf *config.Config, log mtglib.Logger) (*webrelay.Origin, string, error) {
+func buildOrigin(
+	conf *config.Config, counters *webrelay.Counters, log mtglib.Logger,
+) (*webrelay.Origin, string, error) {
 	listener, found := conf.WebBackendListener()
 	if !found {
 		return nil, "", fmt.Errorf("[web] backend names no [[listener]]")
@@ -310,11 +403,13 @@ func buildOrigin(conf *config.Config, log mtglib.Logger) (*webrelay.Origin, stri
 		return nil, "", fmt.Errorf("[web] limits: %w", err)
 	}
 
-	secrets := orderedSecrets(conf)
+	names, secrets := orderedSecrets(conf)
+	counters.SetProfiles(names)
 
 	origin, err := webrelay.NewOrigin(webrelay.OriginOptions{
 		Host:        conf.Web.Host.Get(""),
 		Secrets:     secrets,
+		Counters:    counters,
 		Signer:      signer,
 		Cover:       cover,
 		Backend:     backend,
@@ -427,7 +522,7 @@ func clientIPResolver(source config.ClientIPSource) func(*http.Request) net.Addr
 // The order is the profile numbering, and it appears in logs and metrics, so it
 // has to survive a restart that did not change the configuration. A map range
 // would renumber every profile on every start for no reason at all.
-func orderedSecrets(conf *config.Config) []mtglib.Secret {
+func orderedSecrets(conf *config.Config) ([]string, []mtglib.Secret) {
 	named := conf.GetSecrets()
 	names := make([]string, 0, len(named))
 
@@ -442,5 +537,7 @@ func orderedSecrets(conf *config.Config) []mtglib.Secret {
 		secrets = append(secrets, named[name])
 	}
 
-	return secrets
+	// Returned together, from one walk of one sorted key list, so the two
+	// slices cannot come to disagree about which name belongs to which profile.
+	return names, secrets
 }

@@ -627,6 +627,30 @@ half-applied. A reload that cannot read or validate the file keeps the running
 set — an emptied registry would serve the cover site to every real user while
 reporting nothing wrong. Windows has no `SIGHUP`, so restart the relay there.
 
+**Watching it.** The relay reports its own counters on a socket of its own:
+
+```toml
+[web]
+stats-bind-to = "127.0.0.1:8100"
+```
+
+```console
+curl http://127.0.0.1:8100/stats
+```
+
+Sessions, streams, bytes in each direction, profile names, reload outcomes, and a
+breakdown of *why* requests were refused — `cover_served`, `not_found`,
+`bad_token`, `session_limit`. The breakdown is the point: a climb in
+`cover_served` alongside users reporting failures means a hostname or secret-set
+mismatch, and a climb in `session_limit` means capacity, and one number cannot
+tell those apart.
+
+It **must** be a loopback address and the relay refuses to start otherwise. It is
+deliberately a second socket rather than a path on `bind-to`: that one is
+published to the internet by the front proxy, where everything without a
+credential the relay minted is answered by the cover site — a real endpoint there
+would be a fingerprint however it was gated. It is off by default.
+
 [contrib/web-relay/](contrib/web-relay/README.md) is the deployment: the Caddy
 vhost, the four hops that have to carry the client's address, and the acceptance
 checklist for a real client. `/stats` advertises `web-relay` in `features` when a

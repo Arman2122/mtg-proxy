@@ -45,6 +45,7 @@ type tomlConfig struct {
 		MaxStreams        uint   `toml:"max-streams"         json:"maxStreams,omitempty"`
 		MaxFramePayload   string `toml:"max-frame-payload"   json:"maxFramePayload,omitempty"`
 		CarrierBatchBytes string `toml:"carrier-batch-bytes" json:"carrierBatchBytes,omitempty"`
+		StatsBindTo       string `toml:"stats-bind-to"      json:"statsBindTo,omitempty"`
 	} `toml:"web" json:"web"`
 	ProxyProtocolListener       bool   `toml:"proxy-protocol-listener" json:"proxyProtocolListener"`
 	PreferIP                    string `toml:"prefer-ip" json:"preferIp,omitempty"`

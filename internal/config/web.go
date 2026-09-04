@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/Arman2122/mtg-proxy/internal/webrelay"
 	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
@@ -104,6 +105,15 @@ type ConfigWeb struct {
 	MaxStreams    TypeConcurrency    `json:"maxStreams"`
 	MaxPayload    TypeBytes          `json:"maxFramePayload"`
 	BatchBytes    TypeBytes          `json:"carrierBatchBytes"`
+
+	// StatsBindTo is the loopback address the relay serves its own counters on.
+	// Empty (the default) means no stats server at all.
+	//
+	// Deliberately a second socket rather than a path on BindTo: that one is
+	// published to the internet by the front proxy, and the relay's recognition
+	// rule says everything without a credential it minted gets the cover site.
+	// An endpoint there would be a fingerprint whether or not it was gated.
+	StatsBindTo TypeHostPort `json:"statsBindTo"`
 }
 
 // WebBackendListener finds the [[listener]] stanza the [web] backend address
@@ -181,6 +191,15 @@ func (c *Config) ValidateWeb() error {
 	if (web.CoverDir == "") == (web.CoverUpstream == "") {
 		return fmt.Errorf("[web] needs exactly one of cover-dir or cover-upstream: " +
 			"the hostname must serve a plausible website to everyone who is not a Telegram client")
+	}
+
+	// Refused, not warned about. This socket answers, with no credential at
+	// all, how many sessions the relay is carrying and how many bytes it has
+	// moved -- the traffic analysis this whole transport exists to deny. An
+	// operator who typed a public address has published that, and a line in a
+	// log is not where they would find out.
+	if err := webrelay.ValidateStatsBind(web.StatsBindTo.Get("")); err != nil {
+		return err
 	}
 
 	listener, found := c.WebBackendListener()

@@ -184,6 +184,23 @@ bind-to = "0.0.0.0:3128"
 # # an application. Listings are always off.
 # cover-dir = "/srv/site"
 # # cover-upstream = "http://127.0.0.1:8080"
+
+# The relay's own counters, on a socket of their own: sessions, streams, bytes,
+# and why requests were refused. Empty (the default) means no stats server.
+#
+# MUST be a loopback address, and the relay refuses to start otherwise. This
+# endpoint answers, with no credential at all, how many sessions are live and
+# how many bytes have moved -- exactly the traffic analysis this transport
+# exists to deny -- so publishing it would undo the point of running it.
+#
+# Deliberately NOT a path on bind-to above: that socket is published to the
+# internet by the front proxy, and everything on it without a credential the
+# relay minted is answered by the cover site. A real endpoint there would be a
+# fingerprint no matter how it was gated.
+#
+#   curl http://127.0.0.1:8100/stats
+#
+# stats-bind-to = "127.0.0.1:8100"
 #
 # # How the relay learns the browser's address. There is no fallback to the
 # # socket: behind a front proxy that is loopback for every user alive.

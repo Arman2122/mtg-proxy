@@ -46,6 +46,11 @@ type OriginOptions struct {
 	// Signer mints and recognises the bootstrap and session tokens.
 	Signer *Signer
 
+	// Counters, when set, is where this origin records what it is doing. Nil
+	// disables every counter and the relay serves identically, which is what
+	// lets the tests build an origin without one.
+	Counters *Counters
+
 	// Cover handles every request that carries no authentic credential.
 	Cover http.Handler
 
@@ -117,6 +122,10 @@ type Origin struct {
 	clientIP    func(r *http.Request) net.Addr
 	log         mtglib.Logger
 
+	// counters may be nil: an origin built without one still serves, and every
+	// counter method is nil-safe, so tests need not care.
+	counters *Counters
+
 	global *budget
 }
 
@@ -165,6 +174,7 @@ func NewOrigin(opts OriginOptions) (*Origin, error) {
 		dialTimeout: opts.DialTimeout,
 		clientIP:    opts.ClientIP,
 		log:         opts.Logger,
+		counters:    opts.Counters,
 		global:      newBudget(DefaultGlobalPendingBytes, DefaultGlobalPendingItems),
 	}
 
@@ -215,6 +225,20 @@ func (o *Origin) SetSecrets(secrets []mtglib.Secret) error {
 }
 
 // Profiles reports how many profiles the origin currently serves.
+// StatsHandler builds the handler for this origin's own counters.
+//
+// It hands out the store rather than a copy of its numbers because the session
+// count has to be read at scrape time: the store reaps expired sessions on its
+// own schedule, so a number sampled anywhere else is a number that was true
+// once.
+//
+// The result belongs on a SEPARATE listener. Serving it from this origin's
+// handler would put it on the socket the front proxy publishes -- see
+// StatsHandler's own comment for why that is not a thing to do.
+func (o *Origin) StatsHandler(now func() time.Time) *StatsHandler {
+	return NewStatsHandler(o.counters, o.store, now)
+}
+
 func (o *Origin) Profiles() int {
 	return o.registry.Load().Len()
 }
@@ -243,6 +267,7 @@ func (o *Origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	o.counters.onCoverServed()
 	o.cover.ServeHTTP(w, r)
 }
 
@@ -346,6 +371,8 @@ func (o *Origin) serveSessionCreate(w http.ResponseWriter, r *http.Request) bool
 
 	switch outcome {
 	case admitted:
+		o.counters.onSessionCreated()
+
 		header := w.Header()
 		header.Set("X-Session-Token", session)
 		header.Set("X-Down-Cursor", "0")
@@ -359,6 +386,8 @@ func (o *Origin) serveSessionCreate(w http.ResponseWriter, r *http.Request) bool
 		}
 
 	case atCapacity:
+		o.counters.onSessionLimit()
+
 		// The bootstrap is deliberately still unspent, so the byte-identical
 		// request is safe to repeat. The bridge retries under a budget rather
 		// than a fixed count.
@@ -389,6 +418,7 @@ func (o *Origin) serveSessionDelete(w http.ResponseWriter, r *http.Request) bool
 		// Authentic, but naming no session this relay holds. Idempotent applies
 		// to a session that exists; this one does not, and telling a prober
 		// apart from a client here costs nothing.
+		o.counters.onBadToken()
 		o.notFound(w)
 
 		return true
@@ -433,6 +463,7 @@ func (o *Origin) serveWebSocket(w http.ResponseWriter, r *http.Request) bool {
 		// Either the session is gone, or a second socket is trying to join one
 		// that already has a carrier. The frame stream has one ordering and two
 		// sockets feeding it have none.
+		o.counters.onBadToken()
 		o.notFound(w)
 
 		return true
@@ -458,8 +489,10 @@ func (o *Origin) serveWebSocket(w http.ResponseWriter, r *http.Request) bool {
 		ClientAddr:  client,
 		MaxStreams:  o.maxStreams,
 		DialTimeout: o.dialTimeout,
+		Counters:    o.counters,
 	})
 
+	o.counters.onSessionAttached()
 	o.logSession(profile, client)
 
 	if err := carrier.Serve(ctx); err != nil && !errors.Is(err, ws.ErrClosed) {
@@ -489,6 +522,8 @@ func (o *Origin) resolveClient(r *http.Request) net.Addr {
 
 // notFound is the tier-two answer: local, uncacheable, and carrying nothing.
 func (o *Origin) notFound(w http.ResponseWriter) {
+	o.counters.onNotFound()
+
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)

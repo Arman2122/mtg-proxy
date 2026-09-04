@@ -65,6 +65,10 @@ type SessionOptions struct {
 	MaxStreams  int
 	DialTimeout time.Duration
 
+	// Counters may be nil. Every method on it is nil-safe, so a session built
+	// without one behaves exactly as it did before they existed.
+	Counters *Counters
+
 	// PendingBytes and PendingItems bound this one session's downlink queue.
 	// Zero means the defaults. They are separate from the global budget because
 	// the two answer different questions: the global one stops the process
@@ -128,6 +132,9 @@ type session struct {
 	streams    map[uint32]*stream
 	tombstones *tombstones
 
+	// counters may be nil; every method on it is nil-safe.
+	counters *Counters
+
 	wg sync.WaitGroup
 }
 
@@ -145,6 +152,7 @@ func newSession(conn carrier, opts SessionOptions) *session {
 		dialTimeout: opts.DialTimeout,
 		streams:     make(map[uint32]*stream),
 		tombstones:  newTombstones(MaxTombstones),
+		counters:    opts.Counters,
 	}
 }
 
