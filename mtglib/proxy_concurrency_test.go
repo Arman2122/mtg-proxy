@@ -162,6 +162,11 @@ func TestConnectionsAreCountedPerUser(t *testing.T) {
 		}
 	}
 
+	// Both conditions, not just the registry. A stream is registered in admit,
+	// which runs BEFORE its Telegram handshake completes, so waiting on the
+	// registry alone would let teardown begin while a dial was still mid-read
+	// -- and the handshake it interrupted would be counted as a failure of the
+	// proxy rather than of the test's own timing.
 	require.Eventually(t, func() bool {
 		counts := liveCount(h.proxy)
 		for name, count := range wanted {
@@ -170,9 +175,9 @@ func TestConnectionsAreCountedPerUser(t *testing.T) {
 			}
 		}
 
-		return len(counts) == len(wanted)
+		return len(counts) == len(wanted) && sink.accepted.Load() == int64(total)
 	}, 20*time.Second, 20*time.Millisecond,
-		"every stream must register under its own secret")
+		"every stream must register under its own secret and reach Telegram")
 
 	stats := statsFor(t, h.proxy)
 
@@ -286,15 +291,18 @@ func TestCountersStayExactUnderConcurrentChurn(t *testing.T) {
 		dones = append(dones, done)
 	}
 
+	// The registry AND the handshakes: see the note in the test above. Under a
+	// loaded CI runner the gap between the two is wide enough to matter, and it
+	// is what made this assertion fail there while passing locally.
 	require.Eventually(t, func() bool {
 		total := 0
 		for _, count := range liveCount(h.proxy) {
 			total += count
 		}
 
-		return total == connections
+		return total == connections && sink.accepted.Load() == int64(connections)
 	}, 30*time.Second, 20*time.Millisecond,
-		"every stream must be admitted")
+		"every stream must be admitted and reach Telegram")
 
 	stats := statsFor(t, h.proxy)
 	require.EqualValues(t, connections, stats.TotalConnections)
@@ -303,6 +311,11 @@ func TestCountersStayExactUnderConcurrentChurn(t *testing.T) {
 		require.EqualValues(t, perUser, stats.Users[name].Connections,
 			"each user opened the same number of connections")
 	}
+
+	// Asserted here rather than after teardown: once this test starts closing
+	// sockets, a failed handshake read no longer distinguishes a proxy fault
+	// from the test's own shutdown.
+	require.Zero(t, sink.failed.Load(), "no Telegram handshake may fail under load")
 
 	sink.closeAll()
 
@@ -338,8 +351,6 @@ func TestCountersStayExactUnderConcurrentChurn(t *testing.T) {
 			"a connection counter that does not return to zero double-counts every restart")
 		require.Empty(t, after.Users[name].ConnectedIPs)
 	}
-
-	require.Zero(t, sink.failed.Load(), "no Telegram handshake may fail under load")
 }
 
 // A user's connections are attributed to that user on both doors at once.
