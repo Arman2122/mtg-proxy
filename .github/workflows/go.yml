@@ -198,8 +198,53 @@ jobs:
         with:
           subject-path: 'dist/*'
 
+      # The description on a release page is the tag's own annotation. Every
+      # tag here is cut with `git tag -a` carrying hand-written notes, and
+      # without this step they stay invisible: GitHub's generated notes come out
+      # as a bare compare link whenever a release has no merged pull requests
+      # behind it, which is most of them on this project.
+      #
+      # Read over the API rather than from a working tree, because this job
+      # deliberately has none (see the comment on the job) -- two API reads cost
+      # less than reintroducing a checkout that would persist a contents: write
+      # token to disk.
+      #
+      # A lightweight tag has no annotation to read, and its ref object is the
+      # commit itself; that case yields an empty body and the generated notes
+      # stand alone, exactly as before this step existed.
+      - name: Take the release description from the tag annotation
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          ref="$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha')"
+          kind="${ref%% *}"
+          sha="${ref##* }"
+          message=""
+          if [ "${kind}" = "tag" ]; then
+            message="$(gh api "repos/${REPO}/git/tags/${sha}" --jq '.message')"
+          fi
+          # `git tag -a` puts a subject on the first line. When that subject is
+          # only the version, it would render directly beneath a heading that
+          # already names the version, so drop it and any blank line after it.
+          if [ "$(printf %s "${message}" | head -n 1)" = "${TAG}" ]; then
+            message="$(printf %s "${message}" | tail -n +2 | sed '1{/^$/d;}')"
+          fi
+          {
+            echo 'body<<MTG_RELEASE_NOTES_EOF'
+            printf %s "${message}"
+            echo
+            echo 'MTG_RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
+          # Prepended to the generated notes, so a release page leads with what
+          # changed and why, and still ends with the commit range.
+          body: ${{ steps.notes.outputs.body }}
           generate_release_notes: true
