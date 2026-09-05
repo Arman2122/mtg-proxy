@@ -220,6 +220,40 @@ func acceptedClientIP(addr net.Addr) (net.IP, bool) {
 	return tcpAddr.IP, true
 }
 
+// The accept loop's backoff. A transient accept error is retried after a pause
+// that starts at acceptRetryMin, doubles on every consecutive failure and is
+// capped at acceptRetryMax; any accepted connection resets it. The numbers are
+// net/http's, which has ridden out the same bursts for a decade.
+const (
+	acceptRetryMin = 5 * time.Millisecond
+	acceptRetryMax = time.Second
+)
+
+// nextAcceptRetry is the pause after one more consecutive accept failure.
+func nextAcceptRetry(current time.Duration) time.Duration {
+	if current == 0 {
+		return acceptRetryMin
+	}
+
+	if next := current * 2; next < acceptRetryMax {
+		return next
+	}
+
+	return acceptRetryMax
+}
+
+// isTransientAcceptError says whether the kernel will stop returning this error
+// by itself: the descriptor table filling up, a connection the peer aborted
+// between the kernel's accept and ours. The net package classifies exactly
+// these as temporary on every platform, and that classification is asked for
+// through a local interface rather than net.Error, whose Temporary method is
+// deprecated for every purpose except this one.
+func isTransientAcceptError(err error) bool {
+	var transient interface{ Temporary() bool }
+
+	return errors.As(err, &transient) && transient.Temporary()
+}
+
 // Serve starts a proxy on a given listener with the default (FakeTLS-only)
 // policy.
 func (p *Proxy) Serve(listener net.Listener) error {
@@ -233,16 +267,50 @@ func (p *Proxy) ServeWithPolicy(listener net.Listener, policy ListenerPolicy) er
 	p.streamWaitGroup.Add(1)
 	defer p.streamWaitGroup.Done()
 
+	var retryIn time.Duration
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-p.ctx.Done():
+			// The listener was closed, or the proxy is stopping. Both are the
+			// caller's doing, and neither is an error to report.
+			if errors.Is(err, net.ErrClosed) || p.ctx.Err() != nil {
 				return nil
-			default:
+			}
+
+			// A socket that is broken rather than busy -- a descriptor closed
+			// underneath us, a listener that was never listening -- is not
+			// coming back, and retrying it would only hide that. It is returned
+			// so the caller can decide what a dead listener means; for the
+			// public port, that the process must not go on looking healthy.
+			if !isTransientAcceptError(err) {
 				return fmt.Errorf("cannot accept a new connection: %w", err)
 			}
+
+			// Busy, not broken: the descriptor table is full, or a peer reset
+			// between the kernel's accept and ours. This used to return, and
+			// the caller discarded the error, so one such moment took the
+			// listener off the air for good while the process stayed up and
+			// reported itself healthy. Pause and try again, backing off the way
+			// net/http does, so a burst is ridden out rather than spun on.
+			retryIn = nextAcceptRetry(retryIn)
+			p.logger.BindStr("retry_in", retryIn.String()).
+				WarningError("cannot accept a new connection, retrying", err)
+
+			timer := time.NewTimer(retryIn)
+
+			select {
+			case <-timer.C:
+			case <-p.ctx.Done():
+				timer.Stop()
+
+				return nil
+			}
+
+			continue
 		}
+
+		retryIn = 0
 
 		ipAddr, ok := acceptedClientIP(conn.RemoteAddr())
 		if !ok {
