@@ -478,10 +478,12 @@ A user who was working stops working, and reports a website where the app used t
 From their side this is indistinguishable from the censorship the relay exists to get
 around, so it is worth being systematic.
 
-**Cause 1: the reload never happened.** The relay re-reads the `[secrets]` table on
-SIGHUP only. Adding a user to the config file and reloading the *proxy* does nothing for
-the relay — they are separate processes. Until the relay gets its signal, the new user's
-link is answered by the cover site.
+**Cause 1: the user is not in the file.** The relay reads the config file and nothing
+else. It watches that file and applies a changed `[secrets]` table by itself within a
+few seconds — so a user who *is* in the file is known to the relay without anyone
+sending anything. A user added through the proxy's management API and never written to
+the file is not, and their link is answered by the cover site. Write the file. To apply
+a change immediately rather than on the next look:
 
 ```bash
 systemctl reload mtg-proxy-web-relay
@@ -494,7 +496,7 @@ kill -HUP "$(pidof mtg-proxy-web-relay)"
 No unit file ships in the repository, so the name above is only the one used in the
 project's own examples — substitute whatever you called yours. For `systemctl reload` to
 work at all, the unit needs `ExecReload=/bin/kill -HUP $MAINPID`. Windows builds have no
-SIGHUP and no reload; restart the relay there.
+SIGHUP; the file watcher is the only trigger there.
 
 **Cause 2: the reload was refused.** Every refusal is a warning in the relay's log and a
 tick on `reload_failures`:
@@ -503,18 +505,22 @@ tick on `reload_failures`:
 curl -sS http://127.0.0.1:8100/stats | jq '{reloads, reload_failures, last_reload, profiles}'
 ```
 
-If `reload_failures` moved and `last_reload` did not, the signal arrived and the file was
-rejected. The log says which:
+If `reload_failures` moved and `last_reload` did not, a reload — the relay's own look at
+the file, or your signal — found the file and rejected it. The log says which, and
+`trigger=file` or `trigger=signal` says whose:
 
-- `web relay reload: cannot read the config, keeping the current profiles` — the file was
-  being written when the signal arrived, or the path changed.
+- `web relay reload: cannot read the config, keeping the current profiles` — the file
+  does not parse, or the path changed. The watcher leaves a file alone until it has held
+  still across two looks, so from `trigger=file` this means the *finished* file is broken;
+  from `trigger=signal` it may only mean the signal landed mid-write.
 - `web relay reload: the config is unusable, keeping the current profiles` — it would not
   pass `--check`.
 - `web relay reload: [web] changed in a way that needs a restart, profiles left
   unchanged` — you changed the host, the bound address, the backend, the token key, the
   cover site, the limits, the stats address, or the backend listener's `proxy-protocol`.
   Only the profile set is reloadable; the rest is refused whole rather than half-applied.
-  Restart the relay.
+  Restart the relay. The refusal is logged and counted once, not again on every look at
+  the file.
 
 In every one of those the relay keeps the profile set it already had, on purpose. A relay
 that emptied its registry because someone saved a broken file would serve the cover site

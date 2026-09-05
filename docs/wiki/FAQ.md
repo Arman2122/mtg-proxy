@@ -112,19 +112,19 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 
 Both go through the same atomic swap. The new secret works immediately; every other user keeps their connection and their counters. Only a secret that was removed or re-keyed has its connections closed. API mutations are in-memory only, so write the file too — a later reload or a restart re-reads it and overrides them.
 
-If you also run the WEB relay, it is a second process and does not share that listener. Send it `SIGHUP` after the file changes, or the new user's WEB link is answered by the cover site — which, from their side, looks exactly like the censorship the relay exists to get around:
+If you also run the WEB relay, it is a second process and does not share that listener — but it watches the file, and applies a changed `[secrets]` table by itself within a few seconds of the write. Nothing has to be sent. To apply it immediately rather than on the next look:
 
 ```bash
 systemctl reload mtg-proxy-web-relay
 ```
 
-See [[Multi-User-and-API]].
+What the relay cannot see is a change made through the API and never written to the file. That user's WEB link is answered by the cover site — which, from their side, looks exactly like the censorship the relay exists to get around. Write the file. See [[Multi-User-and-API]].
 
 ### What happens to sessions when I restart the relay?
 
 Every live WEB session ends. Session state is held in memory only, so a restart drops all of it; clients then run their own retry ladder, reload the bridge page and bootstrap a new session. Links do not change — the signing key lives on disk and the capability is derived from the hostname — so nothing has to be re-issued.
 
-A `SIGHUP` reload is the gentle path: it swaps the profile set and leaves live sessions alone. Anything else that changed under `[web]`, or the backend listener's `proxy-protocol` flag, is refused whole with "restart required" rather than half-applied, and an unreadable or invalid file keeps the running set. Windows builds have no `SIGHUP`; restart the relay there. Rotating `token-key` invalidates every live session by design. See [[WEB-Proxy-Setup]].
+A reload — the automatic one when the file changes, or a `SIGHUP` — is the gentle path: it swaps the profile set and leaves live sessions alone. Anything else that changed under `[web]`, or the backend listener's `proxy-protocol` flag, is refused whole with "restart required" rather than half-applied, and an unreadable or invalid file keeps the running set. Windows builds have no `SIGHUP`; the file watcher is the only trigger there. Rotating `token-key` invalidates every live session by design. See [[WEB-Proxy-Setup]].
 
 ### Can I see the relay's own counters?
 
@@ -199,4 +199,4 @@ mtg-proxy runs as a managed child process of the Penhoon panel, one process per 
 - **The `features` array on `/stats`.** `client-ips`, `faketls`, `listeners`, `quota-reset`, `secret-modes`, `secrets-api`, `web-relay`. These strings are public API — never renamed or removed, only appended — so a panel can tell an old binary from a new one without parsing version numbers.
 - **Release asset names.** `mtg-proxy-<version>-linux-<arch>.tar.gz`, with an inner directory of the same name holding a binary named exactly `mtg-proxy`, plus `mtg-proxy-<version>-checksums.txt`.
 
-The WEB relay is a separate process, and nothing in this repository starts it for you — a WEB deployment is wired up by hand or by whatever supervises the proxy. The relay's `SIGHUP` reload exists precisely so that whoever is the source of truth for the secret set can push a change without a restart. See [[Multi-User-and-API]] and [[Installation]].
+The WEB relay is a separate process, and nothing in this repository starts it for you — a WEB deployment is wired up by hand or by whatever supervises the proxy. The relay watches the config file precisely so that whoever is the source of truth for the secret set has nothing to tell it: write the file and the relay follows. See [[Multi-User-and-API]] and [[Installation]].

@@ -182,7 +182,8 @@ Per user:
 | `quota_reset` | when not `none` | Currently only `"monthly"`. |
 | `expires_at` | when an expiry is set | RFC3339. |
 | `disabled` | when true | Omitted when false. |
-| `ad_tag_skipped` | when non-zero | Ad-tagged streams that took the direct path because their transport has no middle-proxy reframer. |
+| `ad_tag_skipped` | when non-zero | Ad-tagged streams that took the direct path because their transport has no middle-proxy reframer. By design. |
+| `ad_tag_failed` | when non-zero | Ad-tagged streams that took the direct path because the middle proxy could not be reached or refused them. Not by design: this is the sponsored channel going missing. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` | See below. |
 
 Two behaviours that catch people out:
@@ -552,7 +553,11 @@ takes flags instead of a file: there is no source to re-read.
 The WEB relay is a second process of the same binary reading the same file. It
 does not share the management listener — putting an HTTP management surface on a
 process whose entire security argument is that it presents one ordinary hostname
-to the internet would defeat the point. It reloads on `SIGHUP` instead.
+to the internet would defeat the point. Instead it **watches the file**: a
+changed `[secrets]` table is applied by itself within a few seconds of the write
+settling. Add a user to the file and there is nothing to tell the relay.
+
+A `SIGHUP` applies a change immediately rather than on the next look:
 
 ```bash
 kill -HUP <relay-pid>
@@ -565,6 +570,11 @@ file under `contrib/web-relay/`, but no unit file, so this is one you write:
 ```bash
 systemctl reload mtg-proxy-web-relay
 ```
+
+The file is the only thing the relay reads. A user added through this API and
+never written to the file is unknown to the relay, and their WEB link is
+answered by the cover site. The API is in-memory by design (see above); write
+the file.
 
 Only the secret set reloads. Live sessions keep running, a newly added secret is
 recognised on its next page load, and a removed one stops being recognised.
@@ -587,9 +597,11 @@ the relay exists to get around.
 Refusals are counted, so "my SIGHUP did nothing" is distinguishable from "my
 SIGHUP was never delivered". If you set `[web] stats-bind-to`, the relay's own
 stats socket reports `reloads` (successes), `reload_failures` and `last_reload`
-(the time of the last success). One gap to know about: a file that cannot be
-read or parsed at all is logged but **not** counted, because the counter lives
-behind the read. Watch the relay's log as well as its counters.
+(the time of the last success). Every refusal counts, an unparseable file
+included; a file the relay refused counts once and is not tried again until it
+changes. A file change that left the profiles alone is not a reload and moves
+nothing, whereas a `SIGHUP` that changed nothing still counts as one — the
+operator who sent it is asking whether it landed.
 
 That socket must be a loopback **IP literal**. The relay refuses to start on
 anything else, and refuses names — `localhost` included — because a name can
@@ -602,8 +614,10 @@ fingerprint however well it was gated. See [[Monitoring]] and
 
 **Windows has no SIGHUP.** Go defines the constant but nothing delivers it, so
 the Windows build registers no reload signal at all rather than advertising one
-that never fires. Restart the relay there. A deployment running both processes
-reloads both: `POST /reload` for the proxy, `SIGHUP` for the relay.
+that never fires. The file watcher runs there as everywhere, so a Windows relay
+follows the file by itself; it just cannot be hurried. A deployment running both
+processes reloads the proxy with `POST /reload` and lets the relay follow the
+file — or sends it `SIGHUP` to make that immediate.
 
 ## See also 🔗
 

@@ -14,7 +14,7 @@ and statsd metrics — is upstream's and behaves as upstream documents it. This 
 the multi-user layer on top: named secrets, a management API, per-user governance, the
 sponsored channel that mtg v2 dropped, and the WEB transport.
 
-Current release: **v1.3.0**. Building from source needs Go 1.26 or newer.
+Current release: **v1.4.0**. Building from source needs Go 1.26 or newer.
 
 ## How a client reaches it 🚪
 
@@ -41,7 +41,7 @@ person keeps one name, one quota bucket and one set of counters whichever they u
 | Multiple secrets | One named secret per user, each able to front behind a different hostname. Upstream's single `secret = "…"` still works and becomes a user named `default`. | [[Multi-User-and-API]] |
 | Per-user stats | `GET /stats` on `api-bind-to`: live connections, bytes in and out, last seen, quota use, and a sorted `features` list a panel reads instead of parsing version strings. | [[Monitoring]] |
 | Management API | `GET`/`POST`/`PUT /secrets`, `DELETE /secrets/{name}` and the `/adtag` routes add, remove and re-key users at runtime. `api-token` puts a bearer token on every endpoint. | [[Multi-User-and-API]] |
-| Hot reload | `POST /reload` re-reads `[secrets]`, `ad-tag`, `[secret-ad-tags]` and `[secret-limits]` and swaps them in atomically; unaffected users stay connected. The WEB relay is a separate process and reloads on `SIGHUP`. | [[Multi-User-and-API]] |
+| Hot reload | `POST /reload` re-reads `[secrets]`, `ad-tag`, `[secret-ad-tags]` and `[secret-limits]` and swaps them in atomically; unaffected users stay connected. The WEB relay is a separate process that watches the same file and follows it by itself; `SIGHUP` makes that immediate. | [[Multi-User-and-API]] |
 | Quotas, expiry, disable | `[secret-limits.<name>]` gives a user a data cap (optionally resetting monthly), a deadline and an on/off switch. A limited user is routed to the fronting domain, exactly like a wrong secret, so a prober cannot tell them apart. | [[Limits-and-Quotas]] |
 | Connection throttling | `[throttle] max-connections` with a fair-share cap recomputed every few seconds: light users keep everything they have, and the rest of the budget is split among heavy ones. | [[Limits-and-Quotas]] |
 | Sponsored channel | `ad-tag` routes matching clients through Telegram's middle proxies so your promoted channel sits at the top of their chat list. Needs a reachable public IP. | [[Configuration]] |

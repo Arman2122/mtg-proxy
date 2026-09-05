@@ -42,8 +42,9 @@ archives, built by `.github/workflows/go.yml`:
 There are no macOS, FreeBSD or OpenBSD release binaries. Go cross-compiles to
 all of them, so build from source if that is what you have — but nothing in CI
 exercises those targets. The Windows builds are for running the proxy; the WEB
-relay is the component that is not really at home there, because Windows has no
-`SIGHUP` and so no reload (see [Running under systemd](#running-under-systemd)).
+relay runs there too and follows its config file by itself, but Windows has no
+`SIGHUP`, so there is no way to make a reload immediate (see
+[Running under systemd](#running-under-systemd)).
 
 Every binary is built with `CGO_ENABLED=0`, so it is statically linked and has
 no libc dependency. The `linux-amd64` archive runs unchanged on glibc and musl
@@ -52,13 +53,13 @@ distributions, and inside a `scratch` container.
 Pick the archive for your platform:
 
 ```bash
-curl -sfLO https://github.com/Arman2122/mtg-proxy/releases/download/v1.3.0/mtg-proxy-1.3.0-linux-amd64.tar.gz
+curl -sfLO https://github.com/Arman2122/mtg-proxy/releases/download/v1.4.0/mtg-proxy-1.4.0-linux-amd64.tar.gz
 ```
 
 Verify it before unpacking — see the next section — then unpack:
 
 ```bash
-tar -xzf mtg-proxy-1.3.0-linux-amd64.tar.gz
+tar -xzf mtg-proxy-1.4.0-linux-amd64.tar.gz
 ```
 
 Each archive unpacks into a directory named after itself containing four files:
@@ -76,7 +77,7 @@ Set the version once. Note that the file names carry the version **without** the
 leading `v`, while the release URL carries it **with**:
 
 ```bash
-VERSION=1.3.0
+VERSION=1.4.0
 ```
 
 ```bash
@@ -157,15 +158,15 @@ The image is published to the GitHub Container Registry for `linux/amd64` and
 `linux/arm64`:
 
 ```bash
-docker pull ghcr.io/arman2122/mtg-proxy:1.3.0
+docker pull ghcr.io/arman2122/mtg-proxy:1.4.0
 ```
 
 Tags produced by `.github/workflows/docker-publish.yml`:
 
 | Tag | Means |
 |---|---|
-| `1.3.0` | that exact release |
-| `1.3` | the newest patch in that minor series |
+| `1.4.0` | that exact release |
+| `1.4` | the newest patch in that minor series |
 | `latest` | the newest tagged, non-prerelease build |
 | `sha-<commit>` | one commit on `main`, released or not |
 
@@ -177,13 +178,13 @@ driven entirely from environment variables in the style of the official
 `telegrammessenger/proxy` image:
 
 ```bash
-docker run -d --name mtg -p 443:443 -e SECRET=00112233445566778899aabbccddeeff -e SECRET_HOST=storage.googleapis.com -e MTG_BIND_TO=0.0.0.0:443 ghcr.io/arman2122/mtg-proxy:1.3.0
+docker run -d --name mtg -p 443:443 -e SECRET=00112233445566778899aabbccddeeff -e SECRET_HOST=storage.googleapis.com -e MTG_BIND_TO=0.0.0.0:443 ghcr.io/arman2122/mtg-proxy:1.4.0
 ```
 
 For anything beyond one secret, mount a real config over the bundled default:
 
 ```bash
-docker run -d --name mtg -p 443:443 -v /etc/mtg-proxy/config.toml:/config/config.toml:ro ghcr.io/arman2122/mtg-proxy:1.3.0
+docker run -d --name mtg -p 443:443 -v /etc/mtg-proxy/config.toml:/config/config.toml:ro ghcr.io/arman2122/mtg-proxy:1.4.0
 ```
 
 `/config/config.toml` is a symlink to `/config.toml`, so mounting either path
@@ -193,7 +194,7 @@ Verify the image the same way as the archives, using the other workflow name,
 and verify a released tag rather than `latest`:
 
 ```bash
-gh attestation verify oci://ghcr.io/arman2122/mtg-proxy:1.3.0 --repo Arman2122/mtg-proxy --signer-workflow Arman2122/mtg-proxy/.github/workflows/docker-publish.yml
+gh attestation verify oci://ghcr.io/arman2122/mtg-proxy:1.4.0 --repo Arman2122/mtg-proxy --signer-workflow Arman2122/mtg-proxy/.github/workflows/docker-publish.yml
 ```
 
 ### Running the container as a non-root user
@@ -204,7 +205,7 @@ For a process parsing hostile input off port 443 it is worth switching, so add
 `--user 65534:65534` once you have checked both:
 
 ```bash
-docker run -d --name mtg -p 443:443 --user 65534:65534 -v /etc/mtg-proxy/config.toml:/config/config.toml:ro ghcr.io/arman2122/mtg-proxy:1.3.0
+docker run -d --name mtg -p 443:443 --user 65534:65534 -v /etc/mtg-proxy/config.toml:/config/config.toml:ro ghcr.io/arman2122/mtg-proxy:1.4.0
 ```
 
 - **The config must be readable by uid 65534.** A root-owned `0600` config is a
@@ -248,7 +249,7 @@ To reproduce the release build flags exactly — useful when you want the versio
 string to say something other than `dev`:
 
 ```bash
-CGO_ENABLED=0 go build -trimpath -mod=readonly -buildvcs=false -ldflags "-s -w -X main.version=1.3.0" -o mtg-proxy .
+CGO_ENABLED=0 go build -trimpath -mod=readonly -buildvcs=false -ldflags "-s -w -X main.version=1.4.0" -o mtg-proxy .
 ```
 
 Cross-compiling is the usual Go story; nothing here needs a C toolchain:
@@ -438,9 +439,11 @@ See [[Multi-User-and-API]] for what a reload does and does not swap.
 
 ### A second unit for the WEB relay
 
-`mtg-proxy web-relay` is a separate process reading the same config file, and it
-is the one that *does* reload on `SIGHUP`. Copy the unit above, change
-`ExecStart`, and add the reload line:
+`mtg-proxy web-relay` is a separate process reading the same config file. It
+watches that file and applies a changed `[secrets]` table by itself within a
+few seconds, so nothing *has* to reload it — but it is the one process that
+*does* accept `SIGHUP`, which applies a change immediately rather than on the
+next look. Copy the unit above, change `ExecStart`, and add the reload line:
 
 ```ini
 ExecStart=/usr/local/bin/mtg-proxy web-relay /etc/mtg-proxy/config.toml
@@ -462,10 +465,11 @@ so it needs no capability. Validate its configuration before enabling it:
 mtg-proxy web-relay --check /etc/mtg-proxy/config.toml
 ```
 
-Reload is Unix-only. The Windows build registers no reload signal at all —
-Go defines `SIGHUP` there but nothing ever delivers it, so advertising a reload
-would advertise something that silently never happens. A Windows relay restarts
-to pick up a new secret set. See [[WEB-Proxy-Setup]].
+The signal is Unix-only. The Windows build registers no reload signal at all —
+Go defines `SIGHUP` there but nothing ever delivers it, so advertising one would
+advertise something that silently never happens. The file watcher runs
+everywhere, so a Windows relay picks up a new secret set by itself; it just
+cannot be hurried. See [[WEB-Proxy-Setup]].
 
 ## Checking the installed version
 
@@ -500,7 +504,7 @@ A binary you built yourself in a git checkout does show a commit, plus a
 For the container:
 
 ```bash
-docker run --rm ghcr.io/arman2122/mtg-proxy:1.3.0 --version
+docker run --rm ghcr.io/arman2122/mtg-proxy:1.4.0 --version
 ```
 
 Expect the image's output to differ in those same two fields — the Dockerfile

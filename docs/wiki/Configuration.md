@@ -366,10 +366,12 @@ has these compiled in and learns nothing from the handshake, so a larger value
 breaks interop with no error anywhere. Values above the ceiling are refused at
 startup.
 
-**Reload is limited.** The relay re-reads `[secrets]` on `SIGHUP` and swaps its
-profile set atomically. Any other change under `[web]`, or to the backend
-listener's `proxy-protocol`, is refused whole with "restart required" rather than
-half-applied. Windows has no `SIGHUP`, so restart the relay there.
+**Reload is automatic, and limited.** The relay watches the file and applies a
+changed `[secrets]` table by itself within a few seconds, swapping its profile
+set atomically; `SIGHUP` applies it immediately. Any other change under `[web]`,
+or to the backend listener's `proxy-protocol`, is refused whole with "restart
+required" rather than half-applied. Windows has no `SIGHUP`; the watcher is the
+only trigger there.
 
 This transport has been tried end to end against Telegram Desktop 7.1.2 on
 Windows, through Caddy. Other client platforms have not been through the

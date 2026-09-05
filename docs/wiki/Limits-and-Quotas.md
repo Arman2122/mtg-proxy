@@ -62,7 +62,7 @@ Four things about these values are easy to get wrong.
 
 **A typo in a key is silent.** The TOML parser does not reject unknown fields (that is deliberate: it lets a config written for a newer mtg-proxy load on an older binary instead of taking the inbound offline). So `quota_reset = "monthly"` with an underscore parses fine and does nothing. A typo in the *secret name* is caught — `[secret-limits.ghost]` with no `ghost` in `[secrets]` fails validation at startup with `secret-limits refers to unknown secret "ghost"`.
 
-Changes to this file take effect on `POST /reload` or a restart. There is no SIGHUP reload for `mtg-proxy run` (SIGHUP is wired for `mtg-proxy web-relay` only).
+Changes to this file take effect on `POST /reload` or a restart. There is no SIGHUP reload for `mtg-proxy run` (SIGHUP is wired for `mtg-proxy web-relay` only, and the relay does not read this table at all — it watches the file for `[secrets]` alone).
 
 ```bash
 curl -X POST http://127.0.0.1:9090/reload

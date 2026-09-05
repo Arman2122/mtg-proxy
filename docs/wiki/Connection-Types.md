@@ -380,9 +380,11 @@ stats-bind-to = "127.0.0.1:8100"
 curl http://127.0.0.1:8100/stats
 ```
 
-The relay re-reads `[secrets]` on `SIGHUP` and swaps its profile set atomically;
-any other change under `[web]` is refused whole with `restart required` rather
-than half-applied. Windows has no `SIGHUP`, so restart the relay there.
+The relay watches the file and applies a changed `[secrets]` table by itself
+within a few seconds, swapping its profile set atomically; `SIGHUP` applies it
+immediately. Any other change under `[web]` is refused whole with `restart
+required` rather than half-applied. Windows has no `SIGHUP`; the watcher is the
+only trigger there.
 
 **When to use it.** When FakeTLS is being blocked where your users are and you
 have a hostname, a certificate and desktop users. It is additive: run it beside

@@ -160,6 +160,7 @@ shape it always had:
 | `expires_at` | The user has an `expires` deadline. |
 | `disabled` | The user is disabled. Omitted, not `false`, when enabled. |
 | `ad_tag_skipped` | It is non-zero: an ad-tagged stream of this user's took the direct path because its transport has no middle-proxy reframer, losing its sponsored channel. A silent skip is a revenue bug nobody can diagnose, so it is reported. |
+| `ad_tag_failed` | It is non-zero: an ad-tagged stream on a transport the middle proxy *does* handle took the direct path anyway, because the middle proxy could not be reached or refused it. Unlike a skip this is not by design — a server that cannot reach `core.telegram.org`, or a revoked tag, shows up here and nowhere else. |
 | `connected_ips` / `last_ip` | `track-client-ips` is on. See below. |
 
 The throttle block reports `active` (whether caps are being applied at all),
@@ -306,10 +307,14 @@ startup and refreshed on reload. It is never `null`. The relay's own matching is
 by capability and index and works without names; they are here so this report
 lines up with the proxy's `/stats`, which is keyed by name.
 
-`reloads`, `reload_failures` and `last_reload` cover `SIGHUP`. `last_reload` is
-`null` until the first one lands. On Windows the relay registers no reload
-signal at all, because nothing there ever delivers SIGHUP, so these three stay
-at zero and a new profile set needs a restart.
+`reloads`, `reload_failures` and `last_reload` cover both ways a reload happens:
+the relay noticing that the file changed, and a `SIGHUP`. `last_reload` is
+`null` until the first one lands. A file change that left the profiles as they
+were — a comment, a limit, the proxy's own settings — is not a reload and moves
+nothing; a `SIGHUP` that changed nothing still counts, because the operator who
+sent it is asking whether it landed. A file the relay refused counts once, not
+again on every look. On Windows the relay registers no reload signal, because
+nothing there ever delivers SIGHUP; the file watcher runs there as everywhere.
 
 **Sessions.** `active` is taken from the session store — the thing that actually
 enforces the limit — rather than from a counter, so comparing it with `max` is
@@ -470,8 +475,9 @@ Lines worth knowing, all at warn level unless noted:
   take the public port down.
 - `SNI-DNS mismatch: ...` — the secret's fronting hostname does not resolve to
   this server's public IP. See [[Troubleshooting]].
-- `web relay reload: ...` — one line per failure mode of a SIGHUP, each saying
-  which profiles were kept.
+- `web relay reload: ...` — one line per refused reload, each saying which
+  profiles were kept, with `trigger=file` or `trigger=signal` for where it came
+  from.
 - `web relay stats server stopped` — the counters socket died while the relay
   carried on.
 
@@ -503,10 +509,11 @@ On the WEB relay, from its own `/stats`:
   `sessions.max`.
 - `refused.cover_served` climbing sharply at the same time as user reports. On
   its own it is background noise.
-- `reload_failures` incrementing. That is a SIGHUP that arrived and was refused
-  — a config the relay would not take, or a `[web]` change that needs a restart.
-  It is the only way to tell that apart from a SIGHUP that never arrived, where
-  no counter moves at all.
+- `reload_failures` incrementing. That is a reload that was refused — a file the
+  relay would not take, or a `[web]` change that needs a restart — whether the
+  relay found the change itself or a SIGHUP asked for it. It is the only way to
+  tell a refused SIGHUP apart from one that never arrived, where no counter
+  moves at all.
 - `sessions.created - sessions.attached` growing faster than usual: clients are
   giving up between the page and the WebSocket, which usually means the front
   proxy is mishandling the upgrade. See [[WEB-Proxy-Setup]].

@@ -319,7 +319,9 @@ reports what each socket accepts; `obfuscated` counts the trial-decryption entry
 any reason, `rate_limited` turned away by the per-IP budget, and `draining` as a
 live gauge of refused connections currently being drained). A user also gains
 `ad_tag_skipped` once one of its ad-tagged streams took the direct path because
-its transport has no middle-proxy reframer — see
+its transport has no middle-proxy reframer, and `ad_tag_failed` once one did so
+because the middle proxy could not be reached or refused it — the first is by
+design, the second is an outage — see
 [Sponsored channel](#sponsored-channel-ad-tag).
 
 `features` is a sorted list of capability names this build supports, meant to be
@@ -384,10 +386,11 @@ Responses: `200 {"status":"ok"}` on success; `500` if the config cannot be read
 (the current set stays active); `503` when the proxy was started without a config
 file (`simple-run`); `405` for a non-POST request.
 
-The WEB relay is a second process and does not share this listener; it reloads
-the same `[secrets]` table on `SIGHUP` instead — see
-[WEB proxy transport](#web-proxy-transport). A deployment running both reloads
-both.
+The WEB relay is a second process and does not share this listener. It watches
+the config file and applies a changed `[secrets]` table by itself within a few
+seconds; `SIGHUP` applies it immediately — see
+[WEB proxy transport](#web-proxy-transport). A change made through this API
+alone, without writing the file, never reaches the relay.
 
 ### Secrets & ad-tag management API
 
@@ -617,8 +620,10 @@ a credential the relay minted gets it — on every path, including the API ones
 — and nothing ships as a default, because a starter page many operators
 installed would be a better signature than anything the protocol leaks.
 
-**Adding and removing users without a restart.** The relay re-reads the
-`[secrets]` table on `SIGHUP` and swaps its profile set atomically:
+**Adding and removing users without a restart.** The relay watches its config
+file. A changed `[secrets]` table is applied by itself within a few seconds of
+the write settling, and swapped in atomically; nothing has to be told. `SIGHUP`
+applies it immediately rather than on the next look:
 
 ```console
 systemctl reload mtg-proxy-web-relay        # or: kill -HUP <pid>
@@ -628,9 +633,10 @@ Live sessions keep running, a newly added secret is recognised on its next page
 load, and a removed one stops being recognised. Only the secret set is
 reloadable: any other change under `[web]`, or to the backend listener's
 `proxy-protocol`, is refused whole with `restart required` rather than
-half-applied. A reload that cannot read or validate the file keeps the running
-set — an emptied registry would serve the cover site to every real user while
-reporting nothing wrong. Windows has no `SIGHUP`, so restart the relay there.
+half-applied — once, not again on every look. A reload that cannot read or
+validate the file keeps the running set — an emptied registry would serve the
+cover site to every real user while reporting nothing wrong. Windows has no
+`SIGHUP`; the watcher is the only trigger there, and it is enough.
 
 **Watching it.** The relay reports its own counters on a socket of its own:
 

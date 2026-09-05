@@ -215,7 +215,7 @@ Group=mtg-proxy
 # A file that would not validate fails the start instead of the first client.
 ExecStartPre=/usr/local/bin/mtg-proxy web-relay --check /etc/mtg-proxy/config.toml
 ExecStart=/usr/local/bin/mtg-proxy web-relay /etc/mtg-proxy/config.toml
-# This is what makes `systemctl reload` swap the profile set.
+# The relay follows the file by itself; this makes `systemctl reload` do it now.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
@@ -282,7 +282,7 @@ The `listeners` array reports the backend as `unreachable`, with the reason. Tha
 
 ## Adding and removing users
 
-The relay reads the same `[secrets]` table as the proxy, and re-reads it on **SIGHUP**:
+The relay reads the same `[secrets]` table as the proxy, and it **watches the file**: a change is applied by itself within a few seconds of the write settling. Add a user to the file and there is nothing to send. To apply it immediately rather than on the next look, **SIGHUP**:
 
 ```bash
 systemctl reload mtg-proxy-web-relay
@@ -294,22 +294,23 @@ Or without systemd:
 kill -HUP "$(pidof mtg-proxy-web-relay)"
 ```
 
-**A deployment running both processes reloads both.** The proxy does not handle SIGHUP; its reload is the endpoint on `api-bind-to`:
+**The proxy still has to be told.** It does not watch the file and does not handle SIGHUP; its reload is the endpoint on `api-bind-to`:
 
 ```bash
 curl -X POST http://127.0.0.1:9090/reload
 ```
 
-Send the relay a HUP whenever a client is added or removed. Until you do, a new client's WEB link is answered by the cover site — which, from that client's side, is indistinguishable from the censorship this relay exists to get around.
+The file is the only thing the relay reads. A client added through the proxy's management API and never written to the file is unknown to the relay, and that client's WEB link is answered by the cover site — which, from their side, is indistinguishable from the censorship this relay exists to get around. Write the file.
 
 What a reload does and does not do:
 
 - Only the **profile set** is swapped, atomically. Live sessions are not disturbed.
 - Any other change under `[web]` — the host, the bound address, the backend, the token key, the cover site, the stats address, the limits — or a change to the backend listener's `proxy-protocol`, is refused **whole**: the relay logs that a restart is required and keeps running with what it has. Applying half of a changed file is how a process ends up in a state no configuration describes.
-- A file that is unreadable, fails validation, or would leave the relay with no usable profile is also refused, and the running set is kept. A relay that emptied its registry because someone saved a broken file would serve the cover site to every real user while reporting nothing wrong.
+- A file that is unreadable, fails validation, or would leave the relay with no usable profile is also refused, and the running set is kept. A relay that emptied its registry because someone saved a broken file would serve the cover site to every real user while reporting nothing wrong. A refused file is refused once, not again on every look, and a file that is mid-write is left alone until it holds still.
+- A file change that leaves the profiles as they were — a comment, a limit, the proxy's own settings — is not a reload and is not counted as one.
 - Revoking a client is enforced by the **proxy**, which closes their connections when it reloads. The relay only gates the front door.
 
-Windows builds have no SIGHUP and no reload. Restart the relay there.
+Windows builds have no SIGHUP. The watcher is the only trigger there, and it is enough.
 
 ## Verifying it 🔍
 
@@ -383,7 +384,7 @@ This is what makes tiers one and two observable without a credential of your own
 - `refused.cover_served` is tier three. On a public hostname a non-zero number is normal — it is the internet knocking. A **sudden climb** alongside users reporting failures is the signature of a hostname or secret-set mismatch, usually a reload that did not land.
 - `refused.bad_token` is a bearer naming no live session: torn down already, or a second socket trying to join a session that already has a carrier.
 - `refused.session_limit` is capacity against `max-sessions`, not abuse.
-- `reloads` and `reload_failures` are how you tell "my SIGHUP did nothing" from "my SIGHUP was never delivered". A change that needs a restart increments `reload_failures`.
+- `reloads` and `reload_failures` count both the changes the relay found in the file and the SIGHUPs it was sent, and are how you tell "my SIGHUP did nothing" from "my SIGHUP was never delivered". A change that needs a restart increments `reload_failures`, once.
 
 `bytes` are relay payload, not wire bytes — frame headers and WebSocket framing are excluded, so they compare with the proxy's own counters rather than with anything tcpdump shows.
 
