@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"os"
@@ -68,11 +69,45 @@ var (
 	)
 )
 
+// Doctor is `mtg doctor`: the checks an operator runs when a proxy does not
+// work. It is the one command whose own correctness nobody can check in the
+// field -- a ✅ for a broken thing or a ❌ for a working one sends them the
+// wrong way -- so every way it reaches the world is a seam a test can drive:
+// the network and the resolver come in through diagnose, and the NTP query and
+// the output are fields.
 type Doctor struct {
 	conf *config.Config
 
+	// out is where the report goes; Run points it at stdout.
+	out io.Writer
+	// queryNTP is how the skew check learns the clock offset; Run points it
+	// at the real pool.
+	queryNTP ntpOffset
+
 	ConfigPath      string `kong:"arg,required,type='existingfile',help='Path to the configuration file.',name='config-path'"`                                                                       //nolint: lll
 	SkipNativeCheck bool   `kong:"help='Skip the native network connectivity check (useful when proxy chaining is configured and direct egress is not expected to work).',name='skip-native-check'"` //nolint: lll
+}
+
+// ntpOffset asks one NTP host for this machine's clock offset.
+type ntpOffset func(host string) (time.Duration, error)
+
+// ntpPool is the host the real query goes to.
+const ntpPool = "0.pool.ntp.org"
+
+// say writes one line of the report. The report is best-effort output to a
+// terminal: a failed write is not a diagnosis and must not change the verdict,
+// so the error is deliberately not consulted.
+func (d *Doctor) say(format string, args ...any) {
+	fmt.Fprintf(d.out, format+"\n", args...) //nolint: errcheck
+}
+
+func queryNTPOffset(host string) (time.Duration, error) {
+	response, err := ntp.Query(host)
+	if err != nil {
+		return 0, err //nolint: wrapcheck // the report prints it as the pool's own error
+	}
+
+	return response.ClockOffset, nil
 }
 
 func (d *Doctor) Run(cli *CLI, version string) error {
@@ -82,12 +117,8 @@ func (d *Doctor) Run(cli *CLI, version string) error {
 	}
 
 	d.conf = conf
-
-	fmt.Println("Deprecated options")
-	everythingOK := d.checkDeprecatedConfig()
-
-	fmt.Println("Time skewness")
-	everythingOK = d.checkTimeSkewness() && everythingOK
+	d.out = os.Stdout
+	d.queryNTP = queryNTPOffset
 
 	resolver, err := network.GetDNS(conf.GetDNS())
 	if err != nil {
@@ -116,34 +147,54 @@ func (d *Doctor) Run(cli *CLI, version string) error {
 		int(lowat),
 	)
 
-	fmt.Println("Validate native network connectivity")
-	if d.SkipNativeCheck {
-		fmt.Println("  ⏭ Skipped (--skip-native-check)")
-	} else {
-		everythingOK = d.checkNetwork(base) && everythingOK
+	ok, err := d.diagnose(base, resolver)
+	if err != nil {
+		return err
 	}
 
-	for _, url := range conf.Network.Proxies {
-		value, err := network.NewProxyNetwork(base, url.Get(nil))
-		if err != nil {
-			return err
-		}
-
-		fmt.Printf("Validate network connectivity with proxy %s\n", url.Get(nil))
-		everythingOK = d.checkNetwork(value) && everythingOK
-	}
-
-	fmt.Println("Validate fronting domain connectivity")
-	everythingOK = d.checkFrontingDomain(base) && everythingOK
-
-	fmt.Println("Validate SNI-DNS match")
-	everythingOK = d.checkSecretHost(resolver, base) && everythingOK
-
-	if !everythingOK {
+	if !ok {
 		os.Exit(1)
 	}
 
 	return nil
+}
+
+// diagnose runs every check, in the order the report shows them, against the
+// network and resolver it is given, and says whether all of them passed. Run
+// hands it the real ones; a test hands it fakes, which is what makes the checks
+// testable at all. The verdict is the conjunction of every check, so a check
+// that is dropped from it here is a check the operator silently stops getting.
+func (d *Doctor) diagnose(base mtglib.Network, resolver ipLookup) (bool, error) {
+	d.say("Deprecated options")
+	everythingOK := d.checkDeprecatedConfig()
+
+	d.say("Time skewness")
+	everythingOK = d.checkTimeSkewness() && everythingOK
+
+	d.say("Validate native network connectivity")
+	if d.SkipNativeCheck {
+		d.say("  ⏭ Skipped (--skip-native-check)")
+	} else {
+		everythingOK = d.checkNetwork(base) && everythingOK
+	}
+
+	for _, url := range d.conf.Network.Proxies {
+		value, err := network.NewProxyNetwork(base, url.Get(nil))
+		if err != nil {
+			return false, err //nolint: wrapcheck // named by the caller's own message
+		}
+
+		d.say("Validate network connectivity with proxy %s", url.Get(nil))
+		everythingOK = d.checkNetwork(value) && everythingOK
+	}
+
+	d.say("Validate fronting domain connectivity")
+	everythingOK = d.checkFrontingDomain(base) && everythingOK
+
+	d.say("Validate SNI-DNS match")
+	everythingOK = d.checkSecretHost(resolver, base) && everythingOK
+
+	return everythingOK, nil
 }
 
 func (d *Doctor) checkDeprecatedConfig() bool {
@@ -151,7 +202,7 @@ func (d *Doctor) checkDeprecatedConfig() bool {
 
 	if d.conf.DomainFrontingIP.Value != nil {
 		ok = false
-		tplWDeprecatedConfig.Execute(os.Stdout, map[string]string{ //nolint: errcheck
+		tplWDeprecatedConfig.Execute(d.out, map[string]string{ //nolint: errcheck
 			"when":        "2.3.0",
 			"old":         "domain-fronting-ip",
 			"old_section": "",
@@ -162,7 +213,7 @@ func (d *Doctor) checkDeprecatedConfig() bool {
 
 	if d.conf.DomainFronting.IP.Value != nil {
 		ok = false
-		tplWDeprecatedConfig.Execute(os.Stdout, map[string]string{ //nolint: errcheck
+		tplWDeprecatedConfig.Execute(d.out, map[string]string{ //nolint: errcheck
 			"when":        "2.4.0",
 			"old":         "ip",
 			"old_section": "domain-fronting",
@@ -173,7 +224,7 @@ func (d *Doctor) checkDeprecatedConfig() bool {
 
 	if d.conf.DomainFrontingPort.Value != 0 {
 		ok = false
-		tplWDeprecatedConfig.Execute(os.Stdout, map[string]string{ //nolint: errcheck
+		tplWDeprecatedConfig.Execute(d.out, map[string]string{ //nolint: errcheck
 			"when":        "2.3.0",
 			"old":         "domain-fronting-port",
 			"old_section": "",
@@ -184,7 +235,7 @@ func (d *Doctor) checkDeprecatedConfig() bool {
 
 	if d.conf.DomainFrontingProxyProtocol.Value {
 		ok = false
-		tplWDeprecatedConfig.Execute(os.Stdout, map[string]string{ //nolint: errcheck
+		tplWDeprecatedConfig.Execute(d.out, map[string]string{ //nolint: errcheck
 			"when":        "2.3.0",
 			"old":         "domain-fronting-proxy-protocol",
 			"old_section": "",
@@ -195,7 +246,7 @@ func (d *Doctor) checkDeprecatedConfig() bool {
 
 	if d.conf.Network.DOHIP.Value != nil {
 		ok = false
-		tplWDeprecatedConfig.Execute(os.Stdout, map[string]string{ //nolint: errcheck
+		tplWDeprecatedConfig.Execute(d.out, map[string]string{ //nolint: errcheck
 			"when":        "2.3.0",
 			"old":         "doh-ip",
 			"old_section": "network",
@@ -205,38 +256,38 @@ func (d *Doctor) checkDeprecatedConfig() bool {
 	}
 
 	if ok {
-		fmt.Println("  ✅ All good")
+		d.say("  ✅ All good")
 	}
 
 	return ok
 }
 
 func (d *Doctor) checkTimeSkewness() bool {
-	response, err := ntp.Query("0.pool.ntp.org")
+	offset, err := d.queryNTP(ntpPool)
 	if err != nil {
-		tplError.Execute(os.Stdout, map[string]any{ //nolint: errcheck
+		tplError.Execute(d.out, map[string]any{ //nolint: errcheck
 			"description": "cannot access ntp pool",
 			"error":       err,
 		})
 		return false
 	}
 
-	skewness := response.ClockOffset.Abs()
+	skewness := offset.Abs()
 	confValue := d.conf.TolerateTimeSkewness.Get(mtglib.DefaultTolerateTimeSkewness)
 	diff := float64(skewness) / float64(confValue)
 	tplData := map[string]any{
-		"drift": response.ClockOffset,
+		"drift": offset,
 		"value": confValue,
 	}
 
 	switch {
 	case diff < 0.3:
-		tplOTimeSkewness.Execute(os.Stdout, tplData) //nolint: errcheck
+		tplOTimeSkewness.Execute(d.out, tplData) //nolint: errcheck
 		return true
 	case diff < 0.7:
-		tplWTimeSkewness.Execute(os.Stdout, tplData) //nolint: errcheck
+		tplWTimeSkewness.Execute(d.out, tplData) //nolint: errcheck
 	default:
-		tplETimeSkewness.Execute(os.Stdout, tplData) //nolint: errcheck
+		tplETimeSkewness.Execute(d.out, tplData) //nolint: errcheck
 	}
 
 	return false
@@ -269,12 +320,12 @@ func (d *Doctor) checkNetwork(ntw mtglib.Network) bool {
 
 	for i, dc := range dcs {
 		if results[i].err == nil {
-			tplODCConnect.Execute(os.Stdout, map[string]any{ //nolint: errcheck
+			tplODCConnect.Execute(d.out, map[string]any{ //nolint: errcheck
 				"dc":  dc,
 				"rtt": results[i].rtt.Round(time.Microsecond),
 			})
 		} else {
-			tplEDCConnect.Execute(os.Stdout, map[string]any{ //nolint: errcheck
+			tplEDCConnect.Execute(d.out, map[string]any{ //nolint: errcheck
 				"dc":    dc,
 				"error": results[i].err,
 			})
@@ -369,7 +420,7 @@ func (d *Doctor) checkFrontingDomain(ntw mtglib.Network) bool {
 
 	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
-		tplEFrontingDomain.Execute(os.Stdout, map[string]any{ //nolint: errcheck
+		tplEFrontingDomain.Execute(d.out, map[string]any{ //nolint: errcheck
 			"address": address,
 			"error":   err,
 		})
@@ -378,20 +429,20 @@ func (d *Doctor) checkFrontingDomain(ntw mtglib.Network) bool {
 
 	conn.Close() //nolint: errcheck
 
-	tplOFrontingDomain.Execute(os.Stdout, map[string]any{ //nolint: errcheck
+	tplOFrontingDomain.Execute(d.out, map[string]any{ //nolint: errcheck
 		"address": address,
 	})
 
 	return true
 }
 
-func (d *Doctor) checkSecretHost(resolver *net.Resolver, ntw mtglib.Network) bool {
+func (d *Doctor) checkSecretHost(resolver ipLookup, ntw mtglib.Network) bool {
 	host := d.getFirstSecretHost()
 
 	res := runSNICheck(context.Background(), resolver, d.conf, ntw, host)
 
 	if res.ResolveErr != nil {
-		tplError.Execute(os.Stdout, map[string]any{ //nolint: errcheck
+		tplError.Execute(d.out, map[string]any{ //nolint: errcheck
 			"description": fmt.Sprintf("cannot resolve DNS name of %s", host),
 			"error":       res.ResolveErr,
 		})
@@ -399,7 +450,7 @@ func (d *Doctor) checkSecretHost(resolver *net.Resolver, ntw mtglib.Network) boo
 	}
 
 	if !res.PublicIPKnown() {
-		tplError.Execute(os.Stdout, map[string]any{ //nolint: errcheck
+		tplError.Execute(d.out, map[string]any{ //nolint: errcheck
 			"description": "cannot detect public IP address",
 			"error":       errors.New("cannot detect automatically and public-ipv4/public-ipv6 are not set in config"),
 		})
@@ -417,7 +468,7 @@ func (d *Doctor) checkSecretHost(resolver *net.Resolver, ntw mtglib.Network) boo
 			}
 		}
 
-		tplODNSSNIMatch.Execute(os.Stdout, map[string]any{ //nolint: errcheck
+		tplODNSSNIMatch.Execute(d.out, map[string]any{ //nolint: errcheck
 			"ip":       matched,
 			"hostname": host,
 		})
@@ -429,7 +480,7 @@ func (d *Doctor) checkSecretHost(resolver *net.Resolver, ntw mtglib.Network) boo
 		strAddresses = append(strAddresses, `"`+ip.String()+`"`)
 	}
 
-	tplEDNSSNIMatch.Execute(os.Stdout, map[string]any{ //nolint: errcheck
+	tplEDNSSNIMatch.Execute(d.out, map[string]any{ //nolint: errcheck
 		"hostname": host,
 		"resolved": strings.Join(strAddresses, ", "),
 		"ip4":      res.OurIPv4,

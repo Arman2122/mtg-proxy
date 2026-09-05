@@ -36,9 +36,16 @@ func (r sniCheckResult) PublicIPKnown() bool {
 // from conf.Secret.Host so multi-secret configs can check the first secret's
 // host (see Doctor.getFirstSecretHost). It gathers data only — it does not
 // decide success; see sniCheckResult.
+// ipLookup is the one resolver call the SNI check makes. *net.Resolver
+// satisfies it; a test answers it from a map, which is what lets the check be
+// exercised without a name that resolves on the internet.
+type ipLookup interface {
+	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
+}
+
 func runSNICheck(
 	ctx context.Context,
-	resolver *net.Resolver,
+	resolver ipLookup,
 	conf *config.Config,
 	ntw mtglib.Network,
 	host string,

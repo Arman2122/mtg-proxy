@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/antireplay"
@@ -24,10 +25,19 @@ import (
 	"github.com/yl2chen/cidranger"
 )
 
+// zerologFieldNames sets the field names once for the process. They are
+// package-level state in zerolog, with no per-logger form, and writing them
+// from every makeLogger call is a data race the moment two loggers are built
+// at once -- which production never does, and a test of the run loop does.
+// The level is not here: zerolog stores it atomically, and it is per call.
+var zerologFieldNames sync.Once
+
 func makeLogger(conf *config.Config) mtglib.Logger {
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
-	zerolog.TimestampFieldName = "timestamp"
-	zerolog.LevelFieldName = "level"
+	zerologFieldNames.Do(func() {
+		zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
+		zerolog.TimestampFieldName = "timestamp"
+		zerolog.LevelFieldName = "level"
+	})
 
 	if conf.Debug.Get(false) {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
@@ -373,12 +383,6 @@ func maybeProxyProtocol(listener net.Listener, enabled bool) net.Listener {
 // decision and its own policy, and a bind failure there is logged and skipped:
 // the loopback port a panel allocated may have been taken since, and losing the
 // WEB backend must never take the public port down with it.
-func buildListeners(conf *config.Config, log mtglib.Logger) ([]servedListener, error) {
-	return buildListenersWith(conf, log, func(addr string) (net.Listener, error) {
-		return utils.NewListener(addr, 0)
-	})
-}
-
 // listenFunc binds one address. It is a parameter so a test can hand in
 // sockets it already holds, and for no other reason: production always binds
 // through utils.NewListener, and a test that wants a bind to fail for real can
@@ -490,7 +494,24 @@ func listenerReport(conf *config.Config) []mtglib.ListenerJSON {
 	return report
 }
 
-func runProxy(conf *config.Config, version, configPath string) error { //nolint: funlen, cyclop
+func runProxy(conf *config.Config, version, configPath string) error {
+	return runProxyWith(utils.RootContext().Done(), conf, version, configPath, func(addr string) (net.Listener, error) {
+		return utils.NewListener(addr, 0)
+	})
+}
+
+// runProxyWith is runProxy with its two seams exposed: what ends it, and how
+// it binds a socket. Production passes the signal-driven root context's Done
+// channel and utils.NewListener; a test passes a channel it can close and
+// sockets it already holds. Nothing else about the run differs.
+//
+// It is a channel and not a context on purpose. The run needs nothing from a
+// context but the signal to stop, and everything it builds -- the proxy, the
+// event stream, the lists -- owns its own lifetime and ends on its own
+// Shutdown, not on this signal.
+func runProxyWith( //nolint: funlen, cyclop
+	stop <-chan struct{}, conf *config.Config, version, configPath string, listen listenFunc,
+) error {
 	logger := makeLogger(conf)
 
 	logger.BindJSON("configuration", conf.String()).Debug("configuration")
@@ -597,18 +618,59 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 		return fmt.Errorf("cannot create a proxy: %w", err)
 	}
 
-	served, err := buildListeners(conf, logger)
+	served, err := buildListenersWith(conf, logger, listen)
 	if err != nil {
 		return err
 	}
 
-	ctx := utils.RootContext()
+	return serveUntilDone(stop, proxy, served, logger)
+}
 
-	for _, sl := range served {
-		go proxy.ServeWithPolicy(sl.serve, sl.policy) //nolint: errcheck
+// serveUntilDone runs every socket until it is told to stop or the public
+// socket dies, then closes the sockets and stops the proxy.
+//
+// A [[listener]] that dies is logged and the rest carry on: losing the WEB
+// backend must never take the public port down, which is the same rule that
+// makes its bind failure non-fatal. The public socket dying is different. It
+// is the one thing this process exists to serve, and a proxy that carried on
+// without it would look healthy to its supervisor while every client got a
+// refused connection. Returning the error is what lets a supervisor's
+// restart-on-failure do its job. Before this, every accept loop's return was
+// discarded, so a dead public socket was a process that kept running.
+func serveUntilDone(
+	stop <-chan struct{}, proxy *mtglib.Proxy, served []servedListener, logger mtglib.Logger,
+) error {
+	publicDown := make(chan error, 1)
+
+	for i, sl := range served {
+		go func() {
+			err := proxy.ServeWithPolicy(sl.serve, sl.policy)
+			if err == nil {
+				return
+			}
+
+			addr := sl.raw.Addr().String()
+
+			if i > 0 {
+				logger.BindStr("listener", addr).
+					WarningError("extra listener stopped; the public port keeps serving", err)
+
+				return
+			}
+
+			select {
+			case publicDown <- fmt.Errorf("public listener %s stopped: %w", addr, err):
+			default:
+			}
+		}()
 	}
 
-	<-ctx.Done()
+	var stopped error
+
+	select {
+	case <-stop:
+	case stopped = <-publicDown:
+	}
 
 	for _, sl := range served {
 		sl.raw.Close() //nolint: errcheck
@@ -616,5 +678,5 @@ func runProxy(conf *config.Config, version, configPath string) error { //nolint:
 
 	proxy.Shutdown()
 
-	return nil
+	return stopped
 }
