@@ -40,7 +40,7 @@ person keeps one name, one quota bucket and one set of counters whichever they u
 |---|---|---|
 | Multiple secrets | One named secret per user, each able to front behind a different hostname. Upstream's single `secret = "…"` still works and becomes a user named `default`. | [[Multi-User-and-API]] |
 | Per-user stats | `GET /stats` on `api-bind-to`: live connections, bytes in and out, last seen, quota use, and a sorted `features` list a panel reads instead of parsing version strings. | [[Monitoring]] |
-| Management API | `GET`/`POST`/`PUT /secrets`, `DELETE /secrets/{name}` and the `/adtag` routes add, remove and re-key users at runtime. `api-token` puts a bearer token on every endpoint. | [[Multi-User-and-API]] |
+| Management API | `GET`/`POST`/`PUT /secrets`, `GET`/`DELETE /secrets/{name}` and the `/adtag` routes add, remove and re-key users at runtime. `api-token` puts a bearer token on every endpoint. | [[Multi-User-and-API]] |
 | Hot reload | `POST /reload` re-reads `[secrets]`, `ad-tag`, `[secret-ad-tags]` and `[secret-limits]` and swaps them in atomically; unaffected users stay connected. The WEB relay is a separate process that watches the same file and follows it by itself; `SIGHUP` makes that immediate. | [[Multi-User-and-API]] |
 | Quotas, expiry, disable | `[secret-limits.<name>]` gives a user a data cap (optionally resetting monthly), a deadline and an on/off switch. A limited user is routed to the fronting domain, exactly like a wrong secret, so a prober cannot tell them apart. | [[Limits-and-Quotas]] |
 | Connection throttling | `[throttle] max-connections` with a fair-share cap recomputed every few seconds: light users keep everything they have, and the rest of the budget is split among heavy ones. | [[Limits-and-Quotas]] |

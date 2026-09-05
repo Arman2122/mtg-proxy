@@ -287,6 +287,7 @@ where every connection otherwise arrives from `127.0.0.1`. See
 | Method and path | Action |
 |---|---|
 | `GET /secrets` | List every secret with its live counters. |
+| `GET /secrets/{name}` | One entry of that list, by name — the same object the list would hold for that user, from the same snapshot. |
 | `POST /secrets` | Add or replace one secret. |
 | `PUT /secrets` | Replace the entire set. |
 | `DELETE /secrets/{name}` | Remove one. |
@@ -481,7 +482,7 @@ field of the `/secrets` routes.
 |---|---|
 | `400` | Malformed JSON, an unknown JSON field, an invalid secret, a bad ad-tag, an unparseable quota or expiry, or a swap that would leave nothing to front. |
 | `401` | `api-token` is set and the `Authorization` header is missing or wrong. |
-| `404` | Unknown secret name on `DELETE /secrets/{name}` or `/reset-quota`; unknown path. |
+| `404` | Unknown secret name on `GET` or `DELETE /secrets/{name}` or `/reset-quota`; unknown path. |
 | `405` | Wrong method — `POST /stats`, or anything but `POST` on `/reload`. |
 | `409` | `DELETE /secrets/{name}` would remove the last secret. |
 | `500` | `POST /reload` could not read, parse or validate the config file. |

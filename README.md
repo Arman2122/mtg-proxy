@@ -403,6 +403,7 @@ at runtime, without editing the file or restarting:
 | `GET /secrets` | List secrets (`name`, `secret`, `host`, `mode`, `ad_tag`, `effective_ad_tag`, plus `unserved` and `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled` when set). |
 | `POST /secrets` | Add or update one: `{"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?}`. |
 | `PUT /secrets` | Replace the whole set: `{"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?}},"ad_tag"?}`. |
+| `GET /secrets/{name}` | One entry of the list above, by name, with the same live counters (`404` if unknown). |
 | `DELETE /secrets/{name}` | Remove one (`404` if unknown, `409` if it is the last one). |
 | `POST /secrets/{name}/reset-quota` | Zero the secret's used-bytes counter (`404` if unknown). |
 | `GET /adtag` | Read the global ad-tag: `{"ad_tag":"<hex>"\|null}`. |

@@ -349,6 +349,7 @@ func (p *Proxy) buildAPIHandler(token string) http.Handler {
 	mux.HandleFunc("GET /secrets", p.handleGetSecrets)
 	mux.HandleFunc("PUT /secrets", p.handlePutSecrets)
 	mux.HandleFunc("POST /secrets", p.handlePostSecret)
+	mux.HandleFunc("GET /secrets/{name}", p.handleGetSecret)
 	mux.HandleFunc("DELETE /secrets/{name}", p.handleDeleteSecret)
 	mux.HandleFunc("POST /secrets/{name}/reset-quota", p.handleResetQuota)
 
@@ -647,6 +648,27 @@ func (p *Proxy) handlePostSecret(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, statusOK)
+}
+
+// handleGetSecret serves GET /secrets/{name}: the one entry GET /secrets would
+// list for that name, with the same live counters, or 404.
+//
+// It is the same snapshot the collection is built from, taken once, so the two
+// cannot disagree about a user. It exists because a panel drawing one user's
+// page was fetching the whole collection to pick one out -- and because a path
+// that accepts DELETE and answers GET with 405 is the shape of an accident.
+func (p *Proxy) handleGetSecret(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	for _, info := range p.SnapshotSecrets() {
+		if info.Name == name {
+			writeJSON(w, http.StatusOK, info)
+
+			return
+		}
+	}
+
+	httpError(w, http.StatusNotFound, fmt.Errorf("%w: %q", ErrSecretNotFound, name))
 }
 
 func (p *Proxy) handleDeleteSecret(w http.ResponseWriter, r *http.Request) {
