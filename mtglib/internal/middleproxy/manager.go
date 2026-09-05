@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,7 +26,18 @@ const (
 	configURLv6   = "https://core.telegram.org/getProxyConfigV6"
 	refreshPeriod = time.Hour
 	fetchTimeout  = 30 * time.Second
+
+	// retryPeriod is how long the manager waits after a failed fetch before
+	// trying again, in the background. Nothing in a client's path ever waits
+	// for that retry: see ensureReady.
+	retryPeriod = time.Minute
 )
+
+// errFetching is what a dial gets while the very first fetch is still in
+// flight. It is an error and not a wait, because the fetch can take up to
+// three times fetchTimeout, and a client that queued behind it would sit there
+// for the whole of that with its connection open and nothing happening.
+var errFetching = errors.New("middle-proxy config is still being fetched")
 
 // Dialer is the subset of mtglib.Network the manager needs to reach a middle
 // proxy. It is declared here to keep this internal package free of an import
@@ -45,11 +57,23 @@ type Logger interface {
 // lists, and dials RPC proxy streams that carry an ad_tag. It fetches lazily on
 // first use (so a proxy without advertising never touches the network) and then
 // refreshes hourly. It is safe for concurrent use.
+//
+// Exactly one fetch is ever in a client's path: the first. Every later one runs
+// in the background, and a dial that arrives while the manager is not ready is
+// told so at once and takes the direct route. This is the whole design: a fetch
+// is three sequential HTTP requests of up to fetchTimeout each against a host
+// the network may well be blocking, and an earlier version queued every
+// ad-tagged dial behind it, so a proxy whose ad-tag was configured on a network
+// that could not reach core.telegram.org held every client for up to ninety
+// seconds, one after another, before letting each one through direct.
 type Manager struct {
 	ctx        context.Context
 	httpClient *http.Client
 	logger     Logger
 	preferIP   string
+
+	// retryPeriod is a field so a test can shorten it.
+	retryPeriod time.Duration
 
 	mu       sync.RWMutex
 	ready    bool
@@ -57,20 +81,26 @@ type Manager struct {
 	middleV4 map[int][]string
 	middleV6 map[int][]string
 
-	fetchMu     sync.Mutex
+	// fetching says the first fetch is in flight. lastErr is why the manager is
+	// not ready, kept so a dial that arrives before the next retry can be told
+	// why without waiting for it.
+	fetching bool
+	lastErr  error
+
 	refreshOnce sync.Once
 }
 
 // NewManager builds a Manager. httpClient should be built with the proxy's
 // network settings (e.g. mtglib.Network.MakeHTTPClient) so DNS and upstream
 // proxying apply. preferIP is the proxy's IP connectivity preference. The
-// hourly refresh loop and any in-flight fetches stop when ctx is cancelled.
+// refresh loop and any in-flight fetches stop when ctx is cancelled.
 func NewManager(ctx context.Context, httpClient *http.Client, logger Logger, preferIP string) *Manager {
 	return &Manager{
-		ctx:        ctx,
-		httpClient: httpClient,
-		logger:     logger,
-		preferIP:   preferIP,
+		ctx:         ctx,
+		httpClient:  httpClient,
+		logger:      logger,
+		preferIP:    preferIP,
+		retryPeriod: retryPeriod,
 	}
 }
 
@@ -84,40 +114,72 @@ func (m *Manager) Warm() {
 	}()
 }
 
-// ensureReady fetches the config if it has not been loaded yet and starts the
-// hourly refresh loop on first success.
+// ensureReady makes sure the config has been fetched, without making the caller
+// wait for anything but the very first attempt.
+//
+// After that attempt the answer is immediate whatever the state: ready, still
+// fetching, or failed and waiting for the background retry. The refresh loop
+// starts after the first attempt regardless of how it went, so a proxy that
+// came up on a network that was blocking Telegram recovers by itself once the
+// network does, with no client ever having paid for the outage.
 func (m *Manager) ensureReady() error {
-	if m.Ready() {
-		return nil
-	}
+	m.mu.Lock()
 
-	if err := m.fetch(m.ctx); err != nil {
+	switch {
+	case m.ready:
+		m.mu.Unlock()
+
+		return nil
+	case m.fetching:
+		m.mu.Unlock()
+
+		return errFetching
+	case m.lastErr != nil:
+		err := m.lastErr
+		m.mu.Unlock()
+
 		return err
 	}
 
+	m.fetching = true
+	m.mu.Unlock()
+
+	err := m.fetch(m.ctx)
+
 	m.startRefresh()
 
-	return nil
+	return err
 }
 
+// startRefresh begins the background loop, once. It re-fetches every
+// refreshPeriod while the config is loaded, and every retryPeriod until it is.
 func (m *Manager) startRefresh() {
 	m.refreshOnce.Do(func() {
-		go func() {
-			ticker := time.NewTicker(refreshPeriod)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-m.ctx.Done():
-					return
-				case <-ticker.C:
-					if err := m.fetch(m.ctx); err != nil {
-						m.logger.Warning("cannot refresh middle-proxy config: " + err.Error())
-					}
-				}
-			}
-		}()
+		go m.refreshLoop()
 	})
+}
+
+func (m *Manager) refreshLoop() {
+	for {
+		wait := refreshPeriod
+		if !m.Ready() {
+			wait = m.retryPeriod
+		}
+
+		timer := time.NewTimer(wait)
+
+		select {
+		case <-m.ctx.Done():
+			timer.Stop()
+
+			return
+		case <-timer.C:
+		}
+
+		if err := m.fetch(m.ctx); err != nil {
+			m.logger.Warning("cannot refresh middle-proxy config: " + err.Error())
+		}
+	}
 }
 
 // Ready reports whether the proxy secret and at least one middle-proxy address
@@ -136,10 +198,27 @@ func (m *Manager) proxySecret() []byte {
 	return m.secret
 }
 
+// fetch runs one complete fetch and records how it went. It is called from one
+// place at a time -- the first ensureReady, then only the refresh loop -- so it
+// takes no lock of its own around the network round trips.
 func (m *Manager) fetch(ctx context.Context) error {
-	m.fetchMu.Lock()
-	defer m.fetchMu.Unlock()
+	err := m.fetchAll(ctx)
 
+	m.mu.Lock()
+	m.fetching = false
+
+	if err != nil {
+		m.lastErr = fmt.Errorf("middle-proxy config unavailable, retrying in the background: %w", err)
+	} else {
+		m.lastErr = nil
+	}
+
+	m.mu.Unlock()
+
+	return err
+}
+
+func (m *Manager) fetchAll(ctx context.Context) error {
 	secret, err := m.fetchBytes(ctx, secretURL)
 	if err != nil {
 		return fmt.Errorf("cannot fetch proxy secret: %w", err)
