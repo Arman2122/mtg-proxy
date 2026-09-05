@@ -123,7 +123,8 @@ func (s *Secret) Set(text string) error {
 	default:
 		return fmt.Errorf(
 			"unrecognised secret: %d bytes (expected 16 for plain, 17 starting with 0xdd for dd, "+
-				"or 0xee followed by 16 key bytes and a hostname for ee)", len(decoded))
+				"or 0xee followed by 16 key bytes and a hostname for ee)", len(decoded),
+		)
 	}
 
 	// An all-zero key parses today and then fails Valid() deep inside

@@ -536,7 +536,8 @@ func goldenTelegramLines(t *testing.T, frame []byte) []string {
 	src := goldenFrameSource{r: bytes.NewReader(slices.Clone(frame))}
 
 	dcID, tag, _, err := obfuscation.Obfuscator{}.ReadHandshake(
-		src, obfuscation.TagSetOf(obfuscation.TagPaddedIntermediate))
+		src, obfuscation.TagSetOf(obfuscation.TagPaddedIntermediate),
+	)
 	require.NoError(t, err, "the frame handed to Telegram must be a readable obfuscated2 handshake")
 
 	return []string{

@@ -193,6 +193,18 @@ linters:
         linters:
           - gosec
 
+      # The same family, in the three places that shuffle a list to spread load:
+      # the order Telegram's DC addresses are tried, the order a resolved name's
+      # IPs are tried, and which of several configured networks goes first.
+      # Shuffling is for distribution, not secrecy -- the order is visible in a
+      # packet capture either way -- and nothing here derives a key, a nonce or
+      # an IV. They are listed separately from the four above so that removing
+      # one exclusion never silently widens another.
+      - path: (mtglib/internal/dc/addr_set\.go|network/network\.go|network/v2/multi_network\.go)
+        text: "G404"
+        linters:
+          - gosec
+
 formatters:
   enable:
     # Enforced here rather than remembered: `mise run fmt` already shells out
@@ -200,4 +212,5 @@ formatters:
     - gofumpt
   settings:
     gofumpt:
-      extra-rules: true
+      extra:
+        group-params: true

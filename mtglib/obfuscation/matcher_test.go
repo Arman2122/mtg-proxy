@@ -186,7 +186,8 @@ func TestMatchHandshakeFindsTheRightCandidate(t *testing.T) {
 		wire := clientHandshake(t, keys[want], TagIntermediate, 3, nil)
 
 		result, err := MatchHandshake(
-			&memConn{read: bytes.NewReader(wire)}, keys, allTagsInternal)
+			&memConn{read: bytes.NewReader(wire)}, keys, allTagsInternal,
+		)
 		require.NoError(t, err)
 
 		assert.Equal(t, want, result.Index)
@@ -214,7 +215,8 @@ func TestMatchHandshakeConnStartsAtKeystreamOffset64(t *testing.T) {
 		require.Len(t, wire, hfLen+len(payload))
 
 		result, err := MatchHandshake(
-			&memConn{read: bytes.NewReader(wire)}, decoys, allTagsInternal)
+			&memConn{read: bytes.NewReader(wire)}, decoys, allTagsInternal,
+		)
 		require.NoError(t, err)
 		require.Equal(t, 2, result.Index)
 
@@ -235,11 +237,13 @@ func TestMatchHandshakeRoundTripsWithReadHandshake(t *testing.T) {
 	wire := clientHandshake(t, key, TagAbridged, 4, nil)
 
 	matched, err := MatchHandshake(
-		&memConn{read: bytes.NewReader(wire)}, [][]byte{key}, allTagsInternal)
+		&memConn{read: bytes.NewReader(wire)}, [][]byte{key}, allTagsInternal,
+	)
 	require.NoError(t, err)
 
 	dc, tag, _, err := Obfuscator{Secret: key}.ReadHandshake(
-		&memConn{read: bytes.NewReader(wire)}, allTagsInternal)
+		&memConn{read: bytes.NewReader(wire)}, allTagsInternal,
+	)
 	require.NoError(t, err)
 
 	assert.Equal(t, matched.DC, dc)
@@ -259,7 +263,8 @@ func TestMatchResultReplayKey(t *testing.T) {
 	wire := clientHandshake(t, key, TagPaddedIntermediate, 2, nil)
 
 	result, err := MatchHandshake(
-		&memConn{read: bytes.NewReader(wire)}, [][]byte{key}, allTagsInternal)
+		&memConn{read: bytes.NewReader(wire)}, [][]byte{key}, allTagsInternal,
+	)
 	require.NoError(t, err)
 
 	replayKey := result.ReplayKey()
@@ -270,7 +275,8 @@ func TestMatchResultReplayKey(t *testing.T) {
 
 	// Identical frames must produce identical keys, or the cache never fires.
 	again, err := MatchHandshake(
-		&memConn{read: bytes.NewReader(wire)}, [][]byte{key}, allTagsInternal)
+		&memConn{read: bytes.NewReader(wire)}, [][]byte{key}, allTagsInternal,
+	)
 	require.NoError(t, err)
 	assert.Equal(t, replayKey, again.ReplayKey())
 }
@@ -286,7 +292,8 @@ func TestMatchHandshakeRejectsUnhonouredTag(t *testing.T) {
 		_, err := MatchHandshake(
 			&memConn{read: bytes.NewReader(wire)},
 			[][]byte{key},
-			TagSetOf(TagPaddedIntermediate))
+			TagSetOf(TagPaddedIntermediate),
+		)
 
 		require.ErrorIs(t, err, ErrNoMatchingSecret)
 	}
@@ -294,7 +301,8 @@ func TestMatchHandshakeRejectsUnhonouredTag(t *testing.T) {
 	// The same frame under the same key is accepted once the tag is honoured.
 	wire := clientHandshake(t, key, TagAbridged, 2, nil)
 	_, err := MatchHandshake(
-		&memConn{read: bytes.NewReader(wire)}, [][]byte{key}, TagSetOf(TagAbridged))
+		&memConn{read: bytes.NewReader(wire)}, [][]byte{key}, TagSetOf(TagAbridged),
+	)
 	require.NoError(t, err)
 }
 
@@ -316,7 +324,8 @@ func TestMatchHandshakeShortRead(t *testing.T) {
 	wire := clientHandshake(t, testKey(t), TagPaddedIntermediate, 2, nil)
 
 	_, err := MatchHandshake(
-		&memConn{read: bytes.NewReader(wire[:hfLen-1])}, [][]byte{testKey(t)}, allTagsInternal)
+		&memConn{read: bytes.NewReader(wire[:hfLen-1])}, [][]byte{testKey(t)}, allTagsInternal,
+	)
 
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, ErrNoMatchingSecret))
@@ -344,7 +353,8 @@ func FuzzMatchHandshakeNoFalseMatch(f *testing.F) {
 		copy(raw[:], data)
 
 		_, err := MatchHandshake(
-			&memConn{read: bytes.NewReader(raw[:])}, keys, allTagsInternal)
+			&memConn{read: bytes.NewReader(raw[:])}, keys, allTagsInternal,
+		)
 
 		require.ErrorIs(t, err, ErrNoMatchingSecret)
 	})

@@ -351,7 +351,8 @@ func (c *chain) openStream(t *testing.T, streamID uint32) (essentials.Conn, stri
 	// The client's own dd handshake. Its bytes become the first DATA frame; the
 	// proxy reads exactly 64 of them, matches the key, and dials out.
 	obfuscated, err := obfuscation.Obfuscator{Secret: c.key[:]}.SendHandshake(
-		transport, 2, obfuscation.TagPaddedIntermediate)
+		transport, 2, obfuscation.TagPaddedIntermediate,
+	)
 	require.NoError(t, err)
 
 	return obfuscated, sessionToken

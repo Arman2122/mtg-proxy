@@ -1,10 +1,30 @@
 [tools]
+# Editor and reporting tools: their version does not decide whether the build
+# passes, so they float. govulncheck deliberately floats too -- for a scanner
+# the newest analyzer is the point, and its database is fetched at run time
+# anyway.
 "go:golang.org/x/pkgsite/cmd/pkgsite" = "latest"
 "go:golang.org/x/tools/gopls" = "latest"
 "go:golang.org/x/vuln/cmd/govulncheck" = "latest"
 "go:mvdan.cc/gofumpt" = "latest"
-go = "latest"
-golangci-lint = "latest"
+
+# These two are PINNED because they decide whether the build passes.
+#
+# mise.lock has recorded these same versions since the first commit, but the
+# lockfile is not being honoured on CI: on 2026-09-04 two Dependabot pull
+# requests that touched no Go code failed the Lint job on five gosec findings
+# the locked golangci-lint does not implement, so the runner had resolved
+# `latest` and installed something newer. A gate whose result depends on the
+# day it runs is not a gate, and a version named here is obeyed whether or not
+# the lockfile is.
+#
+# They match mise.lock deliberately, so the two cannot disagree. Upgrading is a
+# deliberate commit: change the version here, run `mise run fmt` and
+# `mise run lint`, and fix whatever the new version finds in that same change.
+# The tree is currently clean under 2.13.2 as well, so that upgrade is a
+# one-line change whenever it is wanted.
+go = "1.26.6"
+golangci-lint = "2.12.2"
 
 [vars]
 fuzzflags = "-fuzztime=120s"

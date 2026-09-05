@@ -139,7 +139,8 @@ func TestDomainFrontingWithNoTargetClosesWithoutDialling(t *testing.T) {
 	h.proxy.domainFrontingHost = ""
 	h.proxy.domainFrontingPort = 443
 	h.proxy.secrets.Store(buildSecretSet(
-		map[string]Secret{"alice": hostlessSecret(t, SecretModeDD)}, nil, nil, nil))
+		map[string]Secret{"alice": hostlessSecret(t, SecretModeDD)}, nil, nil, nil,
+	))
 
 	client, done := h.dialProxy(t, nil)
 

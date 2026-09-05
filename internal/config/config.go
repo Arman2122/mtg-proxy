@@ -60,7 +60,8 @@ func (l ConfigListener) Policy() (mtglib.ListenerPolicy, error) {
 		return mtglib.ListenerPolicy{}, fmt.Errorf(
 			"listener %s: accept must be a non-empty subset of [\"dd\",\"plain\"]; "+
 				"the top-level bind-to serves FakeTLS and a [[listener]] never does. "+
-				"Run two listeners if you need both", l.BindTo.Get(""))
+				"Run two listeners if you need both", l.BindTo.Get(""),
+		)
 	}
 
 	action := mtglib.UnknownSecretClose
@@ -288,7 +289,8 @@ func (c *Config) validateListeners(seen map[string]struct{}) error {
 				"listener %s accepts %v on a public address. "+
 					"A non-FakeTLS listener answers obfuscated2 and is fingerprintable as an MTProto proxy. "+
 					"Set public = true on this [[listener]] to confirm, or bind it to 127.0.0.1",
-				addr, policy.Modes.Strings())
+				addr, policy.Modes.Strings(),
+			)
 		}
 	}
 

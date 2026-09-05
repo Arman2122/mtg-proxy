@@ -75,7 +75,8 @@ func Probe(ctx context.Context, conn net.Conn, dc int) (time.Duration, error) {
 	// 1. obfuscated2 handshake. Empty Secret = no MTProxy secret mixing,
 	// which is how mtg itself talks to a DC (see mtglib/proxy.go).
 	obfsConn, err := obfuscation.Obfuscator{}.SendHandshake(
-		adaptConn(conn), dc, obfuscation.TagPaddedIntermediate)
+		adaptConn(conn), dc, obfuscation.TagPaddedIntermediate,
+	)
 	if err != nil {
 		return 0, fmt.Errorf("obfuscated2 handshake: %w", err)
 	}

@@ -274,7 +274,8 @@ func TestDialProxyStreamThreadsPaddedIntermediate(t *testing.T) {
 					PaddedIntermediate: tc.padded,
 					AdvertisedPort:     443,
 					AdTag:              [adTagLength]byte{0xaa, 0xbb, 0xcc, 0xdd},
-				})
+				},
+			)
 			require.NoError(t, err)
 
 			defer stream.Close() //nolint: errcheck

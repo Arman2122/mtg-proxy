@@ -86,7 +86,8 @@ func newCountedRelay(t *testing.T) *countedRelay {
 // stats is what the relay's own stats socket would answer right now.
 func (r *countedRelay) stats() RelayStats {
 	return r.origin.StatsHandler(time.Now).counters.Snapshot(
-		time.Now(), r.origin.store.maxSessions, r.origin.store.countSessions())
+		time.Now(), r.origin.store.maxSessions, r.origin.store.countSessions(),
+	)
 }
 
 // openSession walks the bootstrap the bridge page walks and returns the session
@@ -98,7 +99,8 @@ func (r *countedRelay) openSession(t *testing.T) string {
 	require.NoError(t, err)
 
 	pageResponse, err := r.server.Client().Get( //nolint:noctx // a test request
-		r.server.URL + "/?bridge=" + capability.String())
+		r.server.URL + "/?bridge=" + capability.String(),
+	)
 	require.NoError(t, err)
 
 	defer pageResponse.Body.Close()

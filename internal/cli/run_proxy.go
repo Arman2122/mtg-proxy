@@ -209,7 +209,8 @@ func makeEventStream(conf *config.Config, logger mtglib.Logger) (mtglib.EventStr
 		)
 
 		listener, err := (&net.ListenConfig{}).Listen(
-			context.Background(), "tcp", conf.Stats.Prometheus.BindTo.Get(""))
+			context.Background(), "tcp", conf.Stats.Prometheus.BindTo.Get(""),
+		)
 		if err != nil {
 			return nil, fmt.Errorf("cannot start a listener for prometheus: %w", err)
 		}

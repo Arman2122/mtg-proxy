@@ -72,7 +72,8 @@ func TestTrackClientIPsCannotBeDefaultedOn(t *testing.T) {
 	conf, err := config.Parse([]byte(
 		"secret = \"ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d\"\n" +
 			"bind-to = \"0.0.0.0:443\"\n" +
-			"track-client-ips = false\n"))
+			"track-client-ips = false\n",
+	))
 	require.NoError(t, err)
 
 	require.True(t, conf.TrackClientIPs.Get(true),

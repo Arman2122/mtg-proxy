@@ -102,7 +102,8 @@ func parseEnvSecret(value string) (mtglib.Secret, error) {
 				"%s is a %s-mode secret with no fronting hostname; the bind-to listener serves FakeTLS "+
 					"only and the environment cannot declare a [[listener]], so either set %s to a fronting "+
 					"domain, provide a full ee-prefixed secret, or move the secret into the config file's "+
-					"[secrets] table alongside a matching [[listener]]", EnvSecret, secret.Mode, EnvSecretHost)
+					"[secrets] table alongside a matching [[listener]]", EnvSecret, secret.Mode, EnvSecretHost,
+			)
 		}
 
 		secret.Host = host

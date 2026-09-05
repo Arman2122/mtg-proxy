@@ -154,7 +154,8 @@ func TestSendHandshakeStampsRequestedTag(t *testing.T) {
 		require.Len(t, wire, 64)
 
 		readDC, readTag, _, err := obfs.ReadHandshake(
-			&memConn{read: bytes.NewReader(wire)}, allTagsSet)
+			&memConn{read: bytes.NewReader(wire)}, allTagsSet,
+		)
 		require.NoError(t, err)
 
 		assert.Equal(t, 2, readDC)

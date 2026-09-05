@@ -54,7 +54,8 @@ func ParseSecretMode(s string) (SecretMode, error) {
 		return SecretModePlain, nil
 	default:
 		return SecretModeFakeTLS, fmt.Errorf(
-			"unknown secret mode %q (expected one of \"dd\", \"ee\", \"plain\")", s)
+			"unknown secret mode %q (expected one of \"dd\", \"ee\", \"plain\")", s,
+		)
 	}
 }
 

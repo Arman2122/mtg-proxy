@@ -75,7 +75,8 @@ func BenchmarkTrialDecrypt(b *testing.B) {
 	allowed := obfuscation.TagSetOf(
 		obfuscation.TagPaddedIntermediate,
 		obfuscation.TagIntermediate,
-		obfuscation.TagAbridged)
+		obfuscation.TagAbridged,
+	)
 
 	// Built under a key that is deliberately NOT in the candidate set.
 	frame := benchFrame(benchRandom(16), obfuscation.TagPaddedIntermediate)

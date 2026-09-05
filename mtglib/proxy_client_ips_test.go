@@ -99,7 +99,8 @@ func connectThrough(
 		require.EqualValues(t, 0x16, first[0])
 
 		_, err = client.Write(ec.framePayload(
-			obfuscatedFrame(t, key, obfuscation.TagPaddedIntermediate, 2)))
+			obfuscatedFrame(t, key, obfuscation.TagPaddedIntermediate, 2),
+		))
 		require.NoError(t, err)
 	}
 
