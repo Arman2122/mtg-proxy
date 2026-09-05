@@ -471,6 +471,19 @@ Lines worth knowing, all at warn level unless noted:
   engage and never see it release. Watch `throttle.active` on `/stats` if you
   need both edges.
 - `cannot start extra listener on <addr>` — one `[[listener]]` failed to bind.
+- `cannot accept a new connection, retrying` with `retry_in` — a transient
+  accept error: the descriptor table is full, or a peer reset between the
+  kernel's accept and the proxy's. The loop pauses and tries again, doubling
+  from 5ms to a second, and resets on the next accepted connection. A steady
+  stream of these means the process is at its file-descriptor limit; check
+  `LimitNOFILE` on the unit.
+- `extra listener stopped; the public port keeps serving` — a `[[listener]]`'s
+  socket broke for good. The public port is unaffected. The relay's backend is
+  usually the one, and WEB clients get the cover site until a restart.
+- `public listener <addr> stopped: ...` — the public socket broke for good,
+  and the process **exited** with that error rather than run on looking
+  healthy while serving nobody. Under `Restart=on-failure` it is back a few
+  seconds later; see [[Troubleshooting]].
   The proxy keeps running on the rest, deliberately: one bad stanza must not
   take the public port down.
 - `SNI-DNS mismatch: ...` — the secret's fronting hostname does not resolve to

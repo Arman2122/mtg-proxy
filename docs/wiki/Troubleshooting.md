@@ -124,6 +124,27 @@ on serving everything else — losing a WEB backend must never take the public p
 with it. That warning is at WARN level, so you will see it, but nothing else will tell
 you: the relay beside it will then fail every stream.
 
+### The process exited with `public listener ... stopped`
+
+The public socket broke for good — a descriptor closed underneath the process, a
+listener that stopped listening — and the proxy exited, non-zero, with that error
+rather than run on looking healthy while every client got a refused connection. Under
+`Restart=on-failure` it is back a few seconds later, and the exit is the only reason it
+is: a supervisor cannot restart a process that has not stopped. If you supervise it
+some other way, make sure it restarts on a non-zero exit.
+
+This is different from a busy socket. A full file-descriptor table, or a peer that
+reset between the kernel's accept and the proxy's, is transient, and the proxy rides it
+out: it logs `cannot accept a new connection, retrying` with a `retry_in` that doubles
+from 5ms to a second, and carries on the moment the next connection is accepted. A
+steady stream of those lines is a process at its descriptor limit — raise
+`LimitNOFILE` on the unit — not a process about to exit.
+
+An extra `[[listener]]` breaking does not exit the process. It logs
+`extra listener stopped; the public port keeps serving` and the public port is
+unaffected; the relay's backend is usually the one, and WEB clients get the cover site
+until a restart.
+
 ### The config parses, but half your settings did nothing
 
 This is the one that costs the most time, and it is not a bug in mtg-proxy — it is how

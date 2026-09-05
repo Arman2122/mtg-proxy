@@ -367,6 +367,9 @@ Type=simple
 User=mtg-proxy
 Group=mtg-proxy
 ExecStart=/usr/local/bin/mtg-proxy run /etc/mtg-proxy/config.toml
+# Not decoration. If the public socket ever breaks for good, the proxy exits
+# non-zero rather than run on looking healthy while serving nobody, and this
+# line is what brings it back. A [[listener]] breaking does not exit it.
 Restart=on-failure
 RestartSec=5s
 
