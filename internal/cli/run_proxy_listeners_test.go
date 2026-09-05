@@ -10,6 +10,7 @@ import (
 
 	"github.com/Arman2122/mtg-proxy/internal/config"
 	"github.com/Arman2122/mtg-proxy/internal/proxyprotocol"
+	"github.com/Arman2122/mtg-proxy/internal/utils"
 	"github.com/Arman2122/mtg-proxy/logger"
 	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/stretchr/testify/assert"
@@ -55,19 +56,77 @@ func (r *recordingLogger) recorded() []string {
 	return append([]string(nil), r.warnings...)
 }
 
-// freePort returns a port that was free a moment ago. bind-to rejects port 0,
-// so a config needs a concrete number.
-func freePort(t *testing.T) uint {
+// heldPorts is a set of loopback sockets bound in advance and handed to
+// buildListenersWith by address. bind-to rejects port 0, so a config has to
+// name concrete ports; picking a free one and closing it left a gap between
+// the pick and the bind in which any parallel test in this package could take
+// it, and a [[listener]] that loses its port is skipped by design, so the
+// symptom was one listener served where two were expected -- once, under
+// -race, and never on rerun. Here the socket picked IS the socket served, and
+// there is no gap.
+//
+// An address it does not hold goes to the real binder, so a test that wants a
+// bind to fail for real -- takenPort -- still gets a real failure.
+type heldPorts struct {
+	mu   sync.Mutex
+	held map[string]net.Listener
+}
+
+func holdPorts(t *testing.T, n int) (*heldPorts, []uint) {
 	t.Helper()
 
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
+	h := &heldPorts{held: make(map[string]net.Listener, n)}
+	ports := make([]uint, 0, n)
 
-	port := uint(l.Addr().(*net.TCPAddr).Port) //nolint: forcetypeassert
+	for range n {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
 
-	require.NoError(t, l.Close())
+		h.held[l.Addr().String()] = l
+		ports = append(ports, uint(l.Addr().(*net.TCPAddr).Port)) //nolint: forcetypeassert
+	}
 
-	return port
+	// Whatever was never asked for is closed here; whatever was handed out
+	// belongs to the served set and closeServed closes it.
+	t.Cleanup(func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		for _, l := range h.held {
+			l.Close() //nolint: errcheck
+		}
+	})
+
+	return h, ports
+}
+
+func (h *heldPorts) listen(addr string) (net.Listener, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if l, ok := h.held[addr]; ok {
+		delete(h.held, addr)
+
+		return l, nil
+	}
+
+	return utils.NewListener(addr, 0)
+}
+
+// remaining lists the held addresses nobody asked for. A test asserts it is
+// empty, so a config that rendered an address in a form the binder was not
+// asked for by -- and so fell through to a real, racy bind -- fails loudly
+// instead of flaking quietly.
+func (h *heldPorts) remaining() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	addrs := make([]string, 0, len(h.held))
+	for addr := range h.held {
+		addrs = append(addrs, addr)
+	}
+
+	return addrs
 }
 
 // takenPort occupies a port for the whole test and returns it.
@@ -117,6 +176,7 @@ func assertServing(t *testing.T, listener net.Listener) {
 func TestExtraListenerBindFailureIsNotFatal(t *testing.T) {
 	t.Parallel()
 
+	ports, held := holdPorts(t, 1)
 	busy := takenPort(t)
 	conf := parseConfig(t, fmt.Sprintf(`
 secret = "%s"
@@ -125,13 +185,16 @@ bind-to = "127.0.0.1:%d"
 [[listener]]
 bind-to = "127.0.0.1:%d"
 accept = ["dd", "plain"]
-`, mtglib.GenerateSecret("cover.example.com").Hex(), freePort(t), busy))
+`, mtglib.GenerateSecret("cover.example.com").Hex(), held[0], busy))
 
 	log := newRecordingLogger()
 
-	served, err := buildListeners(conf, log)
+	// The taken port is not held, so it reaches the real binder and fails for
+	// real -- which is the behaviour under test.
+	served, err := buildListenersWith(conf, log, ports.listen)
 	require.NoError(t, err)
 	closeServed(t, served)
+	require.Empty(t, ports.remaining())
 
 	require.Len(t, served, 1, "the extra listener must be skipped, not served")
 	assert.Equal(t, mtglib.DefaultListenerPolicy, served[0].policy)
@@ -148,6 +211,7 @@ accept = ["dd", "plain"]
 func TestGlobalProxyProtocolDoesNotWrapExtraListener(t *testing.T) {
 	t.Parallel()
 
+	ports, held := holdPorts(t, 2)
 	conf := parseConfig(t, fmt.Sprintf(`
 secret = "%s"
 bind-to = "127.0.0.1:%d"
@@ -156,11 +220,12 @@ proxy-protocol-listener = true
 [[listener]]
 bind-to = "127.0.0.1:%d"
 accept = ["dd"]
-`, mtglib.GenerateSecret("cover.example.com").Hex(), freePort(t), freePort(t)))
+`, mtglib.GenerateSecret("cover.example.com").Hex(), held[0], held[1]))
 
-	served, err := buildListeners(conf, newRecordingLogger())
+	served, err := buildListenersWith(conf, newRecordingLogger(), ports.listen)
 	require.NoError(t, err)
 	closeServed(t, served)
+	require.Empty(t, ports.remaining())
 
 	require.Len(t, served, 2)
 
@@ -177,6 +242,7 @@ accept = ["dd"]
 func TestExtraListenerProxyProtocolIsPerListener(t *testing.T) {
 	t.Parallel()
 
+	ports, held := holdPorts(t, 2)
 	conf := parseConfig(t, fmt.Sprintf(`
 secret = "%s"
 bind-to = "127.0.0.1:%d"
@@ -185,11 +251,12 @@ bind-to = "127.0.0.1:%d"
 bind-to = "127.0.0.1:%d"
 accept = ["plain"]
 proxy-protocol = true
-`, mtglib.GenerateSecret("cover.example.com").Hex(), freePort(t), freePort(t)))
+`, mtglib.GenerateSecret("cover.example.com").Hex(), held[0], held[1]))
 
-	served, err := buildListeners(conf, newRecordingLogger())
+	served, err := buildListenersWith(conf, newRecordingLogger(), ports.listen)
 	require.NoError(t, err)
 	closeServed(t, served)
+	require.Empty(t, ports.remaining())
 
 	require.Len(t, served, 2)
 

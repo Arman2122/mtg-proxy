@@ -373,11 +373,23 @@ func maybeProxyProtocol(listener net.Listener, enabled bool) net.Listener {
 // the loopback port a panel allocated may have been taken since, and losing the
 // WEB backend must never take the public port down with it.
 func buildListeners(conf *config.Config, log mtglib.Logger) ([]servedListener, error) {
+	return buildListenersWith(conf, log, func(addr string) (net.Listener, error) {
+		return utils.NewListener(addr, 0)
+	})
+}
+
+// listenFunc binds one address. It is a parameter so a test can hand in
+// sockets it already holds, and for no other reason: production always binds
+// through utils.NewListener, and a test that wants a bind to fail for real can
+// still fall through to it.
+type listenFunc func(addr string) (net.Listener, error)
+
+func buildListenersWith(conf *config.Config, log mtglib.Logger, listen listenFunc) ([]servedListener, error) {
 	bindAddrs := conf.GetBindAddrs()
 	baseListeners := make([]net.Listener, 0, len(bindAddrs))
 
 	for _, addr := range bindAddrs {
-		l, err := utils.NewListener(addr, 0)
+		l, err := listen(addr)
 		if err != nil {
 			for _, prev := range baseListeners {
 				prev.Close() //nolint: errcheck
@@ -424,7 +436,7 @@ func buildListeners(conf *config.Config, log mtglib.Logger) ([]servedListener, e
 			continue
 		}
 
-		l, err := utils.NewListener(addr, 0)
+		l, err := listen(addr)
 		if err != nil {
 			log.WarningError("cannot start extra listener on "+addr, err)
 

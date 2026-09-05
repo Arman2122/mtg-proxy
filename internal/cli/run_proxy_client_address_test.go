@@ -155,6 +155,7 @@ func TestPlainListenerReportsTheSocketAddress(t *testing.T) {
 func TestWebDeploymentShapeBuildsBothListeners(t *testing.T) {
 	t.Parallel()
 
+	ports, held := holdPorts(t, 3)
 	conf := parseConfig(t, fmt.Sprintf(`
 secret = "%s"
 bind-to = "127.0.0.1:%d"
@@ -172,14 +173,15 @@ public = true
 bind-to = "127.0.0.1:%d"
 accept = ["dd"]
 proxy-protocol = true
-`, mtglib.GenerateSecret("cover.example.com").Hex(), freePort(t), freePort(t), freePort(t)))
+`, mtglib.GenerateSecret("cover.example.com").Hex(), held[0], held[1], held[2]))
 
 	require.True(t, conf.TrackClientIPs.Get(false),
 		"the option must survive a config that also declares listeners")
 
-	served, err := buildListeners(conf, newRecordingLogger())
+	served, err := buildListenersWith(conf, newRecordingLogger(), ports.listen)
 	require.NoError(t, err)
 	closeServed(t, served)
+	require.Empty(t, ports.remaining())
 
 	require.Len(t, served, 3, "bind-to plus both listeners")
 
