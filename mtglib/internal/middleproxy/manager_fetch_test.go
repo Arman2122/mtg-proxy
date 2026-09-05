@@ -89,30 +89,24 @@ func TestAFailedFetchDoesNotStallTheNextDial(t *testing.T) {
 	require.Equal(t, int32(1), calls.Load(), "a dial after a failed fetch went back to the network")
 }
 
-// A dial that arrives while the first fetch is still in flight is not queued
-// behind it. Warm() starts that fetch at boot; a client connecting a moment
-// later used to sit on the fetch lock for the whole of it.
-func TestADialDuringTheFirstFetchDoesNotQueue(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// blockingFirstFetch is a network on which the first request hangs until the
+// test releases it. It is what Warm() runs into at boot on a blocked network.
+func blockingFirstFetch(t *testing.T, mgr *Manager) (release chan struct{}) {
+	t.Helper()
 
 	var (
 		enteredOnce sync.Once
 		entered     = make(chan struct{})
-		release     = make(chan struct{})
 	)
 
-	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+	release = make(chan struct{})
+
+	mgr.httpClient = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
 		enteredOnce.Do(func() { close(entered) })
 		<-release
 
 		return nil, errUnreachable
 	})}
-
-	mgr := NewManager(ctx, client, quietLogger{}, "only-ipv4")
-	mgr.retryPeriod = time.Hour
 
 	mgr.Warm()
 
@@ -122,13 +116,95 @@ func TestADialDuringTheFirstFetchDoesNotQueue(t *testing.T) {
 		t.Fatal("Warm never started a fetch")
 	}
 
+	return release
+}
+
+// A dial that arrives while the first fetch is still in flight waits for it
+// only briefly, and is not queued behind it. Warm() starts that fetch at boot;
+// a client connecting a moment later used to sit on the fetch lock for the
+// whole of it, up to three times fetchTimeout.
+func TestADialDuringTheFirstFetchDoesNotQueue(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := NewManager(ctx, nil, quietLogger{}, "only-ipv4")
+	mgr.retryPeriod = time.Hour
+	mgr.firstFetchGrace = 50 * time.Millisecond
+
+	release := blockingFirstFetch(t, mgr)
+	defer close(release)
+
 	started := time.Now()
 	err := mgr.ensureReady()
 
 	require.ErrorIs(t, err, errFetching)
 	require.Less(t, time.Since(started), time.Second, "a dial queued behind the fetch in flight")
+}
+
+// The wait ends when the fetch does, not when the grace runs out: a client
+// reconnecting after a restart on a healthy network gets the fetch's answer --
+// here a failure, in life a sponsored channel -- rather than a shrug.
+func TestADialDuringTheFirstFetchGetsItsAnswer(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := NewManager(ctx, nil, quietLogger{}, "only-ipv4")
+	mgr.retryPeriod = time.Hour
+	mgr.firstFetchGrace = 10 * time.Second
+
+	release := blockingFirstFetch(t, mgr)
+
+	answered := make(chan error, 1)
+
+	go func() { answered <- mgr.ensureReady() }()
+
+	// Not answered while the fetch is in flight and the grace is long.
+	select {
+	case err := <-answered:
+		t.Fatalf("the dial was answered before the fetch finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
 
 	close(release)
+
+	select {
+	case err := <-answered:
+		require.ErrorIs(t, err, errUnreachable, "the dial must get the fetch's own answer")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dial was not released when the fetch finished")
+	}
+}
+
+// A fetch that returned nothing usable with no error -- a 200 with an empty
+// body -- is a failure like any other: recorded, retried in the background, and
+// not a reason to put every dial back on the synchronous path.
+func TestAnEmptyConfigIsAFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+
+		return okResponse(""), nil
+	})}
+
+	mgr := NewManager(ctx, client, quietLogger{}, "only-ipv4")
+	mgr.retryPeriod = time.Hour
+
+	require.ErrorIs(t, mgr.ensureReady(), errEmptyConfig)
+
+	before := calls.Load()
+
+	require.ErrorIs(t, mgr.ensureReady(), errEmptyConfig)
+	require.Equal(t, before, calls.Load(), "a dial after an empty fetch went back to the network")
 }
 
 // The refresh loop starts whether or not the first fetch succeeded, so a proxy

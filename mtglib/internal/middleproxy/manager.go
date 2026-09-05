@@ -31,13 +31,30 @@ const (
 	// trying again, in the background. Nothing in a client's path ever waits
 	// for that retry: see ensureReady.
 	retryPeriod = time.Minute
+
+	// firstFetchGrace is how long a dial will wait for the FIRST fetch, the
+	// one Warm() starts at boot, before giving up on its sponsored channel.
+	// On a healthy network that fetch takes well under a second, and a client
+	// reconnecting after a restart should keep its ad rather than be counted
+	// as an outage. On a blocked network it takes up to three times
+	// fetchTimeout, and nobody waits for that.
+	firstFetchGrace = 2 * time.Second
 )
 
-// errFetching is what a dial gets while the very first fetch is still in
-// flight. It is an error and not a wait, because the fetch can take up to
-// three times fetchTimeout, and a client that queued behind it would sit there
-// for the whole of that with its connection open and nothing happening.
-var errFetching = errors.New("middle-proxy config is still being fetched")
+var (
+	// errFetching is what a dial gets when the very first fetch is still in
+	// flight after firstFetchGrace. It is an error and not a longer wait,
+	// because the fetch can take up to three times fetchTimeout, and a client
+	// that queued behind it would sit there for the whole of that with its
+	// connection open and nothing happening.
+	errFetching = errors.New("middle-proxy config is still being fetched")
+
+	// errEmptyConfig is a fetch that returned nothing usable with no error: a
+	// 200 with an empty body. It is recorded as a failure so the background
+	// retry owns it, rather than leaving lastErr nil and every dial back on the
+	// synchronous path.
+	errEmptyConfig = errors.New("middle-proxy config is empty")
+)
 
 // Dialer is the subset of mtglib.Network the manager needs to reach a middle
 // proxy. It is declared here to keep this internal package free of an import
@@ -72,8 +89,9 @@ type Manager struct {
 	logger     Logger
 	preferIP   string
 
-	// retryPeriod is a field so a test can shorten it.
-	retryPeriod time.Duration
+	// Fields so a test can shorten them.
+	retryPeriod     time.Duration
+	firstFetchGrace time.Duration
 
 	mu       sync.RWMutex
 	ready    bool
@@ -81,11 +99,14 @@ type Manager struct {
 	middleV4 map[int][]string
 	middleV6 map[int][]string
 
-	// fetching says the first fetch is in flight. lastErr is why the manager is
-	// not ready, kept so a dial that arrives before the next retry can be told
-	// why without waiting for it.
-	fetching bool
-	lastErr  error
+	// fetching says the first fetch is in flight, and firstDone is closed when
+	// it is over, so a dial can wait a bounded time for it. lastErr is why the
+	// manager is not ready, kept so a dial that arrives before the next retry
+	// can be told why without waiting for it.
+	fetching  bool
+	lastErr   error
+	firstDone chan struct{}
+	firstOnce sync.Once
 
 	refreshOnce sync.Once
 }
@@ -96,11 +117,13 @@ type Manager struct {
 // refresh loop and any in-flight fetches stop when ctx is cancelled.
 func NewManager(ctx context.Context, httpClient *http.Client, logger Logger, preferIP string) *Manager {
 	return &Manager{
-		ctx:         ctx,
-		httpClient:  httpClient,
-		logger:      logger,
-		preferIP:    preferIP,
-		retryPeriod: retryPeriod,
+		ctx:             ctx,
+		httpClient:      httpClient,
+		logger:          logger,
+		preferIP:        preferIP,
+		retryPeriod:     retryPeriod,
+		firstFetchGrace: firstFetchGrace,
+		firstDone:       make(chan struct{}),
 	}
 }
 
@@ -115,13 +138,16 @@ func (m *Manager) Warm() {
 }
 
 // ensureReady makes sure the config has been fetched, without making the caller
-// wait for anything but the very first attempt.
+// wait for anything but the very first attempt -- and for that, only briefly.
 //
-// After that attempt the answer is immediate whatever the state: ready, still
-// fetching, or failed and waiting for the background retry. The refresh loop
-// starts after the first attempt regardless of how it went, so a proxy that
-// came up on a network that was blocking Telegram recovers by itself once the
-// network does, with no client ever having paid for the outage.
+// The first attempt is the one Warm() starts at boot. A dial that arrives while
+// it is in flight waits for it up to firstFetchGrace, which on a healthy network
+// is long enough to keep its sponsored channel and on a blocked one is nothing
+// like the fetch's own ceiling. After that attempt the answer is immediate
+// whatever the state: ready, or failed and waiting for the background retry.
+// The refresh loop starts after the first attempt regardless of how it went, so
+// a proxy that came up on a network that was blocking Telegram recovers by
+// itself once the network does, with no client ever having paid for the outage.
 func (m *Manager) ensureReady() error {
 	m.mu.Lock()
 
@@ -133,7 +159,7 @@ func (m *Manager) ensureReady() error {
 	case m.fetching:
 		m.mu.Unlock()
 
-		return errFetching
+		return m.awaitFirstFetch()
 	case m.lastErr != nil:
 		err := m.lastErr
 		m.mu.Unlock()
@@ -149,6 +175,34 @@ func (m *Manager) ensureReady() error {
 	m.startRefresh()
 
 	return err
+}
+
+// awaitFirstFetch waits a bounded time for the fetch in flight, then answers
+// from whatever state it left behind.
+func (m *Manager) awaitFirstFetch() error {
+	timer := time.NewTimer(m.firstFetchGrace)
+	defer timer.Stop()
+
+	select {
+	case <-m.firstDone:
+	case <-timer.C:
+		return errFetching
+	case <-m.ctx.Done():
+		return m.ctx.Err() //nolint: wrapcheck
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.ready {
+		return nil
+	}
+
+	if m.lastErr != nil {
+		return m.lastErr
+	}
+
+	return errFetching
 }
 
 // startRefresh begins the background loop, once. It re-fetches every
@@ -207,6 +261,13 @@ func (m *Manager) fetch(ctx context.Context) error {
 	m.mu.Lock()
 	m.fetching = false
 
+	// A fetch that returned nothing usable is a failure too, whatever the
+	// status codes said; otherwise lastErr would be nil with ready false, and
+	// every dial would be back on the synchronous path, concurrently.
+	if err == nil && !m.ready {
+		err = errEmptyConfig
+	}
+
 	if err != nil {
 		m.lastErr = fmt.Errorf("middle-proxy config unavailable, retrying in the background: %w", err)
 	} else {
@@ -214,6 +275,10 @@ func (m *Manager) fetch(ctx context.Context) error {
 	}
 
 	m.mu.Unlock()
+
+	// Whoever is waiting on the first fetch may go now. Closed once; later
+	// fetches are the loop's and nobody waits on those.
+	m.firstOnce.Do(func() { close(m.firstDone) })
 
 	return err
 }
