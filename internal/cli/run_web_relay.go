@@ -152,7 +152,7 @@ func runWebRelay(conf *config.Config, configPath, version string, checkOnly bool
 		BindInt("profiles", len(conf.GetSecrets())).
 		Info("web relay is running")
 
-	waitForShutdown(configPath, origin, counters, structure, log)
+	waitForShutdown(newProfileReloader(conf, configPath, origin, counters, structure, log))
 
 	ctx, cancel := context.WithTimeout(context.Background(), webShutdownTimeout)
 	defer cancel()
@@ -165,105 +165,40 @@ func runWebRelay(conf *config.Config, configPath, version string, checkOnly bool
 }
 
 // waitForShutdown runs until the process is asked to stop, reloading profiles
-// on every SIGHUP in between.
+// in between: whenever the config file changes, and on every SIGHUP.
 //
-// Reload exists because the panel is the source of truth for who may connect,
-// and it writes the config file before it tells the proxy: without this, adding
-// a client leaves the relay serving that client's own link to the cover site
-// until someone restarts it -- which is indistinguishable, from the client's
-// side, from the censorship the relay is there to get around.
-//
-// One goroutine, one signal at a time, so two reloads can never interleave.
-func waitForShutdown(
-	configPath string, origin *webrelay.Origin, counters *webrelay.Counters,
-	structure string, log mtglib.Logger,
-) {
+// The file is watched because it is the source of truth for who may connect,
+// and the panel writes it before it tells the proxy. The signal is kept because
+// it is immediate, and because it is what every supervisor's reload already
+// sends. Both land on one goroutine, one at a time, so two reloads can never
+// interleave whichever way they arrived.
+func waitForShutdown(reloader *profileReloader) {
 	stop := utils.RootContext()
-
-	signals := reloadSignals()
-	if len(signals) == 0 {
-		<-stop.Done()
-
-		return
-	}
 
 	// Buffered: a HUP that arrives while one is being applied is remembered
 	// rather than dropped, and more than one pending reload is the same reload.
+	// On a platform with no reload signal nothing is ever sent here, and the
+	// watcher is the only trigger.
 	hup := make(chan os.Signal, 1)
 
-	signal.Notify(hup, signals...)
-	defer signal.Stop(hup)
+	if signals := reloadSignals(); len(signals) > 0 {
+		signal.Notify(hup, signals...)
+		defer signal.Stop(hup)
+	}
+
+	watch := time.NewTicker(webWatchInterval)
+	defer watch.Stop()
 
 	for {
 		select {
 		case <-stop.Done():
 			return
 		case <-hup:
-			reloadWebProfiles(configPath, origin, counters, structure, log)
+			reloader.reload(reloadTriggerSignal)
+		case <-watch.C:
+			reloader.tick()
 		}
 	}
-}
-
-// reloadWebProfiles re-reads the config file and swaps the profile set in.
-//
-// Every failure leaves the running set alone and says so. A relay that emptied
-// its registry because someone saved a broken file would serve the cover site
-// to every real user while reporting nothing wrong, and that failure is far
-// worse than a stale profile list.
-func reloadWebProfiles(
-	configPath string, origin *webrelay.Origin, counters *webrelay.Counters,
-	structure string, log mtglib.Logger,
-) {
-	conf, err := utils.ReadConfig(configPath)
-	if err != nil {
-		log.WarningError("web relay reload: cannot read the config, keeping the current profiles", err)
-
-		return
-	}
-
-	// The same validation startup ran, so a reload can never accept a file that
-	// --check would refuse.
-	if err := conf.ValidateWeb(); err != nil {
-		counters.OnReload(time.Now(), err)
-		log.WarningError("web relay reload: the config is unusable, keeping the current profiles", err)
-
-		return
-	}
-
-	next, err := webStructure(conf)
-	if err != nil {
-		counters.OnReload(time.Now(), err)
-		log.WarningError("web relay reload: cannot read the backend listener, keeping the current profiles", err)
-
-		return
-	}
-
-	// Only the profile set is reloadable, and the rest is refused rather than
-	// half-applied. The host is baked into every capability the clients already
-	// hold, the token key has to outlive the tokens it signed, and the backend,
-	// the cover site and the bound address are what the process was built
-	// around. Applying some of a changed file and not the rest is how a relay
-	// ends up in a state no configuration describes.
-	if next != structure {
-		counters.OnReload(time.Now(), errRestartRequired)
-		log.Warning("web relay reload: [web] changed in a way that needs a restart, profiles left unchanged")
-
-		return
-	}
-
-	names, secrets := orderedSecrets(conf)
-
-	if err := origin.SetSecrets(secrets); err != nil {
-		counters.OnReload(time.Now(), err)
-		log.WarningError("web relay reload: the new profile set cannot be served, keeping the current one", err)
-
-		return
-	}
-
-	counters.SetProfiles(names)
-	counters.OnReload(time.Now(), nil)
-
-	log.BindInt("profiles", len(secrets)).Info("web relay reloaded its profiles")
 }
 
 // startStatsServer brings up the relay's own counters socket, or nothing when

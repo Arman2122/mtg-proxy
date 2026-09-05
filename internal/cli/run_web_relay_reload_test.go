@@ -258,7 +258,7 @@ func TestReloadPicksUpANewClient(t *testing.T) {
 	writeReloadConfig(t, dir, nil, "", twoSecrets)
 	require.False(t, servesBridge(t, origin, path, "bob"), "an unconfigured client was already being served")
 
-	reloadWebProfiles(path, origin, nil, structure, log)
+	newProfileReloader(conf, path, origin, nil, structure, log).reload(reloadTriggerSignal)
 
 	require.Equal(t, 2, origin.Profiles(), "the added client never reached the running relay")
 	require.True(t, servesBridge(t, origin, path, "bob"), "the added client is counted but not served")
@@ -309,7 +309,7 @@ func TestReloadRefusesAStructuralChange(t *testing.T) {
 	// A new hostname AND a new client. Neither is applied: the capability every
 	// live client holds was derived over the old host.
 	writeReloadConfig(t, dir, map[string]string{"host": `"other.example.com"`}, "", twoSecrets)
-	reloadWebProfiles(path, origin, nil, structure, log)
+	newProfileReloader(conf, path, origin, nil, structure, log).reload(reloadTriggerSignal)
 
 	require.Equal(t, 1, origin.Profiles(), "a structural change was partly applied")
 	require.Contains(t, strings.Join(log.recorded(), "\n"), "restart")
@@ -334,7 +334,7 @@ func TestReloadKeepsTheRunningSetOnABadFile(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, os.WriteFile(path, []byte("this is not toml at all ]["), 0o600))
-	reloadWebProfiles(path, origin, nil, structure, log)
+	newProfileReloader(conf, path, origin, nil, structure, log).reload(reloadTriggerSignal)
 
 	require.Equal(t, 1, origin.Profiles(), "a broken file emptied the registry")
 	require.NotEmpty(t, log.recorded(), "a failed reload said nothing")
@@ -364,7 +364,7 @@ func TestReloadRefusesCollidingSecrets(t *testing.T) {
 	require.NoError(t, err)
 
 	writeReloadConfig(t, dir, nil, "", collidingSecrets)
-	reloadWebProfiles(path, origin, nil, structure, log)
+	newProfileReloader(conf, path, origin, nil, structure, log).reload(reloadTriggerSignal)
 
 	require.Equal(t, 1, origin.Profiles(), "a colliding set was accepted")
 	require.Contains(t, strings.Join(log.recorded(), "\n"), "keeping the current one")
