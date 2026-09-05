@@ -288,6 +288,12 @@ func TestAdTagIntermediateModesAreOfferedToMiddleProxy(t *testing.T) {
 			// useless for diagnosing lost advertising.
 			assert.NotContains(t, userStatsJSON(t, h.proxy.stats, "alice"), "ad_tag_skipped")
 
+			// What this is instead is a middle proxy that could not be reached,
+			// and that has its own counter: the only thing that tells an
+			// operator their sponsored channel stopped appearing.
+			assert.Equal(t, "1", string(userStatsJSON(t, h.proxy.stats, "alice")["ad_tag_failed"]),
+				"a middle proxy that failed the offer must be counted against the stream's user")
+
 			client.Close() //nolint: errcheck
 			<-done
 		})
@@ -426,8 +432,11 @@ func TestAdTagAbridgedTakesDirectPath(t *testing.T) {
 	assert.Equal(t, "pong from telegram", string(fromTelegram))
 
 	// The skip is recorded against the stream's own user, not the empty name and
-	// not a neighbour.
+	// not a neighbour -- and as a skip, not a failure: nothing failed, the
+	// transport was never offered.
 	assert.Equal(t, "1", string(userStatsJSON(t, h.proxy.stats, "alice")["ad_tag_skipped"]))
+	assert.NotContains(t, userStatsJSON(t, h.proxy.stats, "alice"), "ad_tag_failed",
+		"a skip by design must not be reported as an outage")
 
 	// omitempty: a deployment that never skips must see a byte-identical user
 	// object, so the field may not appear at zero.

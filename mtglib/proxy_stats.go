@@ -36,7 +36,10 @@ type secretStats struct {
 
 	// adTagSkipped counts ad-tagged streams that fell back to the direct path
 	// because their transport is not re-framable for the middle proxy.
+	// adTagFailed counts the ones that could have been advertised and were
+	// not, because the middle proxy could not be reached or refused them.
 	adTagSkipped atomic.Int64
+	adTagFailed  atomic.Int64
 
 	// lastIP is the client address of the most recently admitted connection,
 	// stored as a string. It is written only when the proxy is configured to
@@ -146,6 +149,15 @@ func (s *ProxyStats) AddBytesOut(name string, n int64) {
 // the middle proxy and went direct instead, losing only its sponsored channel.
 func (s *ProxyStats) OnAdTagSkipped(name string) {
 	s.getOrCreate(name).adTagSkipped.Add(1)
+}
+
+// OnAdTagFailed counts one ad-tagged stream whose transport the middle proxy
+// does handle, and which went direct anyway because the middle proxy could not
+// be reached or turned it away. Kept apart from OnAdTagSkipped: a skip is a
+// design outcome, a failure is an operational one, and only the second means
+// something is wrong.
+func (s *ProxyStats) OnAdTagFailed(name string) {
+	s.getOrCreate(name).adTagFailed.Add(1)
 }
 
 // UpdateLastSeen sets the last-seen timestamp for the given secret to now.
@@ -445,6 +457,14 @@ const (
 	// and start a second process, and the only thing it can ask is the running
 	// binary. A proxy answering /stats is the one component it always has.
 	FeatureWebRelay = "web-relay"
+
+	// FeatureWebRelayWatch means the relay follows its config file by itself:
+	// a changed [secrets] table is applied within seconds of the write
+	// settling, with no signal sent. Advertised by the proxy for the same
+	// reason as FeatureWebRelay -- a panel that writes the file and then
+	// signals the relay can stop signalling once it sees this, and the proxy
+	// is the one component it can ask.
+	FeatureWebRelayWatch = "web-relay-watch"
 )
 
 // supportedFeatures is the sorted capability list this build advertises. Keep it
@@ -457,6 +477,7 @@ var supportedFeatures = []string{
 	FeatureSecretModes,
 	FeatureSecretsAPI,
 	FeatureWebRelay,
+	FeatureWebRelayWatch,
 }
 
 // StatsResponse is the JSON response for the stats endpoint.
@@ -529,6 +550,13 @@ type UserStatsJSON struct {
 	// silent skip is a revenue bug nobody can diagnose.
 	AdTagSkipped int64 `json:"ad_tag_skipped,omitempty"`
 
+	// AdTagFailed counts streams that carried an ad tag, on a transport the
+	// middle proxy handles, and took the direct path because the middle proxy
+	// could not be reached or refused them. Unlike a skip this is not by
+	// design: a proxy on a network that cannot reach core.telegram.org, or
+	// whose ad tag was revoked, shows up here and nowhere else.
+	AdTagFailed int64 `json:"ad_tag_failed,omitempty"`
+
 	// ConnectedIPs lists the distinct client addresses holding a live
 	// connection right now, sorted. LastIP is the address of the most recent
 	// admitted connection, which outlives that connection.
@@ -569,6 +597,7 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 			LastSeen:     lastSeenPtr,
 			QuotaUsed:    st.quotaUsed.Load(),
 			AdTagSkipped: st.adTagSkipped.Load(),
+			AdTagFailed:  st.adTagFailed.Load(),
 			LastIP:       lastIP,
 		}
 	}

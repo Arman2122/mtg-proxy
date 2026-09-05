@@ -372,3 +372,47 @@ func TestStatsAdTagSkipped(t *testing.T) {
 		assert.Equal(t, float64(2), user["ad_tag_skipped"])
 	})
 }
+
+// TestStatsAdTagFailed is the same contract for the counter behind a middle
+// proxy that could not be reached or refused the stream: omitted at zero, a
+// number once it happened, and kept apart from the skip. A skip is by design;
+// a failure is an outage, and folding the two together would hide the only
+// signal an operator has that their sponsored channel has stopped appearing.
+func TestStatsAdTagFailed(t *testing.T) {
+	t.Parallel()
+
+	t.Run("absent until a middle proxy actually failed", func(t *testing.T) {
+		t.Parallel()
+
+		p := newAPITestProxy(map[string]Secret{"alice": GenerateSecret("alice.example.com")})
+		assert.NotContains(t, statsUser(t, p, "alice"), "ad_tag_failed")
+	})
+
+	t.Run("counts every failed stream, apart from the skips", func(t *testing.T) {
+		t.Parallel()
+
+		p := newAPITestProxy(map[string]Secret{"alice": GenerateSecret("alice.example.com")})
+		p.stats.OnAdTagFailed("alice")
+		p.stats.OnAdTagFailed("alice")
+		p.stats.OnAdTagSkipped("alice")
+
+		user := statsUser(t, p, "alice")
+		assert.Equal(t, float64(2), user["ad_tag_failed"])
+		assert.Equal(t, float64(1), user["ad_tag_skipped"])
+	})
+}
+
+// statsUser reads one user's object out of GET /stats.
+func statsUser(t *testing.T, p *Proxy, name string) map[string]any {
+	t.Helper()
+
+	rec := doAPI(t, p, "", http.MethodGet, "/stats", "")
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	users, _ := statsRaw(t, rec.Body.Bytes())["users"].(map[string]any)
+	require.Contains(t, users, name)
+
+	user, _ := users[name].(map[string]any)
+
+	return user
+}

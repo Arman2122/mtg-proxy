@@ -1114,6 +1114,11 @@ func (p *Proxy) doTelegramCall(ctx *streamContext) error {
 				Info("advertising is not supported for this transport; using direct connection")
 		default:
 			if err := p.doMiddleProxyCall(ctx); err != nil {
+				// Counted apart from the skip above. That one is by design;
+				// this one is the middle proxy being unreachable or refusing
+				// us, and an operator monetising through @MTProxybot has to
+				// be able to see it without reading logs.
+				p.stats.OnAdTagFailed(ctx.secretName)
 				ctx.logger.WarningError("cannot route through middle proxy, using direct connection", err)
 			} else {
 				return nil

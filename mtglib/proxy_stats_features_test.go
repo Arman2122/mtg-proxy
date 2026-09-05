@@ -61,6 +61,7 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t, "secret-modes", FeatureSecretModes)
 		assert.Equal(t, "secrets-api", FeatureSecretsAPI)
 		assert.Equal(t, "web-relay", FeatureWebRelay)
+		assert.Equal(t, "web-relay-watch", FeatureWebRelayWatch)
 	})
 
 	t.Run("every advertised route actually exists", func(t *testing.T) {
@@ -83,7 +84,7 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t,
 			[]any{
 				"client-ips", "faketls", "listeners", "quota-reset",
-				"secret-modes", "secrets-api", "web-relay",
+				"secret-modes", "secrets-api", "web-relay", "web-relay-watch",
 			},
 			features)
 		// Asserted independently of the literal above, so appending a capability
