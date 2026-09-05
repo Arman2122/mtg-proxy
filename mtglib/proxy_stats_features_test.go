@@ -46,7 +46,7 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t,
 			[]string{
 				FeatureClientIPs, FeatureFakeTLS, FeatureListeners, FeatureQuotaReset,
-				FeatureSecretModes, FeatureSecretsAPI, FeatureWebRelay,
+				FeatureSecretModes, FeatureSecretsAPI, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
 	})
@@ -104,7 +104,7 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t,
 			[]string{
 				FeatureClientIPs, FeatureFakeTLS, FeatureListeners, FeatureQuotaReset,
-				FeatureSecretModes, FeatureSecretsAPI, FeatureWebRelay,
+				FeatureSecretModes, FeatureSecretsAPI, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			stats.buildResponse().Features)
 	})
@@ -121,7 +121,7 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t,
 			[]string{
 				FeatureClientIPs, FeatureFakeTLS, FeatureListeners, FeatureQuotaReset,
-				FeatureSecretModes, FeatureSecretsAPI, FeatureWebRelay,
+				FeatureSecretModes, FeatureSecretsAPI, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
 	})
