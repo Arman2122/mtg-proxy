@@ -200,7 +200,9 @@ func TestTheWatcherDoesNotReapplyWhatASignalApplied(t *testing.T) {
 
 // A file that is missing -- mid-rename, or gone -- is not a failed reload:
 // nothing was attempted. And whatever was pending is forgotten, so a file that
-// comes back has to hold still again before it is trusted.
+// comes back has to hold still again before it is trusted. It is reported once
+// while it is gone, not on every tick and not never: a rename is over in a
+// moment, a permissions change is not.
 func TestAMissingFileIsNotAFailure(t *testing.T) {
 	t.Parallel()
 
@@ -210,10 +212,11 @@ func TestAMissingFileIsNotAFailure(t *testing.T) {
 	w.ticks(1)
 
 	require.NoError(t, os.Remove(w.path))
-	w.ticks(1)
+	w.ticks(5)
 
 	require.Equal(t, 1, w.origin.Profiles())
 	require.Zero(t, w.stats().ReloadFails, "a file that was not there was counted as a failed reload")
+	require.Len(t, w.log.recorded(), 1, "an unreadable file must be reported exactly once while it lasts")
 
 	writeReloadConfig(t, w.dir, nil, "", twoSecrets)
 	w.ticks(1)
@@ -221,4 +224,40 @@ func TestAMissingFileIsNotAFailure(t *testing.T) {
 
 	w.ticks(1)
 	require.Equal(t, 2, w.origin.Profiles())
+}
+
+// A file a signal refused is not refused again by the watcher. This is the
+// sequence a supervisor's reload hook produces -- write, then HUP -- and the
+// failure counter has to say one for one.
+func TestARefusedSignalIsNotRefusedAgainByTheWatcher(t *testing.T) {
+	t.Parallel()
+
+	w := newWatchedRelay(t)
+
+	writeReloadConfig(t, w.dir, map[string]string{"host": `"other.example.com"`}, "", twoSecrets)
+	w.reloader.reload(reloadTriggerSignal)
+
+	require.Equal(t, int64(1), w.stats().ReloadFails, "precondition: the signal was refused once")
+
+	w.ticks(4)
+
+	require.Equal(t, int64(1), w.stats().ReloadFails, "the watcher refused the same file a second time")
+	require.Equal(t, 1, w.origin.Profiles())
+}
+
+// The same for a file that does not parse at all, refused by a signal: counted
+// once, then left alone by the watcher until it changes.
+func TestABrokenFileRefusedBySignalIsNotRefusedAgain(t *testing.T) {
+	t.Parallel()
+
+	w := newWatchedRelay(t)
+
+	require.NoError(t, os.WriteFile(w.path, []byte("this is not toml at all ]["), 0o600))
+	w.reloader.reload(reloadTriggerSignal)
+
+	require.Equal(t, int64(1), w.stats().ReloadFails)
+
+	w.ticks(4)
+
+	require.Equal(t, int64(1), w.stats().ReloadFails, "the watcher refused the same broken file a second time")
 }

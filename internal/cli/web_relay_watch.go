@@ -56,12 +56,17 @@ type profileReloader struct {
 	// previous tick, so a change is applied only once it has held still across
 	// two of them: the panel writes the file and then tells the proxy, and a
 	// read that lands between those two steps sees half a file. attempted is
-	// the last content a reload was run for, whatever the outcome, so a file
-	// the reload refused is refused once and not again on every tick until
-	// someone fixes it.
+	// the last content a reload was run for, whatever the outcome and
+	// whichever trigger asked, so a file the reload refused is refused once --
+	// not again on the next tick because a signal was what refused it, and not
+	// on every tick until someone fixes it.
 	pending    [sha256.Size]byte
 	hasPending bool
 	attempted  [sha256.Size]byte
+
+	// readFailing is set while the file cannot be read, so that state is
+	// reported once when it begins rather than every two seconds or never.
+	readFailing bool
 }
 
 func newProfileReloader(
@@ -84,13 +89,25 @@ func newProfileReloader(
 //
 // A file that cannot be read is not a failed reload -- nothing was attempted --
 // and it forgets whatever was pending, so a file that is being replaced by
-// rename has to hold still again once it is back.
+// rename has to hold still again once it is back. It is reported once, when it
+// starts: a rename is over in a moment, a permissions change is not, and a
+// watcher that went quiet forever over the second would be worse than none.
 func (r *profileReloader) tick() {
 	data, err := os.ReadFile(r.configPath)
 	if err != nil {
 		r.hasPending = false
 
+		if !r.readFailing {
+			r.readFailing = true
+			r.log.WarningError("web relay: cannot read the config file, watching for it to come back", err)
+		}
+
 		return
+	}
+
+	if r.readFailing {
+		r.readFailing = false
+		r.log.Info("web relay: the config file is readable again")
 	}
 
 	sum := sha256.Sum256(data)
@@ -105,22 +122,45 @@ func (r *profileReloader) tick() {
 		return
 	}
 
-	r.attempted = sum
-	r.hasPending = false
-
-	r.reload(reloadTriggerFile)
+	r.apply(data, reloadTriggerFile)
 }
 
-// reload re-reads the config file and swaps the profile set in.
+// reload re-reads the config file on request and swaps the profile set in.
+// This is the signal path; the watcher goes through apply directly with the
+// bytes it already has.
+func (r *profileReloader) reload(trigger string) {
+	data, err := os.ReadFile(r.configPath)
+	if err != nil {
+		// Counted like every other refusal. An operator whose signal hit a
+		// file that was not there, and saw neither a reload nor a failure,
+		// would be back to guessing whether it was delivered at all.
+		r.counters.OnReload(time.Now(), err)
+		r.log.BindStr("trigger", trigger).
+			WarningError("web relay reload: cannot read the config, keeping the current profiles", err)
+
+		return
+	}
+
+	r.apply(data, trigger)
+}
+
+// apply parses one snapshot of the file and swaps the profile set in.
 //
 // Every failure leaves the running set alone and says so. A relay that emptied
 // its registry because someone saved a broken file would serve the cover site
 // to every real user while reporting nothing wrong, and that failure is far
 // worse than a stale profile list.
-func (r *profileReloader) reload(trigger string) {
+func (r *profileReloader) apply(data []byte, trigger string) {
 	log := r.log.BindStr("trigger", trigger)
 
-	conf, err := utils.ReadConfig(r.configPath)
+	// Remembered before the outcome is known, and whichever trigger asked. A
+	// file a signal refused would otherwise be refused a second time by the
+	// watcher two ticks later -- the exact sequence a supervisor's reload hook
+	// produces -- and the failure counter would say two for one.
+	r.attempted = sha256.Sum256(data)
+	r.hasPending = false
+
+	conf, err := utils.ParseConfig(data)
 	if err != nil {
 		// Counted like every other refusal. An operator whose signal hit an
 		// unparseable file, and saw neither a reload nor a failure, would be
