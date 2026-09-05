@@ -183,7 +183,7 @@ Per user:
 | `expires_at` | when an expiry is set | RFC3339. |
 | `disabled` | when true | Omitted when false. |
 | `ad_tag_skipped` | when non-zero | Ad-tagged streams that took the direct path because their transport has no middle-proxy reframer. By design. |
-| `ad_tag_failed` | when non-zero | Ad-tagged streams that took the direct path because the middle proxy could not be reached or refused them. Not by design: this is the sponsored channel going missing. |
+| `ad_tag_failed` | when non-zero | Ad-tagged streams that took the direct path because the middle proxy could not be reached or refused them. Not by design: this is the sponsored channel going missing — except for a few right after a restart, while the middle-proxy config loads. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` | See below. |
 
 Two behaviours that catch people out:

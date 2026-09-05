@@ -160,7 +160,7 @@ shape it always had:
 | `expires_at` | The user has an `expires` deadline. |
 | `disabled` | The user is disabled. Omitted, not `false`, when enabled. |
 | `ad_tag_skipped` | It is non-zero: an ad-tagged stream of this user's took the direct path because its transport has no middle-proxy reframer, losing its sponsored channel. A silent skip is a revenue bug nobody can diagnose, so it is reported. |
-| `ad_tag_failed` | It is non-zero: an ad-tagged stream on a transport the middle proxy *does* handle took the direct path anyway, because the middle proxy could not be reached or refused it. Unlike a skip this is not by design — a server that cannot reach `core.telegram.org`, or a revoked tag, shows up here and nowhere else. |
+| `ad_tag_failed` | It is non-zero: an ad-tagged stream on a transport the middle proxy *does* handle took the direct path anyway, because the middle proxy could not be reached or refused it. Unlike a skip this is not by design — a server that cannot reach `core.telegram.org`, or a revoked tag, shows up here and nowhere else. A few right after a restart are normal: clients reconnecting in the first couple of seconds, before the middle-proxy config has loaded, go direct rather than wait. |
 | `connected_ips` / `last_ip` | `track-client-ips` is on. See below. |
 
 The throttle block reports `active` (whether caps are being applied at all),

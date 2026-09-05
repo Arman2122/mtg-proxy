@@ -321,7 +321,8 @@ live gauge of refused connections currently being drained). A user also gains
 `ad_tag_skipped` once one of its ad-tagged streams took the direct path because
 its transport has no middle-proxy reframer, and `ad_tag_failed` once one did so
 because the middle proxy could not be reached or refused it — the first is by
-design, the second is an outage — see
+design, the second is an outage, apart from a few in the seconds after a restart
+while the middle-proxy config loads — see
 [Sponsored channel](#sponsored-channel-ad-tag).
 
 `features` is a sorted list of capability names this build supports, meant to be
