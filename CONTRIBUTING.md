@@ -76,6 +76,16 @@ Without that setup it skips locally, and **fails** in CI. That asymmetry is deli
 for two releases nothing installed a browser, the test skipped silently on every run,
 and the defect it exists to catch shipped twice.
 
+To get CI's behaviour on your own machine — a skip counted as a failure — set the
+variable CI sets:
+
+```bash
+MTG_REQUIRE_BROWSER_HARNESS=1 go test ./internal/webrelay/page/
+```
+
+That is worth doing before a release when CI is unavailable, because a silent skip is
+indistinguishable from a pass in exactly the situation where nothing else is checking.
+
 ## What makes a change easy to accept
 
 **A test that fails without your change.** This is the single most useful thing in a
