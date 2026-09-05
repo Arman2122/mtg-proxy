@@ -221,16 +221,24 @@ func TestConfigStringRedactsEveryCredential(t *testing.T) {
 		aliceSecret = "7oe1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"
 		bobSecret   = "7ni1GqLy6TBc38CV3jx7q09nb29nbGUuY29t"
 		apiToken    = "s3cr3t-management-token"
+		// Ad tags are what @MTProxybot issued to this operator; whoever holds
+		// one can present another proxy's traffic as theirs.
+		globalAdTag = "0123456789abcdef0123456789abcdef"
+		bobAdTag    = "fedcba9876543210fedcba9876543210"
 	)
 
 	conf, err := config.Parse([]byte(`
 secret = "` + aliceSecret + `"
 bind-to = "0.0.0.0:3128"
 api-token = "` + apiToken + `"
+ad-tag = "` + globalAdTag + `"
 
 [secrets]
 alice = "` + aliceSecret + `"
 bob = "` + bobSecret + `"
+
+[secret-ad-tags]
+bob = "` + bobAdTag + `"
 `))
 	require.NoError(t, err)
 
@@ -242,6 +250,8 @@ bob = "` + bobSecret + `"
 		aliceSecret,
 		bobSecret,
 		apiToken,
+		globalAdTag,
+		bobAdTag,
 		conf.Secret.String(),
 		conf.Secrets["bob"].String(),
 	} {

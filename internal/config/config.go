@@ -509,20 +509,26 @@ func (c *Config) String() string {
 // Config that carries a credential has to be added here too, which is what
 // TestConfigStringRedactsEveryCredential is for.
 func redactConfigCredentials(fields map[string]any) {
-	for _, key := range []string{"secret", "apiToken"} {
+	// The ad tag is a credential too: it is what @MTProxybot issued to this
+	// operator, and whoever holds it can present another proxy's traffic as
+	// this one's.
+	for _, key := range []string{"secret", "apiToken", "adTag"} {
 		if _, found := fields[key]; found {
 			fields[key] = redactedValue
 		}
 	}
 
-	// The named secrets keep their names: which clients exist is the reason to
-	// log the configuration at all, and the key is not the credential.
-	named, ok := fields["secrets"].(map[string]any)
-	if !ok {
-		return
-	}
+	// The named secrets and per-user ad tags keep their names: which clients
+	// exist is the reason to log the configuration at all, and the key is not
+	// the credential.
+	for _, table := range []string{"secrets", "secretAdTags"} {
+		named, ok := fields[table].(map[string]any)
+		if !ok {
+			continue
+		}
 
-	for name := range named {
-		named[name] = redactedValue
+		for name := range named {
+			named[name] = redactedValue
+		}
 	}
 }
