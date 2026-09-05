@@ -263,3 +263,59 @@ func TestClientIPSourceParsing(t *testing.T) {
 	// than one it can.
 	require.Equal(t, config.ClientIPProxyProtocol, source.Get(config.ClientIPProxyProtocol))
 }
+
+// A stats address that other people can reach is refused outright.
+//
+// Refused rather than warned about, because that socket answers -- with no
+// credential at all -- how many sessions the relay carries and how many bytes
+// it has moved, which is exactly the traffic analysis the transport exists to
+// deny. An operator who published that would have no reason to go looking in a
+// log to find out.
+//
+// It is checked through ValidateWeb rather than through a helper, because the
+// helper being correct proves nothing if the relay's own startup does not run
+// it.
+func TestWebStatsBindMustBeLoopback(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		addr   string
+		accept bool
+	}{
+		{name: "off by default", addr: "", accept: true},
+		{name: "ipv4 loopback", addr: "127.0.0.1:8100", accept: true},
+		{name: "another ipv4 loopback", addr: "127.0.0.2:8100", accept: true},
+		{name: "ipv6 loopback", addr: "[::1]:8100", accept: true},
+		{name: "all interfaces", addr: "0.0.0.0:8100", accept: false},
+		{name: "all interfaces v6", addr: "[::]:8100", accept: false},
+		{name: "a routable address", addr: "203.0.113.9:8100", accept: false},
+		{name: "a name that could resolve anywhere", addr: "localhost:8100", accept: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			web := usableWeb
+			if tc.addr != "" {
+				web += fmt.Sprintf("stats-bind-to = %q\n", tc.addr)
+			}
+
+			// Either stage may refuse. A name is turned away by the address
+			// type at parse time, before the loopback check ever sees it;
+			// what matters is that nothing unacceptable reaches a running
+			// relay, not which line said no.
+			conf, err := config.Parse([]byte(webConfigTOML(web)))
+			if err == nil {
+				err = conf.ValidateWeb()
+			}
+
+			if tc.accept {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.Error(t, err, "%q must not be accepted", tc.addr)
+		})
+	}
+}

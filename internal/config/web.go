@@ -5,7 +5,6 @@ import (
 	"net"
 	"strings"
 
-	"github.com/Arman2122/mtg-proxy/internal/webrelay"
 	"github.com/Arman2122/mtg-proxy/mtglib"
 )
 
@@ -198,7 +197,7 @@ func (c *Config) ValidateWeb() error {
 	// moved -- the traffic analysis this whole transport exists to deny. An
 	// operator who typed a public address has published that, and a line in a
 	// log is not where they would find out.
-	if err := webrelay.ValidateStatsBind(web.StatsBindTo.Get("")); err != nil {
+	if err := webStatsBind(web.StatsBindTo.Get("")); err != nil {
 		return err
 	}
 
@@ -219,6 +218,34 @@ func (c *Config) ValidateWeb() error {
 	if !policy.Modes.Has(mtglib.SecretModeDD) {
 		return fmt.Errorf("[web] backend %s does not accept dd secrets, which is the only form a WEB client can hold",
 			web.Backend.Get(""))
+	}
+
+	return nil
+}
+
+// webStatsBind refuses a stats address that is not loopback. An empty address
+// means the stats server is off, which is the default.
+//
+// It lives here, with the other checks on what an operator typed, and not in
+// the relay package: config is what the relay reads, so the relay may import
+// config and config may never import the relay. The reason for the refusal is
+// on the call in ValidateWeb.
+func webStatsBind(addr string) error {
+	if addr == "" {
+		return nil
+	}
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("cannot parse [web] stats-bind-to %q: %w", addr, err)
+	}
+
+	// TypeHostPort has already refused a name here, and a name is the one
+	// thing this could not check anyway: "localhost" resolves wherever the
+	// resolver says, and could resolve somewhere else tomorrow. Were one to
+	// get through, ParseIP would give nil and nil is not loopback.
+	if !net.ParseIP(host).IsLoopback() {
+		return fmt.Errorf("[web] stats-bind-to must be a loopback address: %q is reachable from outside this host", addr)
 	}
 
 	return nil
