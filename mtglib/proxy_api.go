@@ -233,25 +233,42 @@ func (p *Proxy) SetGlobalAdTag(tag *[AdTagLength]byte) error {
 	return p.swapSecretConfigLocked(cfg)
 }
 
-// startAPIServer starts the management HTTP API in background goroutines and
-// shuts it down when ctx is cancelled. It supersedes ProxyStats.StartServer:
+// apiListener is the socket the management API serves on: the one the caller
+// supplied, or one bound now under the proxy's own context. A nil listener
+// with a nil error means no API was asked for.
+//
+// Bound under ctx rather than context.Background because the socket belongs to
+// this proxy and to nothing else. A context already cancelled by the time the
+// proxy is built is a proxy that is already stopping, and not starting its API
+// is the right outcome -- reported, since the caller asked for one.
+func apiListener(ctx context.Context, opts ProxyOpts) (net.Listener, error) {
+	if opts.APIListener != nil {
+		return opts.APIListener, nil
+	}
+
+	if opts.APIBindTo == "" {
+		return nil, nil //nolint: nilnil // no API is not an error
+	}
+
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", opts.APIBindTo)
+	if err != nil {
+		return nil, fmt.Errorf("cannot bind %s: %w", opts.APIBindTo, err)
+	}
+
+	return ln, nil
+}
+
+// startAPIServer serves the management HTTP API on ln in background goroutines
+// and shuts it down when ctx is cancelled. It supersedes ProxyStats.StartServer:
 // the mux is built with access to the whole proxy so it can serve the secrets
 // and adtag routes in addition to /stats and /reload.
-func (p *Proxy) startAPIServer(ctx context.Context, bindTo, token string) {
-	srv := newAPIServer(bindTo, p.buildAPIHandler(token))
-
-	// Background, not ctx, and contextcheck is told so deliberately.
-	// net.Listen never took a context; ListenConfig is spelled out here only
-	// to satisfy noctx. Binding the socket to the proxy's lifetime context
-	// would be a real change -- a ctx already cancelled during startup would
-	// turn a successful bind into a silently skipped API server -- and that
-	// belongs in its own commit.
-	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", bindTo) //nolint:contextcheck
-	if err != nil {
-		p.logger.WarningError("cannot start management API listener", err)
-
-		return
-	}
+//
+// The server is part of the proxy's lifetime in both directions: it starts
+// with it, and Shutdown waits for it to finish shutting down, so the socket is
+// released by the time Shutdown returns. Without that wait a restart on the
+// same address could race a server still winding down and lose.
+func (p *Proxy) startAPIServer(ctx context.Context, ln net.Listener, token string) {
+	srv := newAPIServer(ln.Addr().String(), p.buildAPIHandler(token))
 
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -259,10 +276,14 @@ func (p *Proxy) startAPIServer(ctx context.Context, bindTo, token string) {
 		}
 	}()
 
+	p.apiWaitGroup.Add(1)
+
 	// G118: this goroutine's whole job starts when ctx is already cancelled, so
 	// the request-scoped context it is told to use is exactly the one that must
-	// not be used here. See the comment on Shutdown below.
+	// not be used here.
 	go func() { //nolint:gosec // the deadline is deliberately independent of ctx
+		defer p.apiWaitGroup.Done()
+
 		<-ctx.Done()
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second) //nolint: mnd
@@ -280,7 +301,7 @@ func (p *Proxy) startAPIServer(ctx context.Context, bindTo, token string) {
 		authState = "bearer-token"
 	}
 
-	p.logger.BindStr("bind", bindTo).BindStr("auth", authState).Info("Management API server started")
+	p.logger.BindStr("bind", ln.Addr().String()).BindStr("auth", authState).Info("Management API server started")
 }
 
 // Deadlines for the management API. Without them a client that opens a

@@ -316,6 +316,16 @@ type ProxyOpts struct {
 	// This is an optional setting.
 	APIBindTo string
 
+	// APIListener is a socket already bound for the management API. When it
+	// is set, APIBindTo is ignored and the proxy serves the API on this socket
+	// instead, taking ownership of it: it is closed when the proxy shuts down.
+	//
+	// It exists for an embedder or a test that needs the port to be its own
+	// before the proxy starts, rather than one the proxy picks and reports.
+	//
+	// This is an optional setting.
+	APIListener net.Listener
+
 	// ThrottleMaxConnections is the total connection limit. When total
 	// connections exceed this value, per-user caps are computed using
 	// a fair-share algorithm and new connections from over-cap users

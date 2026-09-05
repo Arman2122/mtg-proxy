@@ -60,10 +60,11 @@ func (blockNoneList) Contains(net.IP) bool { return false }
 func (blockNoneList) Run(time.Duration)    {}
 func (blockNoneList) Shutdown()            {}
 
-// newServingProxy builds a proxy through the public constructor -- the accept
-// loop needs the worker pool and the lists, which the entry harness leaves nil
-// -- with every dependency that could reach a network replaced.
-func newServingProxy(t *testing.T) (*Proxy, *recordingEventStream) {
+// servingOpts is everything the public constructor needs, with every
+// dependency that could reach a network replaced. The accept loop and the API
+// need the worker pool and the lists, which the entry harness leaves nil, so
+// these tests go through NewProxy rather than around it.
+func servingOpts(t *testing.T) (ProxyOpts, *recordingEventStream) {
 	t.Helper()
 
 	upstream, err := net.Listen("tcp", "127.0.0.1:0")
@@ -72,7 +73,7 @@ func newServingProxy(t *testing.T) (*Proxy, *recordingEventStream) {
 
 	events := &recordingEventStream{}
 
-	proxy, err := NewProxy(ProxyOpts{
+	return ProxyOpts{
 		Network:          &fakeNetwork{upstream: upstream},
 		AntiReplayCache:  newMemAntiReplay(),
 		IPBlocklist:      blockNoneList{},
@@ -81,7 +82,16 @@ func newServingProxy(t *testing.T) (*Proxy, *recordingEventStream) {
 		Logger:           testLogger(),
 		Secrets:          map[string]Secret{"alice": GenerateSecret("alice.example.com")},
 		HandshakeTimeout: time.Second,
-	})
+	}, events
+}
+
+// newServingProxy builds a proxy from servingOpts and stops it with the test.
+func newServingProxy(t *testing.T) (*Proxy, *recordingEventStream) {
+	t.Helper()
+
+	opts, events := servingOpts(t)
+
+	proxy, err := NewProxy(opts)
 	require.NoError(t, err)
 	t.Cleanup(proxy.Shutdown)
 

@@ -32,6 +32,10 @@ type Proxy struct {
 	ctxCancel       context.CancelFunc
 	streamWaitGroup sync.WaitGroup
 
+	// apiWaitGroup is the management API server's shutdown, which Shutdown
+	// waits for so the socket is released by the time it returns.
+	apiWaitGroup sync.WaitGroup
+
 	allowFallbackOnUnknownDC    bool
 	trackClientIPs              bool
 	tolerateTimeSkewness        time.Duration
@@ -100,6 +104,9 @@ func (p *Proxy) domainFrontingAddressForHost(host string) string {
 func (p *Proxy) Shutdown() {
 	p.ctxCancel()
 	p.streamWaitGroup.Wait()
+	// The management API shuts itself down on the cancellation above; waiting
+	// for it here is what makes its port free again before this returns.
+	p.apiWaitGroup.Wait()
 	p.workerPool.Release()
 	p.configUpdater.Wait()
 	p.doppelGanger.Shutdown()
@@ -245,8 +252,14 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	// can drive ReloadSecrets and the secrets/adtag mutators. /stats, /reload,
 	// /secrets and /adtag share the api-bind-to listener; reload is a
 	// no-op-with-error when no reloader was supplied.
-	if opts.APIBindTo != "" {
-		proxy.startAPIServer(ctx, opts.APIBindTo, opts.APIToken)
+	//
+	// A socket that cannot be bound is a warning, not a failure: the proxy's
+	// job is the MTProto port, and an operator who lost the API to a taken
+	// port must not lose every client with it.
+	if ln, err := apiListener(ctx, opts); err != nil {
+		logger.WarningError("cannot start management API listener", err)
+	} else if ln != nil {
+		proxy.startAPIServer(ctx, ln, opts.APIToken)
 	}
 
 	if opts.UsageStateFile != "" {
