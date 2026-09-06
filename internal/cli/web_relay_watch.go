@@ -180,6 +180,8 @@ func (r *profileReloader) apply(data []byte, trigger string) {
 		return
 	}
 
+	warnUnknownKeys(log, conf)
+
 	next, err := webStructure(conf)
 	if err != nil {
 		r.counters.OnReload(time.Now(), err)

@@ -2,9 +2,7 @@
 
 mtg-proxy has two independent governors and they answer different questions.
 
-`[secret-limits]` is per user: how many bytes one named secret may move, until when it works, and whether it works at all. `[throttle]` is server-wide: how connections are shared out when everybody arrives at once.
-
-Neither is a bandwidth limiter. There is no per-user speed cap anywhere in mtg-proxy — a user is either relaying at full speed or not connected.
+`[secret-limits]` is per user: how many bytes one named secret may move, how fast, from how many places, until when it works, and whether it works at all. `[throttle]` is server-wide: how connections are shared out when everybody arrives at once.
 
 - [The two governors](#the-two-governors)
 - [Per-user limits: `[secret-limits]`](#per-user-limits-secret-limits)
@@ -12,6 +10,8 @@ Neither is a bandwidth limiter. There is no per-user speed cap anywhere in mtg-p
 - [How quota is counted](#how-quota-is-counted)
 - [Persisting usage: `usage-state-file`](#persisting-usage-usage-state-file)
 - [Resetting a quota](#resetting-a-quota)
+- [Speed limits](#speed-limits)
+- [Address limits](#address-limits)
 - [Connection throttling: `[throttle]`](#connection-throttling-throttle)
 - [Worked example: a small paid deployment](#worked-example-a-small-paid-deployment)
 - [Limits that live elsewhere](#limits-that-live-elsewhere)
@@ -22,10 +22,10 @@ Neither is a bandwidth limiter. There is no per-user speed cap anywhere in mtg-p
 |---|---|---|
 | Scope | one named secret | every user on the proxy |
 | Measures | relayed bytes, throughput, distinct addresses, a wall-clock deadline, an on/off flag | live connection count |
-| Checked | on every new connection | on every new connection |
-| Recomputed | never (it is a direct comparison) | every `check-interval`, default 5s |
+| Checked | on every new connection; the quota on every byte as well | on every new connection |
+| Recomputed | every 5s the clock is consulted: an expiry that passed or a period that rolled over takes effect then | every `check-interval`, default 5s |
 | Survives a restart | only with `usage-state-file` | nothing to survive |
-| Live sessions | closed for `disabled` and `expires`, never for quota, speed or `ip-limit` | never closed |
+| Live sessions | closed for `disabled`, `expires` and an exhausted quota; never for speed or `ip-limit` | never closed |
 | Visible in | `GET /stats`, `GET /secrets`, the log | `GET /stats`, the log |
 
 ## Per-user limits: `[secret-limits]`
@@ -64,7 +64,7 @@ Four things about these values are easy to get wrong.
 
 **Table ordering matters.** In TOML every key after a `[table]` header belongs to that table, so `[secret-limits.*]` and `[secrets]` must come after all your global keys. Put `[secrets]` last of all. This is the single most common way to break a working config file — see [[Configuration]].
 
-**A typo in a key is silent.** The TOML parser does not reject unknown fields (that is deliberate: it lets a config written for a newer mtg-proxy load on an older binary instead of taking the inbound offline). So `quota_reset = "monthly"` with an underscore parses fine and does nothing. A typo in the *secret name* is caught — `[secret-limits.ghost]` with no `ghost` in `[secrets]` fails validation at startup with `secret-limits refers to unknown secret "ghost"`.
+**A typo in a key is not an error, but it is named.** The TOML parser does not reject unknown fields (that is deliberate: it lets a config written for a newer mtg-proxy load on an older binary instead of taking the inbound offline). So `quota_reset = "monthly"` with an underscore parses fine and does nothing — and since v1.8.0 the proxy says so, with a warning naming `secret-limits.alice.quota_reset` at startup and on every reload, and `mtg-proxy doctor` lists it. A typo in the *secret name* is still refused outright: `[secret-limits.ghost]` with no `ghost` in `[secrets]` fails validation at startup with `secret-limits refers to unknown secret "ghost"`.
 
 Changes to this file take effect on `POST /reload` or a restart. There is no SIGHUP reload for `mtg-proxy run` (SIGHUP is wired for `mtg-proxy web-relay` only, and the relay does not read this table at all — it watches the file for `[secrets]` alone).
 
@@ -80,21 +80,24 @@ The operator's view is the log. The proxy writes `connection denied by per-user 
 
 A user at their [address limit](#address-limits) is the one refusal that is not routed to the cover site. It happens at admission, after the secret has matched, so only someone holding the valid secret can ever see it and there is nothing for a prober to learn; the connection is simply closed, on the FakeTLS door after the TLS answer and on an obfuscated listener through that socket's usual exit.
 
-Disabling or expiring a secret also **closes that user's live connections** as soon as the change lands via reload or the API. Going over quota does not. That asymmetry is intentional: revocation should be immediate, but a quota is a billing boundary and cutting a running download in half at an arbitrary byte offset is a support ticket, not a policy.
+Disabling or expiring a secret also **closes that user's live connections**: at once when the change lands via reload or the API, and within five seconds when the clock crosses an expiry on its own. Reaching the quota ends the stream that reaches it, at that byte, and closes any other stream of that user on its next byte or at the next sweep. Since v1.8.0 none of this waits for the user to reconnect.
 
 ## How quota is counted
 
 `quota_used` counts bytes read from and written to the **client** during the relay phase — the two directions summed. The handshake is not counted, and traffic sent to the fronting domain on a refused connection is not counted (it is not attributed to any user).
 
-The check happens once, at admission:
+The check happens twice: at admission, and on every byte.
 
 ```
-if quota is set and quota_used >= quota:  refuse this connection
+at admission:   if quota is set and quota_used >= quota:  refuse this connection
+on every byte:  read or write only what is left; at the byte that reaches the quota, end the stream
 ```
 
-**A live stream can overshoot without limit.** Alice has a 10 GB quota and has used 9.9 GB. She opens a connection — admitted, because 9.9 < 10 — and pulls 40 GiB through that one session. Her `quota_used` ends at about 50 GiB. Her *next* connection is refused. The quota is a gate on new connections, not a hard byte ceiling, and on a paid deployment you should size it with that in mind or pair it with a shorter `expires`.
+**A quota is a ceiling, not a gate.** Alice has a 10 GB quota and has used 9.9 GB. She opens a connection — admitted, because 9.9 < 10 — and starts a 40 GiB download. She receives 100 MB and the stream ends there, at the byte that reached the cap; any other connection she has ends on its next byte, and an idle one within five seconds. Her `quota_used` reads exactly 10 GB. Her next connection is refused at the door. `quota_cutoffs` on `/stats` counts the streams the ceiling ended, which is how you tell a quota that is doing its job from one nobody reaches. (Before v1.8.0 the quota was checked only at admission and a live stream could overshoot it without limit.)
 
-Monthly reset is by **calendar month**, not by a 30-day window from signup. The counter zeroes when the wall clock crosses into a new month, so a user added on the 20th gets a full allowance eleven days later. The rollover happens lazily: whenever the user next tries to connect, and once every 30 seconds in the background — but that background loop only runs when `usage-state-file` is set. Without it, an idle monthly user's `quota_used` on `/stats` can read stale until they connect again.
+Two or more streams of one user moving bytes in the same instant can each deliver up to one read's worth past the cap, so the count can run a few kilobytes over. It cannot run a download over.
+
+Monthly reset is by **calendar month**, not by a 30-day window from signup. The counter zeroes when the wall clock crosses into a new month, so a user added on the 20th gets a full allowance eleven days later. The rollover happens whenever the user next tries to connect, and every five seconds in the background, whether or not `usage-state-file` is set.
 
 Both `/stats` and `/secrets` report usage, with one difference: `/stats` always includes `quota_used` for every user, while `/secrets` includes it only for users who have a quota configured.
 
@@ -116,7 +119,7 @@ Both `/stats` and `/secrets` report usage, with one difference: `/stats` always 
 }
 ```
 
-`quota`, `quota_remaining`, `quota_reset`, `expires_at` and `disabled` appear only when that user has the corresponding limit set. `quota_remaining` is clamped at zero, so it never goes negative after an overshoot.
+`quota`, `quota_remaining`, `quota_reset`, `expires_at` and `disabled` appear only when that user has the corresponding limit set, and `quota_cutoffs` only once a stream has been ended by the cap. `quota_remaining` is clamped at zero.
 
 ## Persisting usage: `usage-state-file`
 

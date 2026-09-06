@@ -92,7 +92,8 @@ func TestCloseDeniedConns(t *testing.T) {
 
 	assert.ErrorIs(t, streams["disabled"].Err(), context.Canceled, "disabled secret's stream must be closed")
 	assert.ErrorIs(t, streams["expired"].Err(), context.Canceled, "expired secret's stream must be closed")
-	assert.NoError(t, streams["quota"].Err(), "over-quota stream must NOT be killed mid-flight")
+	assert.ErrorIs(t, streams["quota"].Err(), context.Canceled,
+		"an exhausted user's stream must be closed: a quota is a ceiling, and an idle stream would otherwise outlive it")
 	assert.NoError(t, streams["ok"].Err(), "healthy stream must stay connected")
 }
 

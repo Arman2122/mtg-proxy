@@ -82,6 +82,7 @@ func runWebRelay(conf *config.Config, configPath, version string, checkOnly bool
 	}
 
 	log := makeLogger(conf).Named("web-relay")
+	warnUnknownKeys(log, conf)
 
 	counters := webrelay.NewCounters(time.Now())
 

@@ -179,6 +179,7 @@ Per user:
 | `last_seen` | always | `null` for a user who has never connected. |
 | `quota_used` | always | Bytes counted against the current quota period. |
 | `quota`, `quota_remaining` | when a quota is set | Bytes. `quota_remaining` floors at 0. |
+| `quota_cutoffs` | when non-zero | Streams ended by reaching the quota since the process started. |
 | `quota_reset` | when not `none` | Currently only `"monthly"`. |
 | `expires_at` | when an expiry is set | RFC3339. |
 | `disabled` | when true | Omitted when false. |
@@ -467,9 +468,9 @@ behaves when a device changes networks, is on [[Limits-and-Quotas]].
   routing of new connections only;
 - **disabling** a secret, or giving it an expiry already in the past, closes its
   live connections immediately;
-- a **quota overrun** never kills an active session. Quotas are enforced when a
-  connection is admitted, not mid-stream, and the post-swap sweep that closes
-  disabled and expired users deliberately skips over-quota ones;
+- a **quota** lowered to or below what the user has already used closes their
+  live connections too, and a quota reached mid-stream ends the stream at the
+  byte that reaches it (v1.8.0; before, a quota was checked only at admission);
 - every other user stays connected, and all counters carry over.
 
 `reset-quota` is the exception: it touches one counter and no connection at all.

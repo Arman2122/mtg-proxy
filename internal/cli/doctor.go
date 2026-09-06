@@ -164,9 +164,29 @@ func (d *Doctor) Run(cli *CLI, version string) error {
 // hands it the real ones; a test hands it fakes, which is what makes the checks
 // testable at all. The verdict is the conjunction of every check, so a check
 // that is dropped from it here is a check the operator silently stops getting.
+// checkUnknownKeys names every key in the file this binary does not know. The
+// proxy logs the same list at startup, but the doctor is what an operator runs
+// when a setting "does nothing", and this is the usual reason it does nothing.
+func (d *Doctor) checkUnknownKeys() bool {
+	if len(d.conf.UnknownKeys) == 0 {
+		d.say("  ✅ Every key in the file is known to this binary")
+
+		return true
+	}
+
+	for _, warning := range d.conf.UnknownKeyWarnings() {
+		d.say("  ⚠️  %s", warning)
+	}
+
+	return false
+}
+
 func (d *Doctor) diagnose(base mtglib.Network, resolver ipLookup) (bool, error) {
 	d.say("Deprecated options")
 	everythingOK := d.checkDeprecatedConfig()
+
+	d.say("Unknown config keys")
+	everythingOK = d.checkUnknownKeys() && everythingOK
 
 	d.say("Time skewness")
 	everythingOK = d.checkTimeSkewness() && everythingOK

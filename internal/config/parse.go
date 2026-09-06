@@ -3,7 +3,11 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"slices"
+	"sort"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -178,5 +182,35 @@ func Parse(rawData []byte) (*Config, error) {
 		return nil, fmt.Errorf("bind-to is required")
 	}
 
+	conf.UnknownKeys = unknownKeys(rawData)
+
 	return conf, nil
+}
+
+// unknownKeys is the list of keys a strict decode of the same document would
+// have refused. The lenient decode above is the one that counts; this second
+// pass exists only to name what it dropped. Any failure of this pass other
+// than unknown keys is ignored, because the document already parsed.
+func unknownKeys(rawData []byte) []string {
+	decoder := toml.NewDecoder(bytes.NewReader(rawData))
+	decoder.DisallowUnknownFields()
+
+	var (
+		probe  tomlConfig
+		strict *toml.StrictMissingError
+	)
+
+	if err := decoder.Decode(&probe); !errors.As(err, &strict) {
+		return nil
+	}
+
+	keys := make([]string, 0, len(strict.Errors))
+
+	for _, decodeErr := range strict.Errors {
+		keys = append(keys, strings.Join(decodeErr.Key(), "."))
+	}
+
+	sort.Strings(keys)
+
+	return slices.Compact(keys)
 }

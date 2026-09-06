@@ -14,8 +14,7 @@ import (
 	"time"
 )
 
-// usageFlushInterval is how often persisted quota usage is written to disk and
-// monthly quota periods are rolled over for display freshness.
+// usageFlushInterval is how often persisted quota usage is written to disk.
 const usageFlushInterval = 30 * time.Second
 
 type secretStats struct {
@@ -33,6 +32,17 @@ type secretStats struct {
 	// periodStart is the unix-nano start of the current quota period, used to
 	// detect monthly rollovers. 0 means "not started yet".
 	periodStart atomic.Int64
+
+	// quotaCeiling is the user's quota as the data path sees it, 0 for
+	// unlimited. It lives beside the counter, like the speed bucket, because
+	// countingConn compares the two on every read and write and must not take
+	// a lock or consult the secret set to do so. Set on every swap.
+	quotaCeiling atomic.Int64
+
+	// quotaCutoffs counts streams the ceiling ended: one per stream, however
+	// many of its reads and writes found the quota gone. It is the difference
+	// between a quota nobody reaches and one that is doing its job.
+	quotaCutoffs atomic.Int64
 
 	// adTagSkipped counts ad-tagged streams that fell back to the direct path
 	// because their transport is not re-framable for the middle proxy.
@@ -172,6 +182,14 @@ func (s *ProxyStats) SetSpeedLimit(name string, bytesPerSecond int64) {
 // OnIPLimitRefused counts one connection refused by the user's address limit.
 func (s *ProxyStats) OnIPLimitRefused(name string) {
 	s.getOrCreate(name).ipLimitRefused.Add(1)
+}
+
+// SetQuotaCeiling installs the quota the data path holds a user to, or
+// unlimited for zero. The live counter is untouched: a ceiling lowered below
+// it ends the user's streams on their next byte and the sweep closes the
+// idle ones.
+func (s *ProxyStats) SetQuotaCeiling(name string, bytes int64) {
+	s.getOrCreate(name).quotaCeiling.Store(bytes)
 }
 
 // OnAdTagFailed counts one ad-tagged stream whose transport the middle proxy
@@ -581,6 +599,10 @@ type UserStatsJSON struct {
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 	Disabled       bool       `json:"disabled,omitempty"`
 
+	// QuotaCutoffs counts streams ended by reaching the quota, since the
+	// process started. A quota nobody reaches shows none.
+	QuotaCutoffs int64 `json:"quota_cutoffs,omitempty"`
+
 	// AdTagSkipped counts streams that carried an ad tag but took the direct
 	// path anyway because their transport has no middle-proxy reframer. An
 	// operator who monetises through @MTProxybot has to be able to see this: a
@@ -655,6 +677,7 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 			BytesOut:        st.bytesOut.Load(),
 			LastSeen:        lastSeenPtr,
 			QuotaUsed:       st.quotaUsed.Load(),
+			QuotaCutoffs:    st.quotaCutoffs.Load(),
 			AdTagSkipped:    st.adTagSkipped.Load(),
 			AdTagFailed:     st.adTagFailed.Load(),
 			ThrottledMillis: st.speed.throttledNanos.Load() / int64(time.Millisecond),

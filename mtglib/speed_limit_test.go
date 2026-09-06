@@ -36,7 +36,7 @@ func throttledPair(t *testing.T, ctx context.Context, stats *ProxyStats, user st
 
 	drained.Go(func() { io.Copy(io.Discard, server) }) //nolint: errcheck
 
-	return newCountingConn(ctx, essentials.WrapNetConn(client), stats, user), &drained
+	return newCountingConn(ctx, nil, essentials.WrapNetConn(client), stats, user), &drained
 }
 
 // writeTimed pushes n bytes through conn the way the relay does, in 32 KiB
@@ -389,7 +389,7 @@ func TestUnlimitedUserWritesOnce(t *testing.T) {
 	stats := NewProxyStats()
 	counter := &writeCounter{}
 
-	conn := newCountingConn(t.Context(), counter, stats, "alice")
+	conn := newCountingConn(t.Context(), nil, counter, stats, "alice")
 
 	n, err := conn.Write(make([]byte, 1<<20))
 	require.NoError(t, err)
@@ -426,7 +426,7 @@ func TestSpeedLimitHoldsUploadToo(t *testing.T) {
 	client, proxySide := net.Pipe()
 	t.Cleanup(func() { client.Close(); proxySide.Close() }) //nolint: errcheck
 
-	reader := newCountingConn(t.Context(), essentials.WrapNetConn(proxySide), stats, "alice")
+	reader := newCountingConn(t.Context(), nil, essentials.WrapNetConn(proxySide), stats, "alice")
 
 	// The client writes as fast as the pipe takes it; the proxy side reads
 	// through the throttled wrapper, the way the relay reads a client.

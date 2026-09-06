@@ -253,7 +253,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	}
 
 	proxy.secrets.Store(initialSet)
-	proxy.applySpeedLimits(initialSet)
+	proxy.applyLimits(initialSet)
 
 	// Start the management API only now that the proxy exists, so the routes
 	// can drive ReloadSecrets and the secrets/adtag mutators. /stats, /reload,
@@ -269,9 +269,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		proxy.startAPIServer(ctx, ln, opts.APIToken)
 	}
 
-	if opts.UsageStateFile != "" {
-		proxy.startUsagePersistence(ctx)
-	}
+	proxy.startMaintenance(ctx, denySweepInterval, usageFlushInterval)
 
 	proxy.doppelGanger.Run()
 

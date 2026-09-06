@@ -156,6 +156,7 @@ shape it always had:
 |---|---|
 | `quota` | The user has a `[secret-limits.<name>] quota`. |
 | `quota_remaining` | Same, clamped at zero rather than going negative. |
+| `quota_cutoffs` | It is non-zero: streams this user had ended by reaching the quota. A quota nobody reaches shows none; a user whose cutoffs keep climbing is at their ceiling and retrying. |
 | `quota_reset` | The user has a reset policy. `"monthly"` is the only value emitted. |
 | `expires_at` | The user has an `expires` deadline. |
 | `disabled` | The user is disabled. Omitted, not `false`, when enabled. |

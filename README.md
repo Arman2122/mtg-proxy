@@ -570,10 +570,11 @@ limit until the report's `ttl` lapses. `ip_limit`, `active_ips` and
 
 When a user is over quota, past its expiry, or disabled, new connections are
 transparently routed to the **fronting domain** — exactly like a wrong secret —
-so a prober cannot tell a limited user from an invalid one. Enforcement happens
-at connection time: an in-progress session is not cut off mid-stream, but
-disabling or expiring a secret (via reload or the API) closes its live
-connections immediately. A quota overrun never kills an active session.
+so a prober cannot tell a limited user from an invalid one. A quota is a
+ceiling: the stream that reaches it ends at that byte, the user's other streams
+end on their next byte, and `quota_cutoffs` on `/stats` counts them. Disabling
+or expiring a secret closes its live connections, at once via reload or the
+API and within five seconds when the clock crosses the expiry on its own.
 
 Usage is exposed per user in `/stats` and `/secrets`:
 

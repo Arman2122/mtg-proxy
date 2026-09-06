@@ -215,27 +215,31 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 		p.stats.PreRegister(name)
 	}
 
-	p.applySpeedLimits(newSet)
+	p.applyLimits(newSet)
 	p.closeStaleConns(oldSet, newSet)
 	p.closeDeniedConns()
 
 	return nil
 }
 
-// applySpeedLimits re-rates every user's bucket from the set just installed.
+// applyLimits installs, from the set just swapped in, the limits that are
+// enforced on the data path rather than at admission: every user's speed
+// bucket is re-rated and their quota ceiling is set, so a change reaches the
+// connections already open without a reconnect.
 // It runs on every swap -- startup, reload, the API -- so a changed limit
 // reaches the user's live connections at once, and a removed one frees them
 // at once. A user dropped from the set keeps their bucket, which is harmless:
 // nothing draws from it, and a user re-added gets it re-rated here.
-func (p *Proxy) applySpeedLimits(set *secretSet) {
+func (p *Proxy) applyLimits(set *secretSet) {
 	for i, name := range set.names {
-		var bytesPerSecond int64
+		var lim SecretLimits
 
 		if i < len(set.limits) {
-			bytesPerSecond = set.limits[i].SpeedBytesPerSecond
+			lim = set.limits[i]
 		}
 
-		p.stats.SetSpeedLimit(name, bytesPerSecond)
+		p.stats.SetSpeedLimit(name, lim.SpeedBytesPerSecond)
+		p.stats.SetQuotaCeiling(name, lim.QuotaBytes)
 	}
 }
 
@@ -302,11 +306,16 @@ func (p *Proxy) checkLimits(name string, lim SecretLimits) (bool, DenyReason) {
 	return true, DenyNone
 }
 
-// closeDeniedConns closes every live stream whose secret is now denied because
-// it was disabled or has expired, so such a change applied via a reload or the
-// API takes effect immediately instead of only blocking new connections. A
-// quota overrun does not close live streams — consistent with the throttle,
-// existing connections are never killed mid-flight.
+// closeDeniedConns closes every live stream whose secret is now denied: it was
+// disabled, has expired, or is at its quota. It runs after every swap, so a
+// change applied via a reload or the API takes effect immediately instead of
+// only blocking new connections, and it runs from the maintenance loop, so a
+// deadline the clock crosses takes effect on its own.
+//
+// Quota is included. The data path ends the stream that crosses the ceiling,
+// but a stream of an exhausted user that is carrying nothing would otherwise
+// sit open until the idle timeout, and a quota lowered below what is already
+// used would reach nobody until they moved a byte.
 func (p *Proxy) closeDeniedConns() {
 	set := p.secrets.Load()
 
@@ -324,7 +333,7 @@ func (p *Proxy) closeDeniedConns() {
 			continue
 		}
 
-		if allowed, reason := p.checkLimits(name, lim); allowed || reason == DenyQuota {
+		if allowed, _ := p.checkLimits(name, lim); allowed {
 			continue
 		}
 
@@ -353,19 +362,41 @@ func (p *Proxy) rolloverAllQuotas() {
 	}
 }
 
-// startUsagePersistence periodically rolls quota periods over and flushes the
-// usage counters to usageStateFile until ctx is cancelled.
-func (p *Proxy) startUsagePersistence(ctx context.Context) {
+// denySweepInterval is how often live streams are checked against the limits
+// the clock alone can cross: an expiry that passes, a quota period that rolls
+// over. It bounds how long a user outlives their deadline, and it is short
+// because the sweep is a walk of the live registry and nothing more.
+const denySweepInterval = 5 * time.Second
+
+// startMaintenance runs, until ctx is cancelled, the work that has to happen
+// on the clock rather than on an event: every sweepEvery, monthly quota
+// periods roll over and streams of users who are now denied are closed;
+// every flushEvery, the usage counters are written to usageStateFile if one
+// is configured.
+//
+// It runs whether or not there is a usage file. The sweep is what makes an
+// expiry a deadline rather than a hint: without it, a user already connected
+// when their expiry passed stayed connected until something else swapped the
+// secret set.
+func (p *Proxy) startMaintenance(ctx context.Context, sweepEvery, flushEvery time.Duration) {
 	go func() {
-		ticker := time.NewTicker(usageFlushInterval)
-		defer ticker.Stop()
+		sweep := time.NewTicker(sweepEvery)
+		defer sweep.Stop()
+
+		flush := time.NewTicker(flushEvery)
+		defer flush.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-sweep.C:
 				p.rolloverAllQuotas()
+				p.closeDeniedConns()
+			case <-flush.C:
+				if p.usageStateFile == "" {
+					continue
+				}
 
 				if err := p.stats.FlushUsage(p.usageStateFile); err != nil {
 					p.logger.WarningError("cannot flush usage state", err)

@@ -638,10 +638,13 @@ answer. Absent fields mean no limit of that kind is set.
 curl -sS -X POST http://127.0.0.1:9090/secrets/alice/reset-quota
 ```
 
-Two behaviours to keep straight. Enforcement happens at connection time, so a quota
-overrun never cuts an active session — a heavy user can stay online past their limit
-until they reconnect. But disabling or expiring a secret does close its live connections,
-on the next reload or API call.
+Two behaviours to keep straight. A quota is a ceiling: the stream that reaches it ends
+at that byte, the user's other streams end on their next byte, and `quota_cutoffs` on
+`/stats` counts them, so a user reporting "the download just stopped" at a round number
+has hit their quota. Disabling or expiring a secret closes its live connections at once
+on reload or through the API, and within five seconds when the clock crosses the
+expiry on its own. (Before v1.8.0 a quota was checked only at admission and an expiry
+only on the next reload.)
 
 And limits set through the API are **in-memory only**. A later `POST /reload`, or a
 restart, re-reads the file and overrides them. Treat the config file as the source of

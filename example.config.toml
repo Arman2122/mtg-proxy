@@ -362,9 +362,12 @@ allow-fallback-on-unknown-dc = false
 #
 # When a user is over quota, past its expiry, or disabled, new connections are
 # transparently routed to the fronting domain (exactly like a wrong secret), so
-# the outcome is indistinguishable to a prober. Quota is enforced at connection
-# time; an in-progress session is not cut off mid-stream, but disabling or
-# expiring a secret (via reload or the API) does close its live connections.
+# the outcome is indistinguishable to a prober. A quota is a ceiling: the stream
+# that reaches it ends at that byte and the user's next connection is refused.
+# Disabling or expiring a secret closes its live connections, at once on reload
+# or through the API and within five seconds when the clock passes the expiry.
+# Every key in this file that the binary does not know is logged as a warning
+# at startup and on reload, and listed by `mtg-proxy doctor`.
 #
 # Fields (all optional):
 #   quota        max relayed bytes; human sizes ("10GB", "500MiB") or a bare

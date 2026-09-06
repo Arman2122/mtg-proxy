@@ -14,7 +14,7 @@ and statsd metrics — is upstream's and behaves as upstream documents it. This 
 the multi-user layer on top: named secrets, a management API, per-user governance, the
 sponsored channel that mtg v2 dropped, and the WEB transport.
 
-Current release: **v1.7.0**. Building from source needs Go 1.26 or newer.
+Current release: **v1.8.0**. Building from source needs Go 1.26 or newer.
 
 ## How a client reaches it 🚪
 

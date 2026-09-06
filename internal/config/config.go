@@ -90,29 +90,37 @@ type ListConfig struct {
 }
 
 type Config struct {
-	Debug                       TypeBool                     `json:"debug"`
-	AllowFallbackOnUnknownDC    TypeBool                     `json:"allowFallbackOnUnknownDc"`
-	Secret                      mtglib.Secret                `json:"secret"`
-	Secrets                     map[string]mtglib.Secret     `json:"secrets"`
-	AdTag                       TypeAdTag                    `json:"adTag"`
-	SecretAdTags                map[string]TypeAdTag         `json:"secretAdTags"`
-	SecretLimits                map[string]ConfigSecretLimit `json:"secretLimits"`
-	UsageStateFile              string                       `json:"usageStateFile"`
-	APIToken                    string                       `json:"apiToken"`
-	BindTo                      []TypeHostPort               `json:"bindTo"`
-	Listeners                   []ConfigListener             `json:"listeners"`
-	Web                         ConfigWeb                    `json:"web"`
-	ProxyProtocolListener       TypeBool                     `json:"proxyProtocolListener"`
-	PreferIP                    TypePreferIP                 `json:"preferIp"`
-	AutoUpdate                  TypeBool                     `json:"autoUpdate"`
-	TrackClientIPs              TypeBool                     `json:"trackClientIps"`
-	DomainFrontingPort          TypePort                     `json:"domainFrontingPort"`
-	DomainFrontingIP            TypeIP                       `json:"domainFrontingIp"`
-	DomainFrontingProxyProtocol TypeBool                     `json:"domainFrontingProxyProtocol"`
-	TolerateTimeSkewness        TypeDuration                 `json:"tolerateTimeSkewness"`
-	Concurrency                 TypeConcurrency              `json:"concurrency"`
-	PublicIPv4                  TypeIP                       `json:"publicIpv4"`
-	PublicIPv6                  TypeIP                       `json:"publicIpv6"`
+	Debug                    TypeBool                     `json:"debug"`
+	AllowFallbackOnUnknownDC TypeBool                     `json:"allowFallbackOnUnknownDc"`
+	Secret                   mtglib.Secret                `json:"secret"`
+	Secrets                  map[string]mtglib.Secret     `json:"secrets"`
+	AdTag                    TypeAdTag                    `json:"adTag"`
+	SecretAdTags             map[string]TypeAdTag         `json:"secretAdTags"`
+	SecretLimits             map[string]ConfigSecretLimit `json:"secretLimits"`
+
+	// UnknownKeys are the dotted paths of every key the file carried that this
+	// binary does not know, sorted. The parser is deliberately lenient -- a
+	// file written for a newer binary must still load on an older one -- so a
+	// typo, or a key in the wrong table, is not an error. It is not silent
+	// either: whoever loads the file logs these. Not part of the config's own
+	// rendering.
+	UnknownKeys                 []string         `json:"-"`
+	UsageStateFile              string           `json:"usageStateFile"`
+	APIToken                    string           `json:"apiToken"`
+	BindTo                      []TypeHostPort   `json:"bindTo"`
+	Listeners                   []ConfigListener `json:"listeners"`
+	Web                         ConfigWeb        `json:"web"`
+	ProxyProtocolListener       TypeBool         `json:"proxyProtocolListener"`
+	PreferIP                    TypePreferIP     `json:"preferIp"`
+	AutoUpdate                  TypeBool         `json:"autoUpdate"`
+	TrackClientIPs              TypeBool         `json:"trackClientIps"`
+	DomainFrontingPort          TypePort         `json:"domainFrontingPort"`
+	DomainFrontingIP            TypeIP           `json:"domainFrontingIp"`
+	DomainFrontingProxyProtocol TypeBool         `json:"domainFrontingProxyProtocol"`
+	TolerateTimeSkewness        TypeDuration     `json:"tolerateTimeSkewness"`
+	Concurrency                 TypeConcurrency  `json:"concurrency"`
+	PublicIPv4                  TypeIP           `json:"publicIpv4"`
+	PublicIPv6                  TypeIP           `json:"publicIpv6"`
 	DomainFronting              struct {
 		Host          TypeHost `json:"host"`
 		IP            TypeIP   `json:"ip"`
@@ -324,6 +332,19 @@ func (c *Config) validateAdTags() error {
 	}
 
 	return nil
+}
+
+// UnknownKeyWarnings renders one warning per unknown key, in the words the
+// log and the doctor both use.
+func (c *Config) UnknownKeyWarnings() []string {
+	out := make([]string, 0, len(c.UnknownKeys))
+
+	for _, key := range c.UnknownKeys {
+		out = append(out, fmt.Sprintf(
+			"unknown config key %q is ignored: a typo, or a key written under the wrong table?", key))
+	}
+
+	return out
 }
 
 // validateSecretLimits ensures every [secret-limits] entry names a secret that

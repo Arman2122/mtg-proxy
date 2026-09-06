@@ -130,7 +130,7 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 		ctx,
 		ctx.logger.Named("relay"),
 		connIdleTimeout{Conn: ctx.telegram(), tracker: tracker},
-		newCountingConn(ctx.ctx, connIdleTimeout{Conn: ctx.client(), tracker: tracker}, p.stats, ctx.secretName),
+		newCountingConn(ctx.ctx, ctx.Close, connIdleTimeout{Conn: ctx.client(), tracker: tracker}, p.stats, ctx.secretName),
 	)
 }
 

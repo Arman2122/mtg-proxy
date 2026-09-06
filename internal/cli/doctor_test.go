@@ -254,6 +254,36 @@ func TestDoctorDeprecatedOptions(t *testing.T) {
 	})
 }
 
+// The doctor names every key the binary does not know, with its path, because
+// "this setting does nothing" is what an operator runs the doctor for.
+func TestDoctorUnknownKeys(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a clean config is all known", func(t *testing.T) {
+		t.Parallel()
+
+		d, out := newDoctor(t, doctorConfig(""), 0, nil)
+
+		assert.True(t, d.checkUnknownKeys())
+		assert.Contains(t, out.String(), "Every key in the file is known")
+	})
+
+	t.Run("a misspelled key is named with its path", func(t *testing.T) {
+		t.Parallel()
+
+		d, out := newDoctor(t, doctorConfig(`track-client-ip = true
+
+[secret-limits.default]
+quota_reset = "monthly"
+`), 0, nil)
+
+		assert.False(t, d.checkUnknownKeys())
+		assert.Contains(t, out.String(), `"track-client-ip"`)
+		assert.Contains(t, out.String(), `"secret-limits.default.quota_reset"`)
+		assert.Contains(t, out.String(), "ignored")
+	})
+}
+
 // The skew check grades the NTP offset against tolerate-time-skewness. Its
 // thresholds are the difference between a proxy that works and one that
 // rejects every client for a reason nothing else reports.

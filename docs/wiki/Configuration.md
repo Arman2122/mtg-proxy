@@ -28,11 +28,14 @@ default.
 
 Two rules cause almost every configuration bug in this project.
 
-**Unknown keys are ignored.** The parser is called without
-`DisallowUnknownFields` (`internal/config/parse.go`). That is deliberate — it is
-what lets a config carrying `[[listener]]` or `[web]` load on an older binary
-that predates those features. The cost is that a typo, or a key in the wrong
-place, produces no error at all.
+**Unknown keys are ignored, but named.** The parser is lenient
+(`internal/config/parse.go`). That is deliberate — it is what lets a config
+carrying `[[listener]]` or `[web]` load on an older binary that predates those
+features. The cost is that a typo, or a key in the wrong place, is not an
+error. Since v1.8.0 it is not silent either: every unknown key is logged as a
+warning, with its full path, when the proxy starts, on every reload, when the
+WEB relay starts or follows the file, and by `mtg-proxy doctor`. If you see
+`unknown config key is ignored`, the key named did nothing.
 
 **A `[table]` header captures everything written after it.** This is ordinary
 TOML, but it is unforgiving here because of the rule above. Every bare top-level
@@ -48,8 +51,9 @@ accept = ["dd"]
 concurrency = 8192
 ```
 
-`[[listener]]` has no `concurrency` field, so that value is silently dropped and
-the proxy runs at the default 4096. The same misplacement inside `[secrets]`
+`[[listener]]` has no `concurrency` field, so that value is dropped — with a
+warning naming `listener.concurrency` — and the proxy runs at the default
+4096. The same misplacement inside `[secrets]`
 fails instead, with a confusing "invalid secret" error, because `[secrets]` maps
 every key it sees to a secret name.
 
@@ -206,9 +210,10 @@ quota = "500MB"
 
 A user who is over quota, past expiry or disabled has new connections routed
 transparently to the fronting domain — exactly what a wrong secret does — so a
-prober cannot tell a limited user from an invalid one. Enforcement is at
-connection time: a session in progress is not cut off mid-stream by a quota
-overrun, though disabling or expiring a secret does close its live connections.
+prober cannot tell a limited user from an invalid one. A quota is a ceiling: the
+stream that reaches it ends at that byte, and the next connection is refused.
+Disabling or expiring a secret closes its live connections, at once on reload
+or through the API and within five seconds when the clock crosses the expiry.
 A user at their address limit is refused at admission instead, after the secret
 has matched, so only a holder of the valid secret can see that refusal.
 

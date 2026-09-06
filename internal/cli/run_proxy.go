@@ -322,12 +322,22 @@ func warnDeprecatedDomainFronting(conf *config.Config, log mtglib.Logger) {
 	}
 }
 
+// warnUnknownKeys names every key the file carried that this binary does not
+// know. The parser is lenient on purpose, so this is the only place a typo or
+// a key under the wrong table becomes visible; one line per key, at warning
+// level, so it is seen at the default log level.
+func warnUnknownKeys(logger mtglib.Logger, conf *config.Config) {
+	for _, key := range conf.UnknownKeys {
+		logger.BindStr("key", key).Warning("unknown config key is ignored: a typo, or a key written under the wrong table?")
+	}
+}
+
 // makeSecretsReloader builds the callback Proxy.ReloadSecrets uses to re-read
 // the secret set on a POST /reload. It re-parses the same config file passed to
 // `mtg run`, so an operator editing [secrets] and calling reload swaps the set
 // without a restart. It returns nil when there is no config file (simple-run),
 // leaving reload unsupported.
-func makeSecretsReloader(configPath string) func() (mtglib.SecretConfig, error) {
+func makeSecretsReloader(configPath string, logger mtglib.Logger) func() (mtglib.SecretConfig, error) {
 	if configPath == "" {
 		return nil
 	}
@@ -337,6 +347,9 @@ func makeSecretsReloader(configPath string) func() (mtglib.SecretConfig, error) 
 		if err != nil {
 			return mtglib.SecretConfig{}, err
 		}
+
+		// A reload is when a typo is most likely to have just been written.
+		warnUnknownKeys(logger, conf)
 
 		return mtglib.SecretConfig{
 			Secrets:      conf.GetSecrets(),
@@ -517,6 +530,7 @@ func runProxyWith( //nolint: funlen, cyclop
 	logger.BindJSON("configuration", conf.String()).Debug("configuration")
 
 	warnIgnoredOfficialEnvs(logger)
+	warnUnknownKeys(logger, conf)
 	warnDeprecatedDomainFronting(conf, logger)
 
 	eventStream, err := makeEventStream(conf, logger)
@@ -594,7 +608,7 @@ func runProxyWith( //nolint: funlen, cyclop
 
 		APIBindTo:       conf.APIBindTo.Get(""),
 		APIToken:        conf.GetAPIToken(),
-		SecretsReloader: makeSecretsReloader(configPath),
+		SecretsReloader: makeSecretsReloader(configPath, logger),
 
 		GlobalAdTag:    conf.GetAdTag(),
 		SecretAdTags:   conf.GetSecretAdTags(),
