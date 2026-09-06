@@ -317,62 +317,67 @@ func TestSpeedLimitAppliesThroughTheProxy(t *testing.T) {
 	// detector is far under the bound for the uncapped one.
 	const rateBytes = 256 << 10
 
-	// Minted for the cover host: the FakeTLS entry forges a ClientHello with
-	// that name in SNI, and the proxy admits a key only under its own host.
-	alice := GenerateSecret(govCoverHost)
-	bob := GenerateSecret(govCoverHost)
+	// Both public doors, because "every door" is a claim about each one. The
+	// secrets are minted per door: the FakeTLS entry forges a ClientHello with
+	// the cover host in SNI and is admitted only under it; the obfuscated2 door
+	// takes a hostless dd key.
+	for _, entry := range govEntryCases()[:2] {
+		t.Run(entry.name, func(t *testing.T) {
+			t.Parallel()
 
-	entry := govEntryCases()[0]
-	require.Equal(t, SecretModeFakeTLS, entry.mode, "the first case is the FakeTLS door")
+			alice := entry.secret(t)
+			bob := entry.secret(t)
 
-	// The case's own harness: it runs the doppelganger, which the FakeTLS door
-	// cannot get past without, and pins the idle and handshake timeouts so
-	// nothing but the cap can pace these streams.
-	h := entry.harness(t,
-		map[string]Secret{"alice": alice, "bob": bob},
-		map[string]SecretLimits{"alice": {SpeedBytesPerSecond: rateBytes}})
+			// The case's own harness: it runs the doppelganger, which the FakeTLS door
+			// cannot get past without, and pins the idle and handshake timeouts so
+			// nothing but the cap can pace these streams.
+			h := entry.harness(t,
+				map[string]Secret{"alice": alice, "bob": bob},
+				map[string]SecretLimits{"alice": {SpeedBytesPerSecond: rateBytes}})
 
-	timeDownload := func(name string, key [SecretKeyLength]byte) time.Duration {
-		client, done := h.dialProxy(t, entry.policy)
-		upstream := connectThrough(t, entry, h, client, name, key)
+			timeDownload := func(name string, key [SecretKeyLength]byte) time.Duration {
+				client, done := h.dialProxy(t, entry.policy)
+				upstream := connectThrough(t, entry, h, client, name, key)
 
-		defer endStream(client, upstream, done)
+				defer endStream(client, upstream, done)
 
-		go func() { upstream.Write(make([]byte, 2*rateBytes)) }() //nolint: errcheck
+				go func() { upstream.Write(make([]byte, 2*rateBytes)) }() //nolint: errcheck
 
-		// The client sees the bytes wrapped in TLS records, which are only
-		// larger, so counting raw bytes up to the payload size is enough.
-		require.NoError(t, client.SetReadDeadline(time.Now().Add(15*time.Second)))
+				// The client sees the bytes wrapped in TLS records, which are only
+				// larger, so counting raw bytes up to the payload size is enough.
+				require.NoError(t, client.SetReadDeadline(time.Now().Add(15*time.Second)))
 
-		started := time.Now()
-		buf := make([]byte, 64<<10)
+				started := time.Now()
+				buf := make([]byte, 64<<10)
 
-		for received := 0; received < 2*rateBytes; {
-			n, err := client.Read(buf)
-			require.NoError(t, err)
+				for received := 0; received < 2*rateBytes; {
+					n, err := client.Read(buf)
+					require.NoError(t, err)
 
-			received += n
-		}
+					received += n
+				}
 
-		return time.Since(started)
+				return time.Since(started)
+			}
+
+			capped := timeDownload("alice", alice.Key)
+			assert.GreaterOrEqual(t, capped, 800*time.Millisecond,
+				"alice is capped and must receive twice her rate in about a second")
+
+			free := timeDownload("bob", bob.Key)
+			assert.Less(t, free, 500*time.Millisecond, "bob is unlimited and must not be paced")
+			assert.Less(t, free, capped/2, "the same transfer must be far faster without the cap than with it")
+
+			var throttled int64
+
+			require.Eventually(t, func() bool {
+				throttled = h.proxy.stats.getOrCreate("alice").speed.throttledNanos.Load()
+
+				return throttled > 0
+			}, time.Second, 10*time.Millisecond, "time held to the cap must be counted for the capped user")
+			assert.Zero(t, h.proxy.stats.getOrCreate("bob").speed.throttledNanos.Load())
+		})
 	}
-
-	capped := timeDownload("alice", alice.Key)
-	assert.GreaterOrEqual(t, capped, 800*time.Millisecond,
-		"alice is capped and must receive twice her rate in about a second")
-
-	free := timeDownload("bob", bob.Key)
-	assert.Less(t, free, 500*time.Millisecond, "bob is unlimited and must not be paced")
-	assert.Less(t, free, capped/2, "the same transfer must be far faster without the cap than with it")
-
-	var throttled int64
-
-	require.Eventually(t, func() bool {
-		throttled = h.proxy.stats.getOrCreate("alice").speed.throttledNanos.Load()
-
-		return throttled > 0
-	}, time.Second, 10*time.Millisecond, "time held to the cap must be counted for the capped user")
-	assert.Zero(t, h.proxy.stats.getOrCreate("bob").speed.throttledNanos.Load())
 }
 
 // An unlimited user pays nothing: the wrapper is the same single read and
@@ -404,4 +409,47 @@ func (w *writeCounter) Write(p []byte) (int, error) {
 	w.calls++
 
 	return len(p), nil
+}
+
+// The upload direction is paced too. Everything above times writes, which is
+// the download direction at the client side; this times reads, which is
+// upload: a client pushing twice the rate into the proxy is held to it just
+// the same. Remove the wait from countingConn.Read and this fails.
+func TestSpeedLimitHoldsUploadToo(t *testing.T) {
+	t.Parallel()
+
+	const rateBytes = 1 << 20
+
+	stats := NewProxyStats()
+	stats.SetSpeedLimit("alice", rateBytes)
+
+	client, proxySide := net.Pipe()
+	t.Cleanup(func() { client.Close(); proxySide.Close() }) //nolint: errcheck
+
+	reader := newCountingConn(t.Context(), essentials.WrapNetConn(proxySide), stats, "alice")
+
+	// The client writes as fast as the pipe takes it; the proxy side reads
+	// through the throttled wrapper, the way the relay reads a client.
+	go func() {
+		piece := make([]byte, 32<<10)
+		for written := 0; written < 2*rateBytes; written += len(piece) {
+			if _, err := client.Write(piece); err != nil {
+				return
+			}
+		}
+	}()
+
+	started := time.Now()
+	buf := make([]byte, 64<<10)
+
+	for received := 0; received < 2*rateBytes; {
+		n, err := reader.Read(buf)
+		require.NoError(t, err)
+
+		received += n
+	}
+
+	elapsed := time.Since(started)
+	assert.GreaterOrEqual(t, elapsed, 800*time.Millisecond, "uploading 2x the rate must take about a second at the cap")
+	assert.Less(t, elapsed, 3*time.Second)
 }

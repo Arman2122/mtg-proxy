@@ -20,6 +20,7 @@ import (
 	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
 	"github.com/pires/go-proxyproto"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	antireplay "github.com/Arman2122/mtg-proxy/antireplay"
@@ -146,6 +147,16 @@ type chain struct {
 func newChain(t *testing.T) *chain {
 	t.Helper()
 
+	return newChainWithLimits(t, nil)
+}
+
+// newChainWithLimits is newChain with per-user limits on the proxy, for the
+// one thing the relay must inherit from the proxy without knowing it: a
+// user's speed limit, enforced on the proxy's side of the loopback hop and
+// felt by the browser through the relay's own flow control.
+func newChainWithLimits(t *testing.T, limits map[string]mtglib.SecretLimits) *chain {
+	t.Helper()
+
 	upstream := startEchoTelegram(t)
 
 	network := &chainNetwork{upstream: upstream}
@@ -166,6 +177,7 @@ func newChain(t *testing.T) *chain {
 		EventStream:     clientIPs,
 		Logger:          logger.NewNoopLogger(),
 		Secrets:         map[string]mtglib.Secret{"web": {Mode: mtglib.SecretModeDD, Key: key}},
+		SecretLimits:    limits,
 		TrackClientIPs:  true,
 		// Short, because the churn test measures what is left standing after a
 		// client goes away, and the default is five minutes.
@@ -304,8 +316,17 @@ type streamConn struct {
 	buf      []byte
 }
 
+// Write cuts at the relay pump's own read size, the way the bridge cuts at
+// frame boundaries. The relay would take a frame up to a megabyte inside the
+// four-megabyte initial window; the test's minimal WebSocket writer would
+// not, since it encodes lengths in sixteen bits.
 func (s *streamConn) Write(p []byte) (int, error) {
-	s.client.send(frame.NewData(s.streamID, append([]byte(nil), p...)))
+	const piece = 32 << 10
+
+	for sent := 0; sent < len(p); sent += piece {
+		end := min(sent+piece, len(p))
+		s.client.send(frame.NewData(s.streamID, append([]byte(nil), p[sent:end]...)))
+	}
 
 	return len(p), nil
 }
@@ -539,4 +560,44 @@ func (c *chain) oneRound(t *testing.T, streamID uint32) {
 
 	require.NoError(t, conn.Close())
 	c.deleteSession(t, sessionToken)
+}
+
+// A speed limit set on the proxy is felt by a WEB client. The relay knows
+// nothing about limits; the proxy holds its side of the loopback hop to the
+// rate, the relay's stream stops being fed, its window credits stop, and the
+// browser slows. This is the claim "every door" makes about the third door,
+// and the one test that would catch the WEB path escaping a user's cap.
+func TestAWebClientIsHeldToTheUsersSpeedLimit(t *testing.T) {
+	t.Parallel()
+
+	// 256 KiB/s, with a 256 KiB echo: the bytes go up through the proxy's
+	// read path and come back down through its write path, half a megabyte
+	// through one bucket that starts with a quarter in it -- about a second.
+	const rateBytes = 256 << 10
+
+	timeEcho := func(c *chain) time.Duration {
+		conn, _ := c.openStream(t, 17)
+
+		payload := make([]byte, rateBytes)
+		started := time.Now()
+
+		go func() { conn.Write(payload) }() //nolint: errcheck
+
+		echoed := make([]byte, len(payload))
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(15*time.Second)))
+		_, err := io.ReadFull(conn, echoed)
+		require.NoError(t, err)
+
+		return time.Since(started)
+	}
+
+	capped := timeEcho(newChainWithLimits(t, map[string]mtglib.SecretLimits{
+		"web": {SpeedBytesPerSecond: rateBytes},
+	}))
+	assert.GreaterOrEqual(t, capped, 800*time.Millisecond,
+		"a capped user's WEB stream must be held to the rate")
+
+	free := timeEcho(newChain(t))
+	assert.Less(t, free, 500*time.Millisecond, "an uncapped user's WEB stream must not be paced")
+	assert.Less(t, free, capped/2)
 }
