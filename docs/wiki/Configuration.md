@@ -177,13 +177,15 @@ in the name is caught rather than silently ignored.
 
 ## `[secret-limits.<name>]`
 
-Per-secret governance: a data quota, an expiry deadline and an off switch. A
-secret without an entry is unlimited, never expires and is enabled.
+Per-secret governance: a data quota, a speed limit, an expiry deadline and an
+off switch. A secret without an entry is unlimited, never expires and is
+enabled.
 
 | key | type | default | meaning |
 |---|---|---|---|
 | `quota` | human size (`"10GB"`, `"500MiB"`) or a bare byte count | unlimited | Maximum relayed bytes. |
 | `quota-reset` | `"none"` \| `"monthly"` | `"none"` | `none` is a lifetime cap; `monthly` resets each month. |
+| `speed` | rate: `"5mbit"`, `"500kbit"`, `"1MB/s"` (bits decimal, bytes base 2, `/s` optional; minimum `64kbit`) | unlimited | Sustained throughput cap for the user, every connection and door together, upload and download combined. Live on reload. See [[Limits-and-Quotas]]. |
 | `expires` | RFC3339 (`"2026-12-31T00:00:00Z"`) or `YYYY-MM-DD` | never | Validity deadline. |
 | `disabled` | bool | `false` | Reject the secret without removing it. |
 
@@ -193,6 +195,7 @@ usage-state-file = "/var/lib/mtg/usage.json"
 [secret-limits.alice]
 quota = "10GB"
 quota-reset = "monthly"
+speed = "5mbit"
 expires = "2026-12-31"
 
 [secret-limits.bob]

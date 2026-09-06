@@ -38,6 +38,7 @@ usage-state-file = "/var/lib/mtg-proxy/usage.json"
 [secret-limits.alice]
 quota = "10GB"
 quota-reset = "monthly"
+speed = "5mbit"
 expires = "2026-12-31"
 disabled = false
 
@@ -49,6 +50,7 @@ quota = "500MB"
 |---|---|---|
 | `quota` | max relayed bytes in the current period; a human size (`"10GB"`, `"500MiB"`) or a bare integer byte count | unlimited |
 | `quota-reset` | `"none"` (a lifetime allowance) or `"monthly"` | `"none"` |
+| `speed` | sustained throughput cap for the user, all connections and doors together; `"5mbit"`, `"500kbit"`, `"1MB/s"` — see [Speed limits](#speed-limits) | unlimited |
 | `expires` | RFC3339 (`"2026-12-31T00:00:00Z"`) or a plain date (`"2026-12-31"`) | never expires |
 | `disabled` | `true` rejects the secret without removing it | `false` |
 
@@ -153,6 +155,31 @@ curl -X POST -H "Authorization: Bearer change-me" http://127.0.0.1:9090/secrets/
 It answers `{"status":"ok"}`, or `404` for a name that is not in the active secret set. The reset is immediate in memory but only reaches `usage-state-file` on the next flush, so a process killed within ~30 seconds of a reset loses it.
 
 To raise or remove a quota instead of clearing usage, edit `[secret-limits]` and reload. Limits changed through `POST /secrets` or `PUT /secrets` are **in-memory only** and are overwritten by the next reload — the config file is the source of truth. Note also that `POST /secrets` replaces the whole entry: omit `quota` from the body and that user's quota is cleared, not left alone. See [[Multi-User-and-API]] for the full route list.
+
+## Speed limits
+
+```toml
+[secret-limits.alice]
+speed = "5mbit"
+```
+
+A speed limit holds one user to a sustained throughput. It is the one limit here that shapes traffic rather than admitting or refusing it, and it is worth being precise about what it is.
+
+**It is per user, not per connection.** Every connection alice has — every device, and every door: FakeTLS, obfuscated2, WEB — draws from one allowance. Two phones on one secret share `5mbit`; a second phone does not double it. This is the difference between a limit a panel can sell and one it cannot.
+
+**It is enforced by the proxy, and can be nowhere else.** The proxy is the only hop that knows which user a byte belongs to: the secret is matched inside the handshake, while the operating system, a firewall or `tc` see TCP flows from addresses — and one user has many addresses, many users share one. Anything outside the process shapes addresses. A tunnel in front (GRE, a TCP relay with PROXY protocol) changes nothing here, because identity never came from the address.
+
+**It is a sustained rate with a one-second burst.** The bucket holds one second of the rate, so MTProto's small, bursty messages stay snappy while a download is held to the line. Upload and download share the one number.
+
+**It never buffers.** The bucket only delays: a read is held until what it read has been paid for, a write until what it is about to write has. Backpressure therefore lands in the client's own TCP window and the kernel does the rest. Throttling a user costs the proxy no memory, and a throttled user cannot make it hoard data.
+
+**It is smooth at low rates.** Each read and write is cut to what the bucket can grant at once, so a `128kbit` user gets a steady trickle rather than a 32 KB block every two seconds. The floor is `64kbit`.
+
+**It is live.** Change it in the file and reload, or through the API, and the connections already open slow down or speed up without being dropped. Remove it and they are freed at once — no reconnect needed.
+
+**Spelling.** Bit units are decimal, as every link is sold: `5mbit` is 5,000,000 bits a second, `500kbit`, `1gbit`; `2mbps` means the same. Byte units are base 2, as the quota is: `1MB/s`, `512KB`. The `/s` is optional, a bare number is bytes per second, and an explicit zero is refused — omit the key for unlimited. The file and the API share one parser, so a spelling one accepts the other does.
+
+**Watching it.** `speed_limit` on `/stats` and `/secrets` is the configured cap in bytes per second. `throttled_ms` on `/stats` is the time the user's connections have spent held to it. A user with a limit and no `throttled_ms` is not reaching it; a user whose `throttled_ms` grows by a second every second is living at it — and that, not a complaint, is how you know the cap is the thing they are experiencing. See [[Monitoring]].
 
 ## Connection throttling: `[throttle]`
 

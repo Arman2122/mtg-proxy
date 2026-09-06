@@ -307,9 +307,11 @@ curl http://127.0.0.1:9090/stats
 
 `last_seen` is `null` for a user who has never connected. The `throttle` object
 is included only when [throttling](#connection-throttling) is configured, and a
-user's `quota`, `quota_remaining`, `quota_reset`, `expires_at` and `disabled`
-fields appear only when that user has the corresponding
-[limit](#per-user-quotas-expiry--disable) set.
+user's `quota`, `quota_remaining`, `quota_reset`, `expires_at`, `disabled` and
+`speed_limit` fields appear only when that user has the corresponding
+[limit](#per-user-quotas-expiry--disable) set, and `throttled_ms` — the time a
+user's connections have spent held to their speed limit — only once it is
+non-zero.
 
 `listeners` and `obfuscated` appear only when at least one
 [`[[listener]]`](#extra-listeners-listener) is configured — a deployment that
@@ -400,9 +402,9 @@ at runtime, without editing the file or restarting:
 
 | Method & path | Action |
 |---|---|
-| `GET /secrets` | List secrets (`name`, `secret`, `host`, `mode`, `ad_tag`, `effective_ad_tag`, plus `unserved` and `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled` when set). |
-| `POST /secrets` | Add or update one: `{"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?}`. |
-| `PUT /secrets` | Replace the whole set: `{"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?}},"ad_tag"?}`. |
+| `GET /secrets` | List secrets (`name`, `secret`, `host`, `mode`, `ad_tag`, `effective_ad_tag`, plus `unserved` and `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled`/`speed_limit` when set). |
+| `POST /secrets` | Add or update one: `{"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?}`. |
+| `PUT /secrets` | Replace the whole set: `{"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?}},"ad_tag"?}`. |
 | `GET /secrets/{name}` | One entry of the list above, by name, with the same live counters (`404` if unknown). |
 | `DELETE /secrets/{name}` | Remove one (`404` if unknown, `409` if it is the last one). |
 | `POST /secrets/{name}/reset-quota` | Zero the secret's used-bytes counter (`404` if unknown). |
@@ -517,9 +519,9 @@ Throttle state is exposed in the stats response:
 
 ### Per-user quotas, expiry & disable
 
-Each named secret can carry governance limits — a data quota, a validity
-deadline, and an on/off switch — so you can run mtg-proxy as a reseller or
-multi-tenant proxy. Add a `[secret-limits.<name>]` table for any secret in
+Each named secret can carry governance limits — a data quota, a speed limit, a
+validity deadline, and an on/off switch — so you can run mtg-proxy as a reseller
+or multi-tenant proxy. Add a `[secret-limits.<name>]` table for any secret in
 `[secrets]`; a secret without one is unlimited, never expires and is enabled.
 
 ```toml
@@ -529,12 +531,23 @@ usage-state-file = "/var/lib/mtg/usage.json"
 [secret-limits.alice]
 quota = "10GB"            # human size or a bare byte count; omit for unlimited
 quota-reset = "monthly"   # "none" (default, lifetime cap) or "monthly"
+speed = "5mbit"           # sustained cap, all of alice's connections together
 expires = "2026-12-31"    # RFC3339 or YYYY-MM-DD; omit for never
 disabled = false          # true rejects the secret without removing it
 
 [secret-limits.bob]
 quota = "500MB"
 ```
+
+**Speed is per user, not per connection.** Every connection alice has, on every
+door, draws from one allowance, so two of her devices share `5mbit`. It is a
+sustained rate with a one-second burst, upload and download combined, enforced
+by the proxy itself — the only hop that knows which user a byte belongs to —
+and it never buffers: the bucket only delays, so backpressure lands in the
+client's own TCP window. Bit units are decimal (`5mbit` is 625,000 bytes/s),
+byte units are base 2 (`1MB/s`), the minimum is `64kbit`. A change reaches
+live connections on reload without dropping them, and `throttled_ms` on `/stats`
+says how long a user has spent held to it.
 
 When a user is over quota, past its expiry, or disabled, new connections are
 transparently routed to the **fronting domain** — exactly like a wrong secret —

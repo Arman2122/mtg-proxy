@@ -182,6 +182,8 @@ Per user:
 | `quota_reset` | when not `none` | Currently only `"monthly"`. |
 | `expires_at` | when an expiry is set | RFC3339. |
 | `disabled` | when true | Omitted when false. |
+| `speed_limit` | when a speed limit is set | Bytes per second. |
+| `throttled_ms` | when non-zero | Milliseconds this user's connections have spent held to their speed limit. See [[Limits-and-Quotas]]. |
 | `ad_tag_skipped` | when non-zero | Ad-tagged streams that took the direct path because their transport has no middle-proxy reframer. By design. |
 | `ad_tag_failed` | when non-zero | Ad-tagged streams that took the direct path because the middle proxy could not be reached or refused them. Not by design: this is the sponsored channel going missing — except for a few right after a restart, while the middle-proxy config loads. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` | See below. |
@@ -341,6 +343,7 @@ The list is sorted by name.
 | `quota_reset` | when not `none` | |
 | `expires_at` | when an expiry is set | |
 | `disabled` | when true | |
+| `speed_limit` | when a speed limit is set (v1.6.0) | Bytes per second; set as `speed` with a human spelling. |
 | `connections` | always (v1.3.0) | Live connections. `0` for a secret nobody has used. |
 | `last_seen` | always (v1.3.0) | `null` when never connected. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` (v1.3.0) | Same gate as `/stats`. |
@@ -367,18 +370,21 @@ curl -s -X POST -H "Authorization: Bearer a-long-random-string" -H "Content-Type
 ```
 
 Fields: `name` and `secret` are required; `ad_tag`, `quota`, `quota_reset`,
-`expires` and `disabled` are optional. `secret` accepts hex or base64 in any of
-the three forms. `quota` takes a human size (`"20GB"`, `"500MiB"` — base-2
-units, so `GB` is 2^30) or a bare integer byte count. `expires` takes RFC3339 or
-`YYYY-MM-DD`; a date-only value means midnight UTC. `quota_reset` is `"none"` or
-`"monthly"`.
+`expires`, `disabled` and `speed` are optional. `secret` accepts hex or base64
+in any of the three forms. `quota` takes a human size (`"20GB"`, `"500MiB"` —
+base-2 units, so `GB` is 2^30) or a bare integer byte count. `expires` takes
+RFC3339 or `YYYY-MM-DD`; a date-only value means midnight UTC. `quota_reset` is
+`"none"` or `"monthly"`. `speed` takes a rate — `"5mbit"`, `"500kbit"`,
+`"1MB/s"` — with the same spellings and the same floor as the config file, and
+reaches the user's live connections at once; see [[Limits-and-Quotas]].
 
 **This route replaces the whole entry, it does not merge.** Re-posting `carol`
 without `quota` clears her quota; without `ad_tag`, clears her ad-tag override.
 Send the complete desired state every time, or read `GET /secrets` first.
 
 Note the asymmetry between what you send and what you read back: `quota` goes in
-as a string and comes out as an integer byte count, and `expires` goes in but
+as a string and comes out as an integer byte count, `speed` goes in as a string
+and comes out as `speed_limit` in bytes per second, and `expires` goes in but
 `expires_at` comes out.
 
 ### PUT /secrets
