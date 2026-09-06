@@ -26,8 +26,9 @@ hard to block in the first place. See [Credits](#credits).
 - **Hot reload** — swap the secret set from the config file without dropping users.
 - **Sponsored channel (ad-tag)** — the promoted-channel feature, back again.
 - **Connection throttling** — automatic fair-share per-user connection caps.
-- **Per-user quotas, expiry & disable** — data caps (with optional monthly reset),
-  a validity deadline, and an on/off switch, persisted across restarts.
+- **Per-user quotas, speed, addresses, expiry & disable** — data caps (with
+  optional monthly reset), a speed limit, a limit on how many places a user may
+  be at once, a validity deadline, and an on/off switch, persisted across restarts.
 - **WEB proxy transport** — the connection type Telegram Desktop 7.1
   added: a page on your hostname carries MTProto over a WebSocket, so a
   network in between sees a browser visiting a website.
@@ -307,11 +308,12 @@ curl http://127.0.0.1:9090/stats
 
 `last_seen` is `null` for a user who has never connected. The `throttle` object
 is included only when [throttling](#connection-throttling) is configured, and a
-user's `quota`, `quota_remaining`, `quota_reset`, `expires_at`, `disabled` and
-`speed_limit` fields appear only when that user has the corresponding
-[limit](#per-user-quotas-expiry--disable) set, and `throttled_ms` — the time a
-user's connections have spent held to their speed limit — only once it is
-non-zero.
+user's `quota`, `quota_remaining`, `quota_reset`, `expires_at`, `disabled`,
+`speed_limit` and `ip_limit` fields appear only when that user has the
+corresponding [limit](#per-user-quotas-expiry--disable) set, and `throttled_ms`
+— the time a user's connections have spent held to their speed limit —
+`active_ips` — how many places they are in right now — and `ip_limit_refused`
+only once they are non-zero.
 
 `listeners` and `obfuscated` appear only when at least one
 [`[[listener]]`](#extra-listeners-listener) is configured — a deployment that
@@ -402,12 +404,15 @@ at runtime, without editing the file or restarting:
 
 | Method & path | Action |
 |---|---|
-| `GET /secrets` | List secrets (`name`, `secret`, `host`, `mode`, `ad_tag`, `effective_ad_tag`, plus `unserved` and `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled`/`speed_limit` when set). |
-| `POST /secrets` | Add or update one: `{"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?}`. |
-| `PUT /secrets` | Replace the whole set: `{"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?}},"ad_tag"?}`. |
+| `GET /secrets` | List secrets (`name`, `secret`, `host`, `mode`, `ad_tag`, `effective_ad_tag`, plus `unserved` and `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled`/`speed_limit`/`ip_limit` when set). |
+| `POST /secrets` | Add or update one: `{"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?}`. |
+| `PUT /secrets` | Replace the whole set: `{"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?,ip_limit?}},"ad_tag"?}`. |
 | `GET /secrets/{name}` | One entry of the list above, by name, with the same live counters (`404` if unknown). |
 | `DELETE /secrets/{name}` | Remove one (`404` if unknown, `409` if it is the last one). |
 | `POST /secrets/{name}/reset-quota` | Zero the secret's used-bytes counter (`404` if unknown). |
+| `GET /secrets/{name}/external-ips` | The user's address view: `ip_limit`, `active_ips`, and the addresses when `track-client-ips` is on. |
+| `PUT /secrets/{name}/external-ips` | `{"ips":[...],"ttl":"90s"}` — report the addresses the user holds on other systems, so the address limit spans them. Expires after `ttl`. |
+| `DELETE /secrets/{name}/external-ips` | Clear that report. |
 | `GET /adtag` | Read the global ad-tag: `{"ad_tag":"<hex>"\|null}`. |
 | `PUT /adtag` | Set the global ad-tag: `{"ad_tag":"<32 hex chars>"}`. |
 | `DELETE /adtag` | Clear the global ad-tag. |
@@ -519,10 +524,11 @@ Throttle state is exposed in the stats response:
 
 ### Per-user quotas, expiry & disable
 
-Each named secret can carry governance limits — a data quota, a speed limit, a
-validity deadline, and an on/off switch — so you can run mtg-proxy as a reseller
-or multi-tenant proxy. Add a `[secret-limits.<name>]` table for any secret in
-`[secrets]`; a secret without one is unlimited, never expires and is enabled.
+Each named secret can carry governance limits — a data quota, a speed limit, an
+address limit, a validity deadline, and an on/off switch — so you can run
+mtg-proxy as a reseller or multi-tenant proxy. Add a `[secret-limits.<name>]`
+table for any secret in `[secrets]`; a secret without one is unlimited, never
+expires and is enabled.
 
 ```toml
 # Persist quota usage across restarts (optional but recommended for quotas).
@@ -532,6 +538,7 @@ usage-state-file = "/var/lib/mtg/usage.json"
 quota = "10GB"            # human size or a bare byte count; omit for unlimited
 quota-reset = "monthly"   # "none" (default, lifetime cap) or "monthly"
 speed = "5mbit"           # sustained cap, all of alice's connections together
+ip-limit = 2              # how many places alice may be at once; omit for unlimited
 expires = "2026-12-31"    # RFC3339 or YYYY-MM-DD; omit for never
 disabled = false          # true rejects the secret without removing it
 
@@ -548,6 +555,18 @@ client's own TCP window. Bit units are decimal (`5mbit` is 625,000 bytes/s),
 byte units are base 2 (`1MB/s`), the minimum is `64kbit`. A change reaches
 live connections on reload without dropping them, and `throttled_ms` on `/stats`
 says how long a user has spent held to it.
+
+**An address limit counts places, not sockets.** All of a device's connections
+come from one address and count once; an IPv6 address counts as its /64. A
+connection from a place alice already holds is always admitted, one from a new
+place only while she is below the limit — refused at admission, after the secret
+matched, so only a holder of the valid secret can ever see it. The check and the
+registration are one atomic step, a slot is freed the moment the last connection
+from that place ends, and a limit lowered on a running proxy never drops anyone.
+A panel that also runs alice's VPN can report the addresses she holds there
+through `PUT /secrets/alice/external-ips`, and they count against the same
+limit until the report's `ttl` lapses. `ip_limit`, `active_ips` and
+`ip_limit_refused` on `/stats` show it working.
 
 When a user is over quota, past its expiry, or disabled, new connections are
 transparently routed to the **fronting domain** — exactly like a wrong secret —

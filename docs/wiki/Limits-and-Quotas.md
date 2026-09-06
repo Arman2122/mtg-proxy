@@ -21,11 +21,11 @@ Neither is a bandwidth limiter. There is no per-user speed cap anywhere in mtg-p
 | | `[secret-limits]` | `[throttle]` |
 |---|---|---|
 | Scope | one named secret | every user on the proxy |
-| Measures | relayed bytes, wall-clock deadline, an on/off flag | live connection count |
+| Measures | relayed bytes, throughput, distinct addresses, a wall-clock deadline, an on/off flag | live connection count |
 | Checked | on every new connection | on every new connection |
 | Recomputed | never (it is a direct comparison) | every `check-interval`, default 5s |
 | Survives a restart | only with `usage-state-file` | nothing to survive |
-| Live sessions | closed for `disabled` and `expires`, never for quota | never closed |
+| Live sessions | closed for `disabled` and `expires`, never for quota, speed or `ip-limit` | never closed |
 | Visible in | `GET /stats`, `GET /secrets`, the log | `GET /stats`, the log |
 
 ## Per-user limits: `[secret-limits]`
@@ -39,6 +39,7 @@ usage-state-file = "/var/lib/mtg-proxy/usage.json"
 quota = "10GB"
 quota-reset = "monthly"
 speed = "5mbit"
+ip-limit = 2
 expires = "2026-12-31"
 disabled = false
 
@@ -51,6 +52,7 @@ quota = "500MB"
 | `quota` | max relayed bytes in the current period; a human size (`"10GB"`, `"500MiB"`) or a bare integer byte count | unlimited |
 | `quota-reset` | `"none"` (a lifetime allowance) or `"monthly"` | `"none"` |
 | `speed` | sustained throughput cap for the user, all connections and doors together; `"5mbit"`, `"500kbit"`, `"1MB/s"` — see [Speed limits](#speed-limits) | unlimited |
+| `ip-limit` | how many places the user may be at once, an integer; a place is an IPv4 address or an IPv6 /64 — see [Address limits](#address-limits) | unlimited |
 | `expires` | RFC3339 (`"2026-12-31T00:00:00Z"`) or a plain date (`"2026-12-31"`) | never expires |
 | `disabled` | `true` rejects the secret without removing it | `false` |
 
@@ -74,7 +76,9 @@ curl -X POST http://127.0.0.1:9090/reload
 
 A disabled, expired or over-quota user is not told anything. On the FakeTLS listener the connection is routed to the fronting domain, exactly as a wrong secret would be, so a prober cannot tell a revoked customer from a wrong guess. On an obfuscated `[[listener]]` it takes the same exit as every other refusal on that socket — close or drain, per that listener's `on-unknown-secret` — so the deny reason is not readable by timing one connection against another. See [[Security]] for why every refusal on that door has to look alike.
 
-The operator's view is the log. The proxy writes `connection denied by per-user limit` with `secret_name` and a `deny_reason` of `disabled`, `expired` or `quota_exceeded`.
+The operator's view is the log. The proxy writes `connection denied by per-user limit` with `secret_name` and a `deny_reason` of `disabled`, `expired`, `quota_exceeded` or `ip_limit`.
+
+A user at their [address limit](#address-limits) is the one refusal that is not routed to the cover site. It happens at admission, after the secret has matched, so only someone holding the valid secret can ever see it and there is nothing for a prober to learn; the connection is simply closed, on the FakeTLS door after the TLS answer and on an obfuscated listener through that socket's usual exit.
 
 Disabling or expiring a secret also **closes that user's live connections** as soon as the change lands via reload or the API. Going over quota does not. That asymmetry is intentional: revocation should be immediate, but a quota is a billing boundary and cutting a running download in half at an arbitrary byte offset is a support ticket, not a policy.
 
@@ -180,6 +184,38 @@ A speed limit holds one user to a sustained throughput. It is the one limit here
 **Spelling.** Bit units are decimal, as every link is sold: `5mbit` is 5,000,000 bits a second, `500kbit`, `1gbit`; `2mbps` means the same. Byte units are base 2, as the quota is: `1MB/s`, `512KB`. The `/s` is optional, a bare number is bytes per second, and an explicit zero is refused — omit the key for unlimited. The file and the API share one parser, so a spelling one accepts the other does.
 
 **Watching it.** `speed_limit` on `/stats` and `/secrets` is the configured cap in bytes per second. `throttled_ms` on `/stats` is the time the user's connections have spent held to it. A user with a limit and no `throttled_ms` is not reaching it; a user whose `throttled_ms` grows by a second every second is living at it — and that, not a complaint, is how you know the cap is the thing they are experiencing. See [[Monitoring]].
+
+## Address limits
+
+```toml
+[secret-limits.alice]
+ip-limit = 2
+```
+
+An address limit is how many places a user may be at once. It is the limit a panel sells as "two devices", and it is worth being precise about what is counted, because the obvious reading — two IP addresses, two connections — is wrong in both directions.
+
+**It counts places, not sockets.** A Telegram client keeps several connections open at once, one per datacenter and more for media, and they all come from the same address. Those are one place. An address counts once however many connections it holds, and it stops counting the instant the last of them ends.
+
+**A place is an IPv4 address or an IPv6 /64.** Hosts rotate the low 64 bits of an IPv6 address (privacy extensions), so counting each address would charge one phone for a dozen devices; the /64 is the network the device is on. A v4-mapped v6 address is its v4 address.
+
+**It is enforced at admission, after the secret matched.** A connection from a place the user already holds is admitted. One from a new place is admitted only while the user is below the limit, and refused otherwise: closed, after the TLS answer on the FakeTLS door and through the socket's usual exit on an obfuscated `[[listener]]`. It is not routed to the cover site, and it does not need to be — only someone holding the valid secret can ever see this refusal. The log line is `connection denied by per-user limit` with `deny_reason` `ip_limit` and, as always, no address.
+
+**The check and the registration are one step.** Two new places arriving in the same instant cannot both read "one below the limit" and both get in; exactly one does. And a slot is released by the same code that releases the connection, so a slot cannot leak without the connection leaking too.
+
+**Lowering it never drops anyone.** Like the quota and unlike a disable, a limit lowered on a running proxy binds the next admission and leaves the connections already open alone. `active_ips` shows the user over the new limit until enough of their places let go.
+
+**A device that changes networks gets its slot back when its old connections end.** A phone that walks from Wi-Fi to mobile data leaves its old sockets open on the proxy until they end, and with a limit of one it is refused from the new address until then. Telegram's own servers close a session that stops pinging within a minute or two, which ends the relay and frees the slot; `[network.timeout] idle` (default 5 minutes) is the outer bound. Lower it if this is your users' common complaint, and set the limit to what people actually own rather than to one.
+
+**It can span more than this proxy.** A panel that also runs the user's VPN and SSH can report the addresses the user holds there, and they count here alongside the user's live connections:
+
+```bash
+curl -X PUT -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9090/secrets/alice/external-ips \
+  -d '{"ips":["198.51.100.7","2001:db8::1"],"ttl":"90s"}'
+```
+
+Alice on her VPN from two places is then refused a third place through the proxy, and admitted from either of the two. The report is pushed, never pulled: no network call sits in the handshake, and each report expires after its `ttl` (default two minutes, at most an hour), so a panel that dies takes its claims with it and the limit degrades to what this proxy can see rather than refusing everyone. The panel refreshes the report as a heartbeat, well inside the ttl. To enforce in the other direction — refusing the VPN because the user is already on the proxy twice — the panel reads this proxy's `connected_ips`, which needs `track-client-ips`. The routes are on [[Multi-User-and-API]].
+
+**Watching it.** `ip_limit` is the configured limit and `active_ips` how many places the user counts as being in right now, on both `/stats` and `/secrets`; `ip_limit_refused` on `/stats` counts the connections turned away. A limit nobody ever hits is doing nothing; a user hitting it constantly is either sharing a secret or roaming between networks, and the two look different in `active_ips`. The addresses themselves — `connected_ips`, `external_ips` — appear only with `track-client-ips`, for the reasons on [[Security]]; the counts always do. Prometheus and statsd get an `ip_limited` counter, and with it a `throttled` counter for the connection throttle below. Nothing about addresses is written to disk or to the log.
 
 ## Connection throttling: `[throttle]`
 

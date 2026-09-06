@@ -23,6 +23,8 @@ func (n noopObserver) EventDomainFronting(_ mtglib.EventDomainFronting)         
 func (n noopObserver) EventTraffic(_ mtglib.EventTraffic)                       {}
 func (n noopObserver) EventFinish(_ mtglib.EventFinish)                         {}
 func (n noopObserver) EventConcurrencyLimited(_ mtglib.EventConcurrencyLimited) {}
+func (n noopObserver) EventThrottled(_ mtglib.EventThrottled)                   {}
+func (n noopObserver) EventIPLimited(_ mtglib.EventIPLimited)                   {}
 func (n noopObserver) EventIPBlocklisted(_ mtglib.EventIPBlocklisted)           {}
 func (n noopObserver) EventReplayAttack(_ mtglib.EventReplayAttack)             {}
 func (n noopObserver) EventIPListSize(_ mtglib.EventIPListSize)                 {}

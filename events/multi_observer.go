@@ -82,6 +82,30 @@ func (m multiObserver) EventConcurrencyLimited(evt mtglib.EventConcurrencyLimite
 	wg.Wait()
 }
 
+func (m multiObserver) EventThrottled(evt mtglib.EventThrottled) {
+	wg := &sync.WaitGroup{}
+
+	for _, v := range m.observers {
+		wg.Go(func() {
+			v.EventThrottled(evt)
+		})
+	}
+
+	wg.Wait()
+}
+
+func (m multiObserver) EventIPLimited(evt mtglib.EventIPLimited) {
+	wg := &sync.WaitGroup{}
+
+	for _, v := range m.observers {
+		wg.Go(func() {
+			v.EventIPLimited(evt)
+		})
+	}
+
+	wg.Wait()
+}
+
 func (m multiObserver) EventIPBlocklisted(evt mtglib.EventIPBlocklisted) {
 	wg := &sync.WaitGroup{}
 

@@ -163,7 +163,11 @@ shape it always had:
 | `throttled_ms` | It is non-zero: milliseconds this user's connections have spent held to their speed limit, all connections summed. A user with a limit and no `throttled_ms` is not reaching it; one whose `throttled_ms` grows a second every second is living at it. That is the honest measure of a cap — one nobody ever waits for is doing nothing. |
 | `ad_tag_skipped` | It is non-zero: an ad-tagged stream of this user's took the direct path because its transport has no middle-proxy reframer, losing its sponsored channel. A silent skip is a revenue bug nobody can diagnose, so it is reported. |
 | `ad_tag_failed` | It is non-zero: an ad-tagged stream on a transport the middle proxy *does* handle took the direct path anyway, because the middle proxy could not be reached or refused it. Unlike a skip this is not by design — a server that cannot reach `core.telegram.org`, or a revoked tag, shows up here and nowhere else. A few right after a restart are normal: clients reconnecting in the first couple of seconds, before the middle-proxy config has loaded, go direct rather than wait. |
+| `ip_limit` | The user has a `[secret-limits.<name>] ip-limit`: how many places they may be at once. |
+| `active_ips` | It is non-zero: how many places the user counts as being in right now — the addresses of their live connections here plus any a panel reported from elsewhere. A count, so it is never gated. Above `ip_limit` means the limit was lowered under open connections, which are never dropped for it. |
+| `ip_limit_refused` | It is non-zero: connections turned away for arriving from one place too many. A limit nobody ever hits is doing nothing; a user hitting it constantly is sharing a secret or roaming between networks, and `active_ips` tells the two apart. |
 | `connected_ips` / `last_ip` | `track-client-ips` is on. See below. |
+| `external_ips` / `external_expires_at` | `track-client-ips` is on and a panel has reported the user's addresses elsewhere through `PUT /secrets/{name}/external-ips`. See [[Multi-User-and-API]]. |
 
 The throttle block reports `active` (whether caps are being applied at all),
 `limit`, and `caps` — a per-user connection ceiling, present only while some
@@ -393,6 +397,8 @@ produces `mtg_client_connections` and the rest.
 | `mtg_ip_blocklisted` | counter | `ip_list` |
 | `mtg_domain_fronting` | counter | none |
 | `mtg_concurrency_limited` | counter | none |
+| `mtg_throttled` | counter | none |
+| `mtg_ip_limited` | counter | none |
 | `mtg_replay_attacks` | counter | none |
 
 Label values: `ip_family` is `ipv4` or `ipv6`; `direction` is `to_client` or
@@ -537,6 +543,10 @@ From Prometheus, if you run it:
 
 - `mtg_replay_attacks` and `mtg_concurrency_limited` are counters that should
   normally stay flat.
+- `mtg_throttled` and `mtg_ip_limited` (v1.7.0) count connections refused by
+  the per-user connection throttle and by a user's address limit. Neither
+  carries a user label — cardinality — so use `/stats` to find who: the
+  `throttle` block for the first, `ip_limit_refused` for the second.
 - `mtg_telegram_connections` at zero while `mtg_client_connections` is not:
   clients are arriving and Telegram is not reachable. Check
   `mtg_domain_fronting_connections` before you page anyone — a wrong secret

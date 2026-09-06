@@ -63,7 +63,10 @@ func newReloadTestProxy(secrets map[string]Secret) *Proxy {
 func registerFakeStream(p *Proxy, secretName string) *streamContext {
 	ctx, cancel := context.WithCancel(context.Background())
 	sc := &streamContext{ctx: ctx, ctxCancel: cancel, secretName: secretName}
-	p.registerConn(sc)
+
+	// A fake stream has no client socket, so it registers uncounted: the
+	// address ledger is exercised by the entry tests, not by these.
+	p.tryRegisterConn(sc)
 
 	return sc
 }

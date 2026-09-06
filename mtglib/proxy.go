@@ -59,16 +59,22 @@ type Proxy struct {
 	usageStateFile string
 	emitTraffic    bool
 
-	stats           *ProxyStats
-	obfsStats       obfuscatedCounters
-	obfsLimiter     *obfuscatedLimiter
-	listeners       []ListenerJSON
-	listenerModes   ModeSet
-	secrets         atomic.Pointer[secretSet]
-	reloader        func() (SecretConfig, error)
-	reloadMu        sync.Mutex
-	liveMu          sync.Mutex
-	liveConns       map[string]map[*streamContext]struct{}
+	stats         *ProxyStats
+	obfsStats     obfuscatedCounters
+	obfsLimiter   *obfuscatedLimiter
+	listeners     []ListenerJSON
+	listenerModes ModeSet
+	secrets       atomic.Pointer[secretSet]
+	reloader      func() (SecretConfig, error)
+	reloadMu      sync.Mutex
+	liveMu        sync.Mutex
+	liveConns     map[string]map[*streamContext]struct{}
+
+	// addresses is each user's counted-address ledger, guarded by liveMu so
+	// that the address-limit check and the registration of a stream are one
+	// critical section. Created on first use and dropped when it counts
+	// nothing, so an idle user costs no memory here.
+	addresses       map[string]*addressLedger
 	network         Network
 	antiReplayCache AntiReplayCache
 	blocklist       IPBlocklist

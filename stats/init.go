@@ -76,6 +76,18 @@ const (
 	//     Type: counter
 	MetricConcurrencyLimited = "concurrency_limited"
 
+	// MetricThrottled defines a metric for a count of events, when a
+	// connection was refused by the per-user connection throttle.
+	//
+	//     Type: counter
+	MetricThrottled = "throttled"
+
+	// MetricIPLimited defines a metric for a count of events, when a
+	// connection was refused because its user was at their address limit.
+	//
+	//     Type: counter
+	MetricIPLimited = "ip_limited"
+
 	// MetricIPBlocklisted defines a metric for a count of events, when
 	// client was blocked because her IP address was found in blocklists.
 	//

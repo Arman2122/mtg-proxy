@@ -33,6 +33,14 @@ func (o *ObserverMock) EventConcurrencyLimited(evt mtglib.EventConcurrencyLimite
 	o.Called(evt)
 }
 
+func (o *ObserverMock) EventThrottled(evt mtglib.EventThrottled) {
+	o.Called(evt)
+}
+
+func (o *ObserverMock) EventIPLimited(evt mtglib.EventIPLimited) {
+	o.Called(evt)
+}
+
 func (o *ObserverMock) EventIPBlocklisted(evt mtglib.EventIPBlocklisted) {
 	o.Called(evt)
 }

@@ -184,9 +184,13 @@ Per user:
 | `disabled` | when true | Omitted when false. |
 | `speed_limit` | when a speed limit is set | Bytes per second. |
 | `throttled_ms` | when non-zero | Milliseconds this user's connections have spent held to their speed limit. See [[Limits-and-Quotas]]. |
+| `ip_limit` | when an address limit is set | How many places the user may be at once. |
+| `active_ips` | when non-zero | How many places the user counts as being in right now: the addresses of their live connections here plus any reported from elsewhere. A count, never gated. |
+| `ip_limit_refused` | when non-zero | Connections turned away for arriving from one place too many. |
 | `ad_tag_skipped` | when non-zero | Ad-tagged streams that took the direct path because their transport has no middle-proxy reframer. By design. |
 | `ad_tag_failed` | when non-zero | Ad-tagged streams that took the direct path because the middle proxy could not be reached or refused them. Not by design: this is the sponsored channel going missing — except for a few right after a restart, while the middle-proxy config loads. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` | See below. |
+| `external_ips`, `external_expires_at` | only with `track-client-ips` | The addresses a panel reported the user present at elsewhere, and when that report lapses. See [external addresses](#external-addresses-secretsnameexternal-ips). |
 
 Two behaviours that catch people out:
 
@@ -206,13 +210,14 @@ Cross-reference: [[Limits-and-Quotas]] for what the quota fields mean,
 `features` is a sorted list of capability names the **binary** supports:
 
 ```text
-client-ips  faketls  listeners  quota-reset  secret-modes  secrets-api  web-relay
+client-ips  faketls  ip-limits  listeners  quota-reset  secret-modes  secrets-api  speed-limits  web-relay  web-relay-watch
 ```
 
 | Name | Means |
 |---|---|
 | `client-ips` | The binary understands `track-client-ips`, and `connected_ips`/`last_ip` may appear when it is on. |
 | `faketls` | The FakeTLS handshake is served. |
+| `ip-limits` | `ip_limit` is accepted on `[secret-limits.<name>]` and the secrets API, `/stats` reports `ip_limit`, `active_ips` and `ip_limit_refused`, and `/secrets/{name}/external-ips` is served. |
 | `listeners` | The `[[listener]]` table is honoured and `/stats` reports each socket. |
 | `quota-reset` | `POST /secrets/{name}/reset-quota` is served. |
 | `secret-modes` | The `dd` and plain secret forms parse and serve. |
@@ -294,6 +299,9 @@ where every connection otherwise arrives from `127.0.0.1`. See
 | `PUT /secrets` | Replace the entire set. |
 | `DELETE /secrets/{name}` | Remove one. |
 | `POST /secrets/{name}/reset-quota` | Zero that secret's used-bytes counter and restart its quota period. |
+| `GET /secrets/{name}/external-ips` | That user's address view: limit, count, and the addresses when tracking is on. |
+| `PUT /secrets/{name}/external-ips` | Report the addresses the user holds on other systems, so the address limit spans them. |
+| `DELETE /secrets/{name}/external-ips` | Clear that report. |
 
 ### GET /secrets
 
@@ -344,9 +352,12 @@ The list is sorted by name.
 | `expires_at` | when an expiry is set | |
 | `disabled` | when true | |
 | `speed_limit` | when a speed limit is set (v1.6.0) | Bytes per second; set as `speed` with a human spelling. |
+| `ip_limit` | when an address limit is set (v1.7.0) | How many places the user may be at once; set as `ip_limit`, an integer. |
+| `active_ips` | when non-zero (v1.7.0) | How many places the user counts as being in right now. Never gated. |
 | `connections` | always (v1.3.0) | Live connections. `0` for a secret nobody has used. |
 | `last_seen` | always (v1.3.0) | `null` when never connected. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` (v1.3.0) | Same gate as `/stats`. |
+| `external_ips`, `external_expires_at` | only with `track-client-ips` (v1.7.0) | Same gate. The user's reported addresses elsewhere and when the report lapses. |
 
 `connections` and `last_seen` were added so a caller rendering one user does not
 have to fetch and filter the whole of `/stats`. They are the same counters
@@ -370,13 +381,15 @@ curl -s -X POST -H "Authorization: Bearer a-long-random-string" -H "Content-Type
 ```
 
 Fields: `name` and `secret` are required; `ad_tag`, `quota`, `quota_reset`,
-`expires`, `disabled` and `speed` are optional. `secret` accepts hex or base64
+`expires`, `disabled`, `speed` and `ip_limit` are optional. `secret` accepts hex or base64
 in any of the three forms. `quota` takes a human size (`"20GB"`, `"500MiB"` —
 base-2 units, so `GB` is 2^30) or a bare integer byte count. `expires` takes
 RFC3339 or `YYYY-MM-DD`; a date-only value means midnight UTC. `quota_reset` is
 `"none"` or `"monthly"`. `speed` takes a rate — `"5mbit"`, `"500kbit"`,
 `"1MB/s"` — with the same spellings and the same floor as the config file, and
-reaches the user's live connections at once; see [[Limits-and-Quotas]].
+reaches the user's live connections at once. `ip_limit` is an integer, how many
+places the user may be at once; zero or absent is unlimited, and a negative
+value is `400`. Both are explained on [[Limits-and-Quotas]].
 
 **This route replaces the whole entry, it does not merge.** Re-posting `carol`
 without `quota` clears her quota; without `ad_tag`, clears her ad-tag override.
@@ -416,6 +429,32 @@ curl -s -X POST -H "Authorization: Bearer a-long-random-string" http://127.0.0.1
 
 That zeroes `quota_used` and restarts the monthly period from now. `404` for an
 unknown name.
+
+### External addresses: `/secrets/{name}/external-ips`
+
+New in v1.7.0, for a panel that enforces one address limit across several
+systems. The proxy counts a user's places as the addresses of their live
+connections here plus whatever the panel reports them holding elsewhere — on a
+VPN, over SSH, on another proxy — and this route is how the panel reports it.
+
+| Method | Body | Answer |
+|---|---|---|
+| `GET` | | The user's address view: `name`, `ip_limit`, `active_ips`, and — only with `track-client-ips` — `connected_ips`, `external_ips` and `external_expires_at`. |
+| `PUT` | `{"ips":["198.51.100.7","2001:db8::1"],"ttl":"90s"}` | Replaces the reported set whole and answers with the same view, so the panel sees what will be enforced. |
+| `DELETE` | | Clears the reported set. |
+
+`ips` is at most 64 literal addresses: no prefixes, no zones, and an IPv6
+address counts as its /64. `ttl` is a Go duration in `(0, 1h]`; omitted, it is
+`2m`. Every entry of one report shares one expiry, and the panel is expected to
+`PUT` again well inside it — a report is a heartbeat, not a registration. When
+it lapses the proxy enforces the limit on what it can see itself, which is the
+right failure for a panel that has gone away. A malformed report is `400` and
+changes nothing; an unknown user is `404` on every verb.
+
+The reported addresses are held in memory only, never written to disk or to
+the log, and read back only with `track-client-ips`, exactly as `connected_ips`
+is; the counts always come back. What counts as a place, and how the limit
+behaves when a device changes networks, is on [[Limits-and-Quotas]].
 
 ### What a mutation does to live connections
 
@@ -488,7 +527,7 @@ field of the `/secrets` routes.
 |---|---|
 | `400` | Malformed JSON, an unknown JSON field, an invalid secret, a bad ad-tag, an unparseable quota or expiry, or a swap that would leave nothing to front. |
 | `401` | `api-token` is set and the `Authorization` header is missing or wrong. |
-| `404` | Unknown secret name on `GET` or `DELETE /secrets/{name}` or `/reset-quota`; unknown path. |
+| `404` | Unknown secret name on `GET` or `DELETE /secrets/{name}`, `/reset-quota` or `/external-ips`; unknown path. |
 | `405` | Wrong method — `POST /stats`, or anything but `POST` on `/reload`. |
 | `409` | `DELETE /secrets/{name}` would remove the last secret. |
 | `500` | `POST /reload` could not read, parse or validate the config file. |

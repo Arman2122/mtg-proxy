@@ -47,6 +47,14 @@ type Observer interface {
 	// mtglib.EventConcurrencyLimited event.
 	EventConcurrencyLimited(mtglib.EventConcurrencyLimited)
 
+	// EventThrottled reacts on incoming mtglib.EventThrottled event: a
+	// connection refused by the per-user connection throttle.
+	EventThrottled(mtglib.EventThrottled)
+
+	// EventIPLimited reacts on incoming mtglib.EventIPLimited event: a
+	// connection refused by the user's address limit.
+	EventIPLimited(mtglib.EventIPLimited)
+
 	// EventIPBlocklisted reacts on incoming mtglib.EventIPBlocklisted event.
 	EventIPBlocklisted(mtglib.EventIPBlocklisted)
 

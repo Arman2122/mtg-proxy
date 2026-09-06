@@ -125,6 +125,14 @@ func (p prometheusProcessor) EventConcurrencyLimited(_ mtglib.EventConcurrencyLi
 	p.factory.metricConcurrencyLimited.Inc()
 }
 
+func (p prometheusProcessor) EventThrottled(_ mtglib.EventThrottled) {
+	p.factory.metricThrottled.Inc()
+}
+
+func (p prometheusProcessor) EventIPLimited(_ mtglib.EventIPLimited) {
+	p.factory.metricIPLimited.Inc()
+}
+
 func (p prometheusProcessor) EventIPBlocklisted(evt mtglib.EventIPBlocklisted) {
 	tag := TagIPListBlock
 	if !evt.IsBlockList {
@@ -173,6 +181,8 @@ type PrometheusFactory struct {
 
 	metricDomainFronting     prometheus.Counter
 	metricConcurrencyLimited prometheus.Counter
+	metricThrottled          prometheus.Counter
+	metricIPLimited          prometheus.Counter
 	metricReplayAttacks      prometheus.Counter
 }
 
@@ -262,6 +272,16 @@ func NewPrometheus(metricPrefix, httpPath string) *PrometheusFactory { //nolint:
 			Name:      MetricConcurrencyLimited,
 			Help:      "A number of sessions that were rejected by concurrency limiter.",
 		}),
+		metricThrottled: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricPrefix,
+			Name:      MetricThrottled,
+			Help:      "A number of sessions that were refused by the per-user connection throttle.",
+		}),
+		metricIPLimited: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: metricPrefix,
+			Name:      MetricIPLimited,
+			Help:      "A number of sessions that were refused by a per-user address limit.",
+		}),
 		metricReplayAttacks: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: metricPrefix,
 			Name:      MetricReplayAttacks,
@@ -280,6 +300,8 @@ func NewPrometheus(metricPrefix, httpPath string) *PrometheusFactory { //nolint:
 
 	registry.MustRegister(factory.metricDomainFronting)
 	registry.MustRegister(factory.metricConcurrencyLimited)
+	registry.MustRegister(factory.metricThrottled)
+	registry.MustRegister(factory.metricIPLimited)
 	registry.MustRegister(factory.metricReplayAttacks)
 
 	return factory

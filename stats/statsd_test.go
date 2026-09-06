@@ -188,6 +188,20 @@ func (suite *StatsdTestSuite) TestEventConcurrencyLimited() {
 	suite.Equal("mtg.concurrency_limited:1|c", suite.statsdServer.String())
 }
 
+func (suite *StatsdTestSuite) TestEventThrottled() {
+	suite.statsd.EventThrottled(mtglib.NewEventThrottled("stream", "alice"))
+
+	time.Sleep(statsdSleepTime)
+	suite.Equal("mtg.throttled:1|c", suite.statsdServer.String())
+}
+
+func (suite *StatsdTestSuite) TestEventIPLimited() {
+	suite.statsd.EventIPLimited(mtglib.NewEventIPLimited("stream", "alice"))
+
+	time.Sleep(statsdSleepTime)
+	suite.Equal("mtg.ip_limited:1|c", suite.statsdServer.String())
+}
+
 func (suite *StatsdTestSuite) TestEventIPBlocklisted() {
 	suite.statsd.EventIPBlocklisted(
 		mtglib.NewEventIPBlocklisted(net.ParseIP("10.0.0.10")),

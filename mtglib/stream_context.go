@@ -51,6 +51,17 @@ type streamContext struct {
 	// connTag is the client's own transport selector. The relay above is
 	// byte-transparent, so the tag announced to Telegram must be this one.
 	connTag obfuscation.ConnectionTag
+
+	// ipLimit is the user's address limit as it stood when the secret
+	// matched, read from the same snapshot as the rest of the attribution.
+	ipLimit int
+
+	// addrKey is the address this stream was counted under in its user's
+	// ledger, and addrCounted says whether it was counted at all -- so the
+	// release on the way out undoes exactly what admission did, whichever
+	// snapshot of the limit it happened under.
+	addrKey     addressKey
+	addrCounted bool
 }
 
 func (s *streamContext) Deadline() (time.Time, bool) {
@@ -150,7 +161,12 @@ func (s *streamContext) Close() {
 // It runs inside newStreamContext BEFORE `defer ctx.Close()` is registered, so
 // the forced assert it used to be leaked the socket on the way out.
 func (s *streamContext) ClientIP() net.IP {
-	ip, _ := acceptedClientIP(s.client().RemoteAddr())
+	conn := s.client()
+	if conn == nil {
+		return nil
+	}
+
+	ip, _ := acceptedClientIP(conn.RemoteAddr())
 
 	return ip
 }

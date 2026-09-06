@@ -177,15 +177,16 @@ in the name is caught rather than silently ignored.
 
 ## `[secret-limits.<name>]`
 
-Per-secret governance: a data quota, a speed limit, an expiry deadline and an
-off switch. A secret without an entry is unlimited, never expires and is
-enabled.
+Per-secret governance: a data quota, a speed limit, an address limit, an expiry
+deadline and an off switch. A secret without an entry is unlimited, never
+expires and is enabled.
 
 | key | type | default | meaning |
 |---|---|---|---|
 | `quota` | human size (`"10GB"`, `"500MiB"`) or a bare byte count | unlimited | Maximum relayed bytes. |
 | `quota-reset` | `"none"` \| `"monthly"` | `"none"` | `none` is a lifetime cap; `monthly` resets each month. |
 | `speed` | rate: `"5mbit"`, `"500kbit"`, `"1MB/s"` (bits decimal, bytes base 2, `/s` optional; minimum `64kbit`) | unlimited | Sustained throughput cap for the user, every connection and door together, upload and download combined. Live on reload. See [[Limits-and-Quotas]]. |
+| `ip-limit` | integer | unlimited | How many places the user may be at once; a place is an IPv4 address or an IPv6 /64 and counts once however many connections it holds. A connection from a new place is refused while the user is at the limit; lowering it never drops open connections. A panel can extend one limit across its other systems through the API. See [[Limits-and-Quotas]]. |
 | `expires` | RFC3339 (`"2026-12-31T00:00:00Z"`) or `YYYY-MM-DD` | never | Validity deadline. |
 | `disabled` | bool | `false` | Reject the secret without removing it. |
 
@@ -196,6 +197,7 @@ usage-state-file = "/var/lib/mtg/usage.json"
 quota = "10GB"
 quota-reset = "monthly"
 speed = "5mbit"
+ip-limit = 2
 expires = "2026-12-31"
 
 [secret-limits.bob]
@@ -207,6 +209,8 @@ transparently to the fronting domain — exactly what a wrong secret does — so
 prober cannot tell a limited user from an invalid one. Enforcement is at
 connection time: a session in progress is not cut off mid-stream by a quota
 overrun, though disabling or expiring a secret does close its live connections.
+A user at their address limit is refused at admission instead, after the secret
+has matched, so only a holder of the valid secret can see that refusal.
 
 Set `usage-state-file` if you use quotas; without it, usage counters reset on
 every restart. Limits set through the management API are in-memory only and are

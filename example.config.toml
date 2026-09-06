@@ -32,12 +32,15 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 # Endpoints:
 #   GET    /stats            per-user connection counts, traffic and quota usage
 #   POST   /reload           re-read [secrets], ad-tag, [secret-ad-tags] and [secret-limits] from this file
-#   GET    /secrets          list secrets (name, secret, host, ad_tag, effective_ad_tag, quota/expiry/disabled/speed_limit)
+#   GET    /secrets          list secrets (name, secret, host, ad_tag, effective_ad_tag, quota/expiry/disabled/speed_limit/ip_limit)
 #   GET    /secrets/{name}   one entry of that list, by name
-#   POST   /secrets          add/update one secret: {"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?}
-#   PUT    /secrets          replace the whole set: {"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?}},"ad_tag"?}
+#   POST   /secrets          add/update one secret: {"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?}
+#   PUT    /secrets          replace the whole set: {"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?,ip_limit?}},"ad_tag"?}
 #   DELETE /secrets/{name}   remove one secret
 #   POST   /secrets/{name}/reset-quota   zero the secret's used-bytes counter
+#   GET    /secrets/{name}/external-ips  the user's address view: ip_limit, active_ips (+ addresses with track-client-ips)
+#   PUT    /secrets/{name}/external-ips  {"ips":[...],"ttl":"90s"}: addresses the user holds on other systems, counted here until ttl
+#   DELETE /secrets/{name}/external-ips  clear that report
 #   GET    /adtag            read the global ad-tag: {"ad_tag": "<hex>"|null}
 #   PUT    /adtag            set the global ad-tag: {"ad_tag":"<32 hex chars>"}
 #   DELETE /adtag            clear the global ad-tag
@@ -376,6 +379,13 @@ allow-fallback-on-unknown-dc = false
 #                is optional). Minimum 64kbit. Omit for unlimited. Enforced by
 #                the proxy, which is the only hop that knows which user a byte
 #                belongs to; live connections follow a change on reload.
+#   ip-limit     how many places this user may be at once: an integer, omit or
+#                0 for unlimited. A place is an IPv4 address or an IPv6 /64, and
+#                counts once however many connections it holds. A connection
+#                from a new place is refused (closed, not fronted) while the
+#                user is at the limit; lowering it never drops open connections.
+#                A panel may report the user's addresses on other systems via
+#                PUT /secrets/{name}/external-ips so one limit spans them all.
 #
 # Set usage-state-file above so quota usage survives restarts. Limits set via
 # the management API are in-memory only and are overridden by the next reload.
@@ -385,6 +395,7 @@ allow-fallback-on-unknown-dc = false
 # [secret-limits.alice]
 # quota = "10GB"
 # speed = "5mbit"
+# ip-limit = 2
 # quota-reset = "monthly"
 # expires = "2026-12-31"
 # disabled = false

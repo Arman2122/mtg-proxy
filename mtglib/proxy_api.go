@@ -38,6 +38,12 @@ type SecretInfo struct {
 	// same way quota is.
 	SpeedLimit int64 `json:"speed_limit,omitempty"`
 
+	// IPLimit is how many distinct addresses the user may be at once, or
+	// absent for unlimited; ActiveIPs is how many they count as being at
+	// right now. Neither is an address, so neither is gated.
+	IPLimit   int `json:"ip_limit,omitempty"`
+	ActiveIPs int `json:"active_ips,omitempty"`
+
 	// Mode is the wire form this secret serialises to: "ee", "dd" or "plain".
 	Mode string `json:"mode"`
 
@@ -65,6 +71,12 @@ type SecretInfo struct {
 	// where they are.
 	ConnectedIPs []string `json:"connected_ips,omitempty"`
 	LastIP       string   `json:"last_ip,omitempty"`
+
+	// ExternalIPs and ExternalExpiresAt are the addresses a panel reported
+	// this user present at elsewhere and when that report lapses, gated
+	// exactly as ConnectedIPs is.
+	ExternalIPs       []string   `json:"external_ips,omitempty"`
+	ExternalExpiresAt *time.Time `json:"external_expires_at,omitempty"`
 }
 
 // SnapshotSecrets returns the active secret set as a name-sorted list, exposing
@@ -83,9 +95,10 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 	// One snapshot for the whole list rather than one per secret: the registry
 	// is walked under a mutex that every connect and disconnect also takes, and
 	// taking it once per user would put a stats read on that path N times for
-	// one request. Nil when address tracking is off, and a lookup into a nil
-	// map is the empty slice, so the gating needs no second branch below.
-	addresses := p.connectedIPs()
+	// one request. The addresses inside are already gated on tracking; the
+	// counts are not, and a lookup of a user with no ledger is the zero
+	// report, so nothing below needs a second branch.
+	addresses := p.addressReports()
 
 	for i, name := range set.names {
 		secret := set.secrets[i]
@@ -108,7 +121,11 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 		fillLimitInfo(&info, set.limits[i], p.stats.quotaUsedValue(name))
 		p.stats.fillRuntimeInfo(&info, name)
 
-		info.ConnectedIPs = addresses[name]
+		report := addresses[name]
+		info.ActiveIPs = report.ActiveIPs
+		info.ConnectedIPs = report.ConnectedIPs
+		info.ExternalIPs = report.ExternalIPs
+		info.ExternalExpiresAt = report.ExternalExpiresAt
 
 		out[i] = info
 	}
@@ -142,6 +159,7 @@ func fillLimitInfo(info *SecretInfo, lim SecretLimits, used int64) {
 
 	info.Disabled = lim.Disabled
 	info.SpeedLimit = lim.SpeedBytesPerSecond
+	info.IPLimit = lim.IPLimit
 }
 
 // ReplaceSecrets swaps the entire secret configuration (secrets + advertising
@@ -359,6 +377,9 @@ func (p *Proxy) buildAPIHandler(token string) http.Handler {
 	mux.HandleFunc("GET /secrets/{name}", p.handleGetSecret)
 	mux.HandleFunc("DELETE /secrets/{name}", p.handleDeleteSecret)
 	mux.HandleFunc("POST /secrets/{name}/reset-quota", p.handleResetQuota)
+	mux.HandleFunc("GET /secrets/{name}/external-ips", p.handleGetExternalIPs)
+	mux.HandleFunc("PUT /secrets/{name}/external-ips", p.handlePutExternalIPs)
+	mux.HandleFunc("DELETE /secrets/{name}/external-ips", p.handleDeleteExternalIPs)
 
 	mux.HandleFunc("GET /adtag", p.handleGetAdTag)
 	mux.HandleFunc("PUT /adtag", p.handlePutAdTag)
@@ -423,13 +444,16 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 	// ever deletes one), so it is still reported, and its connections are still
 	// live until they are swept. The loop below is keyed on the snapshot
 	// instead, because a limit only exists for a secret that still does.
-	for name, addresses := range p.connectedIPs() {
+	for name, report := range p.addressReports() {
 		user, ok := resp.Users[name]
 		if !ok {
 			continue
 		}
 
-		user.ConnectedIPs = addresses
+		user.ActiveIPs = report.ActiveIPs
+		user.ConnectedIPs = report.ConnectedIPs
+		user.ExternalIPs = report.ExternalIPs
+		user.ExternalExpiresAt = report.ExternalExpiresAt
 		resp.Users[name] = user
 	}
 
@@ -464,11 +488,108 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 
 		user.Disabled = lim.Disabled
 		user.SpeedLimit = lim.SpeedBytesPerSecond
+		user.IPLimit = lim.IPLimit
 
 		resp.Users[name] = user
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// addressReportFor is the GET /secrets/{name}/external-ips body: the user's
+// address view with the configured limit filled in. False for an unknown
+// secret.
+func (p *Proxy) addressReportFor(name string) (AddressReport, bool) {
+	set := p.secrets.Load()
+
+	var (
+		limit int
+		found bool
+	)
+
+	for i, n := range set.names {
+		if n == name {
+			limit, found = set.limits[i].IPLimit, true
+
+			break
+		}
+	}
+
+	if !found {
+		return AddressReport{}, false
+	}
+
+	report, ok := p.addressReports()[name]
+	if !ok {
+		report = AddressReport{Name: name}
+	}
+
+	report.IPLimit = limit
+
+	return report, true
+}
+
+// handleGetExternalIPs serves GET /secrets/{name}/external-ips.
+func (p *Proxy) handleGetExternalIPs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	report, ok := p.addressReportFor(name)
+	if !ok {
+		httpError(w, http.StatusNotFound, fmt.Errorf("%w: %q", ErrSecretNotFound, name))
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, report)
+}
+
+// externalIPsRequest is the PUT /secrets/{name}/external-ips body: the
+// addresses the user currently holds on other systems, and for how long this
+// report should count. A panel sends it as a heartbeat, well inside the ttl.
+type externalIPsRequest struct {
+	IPs []string `json:"ips"`
+	TTL string   `json:"ttl,omitempty"`
+}
+
+// handlePutExternalIPs serves PUT /secrets/{name}/external-ips. It replaces
+// the user's reported set and answers with the merged view, so the panel
+// sees what the proxy will enforce.
+func (p *Proxy) handlePutExternalIPs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	var req externalIPsRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	addrs, ttl, err := ParseExternalAddresses(req.IPs, req.TTL)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err)
+
+		return
+	}
+
+	if err := p.SetExternalAddresses(name, addrs, ttl); err != nil {
+		httpError(w, secretMutationStatus(err), err)
+
+		return
+	}
+
+	report, _ := p.addressReportFor(name)
+	writeJSON(w, http.StatusOK, report)
+}
+
+// handleDeleteExternalIPs serves DELETE /secrets/{name}/external-ips.
+func (p *Proxy) handleDeleteExternalIPs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	if err := p.SetExternalAddresses(name, nil, DefaultExternalAddressTTL); err != nil {
+		httpError(w, secretMutationStatus(err), err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, statusOK)
 }
 
 // handleResetQuota serves POST /secrets/{name}/reset-quota, zeroing the secret's
@@ -504,18 +625,23 @@ func (p *Proxy) hasSecret(name string) bool {
 // clears the corresponding limit. Quota accepts human sizes ("10GB"), expires
 // accepts RFC3339 or YYYY-MM-DD, quota_reset is "none" or "monthly", and speed
 // accepts a rate ("5mbit", "1MB/s") -- the same spellings the config file
-// takes, from the same parsers.
+// takes, from the same parsers -- and ip_limit is a count of addresses.
 type limitFields struct {
 	Quota      string `json:"quota,omitempty"`
 	QuotaReset string `json:"quota_reset,omitempty"`
 	Expires    string `json:"expires,omitempty"`
 	Disabled   bool   `json:"disabled,omitempty"`
 	Speed      string `json:"speed,omitempty"`
+	IPLimit    int    `json:"ip_limit,omitempty"`
 }
 
 // parse turns the raw string fields into a SecretLimits, returning an error for
-// a malformed quota, reset policy, expiry or speed.
+// a malformed quota, reset policy, expiry, speed or ip limit.
 func (l limitFields) parse() (SecretLimits, error) {
+	if l.IPLimit < 0 {
+		return SecretLimits{}, fmt.Errorf("%w: ip_limit must not be negative (%d)", ErrSecretInvalid, l.IPLimit)
+	}
+
 	quota, err := ParseQuotaBytes(l.Quota)
 	if err != nil {
 		return SecretLimits{}, err
@@ -542,6 +668,7 @@ func (l limitFields) parse() (SecretLimits, error) {
 		ExpiresAt:           expires,
 		Disabled:            l.Disabled,
 		SpeedBytesPerSecond: speed,
+		IPLimit:             l.IPLimit,
 	}, nil
 }
 

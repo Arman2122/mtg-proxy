@@ -155,6 +155,26 @@ func (suite *PrometheusTestSuite) TestEventConcurrencyLimited() {
 	suite.Contains(data, `mtg_concurrency_limited 1`)
 }
 
+func (suite *PrometheusTestSuite) TestEventThrottled() {
+	suite.prometheus.EventThrottled(mtglib.NewEventThrottled("stream", "alice"))
+
+	time.Sleep(100 * time.Millisecond)
+
+	data, err := suite.Get()
+	suite.NoError(err)
+	suite.Contains(data, `mtg_throttled 1`)
+}
+
+func (suite *PrometheusTestSuite) TestEventIPLimited() {
+	suite.prometheus.EventIPLimited(mtglib.NewEventIPLimited("stream", "alice"))
+
+	time.Sleep(100 * time.Millisecond)
+
+	data, err := suite.Get()
+	suite.NoError(err)
+	suite.Contains(data, `mtg_ip_limited 1`)
+}
+
 func (suite *PrometheusTestSuite) TestEventIPBlocklisted() {
 	suite.prometheus.EventIPBlocklisted(
 		mtglib.NewEventIPBlocklisted(net.ParseIP("2001:db8::68")),

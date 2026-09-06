@@ -41,6 +41,12 @@ type secretStats struct {
 	adTagSkipped atomic.Int64
 	adTagFailed  atomic.Int64
 
+	// ipLimitRefused counts connections turned away for arriving from one
+	// address too many. It is what tells an operator that a limit is being
+	// felt: a limit nobody ever hits is doing nothing, and a user hitting
+	// it constantly is either sharing a secret or roaming between networks.
+	ipLimitRefused atomic.Int64
+
 	// lastIP is the client address of the most recently admitted connection,
 	// stored as a string. It is written only when the proxy is configured to
 	// track addresses, so a deployment that does not ask for them never holds
@@ -161,6 +167,11 @@ func (s *ProxyStats) OnAdTagSkipped(name string) {
 // re-rating the bucket their live connections are drawing from.
 func (s *ProxyStats) SetSpeedLimit(name string, bytesPerSecond int64) {
 	s.getOrCreate(name).speed.set(bytesPerSecond)
+}
+
+// OnIPLimitRefused counts one connection refused by the user's address limit.
+func (s *ProxyStats) OnIPLimitRefused(name string) {
+	s.getOrCreate(name).ipLimitRefused.Add(1)
 }
 
 // OnAdTagFailed counts one ad-tagged stream whose transport the middle proxy
@@ -446,6 +457,13 @@ const (
 	// FeatureFakeTLS means the proxy speaks the FakeTLS (obfuscated) handshake.
 	FeatureFakeTLS = "faketls"
 
+	// FeatureIPLimits means [secret-limits.<name>] and the secrets API accept
+	// a per-user ip_limit, the proxy refuses a connection from one address
+	// too many, /stats reports ip_limit, active_ips and ip_limit_refused, and
+	// GET/PUT/DELETE /secrets/{name}/external-ips let a panel report the
+	// addresses a user holds on other systems so the limit spans them.
+	FeatureIPLimits = "ip-limits"
+
 	// FeatureListeners means the [[listener]] config table is honoured: extra
 	// sockets can be declared, and /stats reports what each one accepts.
 	FeatureListeners = "listeners"
@@ -489,6 +507,7 @@ const (
 var supportedFeatures = []string{
 	FeatureClientIPs,
 	FeatureFakeTLS,
+	FeatureIPLimits,
 	FeatureListeners,
 	FeatureQuotaReset,
 	FeatureSecretModes,
@@ -582,16 +601,31 @@ type UserStatsJSON struct {
 	SpeedLimit      int64 `json:"speed_limit,omitempty"`
 	ThrottledMillis int64 `json:"throttled_ms,omitempty"`
 
+	// IPLimit is the user's address limit; ActiveIPs is how many distinct
+	// addresses they count as being at right now, the addresses of their
+	// live connections here plus any reported from elsewhere; and
+	// IPLimitRefused is how many connections were turned away for arriving
+	// from one address too many. The first two are absent when zero, the
+	// count is never gated: how many places a user is in says nothing about
+	// where.
+	IPLimit        int   `json:"ip_limit,omitempty"`
+	ActiveIPs      int   `json:"active_ips,omitempty"`
+	IPLimitRefused int64 `json:"ip_limit_refused,omitempty"`
+
 	// ConnectedIPs lists the distinct client addresses holding a live
 	// connection right now, sorted. LastIP is the address of the most recent
-	// admitted connection, which outlives that connection.
+	// admitted connection, which outlives that connection. ExternalIPs are
+	// the addresses a panel reported the user present at elsewhere, and
+	// ExternalExpiresAt is when that report lapses unless refreshed.
 	//
-	// Both are filled in only when the proxy is configured with
-	// track-client-ips, and both are omitted when empty, so /stats on a
+	// All are filled in only when the proxy is configured with
+	// track-client-ips, and all are omitted when empty, so /stats on a
 	// deployment that never enabled it is byte-identical to before they
 	// existed. See ProxyOpts.TrackClientIPs for why that is the default.
-	ConnectedIPs []string `json:"connected_ips,omitempty"`
-	LastIP       string   `json:"last_ip,omitempty"`
+	ConnectedIPs      []string   `json:"connected_ips,omitempty"`
+	LastIP            string     `json:"last_ip,omitempty"`
+	ExternalIPs       []string   `json:"external_ips,omitempty"`
+	ExternalExpiresAt *time.Time `json:"external_expires_at,omitempty"`
 }
 
 // buildResponse assembles the base stats response (runtime counters and throttle
@@ -624,6 +658,7 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 			AdTagSkipped:    st.adTagSkipped.Load(),
 			AdTagFailed:     st.adTagFailed.Load(),
 			ThrottledMillis: st.speed.throttledNanos.Load() / int64(time.Millisecond),
+			IPLimitRefused:  st.ipLimitRefused.Load(),
 			LastIP:          lastIP,
 		}
 	}

@@ -101,6 +101,15 @@ type EventThrottled struct {
 	SecretName string
 }
 
+// EventIPLimited is emitted when a connection is refused because the user is
+// at their address limit and it came from an address they are not counted
+// at. It carries the user and not the address, like the refusal's log line.
+type EventIPLimited struct {
+	eventBase
+
+	SecretName string
+}
+
 // EventIPListSize is emitted when mtg updates a contents of the ip lists:
 // allowlist or blocklist.
 type EventIPListSize struct {
@@ -211,6 +220,17 @@ func NewEventReplayAttack(streamID string) EventReplayAttack {
 // NewEventThrottled creates a new EventThrottled event.
 func NewEventThrottled(streamID, secretName string) EventThrottled {
 	return EventThrottled{
+		eventBase: eventBase{
+			timestamp: time.Now(),
+			streamID:  streamID,
+		},
+		SecretName: secretName,
+	}
+}
+
+// NewEventIPLimited creates a new EventIPLimited event.
+func NewEventIPLimited(streamID, secretName string) EventIPLimited {
+	return EventIPLimited{
 		eventBase: eventBase{
 			timestamp: time.Now(),
 			streamID:  streamID,

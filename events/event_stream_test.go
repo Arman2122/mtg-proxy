@@ -204,6 +204,48 @@ func (suite *EventStreamTestSuite) TestEventReplayAttack() {
 	time.Sleep(100 * time.Millisecond)
 }
 
+func (suite *EventStreamTestSuite) TestEventThrottled() {
+	evt := mtglib.NewEventThrottled("CONNID", "alice")
+
+	for _, v := range []*ObserverMock{suite.observerMock1, suite.observerMock2} {
+		v.
+			On("EventThrottled", mock.Anything).
+			Once().
+			Run(func(args mock.Arguments) {
+				caught, ok := args.Get(0).(mtglib.EventThrottled)
+
+				suite.True(ok)
+				suite.Equal(evt.StreamID(), caught.StreamID())
+				suite.Equal(evt.Timestamp(), caught.Timestamp())
+				suite.Equal("alice", caught.SecretName)
+			})
+	}
+
+	suite.stream.Send(suite.ctx, evt)
+	time.Sleep(100 * time.Millisecond)
+}
+
+func (suite *EventStreamTestSuite) TestEventIPLimited() {
+	evt := mtglib.NewEventIPLimited("CONNID", "alice")
+
+	for _, v := range []*ObserverMock{suite.observerMock1, suite.observerMock2} {
+		v.
+			On("EventIPLimited", mock.Anything).
+			Once().
+			Run(func(args mock.Arguments) {
+				caught, ok := args.Get(0).(mtglib.EventIPLimited)
+
+				suite.True(ok)
+				suite.Equal(evt.StreamID(), caught.StreamID())
+				suite.Equal(evt.Timestamp(), caught.Timestamp())
+				suite.Equal("alice", caught.SecretName)
+			})
+	}
+
+	suite.stream.Send(suite.ctx, evt)
+	time.Sleep(100 * time.Millisecond)
+}
+
 func (suite *EventStreamTestSuite) TestEventIPListSize() {
 	evt := mtglib.NewEventIPListSize(10, true)
 

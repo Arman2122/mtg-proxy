@@ -62,6 +62,18 @@ type SecretLimits struct {
 	// to the rate rather than by buffering, so backpressure reaches the
 	// client's own TCP window and nothing is queued in memory.
 	SpeedBytesPerSecond int64
+
+	// IPLimit is how many distinct addresses this user may hold connections
+	// from at once, counting the addresses of their live connections here
+	// together with any a panel has reported them present at elsewhere. 0
+	// means unlimited.
+	//
+	// A connection from an address already counted is always admitted -- a
+	// second socket from the same phone is the same device -- and one from a
+	// new address is refused while the count is at the limit. An IPv6
+	// address counts as its /64. Refusal happens at admission, after the
+	// secret matched, so only a holder of the valid secret can observe it.
+	IPLimit int
 }
 
 // IsZero reports whether the limits impose no restriction at all, i.e. the
@@ -69,7 +81,8 @@ type SecretLimits struct {
 // materialising empty entries in maps and API responses.
 func (l SecretLimits) IsZero() bool {
 	return l.QuotaBytes == 0 && l.QuotaReset == QuotaResetNone &&
-		l.ExpiresAt.IsZero() && !l.Disabled && l.SpeedBytesPerSecond == 0
+		l.ExpiresAt.IsZero() && !l.Disabled && l.SpeedBytesPerSecond == 0 &&
+		l.IPLimit == 0
 }
 
 // DenyReason explains why a connection was refused by the per-user limits.
@@ -87,6 +100,10 @@ const (
 
 	// DenyQuota means the secret has used up its data quota.
 	DenyQuota
+
+	// DenyIPLimit means the connection came from an address the user is not
+	// already counted at, while they are at their address limit.
+	DenyIPLimit
 )
 
 // String returns a short machine-friendly reason label for logs.
@@ -98,6 +115,8 @@ func (d DenyReason) String() string {
 		return "expired"
 	case DenyQuota:
 		return "quota_exceeded"
+	case DenyIPLimit:
+		return "ip_limit"
 	default:
 		return "allowed"
 	}

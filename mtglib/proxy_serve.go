@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sort"
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
@@ -156,6 +155,7 @@ func (p *Proxy) attribute(ctx *streamContext, set *secretSet, i int) bool {
 	ctx.matchedSecretKey = set.secrets[i].Key[:]
 	ctx.secretName = set.names[i]
 	ctx.adTag = set.effectiveAdTag(i)
+	ctx.ipLimit = set.limits[i].IPLimit
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName)
 
 	allowed, reason := p.checkLimits(ctx.secretName, set.limits[i])
@@ -166,12 +166,25 @@ func (p *Proxy) attribute(ctx *streamContext, set *secretSet, i int) bool {
 	return allowed
 }
 
-// admit performs the throttle check and the accounting that must not happen
-// before the secret is known.
+// admit performs the throttle check, the address-limit check and the
+// accounting that must not happen before the secret is known.
 func (p *Proxy) admit(ctx *streamContext) bool {
 	if !p.stats.CanConnect(ctx.secretName) {
 		ctx.logger.Info("connection throttled")
 		p.eventStream.Send(ctx, NewEventThrottled(ctx.streamID, ctx.secretName))
+
+		return false
+	}
+
+	// The address gate and the registration are one critical section, and
+	// both come before OnConnect: a refused connection must never have been
+	// counted, and two new addresses arriving together must not both read
+	// "one below the limit". The log line carries the reason and not the
+	// address, like every other refusal.
+	if !p.tryRegisterConn(ctx) {
+		ctx.logger.BindStr("deny_reason", DenyIPLimit.String()).Info("connection denied by per-user limit")
+		p.stats.OnIPLimitRefused(ctx.secretName)
+		p.eventStream.Send(ctx, NewEventIPLimited(ctx.streamID, ctx.secretName))
 
 		return false
 	}
@@ -188,8 +201,6 @@ func (p *Proxy) admit(ctx *streamContext) bool {
 			p.stats.SetLastIP(ctx.secretName, ip.String())
 		}
 	}
-
-	p.registerConn(ctx)
 
 	return true
 }
@@ -352,9 +363,35 @@ func (p *Proxy) ServeWithPolicy(listener net.Listener, policy ListenerPolicy) er
 	}
 }
 
-func (p *Proxy) registerConn(ctx *streamContext) {
+// tryRegisterConn admits a stream into the live registry and into its user's
+// address ledger in one critical section, or refuses it because the user is
+// at their address limit. The address is resolved before the lock is taken:
+// ClientIP takes a lock of its own, and liveMu sits on the connect and
+// disconnect path of every stream.
+//
+// A limit with no address to count against fails closed. The only way a TCP
+// listener yields no address is a PROXY header that declared a non-TCP
+// source, and admitting such a connection uncounted would make that header
+// the way around the limit.
+func (p *Proxy) tryRegisterConn(ctx *streamContext) bool {
+	key, hasKey := addressKeyOf(ctx.ClientIP())
+	now := time.Now()
+
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
+
+	switch {
+	case hasKey:
+		if !p.ledgerLocked(ctx.secretName).admit(key, ctx.ipLimit, now) {
+			p.dropLedgerIfIdleLocked(ctx.secretName, now)
+
+			return false
+		}
+
+		ctx.addrKey, ctx.addrCounted = key, true
+	case ctx.ipLimit > 0:
+		return false
+	}
 
 	conns := p.liveConns[ctx.secretName]
 	if conns == nil {
@@ -363,77 +400,44 @@ func (p *Proxy) registerConn(ctx *streamContext) {
 	}
 
 	conns[ctx] = struct{}{}
+
+	return true
 }
 
 // connectedIPs snapshots the distinct client addresses holding a live
 // connection, per secret name. It returns nil when address tracking is off, so
 // the field stays absent from /stats rather than present and empty.
-//
-// The lock discipline is closeStaleConns': collect under liveMu, resolve
-// outside it. Nothing but the contexts themselves is touched inside the
-// critical section -- liveMu is a plain Mutex on the connect and disconnect
-// path of every stream, and ClientIP takes a second lock of its own, which is
-// a lock edge worth not creating for a stats scrape.
-//
-// Addresses are deduplicated and sorted. Map iteration order is randomised per
-// run, and an unsorted list would make two scrapes of an unchanged proxy
-// differ -- the same reason the feature list is kept sorted.
 func (p *Proxy) connectedIPs() map[string][]string {
 	if !p.trackClientIPs {
 		return nil
 	}
 
-	p.liveMu.Lock()
+	reports := p.addressReports()
+	rv := make(map[string][]string, len(reports))
 
-	snapshot := make(map[string][]*streamContext, len(p.liveConns))
-
-	for name, conns := range p.liveConns {
-		contexts := make([]*streamContext, 0, len(conns))
-		for sc := range conns {
-			contexts = append(contexts, sc)
+	for name, report := range reports {
+		if len(report.ConnectedIPs) > 0 {
+			rv[name] = report.ConnectedIPs
 		}
-
-		snapshot[name] = contexts
-	}
-	p.liveMu.Unlock()
-
-	rv := make(map[string][]string, len(snapshot))
-
-	for name, contexts := range snapshot {
-		seen := make(map[string]struct{}, len(contexts))
-		addresses := make([]string, 0, len(contexts))
-
-		for _, sc := range contexts {
-			ip := sc.ClientIP()
-			if ip == nil {
-				continue
-			}
-
-			text := ip.String()
-			if _, ok := seen[text]; ok {
-				continue
-			}
-
-			seen[text] = struct{}{}
-
-			addresses = append(addresses, text)
-		}
-
-		if len(addresses) == 0 {
-			continue
-		}
-
-		sort.Strings(addresses)
-
-		rv[name] = addresses
 	}
 
 	return rv
 }
 
+// unregisterConn undoes tryRegisterConn: the stream leaves the registry and
+// its address is released from the ledger, in the same critical section.
 func (p *Proxy) unregisterConn(ctx *streamContext) {
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
+
+	if ctx.addrCounted {
+		if ledger := p.addresses[ctx.secretName]; ledger != nil {
+			ledger.release(ctx.addrKey)
+			p.dropLedgerIfIdleLocked(ctx.secretName, time.Now())
+		}
+
+		ctx.addrCounted = false
+	}
 
 	conns := p.liveConns[ctx.secretName]
 	if conns == nil {

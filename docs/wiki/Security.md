@@ -539,6 +539,14 @@ than counted separately, so it cannot drift from `connections` beside it, and an
 entry disappears when its connection ends. `last_ip` is the address of the most
 recent admitted connection and **outlives that connection**.
 
+The same gate covers `external_ips` (v1.7.0): the addresses a panel has reported
+a user present at on its other systems, through
+`PUT /secrets/{name}/external-ips`, so that one address limit spans them. They
+are held in memory only, expire with the report's `ttl`, are never written to
+disk or to the log, and read back only when tracking is on. The **count** of a
+user's places, `active_ips`, is reported regardless, because how many places a
+user is in says nothing about where. See [[Limits-and-Quotas]].
+
 ### Why it defaults to off
 
 This is a circumvention proxy. The people using it are frequently the reason it

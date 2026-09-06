@@ -45,7 +45,7 @@ func TestStatsFeatures(t *testing.T) {
 
 		assert.Equal(t,
 			[]string{
-				FeatureClientIPs, FeatureFakeTLS, FeatureListeners, FeatureQuotaReset,
+				FeatureClientIPs, FeatureFakeTLS, FeatureIPLimits, FeatureListeners, FeatureQuotaReset,
 				FeatureSecretModes, FeatureSecretsAPI, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
@@ -63,6 +63,7 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t, "web-relay", FeatureWebRelay)
 		assert.Equal(t, "web-relay-watch", FeatureWebRelayWatch)
 		assert.Equal(t, "speed-limits", FeatureSpeedLimits)
+		assert.Equal(t, "ip-limits", FeatureIPLimits)
 	})
 
 	t.Run("every advertised route actually exists", func(t *testing.T) {
@@ -73,6 +74,8 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t, http.StatusOK, doAPI(t, p, "", http.MethodGet, "/secrets", "").Code)
 		assert.Equal(t, http.StatusOK,
 			doAPI(t, p, "", http.MethodPost, "/secrets/alice/reset-quota", "").Code)
+		assert.Equal(t, http.StatusOK,
+			doAPI(t, p, "", http.MethodGet, "/secrets/alice/external-ips", "").Code)
 	})
 
 	t.Run("it serializes as a sorted array, never null", func(t *testing.T) {
@@ -84,7 +87,7 @@ func TestStatsFeatures(t *testing.T) {
 		require.True(t, ok, "features must be a JSON array")
 		assert.Equal(t,
 			[]any{
-				"client-ips", "faketls", "listeners", "quota-reset",
+				"client-ips", "faketls", "ip-limits", "listeners", "quota-reset",
 				"secret-modes", "secrets-api", "speed-limits", "web-relay", "web-relay-watch",
 			},
 			features)
@@ -104,7 +107,7 @@ func TestStatsFeatures(t *testing.T) {
 
 		assert.Equal(t,
 			[]string{
-				FeatureClientIPs, FeatureFakeTLS, FeatureListeners, FeatureQuotaReset,
+				FeatureClientIPs, FeatureFakeTLS, FeatureIPLimits, FeatureListeners, FeatureQuotaReset,
 				FeatureSecretModes, FeatureSecretsAPI, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			stats.buildResponse().Features)
@@ -121,7 +124,7 @@ func TestStatsFeatures(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 		assert.Equal(t,
 			[]string{
-				FeatureClientIPs, FeatureFakeTLS, FeatureListeners, FeatureQuotaReset,
+				FeatureClientIPs, FeatureFakeTLS, FeatureIPLimits, FeatureListeners, FeatureQuotaReset,
 				FeatureSecretModes, FeatureSecretsAPI, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
