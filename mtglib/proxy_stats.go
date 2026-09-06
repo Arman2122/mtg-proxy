@@ -46,6 +46,12 @@ type secretStats struct {
 	// track addresses, so a deployment that does not ask for them never holds
 	// one, and it is never persisted: FlushUsage writes quota counters alone.
 	lastIP atomic.Value // stores string
+
+	// speed is the user's token bucket, shared by every connection of theirs.
+	// It lives here rather than in the secret set because the set is swapped
+	// whole on every reload, and a bucket swapped with it would hand the user
+	// a fresh burst each time; this struct is the runtime state that persists.
+	speed speedLimiter
 }
 
 // rolloverIfNeeded zeroes quotaUsed when the monthly quota period has elapsed.
@@ -149,6 +155,12 @@ func (s *ProxyStats) AddBytesOut(name string, n int64) {
 // the middle proxy and went direct instead, losing only its sponsored channel.
 func (s *ProxyStats) OnAdTagSkipped(name string) {
 	s.getOrCreate(name).adTagSkipped.Add(1)
+}
+
+// SetSpeedLimit installs a user's speed limit, or unlimited for zero,
+// re-rating the bucket their live connections are drawing from.
+func (s *ProxyStats) SetSpeedLimit(name string, bytesPerSecond int64) {
+	s.getOrCreate(name).speed.set(bytesPerSecond)
 }
 
 // OnAdTagFailed counts one ad-tagged stream whose transport the middle proxy
@@ -465,6 +477,11 @@ const (
 	// signals the relay can stop signalling once it sees this, and the proxy
 	// is the one component it can ask.
 	FeatureWebRelayWatch = "web-relay-watch"
+
+	// FeatureSpeedLimits means [secret-limits.<name>] and the secrets API
+	// accept a per-user speed, enforced by the proxy across every connection
+	// and door of that user, and /stats reports speed_limit and throttled_ms.
+	FeatureSpeedLimits = "speed-limits"
 )
 
 // supportedFeatures is the sorted capability list this build advertises. Keep it
@@ -476,6 +493,7 @@ var supportedFeatures = []string{
 	FeatureQuotaReset,
 	FeatureSecretModes,
 	FeatureSecretsAPI,
+	FeatureSpeedLimits,
 	FeatureWebRelay,
 	FeatureWebRelayWatch,
 }
@@ -557,6 +575,13 @@ type UserStatsJSON struct {
 	// whose ad tag was revoked, shows up here and nowhere else.
 	AdTagFailed int64 `json:"ad_tag_failed,omitempty"`
 
+	// SpeedLimit is the user's configured cap in bytes per second, and
+	// ThrottledMillis the time their connections have spent held to it. A
+	// user with a limit and no throttled time is not reaching it; one whose
+	// throttled time grows by a second a second is living at it.
+	SpeedLimit      int64 `json:"speed_limit,omitempty"`
+	ThrottledMillis int64 `json:"throttled_ms,omitempty"`
+
 	// ConnectedIPs lists the distinct client addresses holding a live
 	// connection right now, sorted. LastIP is the address of the most recent
 	// admitted connection, which outlives that connection.
@@ -591,14 +616,15 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 		lastIP, _ := st.lastIP.Load().(string)
 
 		users[name] = UserStatsJSON{
-			Connections:  conns,
-			BytesIn:      st.bytesIn.Load(),
-			BytesOut:     st.bytesOut.Load(),
-			LastSeen:     lastSeenPtr,
-			QuotaUsed:    st.quotaUsed.Load(),
-			AdTagSkipped: st.adTagSkipped.Load(),
-			AdTagFailed:  st.adTagFailed.Load(),
-			LastIP:       lastIP,
+			Connections:     conns,
+			BytesIn:         st.bytesIn.Load(),
+			BytesOut:        st.bytesOut.Load(),
+			LastSeen:        lastSeenPtr,
+			QuotaUsed:       st.quotaUsed.Load(),
+			AdTagSkipped:    st.adTagSkipped.Load(),
+			AdTagFailed:     st.adTagFailed.Load(),
+			ThrottledMillis: st.speed.throttledNanos.Load() / int64(time.Millisecond),
+			LastIP:          lastIP,
 		}
 	}
 	s.mu.RUnlock()

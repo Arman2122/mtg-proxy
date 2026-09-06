@@ -215,10 +215,28 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 		p.stats.PreRegister(name)
 	}
 
+	p.applySpeedLimits(newSet)
 	p.closeStaleConns(oldSet, newSet)
 	p.closeDeniedConns()
 
 	return nil
+}
+
+// applySpeedLimits re-rates every user's bucket from the set just installed.
+// It runs on every swap -- startup, reload, the API -- so a changed limit
+// reaches the user's live connections at once, and a removed one frees them
+// at once. A user dropped from the set keeps their bucket, which is harmless:
+// nothing draws from it, and a user re-added gets it re-rated here.
+func (p *Proxy) applySpeedLimits(set *secretSet) {
+	for i, name := range set.names {
+		var bytesPerSecond int64
+
+		if i < len(set.limits) {
+			bytesPerSecond = set.limits[i].SpeedBytesPerSecond
+		}
+
+		p.stats.SetSpeedLimit(name, bytesPerSecond)
+	}
 }
 
 // closeStaleConns closes every live stream whose secret was dropped from the

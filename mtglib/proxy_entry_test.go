@@ -233,6 +233,9 @@ func newEntryHarness(t *testing.T, secrets map[string]Secret, limits map[string]
 	}
 
 	proxy.secrets.Store(set)
+	// What NewProxy does after storing the set, so a harness with limits is
+	// the proxy an operator would get and not a quieter one.
+	proxy.applySpeedLimits(set)
 	proxy.obfsLimiter = newObfuscatedLimiter(ctx)
 
 	return &entryHarness{

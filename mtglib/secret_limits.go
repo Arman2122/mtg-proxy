@@ -52,6 +52,16 @@ type SecretLimits struct {
 	// Disabled, when true, rejects every new connection for the secret without
 	// removing it from the set.
 	Disabled bool
+
+	// SpeedBytesPerSecond is the sustained throughput this user is allowed,
+	// in bytes per second, upload and download combined, across every
+	// connection and every door they use at once. 0 means unlimited.
+	//
+	// It is a per-user allowance, not a per-connection one: two devices on
+	// the same secret share it. It is enforced by holding reads and writes
+	// to the rate rather than by buffering, so backpressure reaches the
+	// client's own TCP window and nothing is queued in memory.
+	SpeedBytesPerSecond int64
 }
 
 // IsZero reports whether the limits impose no restriction at all, i.e. the
@@ -59,7 +69,7 @@ type SecretLimits struct {
 // materialising empty entries in maps and API responses.
 func (l SecretLimits) IsZero() bool {
 	return l.QuotaBytes == 0 && l.QuotaReset == QuotaResetNone &&
-		l.ExpiresAt.IsZero() && !l.Disabled
+		l.ExpiresAt.IsZero() && !l.Disabled && l.SpeedBytesPerSecond == 0
 }
 
 // DenyReason explains why a connection was refused by the per-user limits.
@@ -125,6 +135,92 @@ func ParseQuotaBytes(s string) (int64, error) {
 	}
 
 	return int64(parsed), nil
+}
+
+// MinSpeedBytesPerSecond is the lowest speed limit accepted: 64 kbit/s, which
+// is exactly 8,000 bytes a second. Below that Telegram is not usable, and a
+// bucket that small would make every read a stall; a value under it is a typo
+// in the units far more often than an intention, so it is refused rather than
+// honoured. Spelled in bits deliberately, so that "64kbit" -- the number the
+// error message names -- is itself accepted.
+const MinSpeedBytesPerSecond = 64_000 / 8
+
+// ParseSpeed parses a speed limit into bytes per second. An empty string
+// yields 0 (unlimited). Both the config file and the management API go through
+// this one function, so they cannot disagree about a spelling.
+//
+// A bare number is bytes per second. Bit units are decimal, as every network
+// link is sold -- "5mbit" is 5,000,000 bits, 625,000 bytes; byte units are
+// binary, as ParseQuotaBytes reads them -- "1MB" is 1,048,576 bytes. A
+// trailing "/s" or "ps" is accepted and means nothing: every value is per
+// second. Case does not matter.
+//
+//	5mbit   500kbit   10gbit   2mbps   1MB/s   512KB/s   625000
+func ParseSpeed(s string) (int64, error) {
+	raw := strings.TrimSpace(s)
+	if raw == "" {
+		return 0, nil
+	}
+
+	lower := strings.ToLower(strings.ReplaceAll(raw, " ", ""))
+
+	// Split the number from its unit at the first character that is not part
+	// of a number.
+	split := 0
+	for split < len(lower) && (lower[split] >= '0' && lower[split] <= '9' || lower[split] == '.') {
+		split++
+	}
+
+	number, unit := lower[:split], lower[split:]
+
+	value, err := strconv.ParseFloat(number, 64)
+	if err != nil || number == "" {
+		return 0, fmt.Errorf("incorrect speed %q: want a number and a unit, like \"5mbit\" or \"1MB/s\"", s)
+	}
+
+	if value <= 0 {
+		return 0, fmt.Errorf("speed must be positive (%q); leave it out for no limit", s)
+	}
+
+	unit = strings.TrimSuffix(unit, "/s")
+
+	var bytesPerSecond float64
+
+	switch {
+	case unit == "":
+		bytesPerSecond = value
+	case strings.HasSuffix(unit, "bps") || strings.HasSuffix(unit, "bit"):
+		prefix := strings.TrimSuffix(strings.TrimSuffix(unit, "bps"), "bit")
+
+		multiplier, ok := map[string]float64{"": 1, "k": 1e3, "m": 1e6, "g": 1e9}[prefix]
+		if !ok {
+			return 0, fmt.Errorf("incorrect speed unit in %q", s)
+		}
+
+		bytesPerSecond = value * multiplier / 8
+	default:
+		multiplier, ok := map[string]float64{
+			"b": 1, "kb": 1 << 10, "mb": 1 << 20, "gb": 1 << 30,
+			"kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30,
+		}[strings.TrimSuffix(unit, "ps")]
+		if !ok {
+			return 0, fmt.Errorf("incorrect speed unit in %q", s)
+		}
+
+		bytesPerSecond = value * multiplier
+	}
+
+	// Far beyond any link this could run on, and beyond what an int can hold
+	// on the 32-bit builds; a value up here is a mistake, not a policy.
+	if bytesPerSecond > 1<<40 {
+		return 0, fmt.Errorf("speed %q is unreasonably large", s)
+	}
+
+	if bytesPerSecond < MinSpeedBytesPerSecond {
+		return 0, fmt.Errorf("speed %q is below the minimum of 64kbit/s (8000 bytes/s)", s)
+	}
+
+	return int64(bytesPerSecond), nil
 }
 
 // ParseQuotaReset parses the reset policy spelling. Empty and "none" both map to

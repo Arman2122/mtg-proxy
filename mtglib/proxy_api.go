@@ -32,6 +32,12 @@ type SecretInfo struct {
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 	Disabled       bool       `json:"disabled,omitempty"`
 
+	// SpeedLimit is the user's cap in bytes per second, upload and download
+	// combined across every connection, or absent for unlimited. It is set
+	// with a human spelling ("5mbit", "1MB/s") and read back as a number, the
+	// same way quota is.
+	SpeedLimit int64 `json:"speed_limit,omitempty"`
+
 	// Mode is the wire form this secret serialises to: "ee", "dd" or "plain".
 	Mode string `json:"mode"`
 
@@ -135,6 +141,7 @@ func fillLimitInfo(info *SecretInfo, lim SecretLimits, used int64) {
 	}
 
 	info.Disabled = lim.Disabled
+	info.SpeedLimit = lim.SpeedBytesPerSecond
 }
 
 // ReplaceSecrets swaps the entire secret configuration (secrets + advertising
@@ -456,6 +463,7 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		}
 
 		user.Disabled = lim.Disabled
+		user.SpeedLimit = lim.SpeedBytesPerSecond
 
 		resp.Users[name] = user
 	}
@@ -494,16 +502,19 @@ func (p *Proxy) hasSecret(name string) bool {
 // limitFields are the optional per-secret governance limits accepted by the
 // secrets API. All fields are optional; omitting them (or sending zero values)
 // clears the corresponding limit. Quota accepts human sizes ("10GB"), expires
-// accepts RFC3339 or YYYY-MM-DD, and quota_reset is "none" or "monthly".
+// accepts RFC3339 or YYYY-MM-DD, quota_reset is "none" or "monthly", and speed
+// accepts a rate ("5mbit", "1MB/s") -- the same spellings the config file
+// takes, from the same parsers.
 type limitFields struct {
 	Quota      string `json:"quota,omitempty"`
 	QuotaReset string `json:"quota_reset,omitempty"`
 	Expires    string `json:"expires,omitempty"`
 	Disabled   bool   `json:"disabled,omitempty"`
+	Speed      string `json:"speed,omitempty"`
 }
 
 // parse turns the raw string fields into a SecretLimits, returning an error for
-// a malformed quota, reset policy or expiry.
+// a malformed quota, reset policy, expiry or speed.
 func (l limitFields) parse() (SecretLimits, error) {
 	quota, err := ParseQuotaBytes(l.Quota)
 	if err != nil {
@@ -520,11 +531,17 @@ func (l limitFields) parse() (SecretLimits, error) {
 		return SecretLimits{}, err
 	}
 
+	speed, err := ParseSpeed(l.Speed)
+	if err != nil {
+		return SecretLimits{}, err
+	}
+
 	return SecretLimits{
-		QuotaBytes: quota,
-		QuotaReset: reset,
-		ExpiresAt:  expires,
-		Disabled:   l.Disabled,
+		QuotaBytes:          quota,
+		QuotaReset:          reset,
+		ExpiresAt:           expires,
+		Disabled:            l.Disabled,
+		SpeedBytesPerSecond: speed,
 	}, nil
 }
 

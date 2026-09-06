@@ -32,9 +32,10 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 # Endpoints:
 #   GET    /stats            per-user connection counts, traffic and quota usage
 #   POST   /reload           re-read [secrets], ad-tag, [secret-ad-tags] and [secret-limits] from this file
-#   GET    /secrets          list secrets (name, secret, host, ad_tag, effective_ad_tag, quota/expiry/disabled)
-#   POST   /secrets          add/update one secret: {"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?}
-#   PUT    /secrets          replace the whole set: {"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?}},"ad_tag"?}
+#   GET    /secrets          list secrets (name, secret, host, ad_tag, effective_ad_tag, quota/expiry/disabled/speed_limit)
+#   GET    /secrets/{name}   one entry of that list, by name
+#   POST   /secrets          add/update one secret: {"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?}
+#   PUT    /secrets          replace the whole set: {"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?}},"ad_tag"?}
 #   DELETE /secrets/{name}   remove one secret
 #   POST   /secrets/{name}/reset-quota   zero the secret's used-bytes counter
 #   GET    /adtag            read the global ad-tag: {"ad_tag": "<hex>"|null}
@@ -351,9 +352,10 @@ allow-fallback-on-unknown-dc = false
 # [secret-ad-tags]
 # bob = "fedcba9876543210fedcba9876543210"
 
-# Optional per-secret governance limits: a data quota, an expiry deadline and a
-# disabled switch. Each [secret-limits.<name>] names a secret from [secrets].
-# A secret without an entry is unlimited, never expires and is enabled.
+# Optional per-secret governance limits: a data quota, a speed limit, an expiry
+# deadline and a disabled switch. Each [secret-limits.<name>] names a secret
+# from [secrets]. A secret without an entry is unlimited in both senses, never
+# expires and is enabled.
 #
 # When a user is over quota, past its expiry, or disabled, new connections are
 # transparently routed to the fronting domain (exactly like a wrong secret), so
@@ -368,6 +370,12 @@ allow-fallback-on-unknown-dc = false
 #   expires      RFC3339 ("2026-12-31T00:00:00Z") or date ("2026-12-31"); omit
 #                for never
 #   disabled     true to reject the secret without removing it (default false)
+#   speed        sustained throughput cap, upload and download combined, shared
+#                by every connection and every door of this user: "5mbit",
+#                "500kbit", "1MB/s" (bits are decimal, bytes are base 2, "/s"
+#                is optional). Minimum 64kbit. Omit for unlimited. Enforced by
+#                the proxy, which is the only hop that knows which user a byte
+#                belongs to; live connections follow a change on reload.
 #
 # Set usage-state-file above so quota usage survives restarts. Limits set via
 # the management API are in-memory only and are overridden by the next reload.
@@ -376,6 +384,7 @@ allow-fallback-on-unknown-dc = false
 # after all global keys — in TOML, keys after a [section] belong to that table.
 # [secret-limits.alice]
 # quota = "10GB"
+# speed = "5mbit"
 # quota-reset = "monthly"
 # expires = "2026-12-31"
 # disabled = false

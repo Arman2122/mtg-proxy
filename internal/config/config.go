@@ -23,6 +23,7 @@ type ConfigSecretLimit struct {
 	QuotaReset TypeQuotaReset `json:"quotaReset"`
 	Expires    TypeExpiry     `json:"expires"`
 	Disabled   TypeBool       `json:"disabled"`
+	Speed      TypeSpeed      `json:"speed"`
 }
 
 // ConfigListener is one [[listener]] block: an extra socket serving the
@@ -393,9 +394,10 @@ func (c *Config) GetSecretLimits() map[string]mtglib.SecretLimits {
 
 	for name, l := range c.SecretLimits {
 		lim := mtglib.SecretLimits{
-			QuotaBytes: l.Quota.Get(0),
-			ExpiresAt:  l.Expires.Get(time.Time{}),
-			Disabled:   l.Disabled.Get(false),
+			QuotaBytes:          l.Quota.Get(0),
+			ExpiresAt:           l.Expires.Get(time.Time{}),
+			Disabled:            l.Disabled.Get(false),
+			SpeedBytesPerSecond: l.Speed.Get(0),
 		}
 
 		if l.QuotaReset.Get("none") == mtglib.QuotaResetMonthly.String() {

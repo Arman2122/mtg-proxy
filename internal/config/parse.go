@@ -18,6 +18,7 @@ type tomlConfig struct {
 	SecretLimits             map[string]struct {
 		Quota      string `toml:"quota" json:"quota,omitempty"`
 		QuotaReset string `toml:"quota-reset" json:"quotaReset,omitempty"`
+		Speed      string `toml:"speed" json:"speed,omitempty"`
 		Expires    string `toml:"expires" json:"expires,omitempty"`
 		Disabled   bool   `toml:"disabled" json:"disabled,omitempty"`
 	} `toml:"secret-limits" json:"secretLimits,omitempty"`
