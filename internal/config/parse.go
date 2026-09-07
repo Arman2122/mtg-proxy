@@ -23,6 +23,8 @@ type tomlConfig struct {
 		Quota      string `toml:"quota" json:"quota,omitempty"`
 		QuotaReset string `toml:"quota-reset" json:"quotaReset,omitempty"`
 		Speed      string `toml:"speed" json:"speed,omitempty"`
+		SpeedUp    string `toml:"speed-up" json:"speedUp,omitempty"`
+		SpeedDown  string `toml:"speed-down" json:"speedDown,omitempty"`
 		Expires    string `toml:"expires" json:"expires,omitempty"`
 		Disabled   bool   `toml:"disabled" json:"disabled,omitempty"`
 		IPLimit    int    `toml:"ip-limit" json:"ipLimit,omitempty"`

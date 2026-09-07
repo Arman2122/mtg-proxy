@@ -25,6 +25,8 @@ type ConfigSecretLimit struct {
 	Expires    TypeExpiry     `json:"expires"`
 	Disabled   TypeBool       `json:"disabled"`
 	Speed      TypeSpeed      `json:"speed"`
+	SpeedUp    TypeSpeed      `json:"speedUp"`
+	SpeedDown  TypeSpeed      `json:"speedDown"`
 	IPLimit    TypeIPLimit    `json:"ipLimit"`
 }
 
@@ -417,11 +419,13 @@ func (c *Config) GetSecretLimits() map[string]mtglib.SecretLimits {
 
 	for name, l := range c.SecretLimits {
 		lim := mtglib.SecretLimits{
-			QuotaBytes:          l.Quota.Get(0),
-			ExpiresAt:           l.Expires.Get(time.Time{}),
-			Disabled:            l.Disabled.Get(false),
-			SpeedBytesPerSecond: l.Speed.Get(0),
-			IPLimit:             l.IPLimit.Get(0),
+			QuotaBytes:              l.Quota.Get(0),
+			ExpiresAt:               l.Expires.Get(time.Time{}),
+			Disabled:                l.Disabled.Get(false),
+			SpeedBytesPerSecond:     l.Speed.Get(0),
+			SpeedUpBytesPerSecond:   l.SpeedUp.Get(0),
+			SpeedDownBytesPerSecond: l.SpeedDown.Get(0),
+			IPLimit:                 l.IPLimit.Get(0),
 		}
 
 		if l.QuotaReset.Get("none") == mtglib.QuotaResetMonthly.String() {

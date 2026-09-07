@@ -95,3 +95,42 @@ alice = "%s"
 	assert.Nil(t, conf.GetSecretLimits())
 	assert.Empty(t, conf.UsageStateFile)
 }
+
+// speed-up and speed-down are each their own cap, spelled like speed, and a
+// value below the floor is refused on either.
+func TestSecretLimitsSpeedDirections(t *testing.T) {
+	t.Parallel()
+
+	alice := mtglib.GenerateSecret("alice.example.com").Hex()
+
+	raw := fmt.Sprintf(`
+bind-to = "10.0.0.1:443"
+
+[secret-limits.alice]
+speed-up = "1mbit"
+speed-down = "2MB/s"
+
+[secrets]
+alice = "%s"
+`, alice)
+
+	conf, err := config.Parse([]byte(raw))
+	require.NoError(t, err)
+	require.NoError(t, conf.Validate())
+
+	a := conf.GetSecretLimits()["alice"]
+	assert.Equal(t, int64(125_000), a.SpeedUpBytesPerSecond)
+	assert.Equal(t, int64(2<<20), a.SpeedDownBytesPerSecond)
+	assert.Zero(t, a.SpeedBytesPerSecond, "the combined cap is a separate key")
+
+	_, err = config.Parse([]byte(fmt.Sprintf(`
+bind-to = "10.0.0.1:443"
+
+[secret-limits.alice]
+speed-down = "32kbit"
+
+[secrets]
+alice = "%s"
+`, alice)))
+	require.ErrorContains(t, err, "64kbit")
+}

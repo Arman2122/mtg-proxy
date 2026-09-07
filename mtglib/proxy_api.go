@@ -38,6 +38,11 @@ type SecretInfo struct {
 	// same way quota is.
 	SpeedLimit int64 `json:"speed_limit,omitempty"`
 
+	// SpeedLimitUp and SpeedLimitDown are the per-direction caps, from the
+	// client's side, in the same unit; absent for unlimited.
+	SpeedLimitUp   int64 `json:"speed_limit_up,omitempty"`
+	SpeedLimitDown int64 `json:"speed_limit_down,omitempty"`
+
 	// IPLimit is how many distinct addresses the user may be at once, or
 	// absent for unlimited; ActiveIPs is how many they count as being at
 	// right now. Neither is an address, so neither is gated.
@@ -71,6 +76,10 @@ type SecretInfo struct {
 	// where they are.
 	ConnectedIPs []string `json:"connected_ips,omitempty"`
 	LastIP       string   `json:"last_ip,omitempty"`
+
+	// ConnectedIPsLastSeen is when each connected address last moved a byte,
+	// gated as ConnectedIPs is.
+	ConnectedIPsLastSeen map[string]time.Time `json:"connected_ips_last_seen,omitempty"`
 
 	// ExternalIPs and ExternalExpiresAt are the addresses a panel reported
 	// this user present at elsewhere and when that report lapses, gated
@@ -124,6 +133,7 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 		report := addresses[name]
 		info.ActiveIPs = report.ActiveIPs
 		info.ConnectedIPs = report.ConnectedIPs
+		info.ConnectedIPsLastSeen = report.ConnectedIPsLastSeen
 		info.ExternalIPs = report.ExternalIPs
 		info.ExternalExpiresAt = report.ExternalExpiresAt
 
@@ -159,6 +169,8 @@ func fillLimitInfo(info *SecretInfo, lim SecretLimits, used int64) {
 
 	info.Disabled = lim.Disabled
 	info.SpeedLimit = lim.SpeedBytesPerSecond
+	info.SpeedLimitUp = lim.SpeedUpBytesPerSecond
+	info.SpeedLimitDown = lim.SpeedDownBytesPerSecond
 	info.IPLimit = lim.IPLimit
 }
 
@@ -377,6 +389,7 @@ func (p *Proxy) buildAPIHandler(token string) http.Handler {
 	mux.HandleFunc("GET /secrets/{name}", p.handleGetSecret)
 	mux.HandleFunc("DELETE /secrets/{name}", p.handleDeleteSecret)
 	mux.HandleFunc("POST /secrets/{name}/reset-quota", p.handleResetQuota)
+	mux.HandleFunc("POST /secrets/{name}/kick", p.handleKick)
 	mux.HandleFunc("GET /secrets/{name}/external-ips", p.handleGetExternalIPs)
 	mux.HandleFunc("PUT /secrets/{name}/external-ips", p.handlePutExternalIPs)
 	mux.HandleFunc("DELETE /secrets/{name}/external-ips", p.handleDeleteExternalIPs)
@@ -452,6 +465,7 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 
 		user.ActiveIPs = report.ActiveIPs
 		user.ConnectedIPs = report.ConnectedIPs
+		user.ConnectedIPsLastSeen = report.ConnectedIPsLastSeen
 		user.ExternalIPs = report.ExternalIPs
 		user.ExternalExpiresAt = report.ExternalExpiresAt
 		resp.Users[name] = user
@@ -488,6 +502,8 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 
 		user.Disabled = lim.Disabled
 		user.SpeedLimit = lim.SpeedBytesPerSecond
+		user.SpeedLimitUp = lim.SpeedUpBytesPerSecond
+		user.SpeedLimitDown = lim.SpeedDownBytesPerSecond
 		user.IPLimit = lim.IPLimit
 
 		resp.Users[name] = user
@@ -632,6 +648,8 @@ type limitFields struct {
 	Expires    string `json:"expires,omitempty"`
 	Disabled   bool   `json:"disabled,omitempty"`
 	Speed      string `json:"speed,omitempty"`
+	SpeedUp    string `json:"speed_up,omitempty"`
+	SpeedDown  string `json:"speed_down,omitempty"`
 	IPLimit    int    `json:"ip_limit,omitempty"`
 }
 
@@ -662,13 +680,25 @@ func (l limitFields) parse() (SecretLimits, error) {
 		return SecretLimits{}, err
 	}
 
+	speedUp, err := ParseSpeed(l.SpeedUp)
+	if err != nil {
+		return SecretLimits{}, fmt.Errorf("speed_up: %w", err)
+	}
+
+	speedDown, err := ParseSpeed(l.SpeedDown)
+	if err != nil {
+		return SecretLimits{}, fmt.Errorf("speed_down: %w", err)
+	}
+
 	return SecretLimits{
-		QuotaBytes:          quota,
-		QuotaReset:          reset,
-		ExpiresAt:           expires,
-		Disabled:            l.Disabled,
-		SpeedBytesPerSecond: speed,
-		IPLimit:             l.IPLimit,
+		QuotaBytes:              quota,
+		QuotaReset:              reset,
+		ExpiresAt:               expires,
+		Disabled:                l.Disabled,
+		SpeedBytesPerSecond:     speed,
+		SpeedUpBytesPerSecond:   speedUp,
+		SpeedDownBytesPerSecond: speedDown,
+		IPLimit:                 l.IPLimit,
 	}, nil
 }
 

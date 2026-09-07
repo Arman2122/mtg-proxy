@@ -45,8 +45,9 @@ func TestStatsFeatures(t *testing.T) {
 
 		assert.Equal(t,
 			[]string{
-				FeatureClientIPs, FeatureFakeTLS, FeatureIPLimits, FeatureListeners, FeatureQuotaReset,
-				FeatureSecretModes, FeatureSecretsAPI, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
+				FeatureClientIPActivity, FeatureClientIPs, FeatureFakeTLS, FeatureIPLimits, FeatureKick,
+				FeatureListeners, FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead,
+				FeatureSecretsAPI, FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
 	})
@@ -64,6 +65,11 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t, "web-relay-watch", FeatureWebRelayWatch)
 		assert.Equal(t, "speed-limits", FeatureSpeedLimits)
 		assert.Equal(t, "ip-limits", FeatureIPLimits)
+		assert.Equal(t, "speed-directions", FeatureSpeedDirections)
+		assert.Equal(t, "kick", FeatureKick)
+		assert.Equal(t, "client-ip-activity", FeatureClientIPActivity)
+		assert.Equal(t, "quota-ceiling", FeatureQuotaCeiling)
+		assert.Equal(t, "secret-read", FeatureSecretRead)
 	})
 
 	t.Run("every advertised route actually exists", func(t *testing.T) {
@@ -76,6 +82,9 @@ func TestStatsFeatures(t *testing.T) {
 			doAPI(t, p, "", http.MethodPost, "/secrets/alice/reset-quota", "").Code)
 		assert.Equal(t, http.StatusOK,
 			doAPI(t, p, "", http.MethodGet, "/secrets/alice/external-ips", "").Code)
+		assert.Equal(t, http.StatusOK, doAPI(t, p, "", http.MethodGet, "/secrets/alice", "").Code)
+		assert.Equal(t, http.StatusOK,
+			doAPI(t, p, "", http.MethodPost, "/secrets/alice/kick", `{"ips":["203.0.113.9"]}`).Code)
 	})
 
 	t.Run("it serializes as a sorted array, never null", func(t *testing.T) {
@@ -87,8 +96,8 @@ func TestStatsFeatures(t *testing.T) {
 		require.True(t, ok, "features must be a JSON array")
 		assert.Equal(t,
 			[]any{
-				"client-ips", "faketls", "ip-limits", "listeners", "quota-reset",
-				"secret-modes", "secrets-api", "speed-limits", "web-relay", "web-relay-watch",
+				"client-ip-activity", "client-ips", "faketls", "ip-limits", "kick", "listeners", "quota-ceiling",
+				"quota-reset", "secret-modes", "secret-read", "secrets-api", "speed-directions", "speed-limits", "web-relay", "web-relay-watch",
 			},
 			features)
 		// Asserted independently of the literal above, so appending a capability
@@ -107,8 +116,9 @@ func TestStatsFeatures(t *testing.T) {
 
 		assert.Equal(t,
 			[]string{
-				FeatureClientIPs, FeatureFakeTLS, FeatureIPLimits, FeatureListeners, FeatureQuotaReset,
-				FeatureSecretModes, FeatureSecretsAPI, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
+				FeatureClientIPActivity, FeatureClientIPs, FeatureFakeTLS, FeatureIPLimits, FeatureKick,
+				FeatureListeners, FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead,
+				FeatureSecretsAPI, FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			stats.buildResponse().Features)
 	})
@@ -124,8 +134,9 @@ func TestStatsFeatures(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 		assert.Equal(t,
 			[]string{
-				FeatureClientIPs, FeatureFakeTLS, FeatureIPLimits, FeatureListeners, FeatureQuotaReset,
-				FeatureSecretModes, FeatureSecretsAPI, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
+				FeatureClientIPActivity, FeatureClientIPs, FeatureFakeTLS, FeatureIPLimits, FeatureKick,
+				FeatureListeners, FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead,
+				FeatureSecretsAPI, FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
 	})

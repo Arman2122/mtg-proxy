@@ -326,6 +326,10 @@ type AddressReport struct {
 	ConnectedIPs      []string   `json:"connected_ips,omitempty"`
 	ExternalIPs       []string   `json:"external_ips,omitempty"`
 	ExternalExpiresAt *time.Time `json:"external_expires_at,omitempty"`
+
+	// ConnectedIPsLastSeen is when each connected address last moved a byte,
+	// gated as ConnectedIPs is.
+	ConnectedIPsLastSeen map[string]time.Time `json:"connected_ips_last_seen,omitempty"`
 }
 
 // addressReports snapshots every user's address view. Like connectedIPs, it
@@ -371,7 +375,7 @@ func (p *Proxy) addressReports() map[string]AddressReport {
 		report := AddressReport{Name: name, ActiveIPs: view.active}
 
 		if p.trackClientIPs {
-			report.ConnectedIPs = distinctClientAddresses(contexts[name])
+			report.ConnectedIPs, report.ConnectedIPsLastSeen = clientAddressActivity(contexts[name])
 			report.ExternalIPs = view.external
 
 			if !view.expires.IsZero() {
@@ -386,12 +390,17 @@ func (p *Proxy) addressReports() map[string]AddressReport {
 	return rv
 }
 
-// distinctClientAddresses is the sorted, deduplicated address list of a set
-// of streams. Sorted because map iteration is randomised per run, and two
-// scrapes of an unchanged proxy must not differ.
-func distinctClientAddresses(contexts []*streamContext) []string {
+// clientAddressActivity is the sorted, deduplicated address list of a set of
+// streams, with the second each address last moved a byte: the latest across
+// the streams sharing it, so a device that fell silent reads as silent while
+// its sibling talks. Sorted because map iteration is randomised per run, and
+// two scrapes of an unchanged proxy must not differ. A stream never stamped
+// (one not yet admitted) lists its address with no time.
+func clientAddressActivity(contexts []*streamContext) ([]string, map[string]time.Time) {
 	seen := make(map[string]struct{}, len(contexts))
 	addresses := make([]string, 0, len(contexts))
+
+	var lastSeen map[string]time.Time
 
 	for _, sc := range contexts {
 		ip := sc.ClientIP()
@@ -400,20 +409,28 @@ func distinctClientAddresses(contexts []*streamContext) []string {
 		}
 
 		text := ip.String()
-		if _, ok := seen[text]; ok {
-			continue
+		if _, ok := seen[text]; !ok {
+			seen[text] = struct{}{}
+
+			addresses = append(addresses, text)
 		}
 
-		seen[text] = struct{}{}
+		if unix := sc.lastActiveUnix.Load(); unix > 0 {
+			if lastSeen == nil {
+				lastSeen = make(map[string]time.Time)
+			}
 
-		addresses = append(addresses, text)
+			if at := time.Unix(unix, 0).UTC(); at.After(lastSeen[text]) {
+				lastSeen[text] = at
+			}
+		}
 	}
 
 	if len(addresses) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	sort.Strings(addresses)
 
-	return addresses
+	return addresses, lastSeen
 }

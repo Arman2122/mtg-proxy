@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
@@ -62,6 +63,10 @@ type streamContext struct {
 	// snapshot of the limit it happened under.
 	addrKey     addressKey
 	addrCounted bool
+
+	// lastActiveUnix is the second this stream last moved a byte, stamped at
+	// admission and by the data path, for the per-address activity report.
+	lastActiveUnix atomic.Int64
 }
 
 func (s *streamContext) Deadline() (time.Time, bool) {

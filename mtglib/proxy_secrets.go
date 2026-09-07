@@ -239,6 +239,7 @@ func (p *Proxy) applyLimits(set *secretSet) {
 		}
 
 		p.stats.SetSpeedLimit(name, lim.SpeedBytesPerSecond)
+		p.stats.SetDirectionalSpeedLimits(name, lim.SpeedUpBytesPerSecond, lim.SpeedDownBytesPerSecond)
 		p.stats.SetQuotaCeiling(name, lim.QuotaBytes)
 	}
 }

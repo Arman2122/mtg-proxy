@@ -63,6 +63,14 @@ type SecretLimits struct {
 	// client's own TCP window and nothing is queued in memory.
 	SpeedBytesPerSecond int64
 
+	// SpeedUpBytesPerSecond and SpeedDownBytesPerSecond cap one direction each,
+	// from the client's side: up is what the client sends, down is what it
+	// receives. Each is its own bucket, so a user may be given a slow upload
+	// and a fast download, and both apply on top of the combined cap when that
+	// is set too. 0 means unlimited.
+	SpeedUpBytesPerSecond   int64
+	SpeedDownBytesPerSecond int64
+
 	// IPLimit is how many distinct addresses this user may hold connections
 	// from at once, counting the addresses of their live connections here
 	// together with any a panel has reported them present at elsewhere. 0
@@ -82,6 +90,7 @@ type SecretLimits struct {
 func (l SecretLimits) IsZero() bool {
 	return l.QuotaBytes == 0 && l.QuotaReset == QuotaResetNone &&
 		l.ExpiresAt.IsZero() && !l.Disabled && l.SpeedBytesPerSecond == 0 &&
+		l.SpeedUpBytesPerSecond == 0 && l.SpeedDownBytesPerSecond == 0 &&
 		l.IPLimit == 0
 }
 

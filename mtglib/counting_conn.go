@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync/atomic"
+	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
 )
@@ -38,12 +39,47 @@ type countingConn struct {
 	// cutoff is counted once however many reads and writes -- from both
 	// pumps of the relay -- find the quota gone.
 	cut atomic.Bool
+
+	// active, when set, is stamped with the second of the stream's latest
+	// byte, for the per-address activity report. Nil in tests that exercise
+	// the wrapper on its own.
+	active *atomic.Int64
 }
 
 func newCountingConn(
 	ctx context.Context, stop func(), conn essentials.Conn, stats *ProxyStats, secretName string,
 ) *countingConn {
 	return &countingConn{Conn: conn, ctx: ctx, stop: stop, st: stats.getOrCreate(secretName)}
+}
+
+// withActivity points the wrapper at the stamp it keeps current.
+func (c *countingConn) withActivity(active *atomic.Int64) *countingConn {
+	c.active = active
+
+	return c
+}
+
+// markActive stamps the stream's latest byte to the second. The store is
+// skipped while the second is unchanged, so the data path pays a clock read
+// and a load per call, and a write once a second.
+func (c *countingConn) markActive() {
+	if c.active == nil {
+		return
+	}
+
+	if now := time.Now().Unix(); c.active.Load() != now {
+		c.active.Store(now)
+	}
+}
+
+// waitBoth charges n bytes to the combined bucket and then to the direction's
+// own, so a byte is paid for under every cap that applies to it.
+func (c *countingConn) waitBoth(combined, direction *speedLimiter, n int) error {
+	if err := combined.wait(c.ctx, n); err != nil {
+		return err
+	}
+
+	return direction.wait(c.ctx, n)
 }
 
 // allowance cuts a transfer of n bytes down to what the quota still permits.
@@ -97,7 +133,7 @@ func (c *countingConn) exhausted() error {
 // cut to the quota's allowance, so what reaches the cap is delivered and
 // nothing past it is read.
 func (c *countingConn) Read(p []byte) (int, error) {
-	limit, ok := c.allowance(c.st.speed.chunk(len(p)))
+	limit, ok := c.allowance(c.st.speedUp.chunk(c.st.speed.chunk(len(p))))
 	if !ok {
 		return 0, c.exhausted()
 	}
@@ -105,12 +141,13 @@ func (c *countingConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p[:limit])
 	if n > 0 {
 		c.st.bytesIn.Add(int64(n))
+		c.markActive()
 
 		if c.charge(n) {
 			return n, c.exhausted()
 		}
 
-		if waitErr := c.st.speed.wait(c.ctx, n); waitErr != nil && err == nil {
+		if waitErr := c.waitBoth(&c.st.speed, &c.st.speedUp, n); waitErr != nil && err == nil {
 			err = waitErr
 		}
 	}
@@ -127,18 +164,19 @@ func (c *countingConn) Write(p []byte) (int, error) {
 	var written int
 
 	for len(p) > 0 {
-		piece, ok := c.allowance(c.st.speed.chunk(len(p)))
+		piece, ok := c.allowance(c.st.speedDown.chunk(c.st.speed.chunk(len(p))))
 		if !ok {
 			return written, c.exhausted()
 		}
 
-		if err := c.st.speed.wait(c.ctx, piece); err != nil {
+		if err := c.waitBoth(&c.st.speed, &c.st.speedDown, piece); err != nil {
 			return written, err
 		}
 
 		n, err := c.Conn.Write(p[:piece])
 		if n > 0 {
 			c.st.bytesOut.Add(int64(n))
+			c.markActive()
 		}
 
 		written += n

@@ -68,6 +68,12 @@ type secretStats struct {
 	// whole on every reload, and a bucket swapped with it would hand the user
 	// a fresh burst each time; this struct is the runtime state that persists.
 	speed speedLimiter
+
+	// speedUp and speedDown are the per-direction buckets, drawn from by the
+	// reads (what the client sends) and the writes (what it receives) alone,
+	// on top of the combined one. Unlimited when the user has no such cap.
+	speedUp   speedLimiter
+	speedDown speedLimiter
 }
 
 // rolloverIfNeeded zeroes quotaUsed when the monthly quota period has elapsed.
@@ -177,6 +183,14 @@ func (s *ProxyStats) OnAdTagSkipped(name string) {
 // re-rating the bucket their live connections are drawing from.
 func (s *ProxyStats) SetSpeedLimit(name string, bytesPerSecond int64) {
 	s.getOrCreate(name).speed.set(bytesPerSecond)
+}
+
+// SetDirectionalSpeedLimits installs a user's per-direction caps, or unlimited
+// for zero, re-rating the buckets in place the way SetSpeedLimit does.
+func (s *ProxyStats) SetDirectionalSpeedLimits(name string, upBytesPerSecond, downBytesPerSecond int64) {
+	st := s.getOrCreate(name)
+	st.speedUp.set(upBytesPerSecond)
+	st.speedDown.set(downBytesPerSecond)
 }
 
 // OnIPLimitRefused counts one connection refused by the user's address limit.
@@ -518,18 +532,45 @@ const (
 	// accept a per-user speed, enforced by the proxy across every connection
 	// and door of that user, and /stats reports speed_limit and throttled_ms.
 	FeatureSpeedLimits = "speed-limits"
+
+	// FeatureSpeedDirections means speed-up and speed-down (speed_up and
+	// speed_down on the API) cap each direction on its own bucket, read back
+	// as speed_limit_up and speed_limit_down.
+	FeatureSpeedDirections = "speed-directions"
+
+	// FeatureKick means POST /secrets/{name}/kick closes a user's live streams
+	// from the named places, matched at the unit the address limit counts.
+	FeatureKick = "kick"
+
+	// FeatureClientIPActivity means connected_ips_last_seen accompanies
+	// connected_ips wherever it is reported: when each address last moved a
+	// byte, gated on track-client-ips exactly as the addresses are.
+	FeatureClientIPActivity = "client-ip-activity"
+
+	// FeatureQuotaCeiling means the quota is enforced on the data path -- a
+	// stream ends at the byte that reaches it and a sweep closes the idle
+	// ones -- rather than only refusing the next connection.
+	FeatureQuotaCeiling = "quota-ceiling"
+
+	// FeatureSecretRead means GET /secrets/{name} is served.
+	FeatureSecretRead = "secret-read"
 )
 
 // supportedFeatures is the sorted capability list this build advertises. Keep it
 // sorted so the response is byte-stable across restarts.
 var supportedFeatures = []string{
+	FeatureClientIPActivity,
 	FeatureClientIPs,
 	FeatureFakeTLS,
 	FeatureIPLimits,
+	FeatureKick,
 	FeatureListeners,
+	FeatureQuotaCeiling,
 	FeatureQuotaReset,
 	FeatureSecretModes,
+	FeatureSecretRead,
 	FeatureSecretsAPI,
+	FeatureSpeedDirections,
 	FeatureSpeedLimits,
 	FeatureWebRelay,
 	FeatureWebRelayWatch,
@@ -623,6 +664,12 @@ type UserStatsJSON struct {
 	SpeedLimit      int64 `json:"speed_limit,omitempty"`
 	ThrottledMillis int64 `json:"throttled_ms,omitempty"`
 
+	// SpeedLimitUp and SpeedLimitDown are the per-direction caps in bytes per
+	// second, from the client's side, or absent for unlimited. ThrottledMillis
+	// above counts the time held to any of the three buckets.
+	SpeedLimitUp   int64 `json:"speed_limit_up,omitempty"`
+	SpeedLimitDown int64 `json:"speed_limit_down,omitempty"`
+
 	// IPLimit is the user's address limit; ActiveIPs is how many distinct
 	// addresses they count as being at right now, the addresses of their
 	// live connections here plus any reported from elsewhere; and
@@ -648,6 +695,12 @@ type UserStatsJSON struct {
 	LastIP            string     `json:"last_ip,omitempty"`
 	ExternalIPs       []string   `json:"external_ips,omitempty"`
 	ExternalExpiresAt *time.Time `json:"external_expires_at,omitempty"`
+
+	// ConnectedIPsLastSeen is, for each address in ConnectedIPs, the second a
+	// stream from it last moved a byte: the latest across the streams sharing
+	// the address. Gated and omitted exactly as ConnectedIPs is, so a panel
+	// can tell a device that fell silent from one still talking.
+	ConnectedIPsLastSeen map[string]time.Time `json:"connected_ips_last_seen,omitempty"`
 }
 
 // buildResponse assembles the base stats response (runtime counters and throttle
@@ -672,17 +725,18 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 		lastIP, _ := st.lastIP.Load().(string)
 
 		users[name] = UserStatsJSON{
-			Connections:     conns,
-			BytesIn:         st.bytesIn.Load(),
-			BytesOut:        st.bytesOut.Load(),
-			LastSeen:        lastSeenPtr,
-			QuotaUsed:       st.quotaUsed.Load(),
-			QuotaCutoffs:    st.quotaCutoffs.Load(),
-			AdTagSkipped:    st.adTagSkipped.Load(),
-			AdTagFailed:     st.adTagFailed.Load(),
-			ThrottledMillis: st.speed.throttledNanos.Load() / int64(time.Millisecond),
-			IPLimitRefused:  st.ipLimitRefused.Load(),
-			LastIP:          lastIP,
+			Connections:  conns,
+			BytesIn:      st.bytesIn.Load(),
+			BytesOut:     st.bytesOut.Load(),
+			LastSeen:     lastSeenPtr,
+			QuotaUsed:    st.quotaUsed.Load(),
+			QuotaCutoffs: st.quotaCutoffs.Load(),
+			AdTagSkipped: st.adTagSkipped.Load(),
+			AdTagFailed:  st.adTagFailed.Load(),
+			ThrottledMillis: (st.speed.throttledNanos.Load() + st.speedUp.throttledNanos.Load() +
+				st.speedDown.throttledNanos.Load()) / int64(time.Millisecond),
+			IPLimitRefused: st.ipLimitRefused.Load(),
+			LastIP:         lastIP,
 		}
 	}
 	s.mu.RUnlock()
