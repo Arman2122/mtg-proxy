@@ -189,6 +189,7 @@ expires and is enabled.
 |---|---|---|---|
 | `quota` | human size (`"10GB"`, `"500MiB"`) or a bare byte count | unlimited | Maximum relayed bytes. |
 | `quota-reset` | `"none"` \| `"monthly"` | `"none"` | `none` is a lifetime cap; `monthly` resets each month. |
+| `speed-up`, `speed-down` | rate, same grammar as `speed` | unlimited | The same cap on one direction alone, from the client's side: `speed-up` holds what the client sends, `speed-down` what it receives. Each is its own bucket; both apply on top of `speed`. |
 | `speed` | rate: `"5mbit"`, `"500kbit"`, `"1MB/s"` (bits decimal, bytes base 2, `/s` optional; minimum `64kbit`) | unlimited | Sustained throughput cap for the user, every connection and door together, upload and download combined. Live on reload. See [[Limits-and-Quotas]]. |
 | `ip-limit` | integer | unlimited | How many places the user may be at once; a place is an IPv4 address or an IPv6 /64 and counts once however many connections it holds. A connection from a new place is refused while the user is at the limit; lowering it never drops open connections. A panel can extend one limit across its other systems through the API. See [[Limits-and-Quotas]]. |
 | `expires` | RFC3339 (`"2026-12-31T00:00:00Z"`) or `YYYY-MM-DD` | never | Validity deadline. |

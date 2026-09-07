@@ -211,19 +211,26 @@ Cross-reference: [[Limits-and-Quotas]] for what the quota fields mean,
 `features` is a sorted list of capability names the **binary** supports:
 
 ```text
-client-ips  faketls  ip-limits  listeners  quota-reset  secret-modes  secrets-api  speed-limits  web-relay  web-relay-watch
+client-ip-activity  client-ips  faketls  ip-limits  kick  listeners  quota-ceiling  quota-reset  secret-modes  secret-read  secrets-api  speed-directions  speed-limits  web-relay  web-relay-watch
 ```
 
 | Name | Means |
 |---|---|
+| `client-ip-activity` | `connected_ips_last_seen` accompanies `connected_ips` wherever it appears: when each address last moved a byte, gated exactly as the addresses are. |
 | `client-ips` | The binary understands `track-client-ips`, and `connected_ips`/`last_ip` may appear when it is on. |
 | `faketls` | The FakeTLS handshake is served. |
 | `ip-limits` | `ip_limit` is accepted on `[secret-limits.<name>]` and the secrets API, `/stats` reports `ip_limit`, `active_ips` and `ip_limit_refused`, and `/secrets/{name}/external-ips` is served. |
+| `kick` | `POST /secrets/{name}/kick` closes a user's live streams from the named places. |
 | `listeners` | The `[[listener]]` table is honoured and `/stats` reports each socket. |
+| `quota-ceiling` | The quota is enforced on the data path — a stream ends at the byte that reaches it and a five-second sweep closes the idle ones — rather than only refusing the next connection. |
 | `quota-reset` | `POST /secrets/{name}/reset-quota` is served. |
 | `secret-modes` | The `dd` and plain secret forms parse and serve. |
+| `secret-read` | `GET /secrets/{name}` is served. |
 | `secrets-api` | The `GET`/`PUT`/`POST`/`DELETE` `/secrets` routes are served. |
+| `speed-directions` | `speed-up` and `speed-down` (`speed_up`/`speed_down` on the API) cap each direction on its own bucket, read back as `speed_limit_up`/`speed_limit_down`. |
+| `speed-limits` | `speed` is accepted on `[secret-limits.<name>]` and the secrets API, and `/stats` reports `speed_limit` and `throttled_ms`. |
 | `web-relay` | This binary carries the WEB transport: the `web-relay` and `generate-web-key` subcommands and the `[web]` table. |
+| `web-relay-watch` | The relay follows its config file by itself; a changed `[secrets]` table is applied within seconds of the write settling. |
 
 It exists so a caller can check a capability before using it, instead of parsing
 a version string and maintaining a table of which release added what. That
@@ -254,6 +261,10 @@ on `/stats` and `/secrets` also reports the addresses behind their connections:
 "alice": {
   "connections": 2,
   "connected_ips": ["198.51.100.7", "203.0.113.44"],
+  "connected_ips_last_seen": {
+    "198.51.100.7": "2026-09-07T10:41:58Z",
+    "203.0.113.44": "2026-09-07T10:42:03Z"
+  },
   "last_ip": "203.0.113.44"
 }
 ```
@@ -261,8 +272,13 @@ on `/stats` and `/secrets` also reports the addresses behind their connections:
 `connected_ips` is the set of distinct addresses holding a live connection right
 now, deduplicated and sorted. It is derived from the connection registry rather
 than counted separately, so it cannot drift from the `connections` beside it,
-and an entry disappears when its connection ends. `last_ip` is the address of
-the most recently admitted connection and outlives that connection.
+and an entry disappears when its connection ends. `connected_ips_last_seen` is,
+for each of those addresses, the second a stream from it last moved a byte —
+the latest across the streams sharing the address, so a device that fell silent
+reads as silent while its sibling on the same address talks. It is stamped to
+the second, on the data path, and gated exactly as the addresses are. `last_ip`
+is the address of the most recently admitted connection and outlives that
+connection.
 
 **Why the default is off, and why leaving it off is the right call for most
 deployments.** This is a circumvention proxy. The people using it are frequently
@@ -414,6 +430,13 @@ Omitting the top-level `ad_tag` **clears the global ad-tag**, and any per-secret
 override not listed is dropped too. This is the route to use when your source of
 truth renders the full roster anyway; use `POST` for incremental edits.
 
+Every per-secret limit travels in the same object as the secret, under the JSON
+spelling of its config key: `quota`, `quota_reset`, `expires`, `disabled`,
+`speed`, `speed_up`, `speed_down` and `ip_limit`. A limit absent from the body is
+absent from the proxy after the swap — this route replaces, it does not merge —
+so a panel that sets a speed through the file must send it here too. Speeds and
+the quota are strings in the config file's grammar; `ip_limit` is a number.
+
 ### DELETE and reset-quota
 
 ```bash
@@ -430,6 +453,29 @@ curl -s -X POST -H "Authorization: Bearer a-long-random-string" http://127.0.0.1
 
 That zeroes `quota_used` and restarts the monthly period from now. `404` for an
 unknown name.
+
+### Kick: `POST /secrets/{name}/kick`
+
+New with the `kick` feature, for a panel that decides which of a user's devices
+is one too many itself and enforces that here:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer a-long-random-string" -H "Content-Type: application/json" -d '{"ips":["203.0.113.9","2001:db8:1:2::1"]}' http://127.0.0.1:9090/secrets/alice/kick
+```
+
+```json
+{"closed": 3}
+```
+
+Every live stream alice holds from one of those places is closed, and her
+streams from every other place keep running. A place is matched at the unit the
+address limit counts: an IPv6 address kicks its whole /64, so the device that
+rotated its low bits since the panel last saw it is still the device that was
+kicked. `ips` is one or more literal addresses, no prefixes, no zones. A place
+the user is not at is a kick of zero, not an error; a malformed body is `400`
+and an unknown user `404`. The kicked client sees its connection drop and will
+reconnect; whether that reconnect is admitted is the address limit's business,
+not the kick's.
 
 ### External addresses: `/secrets/{name}/external-ips`
 
@@ -526,9 +572,9 @@ field of the `/secrets` routes.
 
 | Status | When |
 |---|---|
-| `400` | Malformed JSON, an unknown JSON field, an invalid secret, a bad ad-tag, an unparseable quota or expiry, or a swap that would leave nothing to front. |
+| `400` | Malformed JSON, an unknown JSON field, an invalid secret, a bad ad-tag, an unparseable quota, speed or expiry, a kick naming no valid address, or a swap that would leave nothing to front. |
 | `401` | `api-token` is set and the `Authorization` header is missing or wrong. |
-| `404` | Unknown secret name on `GET` or `DELETE /secrets/{name}`, `/reset-quota` or `/external-ips`; unknown path. |
+| `404` | Unknown secret name on `GET` or `DELETE /secrets/{name}`, `/reset-quota`, `/kick` or `/external-ips`; unknown path. |
 | `405` | Wrong method — `POST /stats`, or anything but `POST` on `/reload`. |
 | `409` | `DELETE /secrets/{name}` would remove the last secret. |
 | `500` | `POST /reload` could not read, parse or validate the config file. |
