@@ -441,12 +441,11 @@ routes both `tg://webproxy` and `t.me/webproxy`, but t.me has not registered tha
 route, so an `https` link resolves as the *username* `@webproxy` and shows a
 stranger's contact page.
 
-**Be honest with your users about the deep link.** The parameter names in
-`tg://webproxy?…` mirror `tg://proxy`, which is the only published precedent, and
-they have not been confirmed against a real client. Treat the printed `host` and
-`secret` — which an operator types into the client's own two fields — as the
-reliable way to configure a client, and the link as a convenience that may or may
-not work.
+**The deep link is confirmed.** The parameter names in `tg://webproxy?…` mirror
+`tg://proxy`, and a real Telegram Desktop opens the link into its WEB proxy form
+with the hostname and secret filled in (confirmed 2026-09-07). The printed `host`
+and `secret` are the same two values for typing into that form by hand where a
+link cannot be opened.
 
 ## Choosing
 

@@ -703,10 +703,11 @@ checklist for a real client. `/stats` advertises `web-relay` in `features` when 
 binary can serve this.
 
 > **What this has been tried against.** Telegram Desktop 7.1.2 on Windows, end
-> to end through Caddy, with both connection types working from the same config.
-> The other client platforms and the `tg://webproxy` link format have not been
-> through the checklist yet, so treat `mtg-proxy access`'s printed hostname and
-> secret as the reliable way to configure a client.
+> to end through Caddy, with both connection types working from the same config,
+> and the `tg://webproxy` link opening the client's WEB proxy form filled in
+> (confirmed 2026-09-07). The other client platforms have not been through the
+> checklist yet; `mtg-proxy access`'s printed hostname and secret configure any
+> of them by hand.
 
 ### Public IP override
 

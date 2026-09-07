@@ -30,7 +30,7 @@ Yes. The same key is valid on `bind-to` (FakeTLS), on an obfuscated2 `[[listener
 
 Telegram Desktop 7.1.2 or later, and nothing else today. 7.1.0 and 7.1.1 had a WebView2 bug that broke some WEB proxies on Windows, so 7.1.2 is the floor.
 
-Be aware of how narrowly this has been exercised: Telegram Desktop 7.1.2 on Windows, end to end through Caddy. macOS (WKWebView) and Linux (WebKitGTK) are different engines running the same page and have not been through the acceptance checklist in `contrib/web-relay/README.md`. The `tg://webproxy` deep link is emitted for convenience, but its parameter names are copied from `tg://proxy` and are not confirmed against a real client — hand people the hostname and secret for the client's own two fields. See [[WEB-Proxy-Setup]].
+Be aware of how narrowly this has been exercised: Telegram Desktop 7.1.2 on Windows, end to end through Caddy. macOS (WKWebView) and Linux (WebKitGTK) are different engines running the same page and have not been through the acceptance checklist in `contrib/web-relay/README.md`. The `tg://webproxy` deep link is confirmed against a real Telegram Desktop (2026-09-07): it opens the client's WEB proxy form with the hostname and secret filled in. The printed hostname and secret configure a client by hand where a link cannot be opened. See [[WEB-Proxy-Setup]].
 
 ### Why does my WEB client reject the secret I gave it?
 

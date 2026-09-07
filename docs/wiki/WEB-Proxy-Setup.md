@@ -408,6 +408,6 @@ The acceptance checklist, from `contrib/web-relay/README.md`:
 
 The last item is not padding. The failure mode this transport has is a page that works everywhere you tested and does nothing inside one client's WebView, presenting as "connecting…" forever, with the only diagnostic in a log the user will not send you.
 
-**What has actually been tried:** Telegram Desktop 7.1.2 on Windows, end to end through Caddy, with FakeTLS and WEB both working from the same config. macOS and Linux clients have not been through the checklist, and the `tg://webproxy` link format has not been confirmed against a real client — hand out the printed hostname and `dd` secret for the client's own two fields until it has.
+**What has actually been tried:** Telegram Desktop 7.1.2 on Windows, end to end through Caddy, with FakeTLS and WEB both working from the same config, and the `tg://webproxy` link opening the client's WEB proxy form with the hostname and secret filled in (confirmed 2026-09-07). macOS and Linux clients have not been through the checklist. The printed hostname and `dd` secret configure a client by hand where a link cannot be opened.
 
 If something is not working, [[Troubleshooting]] covers the common failures; [[FAQ]] and [[Configuration]] cover the rest of the file this page adds two tables to.

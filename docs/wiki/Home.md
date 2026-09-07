@@ -14,7 +14,7 @@ and statsd metrics — is upstream's and behaves as upstream documents it. This 
 the multi-user layer on top: named secrets, a management API, per-user governance, the
 sponsored channel that mtg v2 dropped, and the WEB transport.
 
-Current release: **v1.8.0**. Building from source needs Go 1.26 or newer.
+Current release: **v1.9.0**. Building from source needs Go 1.26 or newer.
 
 ## How a client reaches it 🚪
 
@@ -70,9 +70,9 @@ you control, a browser-trusted certificate, a front proxy that terminates TLS, a
 plausible cover site on that hostname — nothing ships as a default cover site, because a
 starter page many operators installed would be a better signature than anything the
 protocol leaks. Be aware of how far this has been tested: end to end with Telegram
-Desktop 7.1.2 on Windows through Caddy. Other client platforms and the `tg://webproxy`
-link format have not been through the checklist, so treat what `mtg-proxy access` prints
-as the reliable way to configure a client.
+Desktop 7.1.2 on Windows through Caddy, and the `tg://webproxy` link confirmed against
+that client (2026-09-07). Other client platforms have not been through the checklist;
+what `mtg-proxy access` prints configures any of them by hand.
 
 **Wiring a panel or a script to it.** Start at [[Multi-User-and-API]].
 

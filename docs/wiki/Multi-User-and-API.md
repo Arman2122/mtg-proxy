@@ -272,7 +272,10 @@ on `/stats` and `/secrets` also reports the addresses behind their connections:
 `connected_ips` is the set of distinct addresses holding a live connection right
 now, deduplicated and sorted. It is derived from the connection registry rather
 than counted separately, so it cannot drift from the `connections` beside it,
-and an entry disappears when its connection ends. `connected_ips_last_seen` is,
+and an entry disappears when its connection ends. It deduplicates on the full
+address, while `ip-limit` counts an IPv6 /64 as one place: two entries in one
+/64 are one place to the limit, so a caller counting devices from this array
+must collapse to the /64 itself to agree with the refusal. `connected_ips_last_seen` is,
 for each of those addresses, the second a stream from it last moved a byte —
 the latest across the streams sharing the address, so a device that fell silent
 reads as silent while its sibling on the same address talks. It is stamped to
