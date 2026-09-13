@@ -751,7 +751,7 @@ process already uses every CPU core, and multiple secrets are configured through
 | Command | Description |
 |---|---|
 | `mtg-proxy generate-secret [--hex] <hostname>` | Generate a new secret for the given fronting hostname. `--hex`/`-x` prints hex instead of base64. |
-| `mtg-proxy run <config>` | Run the proxy from a config file (supports the full feature set and hot reload). |
+| `mtg-proxy run [--check] <config>` | Run the proxy from a config file (supports the full feature set and hot reload). `--check` parses and validates the file the way `run` does, refuses any key this binary does not read, and exits without listening. |
 | `mtg-proxy simple-run <bind-to> <secret>` | Run without a config file, from flags only (no `[secrets]`, no reload). |
 | `mtg-proxy access [--ipv4 IP] [--ipv6 IP] [--port N] [--hex] <config>` | Print `tg://` / `t.me` links and QR-code URLs for the configured secrets. |
 | `mtg-proxy doctor [--skip-native-check] <config>` | Check connectivity, clock skew, fronting reachability, and SNI-to-DNS match. Run this first when something is off. |

@@ -233,7 +233,10 @@ It prints a line per check with a pass, warn or fail marker, and exits with stat
 anything failed. It reads and validates the config on the way in, so it doubles as the
 fastest syntax check for the proxy half of the file. It does **not** look at `[web]` —
 that is `mtg-proxy web-relay --check`, and the two are complementary rather than
-overlapping.
+overlapping. For a check with no network in it — a panel proving a new binary reads
+every key it writes before swapping it in — `mtg-proxy run --check <config>` parses and
+validates the file exactly as `run` would, treats an unknown key as an error rather
+than a warning, and exits without listening.
 
 What each check actually does:
 
