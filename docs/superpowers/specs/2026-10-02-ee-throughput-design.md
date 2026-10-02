@@ -113,8 +113,10 @@ proxy and its middle proxies, so it ships on by default.
   `bytes.Repeat` and the encryption copy.
 - All complete packets in one relay chunk go out in a single system call.
 
-**Proof:** the existing golden trace test, which pins the exact bytes on the
-wire, passes unchanged; new tests drive odd sizes — one-byte reads, packets
+**Proof:** golden files of the exact bytes on the wire, both directions,
+captured from today's code before the rewrite (a comment in `frame.go` speaks
+of a golden trace test, but none exists), and the rewrite must reproduce them
+byte for byte; new tests drive odd sizes — one-byte reads, packets
 straddling the 64 KiB buffer, several packets per chunk, quick-acks — and
 require a byte-identical stream to today's.
 
@@ -179,8 +181,10 @@ A new end-to-end test: an ee client through the real FakeTLS door, with an
 ad-tagged secret, against a fake middle proxy speaking the real RPC nonce,
 handshake and AES-CBC. Every request must carry the ad tag, and bytes must
 round-trip exactly both ways. The existing real-handshake fake middle proxy
-moves from a `_test.go` file into a small test-support package so the `mtglib`
-tests can use it. This test is written before the middle-proxy rewrite, so the
+moves from a `_test.go` file into an exported, documented test-support file of
+the `middleproxy` package itself — it needs that package's own frame, CBC and
+key-schedule code, so a separate package could only duplicate them — where the
+`mtglib` tests can use it. This test is written before the middle-proxy rewrite, so the
 rewrite is checked against it.
 
 ## Build order
