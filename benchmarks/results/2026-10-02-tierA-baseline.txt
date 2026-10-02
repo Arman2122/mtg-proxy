@@ -394,3 +394,69 @@ BenchmarkDoorIdle/plain                          	572548448	         2.123 ns/op
 BenchmarkDoorIdle/plain                          	564259683	         2.141 ns/op	         2.000 goroutines/conn	     41206 heap-B/conn	     12059 stack-B/conn	       0 B/op	       0 allocs/op
 BenchmarkDoorIdle/plain                          	557654004	         2.155 ns/op	         2.000 goroutines/conn	     41361 heap-B/conn	     12026 stack-B/conn	       0 B/op	       0 allocs/op
 PASS
+
+# ========== middle-proxy leg (BenchmarkMiddleConn), same box and settings ==========
+# Upload MB/s is bounded by the fake peer, which reads with the same code the
+# proxy's download uses; writes/MiB is the proxy's alone.
+
+# ---------- GOMAXPROCS=2 ----------
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib/internal/middleproxy
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkMiddleConn/download/16KiB-2         	     537	   1999518 ns/op	   8.19 MB/s	     65664 reads/MiB	         0 writes/MiB	  121075 B/op	    1040 allocs/op
+BenchmarkMiddleConn/download/16KiB-2         	     595	   1927621 ns/op	   8.50 MB/s	     65664 reads/MiB	         0 writes/MiB	  118479 B/op	    1040 allocs/op
+BenchmarkMiddleConn/download/16KiB-2         	     628	   1896331 ns/op	   8.64 MB/s	     65664 reads/MiB	         0 writes/MiB	  116022 B/op	    1039 allocs/op
+BenchmarkMiddleConn/download/16KiB-2         	     525	   1971568 ns/op	   8.31 MB/s	     65664 reads/MiB	         0 writes/MiB	  121472 B/op	    1040 allocs/op
+BenchmarkMiddleConn/download/16KiB-2         	     608	   1885102 ns/op	   8.69 MB/s	     65664 reads/MiB	         0 writes/MiB	  117479 B/op	    1039 allocs/op
+BenchmarkMiddleConn/download/16KiB-2         	     680	   1833757 ns/op	   8.93 MB/s	     65664 reads/MiB	         0 writes/MiB	  115789 B/op	    1039 allocs/op
+BenchmarkMiddleConn/upload/16KiB-2           	   10000	   1777366 ns/op	   9.22 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108626 B/op	    1034 allocs/op
+BenchmarkMiddleConn/upload/16KiB-2           	    8973	   1812897 ns/op	   9.04 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108522 B/op	    1031 allocs/op
+BenchmarkMiddleConn/upload/16KiB-2           	   10000	   1827973 ns/op	   8.96 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108629 B/op	    1034 allocs/op
+BenchmarkMiddleConn/upload/16KiB-2           	   10000	   1811681 ns/op	   9.04 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108623 B/op	    1034 allocs/op
+BenchmarkMiddleConn/upload/16KiB-2           	    8272	   1789408 ns/op	   9.16 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108468 B/op	    1029 allocs/op
+BenchmarkMiddleConn/upload/16KiB-2           	   10000	   1814113 ns/op	   9.03 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108626 B/op	    1034 allocs/op
+BenchmarkMiddleConn/download/256B-2          	   29468	     37908 ns/op	   6.75 MB/s	     73728 reads/MiB	         0 writes/MiB	    2217 B/op	      33 allocs/op
+BenchmarkMiddleConn/download/256B-2          	   35554	     36871 ns/op	   6.94 MB/s	     73728 reads/MiB	         0 writes/MiB	    2010 B/op	      31 allocs/op
+BenchmarkMiddleConn/download/256B-2          	   31794	     36606 ns/op	   6.99 MB/s	     73728 reads/MiB	         0 writes/MiB	    2079 B/op	      32 allocs/op
+BenchmarkMiddleConn/download/256B-2          	   35918	     34181 ns/op	   7.49 MB/s	     73728 reads/MiB	         0 writes/MiB	    2108 B/op	      32 allocs/op
+BenchmarkMiddleConn/download/256B-2          	   33972	     34885 ns/op	   7.34 MB/s	     73728 reads/MiB	         0 writes/MiB	    2158 B/op	      33 allocs/op
+BenchmarkMiddleConn/download/256B-2          	   37366	     33895 ns/op	   7.55 MB/s	     73728 reads/MiB	         0 writes/MiB	    2056 B/op	      32 allocs/op
+BenchmarkMiddleConn/upload/256B-2            	  207242	     37526 ns/op	   6.82 MB/s	         0 reads/MiB	      4096 writes/MiB	    2432 B/op	      37 allocs/op
+BenchmarkMiddleConn/upload/256B-2            	  188083	     37689 ns/op	   6.79 MB/s	         0 reads/MiB	      4096 writes/MiB	    2433 B/op	      37 allocs/op
+BenchmarkMiddleConn/upload/256B-2            	   81498	     36568 ns/op	   7.00 MB/s	         0 reads/MiB	      4096 writes/MiB	    2412 B/op	      37 allocs/op
+BenchmarkMiddleConn/upload/256B-2            	  187318	     37117 ns/op	   6.90 MB/s	         0 reads/MiB	      4096 writes/MiB	    2429 B/op	      37 allocs/op
+BenchmarkMiddleConn/upload/256B-2            	   67197	     36054 ns/op	   7.10 MB/s	         0 reads/MiB	      4096 writes/MiB	    2410 B/op	      37 allocs/op
+BenchmarkMiddleConn/upload/256B-2            	  188931	     36813 ns/op	   6.95 MB/s	         0 reads/MiB	      4096 writes/MiB	    2437 B/op	      37 allocs/op
+PASS
+
+# ---------- GOMAXPROCS=1 ----------
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib/internal/middleproxy
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkMiddleConn/download/16KiB         	     573	   2357743 ns/op	   6.95 MB/s	     65664 reads/MiB	         0 writes/MiB	  124302 B/op	    1041 allocs/op
+BenchmarkMiddleConn/download/16KiB         	     490	   2210076 ns/op	   7.41 MB/s	     65664 reads/MiB	         0 writes/MiB	  125026 B/op	    1041 allocs/op
+BenchmarkMiddleConn/download/16KiB         	     459	   2256881 ns/op	   7.26 MB/s	     65664 reads/MiB	         0 writes/MiB	  128626 B/op	    1042 allocs/op
+BenchmarkMiddleConn/download/16KiB         	     627	   2168113 ns/op	   7.56 MB/s	     65664 reads/MiB	         0 writes/MiB	  120282 B/op	    1040 allocs/op
+BenchmarkMiddleConn/download/16KiB         	     508	   2209633 ns/op	   7.41 MB/s	     65664 reads/MiB	         0 writes/MiB	  123865 B/op	    1041 allocs/op
+BenchmarkMiddleConn/download/16KiB         	     544	   2145194 ns/op	   7.64 MB/s	     65664 reads/MiB	         0 writes/MiB	  125719 B/op	    1041 allocs/op
+BenchmarkMiddleConn/upload/16KiB           	   10000	   2137684 ns/op	   7.66 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108363 B/op	    1026 allocs/op
+BenchmarkMiddleConn/upload/16KiB           	   10000	   2101460 ns/op	   7.80 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108199 B/op	    1021 allocs/op
+BenchmarkMiddleConn/upload/16KiB           	   10000	   2107210 ns/op	   7.78 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108294 B/op	    1024 allocs/op
+BenchmarkMiddleConn/upload/16KiB           	   10000	   2076372 ns/op	   7.89 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108487 B/op	    1030 allocs/op
+BenchmarkMiddleConn/upload/16KiB           	   10000	   2093720 ns/op	   7.83 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108180 B/op	    1020 allocs/op
+BenchmarkMiddleConn/upload/16KiB           	   10000	   2153936 ns/op	   7.61 MB/s	         0 reads/MiB	        64.00 writes/MiB	  108455 B/op	    1029 allocs/op
+BenchmarkMiddleConn/download/256B          	   26787	     44024 ns/op	   5.81 MB/s	     73728 reads/MiB	         0 writes/MiB	    2185 B/op	      33 allocs/op
+BenchmarkMiddleConn/download/256B          	   25518	     45638 ns/op	   5.61 MB/s	     73728 reads/MiB	         0 writes/MiB	    2186 B/op	      33 allocs/op
+BenchmarkMiddleConn/download/256B          	   25448	     46505 ns/op	   5.50 MB/s	     73728 reads/MiB	         0 writes/MiB	    2194 B/op	      33 allocs/op
+BenchmarkMiddleConn/download/256B          	   28180	     43149 ns/op	   5.93 MB/s	     73728 reads/MiB	         0 writes/MiB	    2148 B/op	      33 allocs/op
+BenchmarkMiddleConn/download/256B          	   25365	     44734 ns/op	   5.72 MB/s	     73728 reads/MiB	         0 writes/MiB	    2214 B/op	      33 allocs/op
+BenchmarkMiddleConn/download/256B          	   27386	     42260 ns/op	   6.06 MB/s	     73728 reads/MiB	         0 writes/MiB	    2162 B/op	      33 allocs/op
+BenchmarkMiddleConn/upload/256B            	   95568	     46302 ns/op	   5.53 MB/s	         0 reads/MiB	      4096 writes/MiB	    2391 B/op	      36 allocs/op
+BenchmarkMiddleConn/upload/256B            	  119310	     44436 ns/op	   5.76 MB/s	         0 reads/MiB	      4096 writes/MiB	    2407 B/op	      36 allocs/op
+BenchmarkMiddleConn/upload/256B            	  128450	     45127 ns/op	   5.67 MB/s	         0 reads/MiB	      4096 writes/MiB	    2407 B/op	      36 allocs/op
+BenchmarkMiddleConn/upload/256B            	   93601	     46154 ns/op	   5.55 MB/s	         0 reads/MiB	      4096 writes/MiB	    2406 B/op	      36 allocs/op
+BenchmarkMiddleConn/upload/256B            	   70651	     42126 ns/op	   6.08 MB/s	         0 reads/MiB	      4096 writes/MiB	    2351 B/op	      35 allocs/op
+BenchmarkMiddleConn/upload/256B            	  104842	     45931 ns/op	   5.57 MB/s	         0 reads/MiB	      4096 writes/MiB	    2389 B/op	      36 allocs/op
+PASS
