@@ -2,6 +2,7 @@ package middleproxy
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"testing"
 
@@ -77,4 +78,46 @@ func TestMiddleConnDownloadReadsInBulk(t *testing.T) { //nolint: paralleltest
 		}
 	})
 	assert.LessOrEqual(t, allocs, 1.0, "reading a packet must not allocate per block or per packet")
+}
+
+// writeCounter counts the writes made on it and discards them, allocating
+// nothing itself.
+type writeCounter struct {
+	captureConn
+
+	writes int
+}
+
+func (w *writeCounter) Write(p []byte) (int, error) {
+	w.writes++
+
+	return len(p), nil
+}
+
+// The upload builds every frame of a relay chunk in place and sends them in
+// one write. Not parallel: AllocsPerRun counts every allocation in the process.
+func TestMiddleConnUploadWritesOnce(t *testing.T) { //nolint: paralleltest
+	var chunk bytes.Buffer
+
+	for i := range 8 {
+		payload := bytes.Repeat([]byte{byte(0x30 + i)}, 1024)
+		chunk.Write(binary.LittleEndian.AppendUint32(nil, uint32(len(payload)))) //nolint: gosec // 1 KiB
+		chunk.Write(payload)
+	}
+
+	raw := &writeCounter{}
+	enc, dec, _, _ := fixedCiphers()
+	m := goldenMiddleConn(raw, enc, dec, true)
+
+	n, err := m.Write(chunk.Bytes())
+	require.NoError(t, err)
+	require.Equal(t, chunk.Len(), n)
+	assert.Equal(t, 1, raw.writes, "eight complete packets in one chunk must leave in one write")
+
+	allocs := testing.AllocsPerRun(100, func() {
+		if _, err := m.Write(chunk.Bytes()); err != nil {
+			panic(err)
+		}
+	})
+	assert.Zero(t, allocs/8, "framing a packet must allocate nothing once the buffers exist")
 }

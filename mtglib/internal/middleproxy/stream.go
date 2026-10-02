@@ -40,7 +40,12 @@ type middleConn struct {
 	// may declare RPC_F_PAD or have its packets trimmed.
 	padded bool
 
-	inbuf []byte
+	// inbuf is the client's stream not yet framed: at most one partial packet
+	// between writes. reqHeader is the RPC_PROXY_REQ prefix, the same for every
+	// packet but its flags word; wbuf collects a write's frames.
+	inbuf     []byte
+	reqHeader []byte
+	wbuf      []byte
 
 	// What the client has yet to receive of the current answer: the last
 	// headLeft bytes of head (the intermediate length prefix), then out, a
@@ -67,11 +72,18 @@ func newMiddleConn(raw essentials.Conn, frame *frameConn, connID [8]byte, adTag 
 	}
 }
 
+// Write frames every complete packet of the client's stream as an
+// RPC_PROXY_REQ, builds them all in one buffer and sends them with one write;
+// a partial packet waits for the rest. Nothing is allocated once the buffers
+// have grown.
 func (m *middleConn) Write(p []byte) (int, error) {
 	m.inbuf = append(m.inbuf, p...)
+	m.wbuf = m.wbuf[:0]
 
-	for len(m.inbuf) >= 4 {
-		length := binary.LittleEndian.Uint32(m.inbuf[:4])
+	consumed := 0
+
+	for rest := m.inbuf; len(rest) >= 4; rest = m.inbuf[consumed:] {
+		length := binary.LittleEndian.Uint32(rest[:4])
 
 		quickAck := false
 		if length >= quickAckLength {
@@ -79,11 +91,11 @@ func (m *middleConn) Write(p []byte) (int, error) {
 			length -= quickAckLength
 		}
 
-		if uint64(len(m.inbuf)) < uint64(length)+4 {
+		if uint64(len(rest)) < uint64(length)+4 {
 			break
 		}
 
-		packet := m.inbuf[4 : 4+length]
+		packet := rest[4 : 4+length]
 		// A plain intermediate frame carries no padding, so trimming it would
 		// silently truncate real payload.
 		if m.padded {
@@ -93,11 +105,17 @@ func (m *middleConn) Write(p []byte) (int, error) {
 			packet = packet[:len(packet)-len(packet)%4]
 		}
 
-		if err := m.frame.writePacket(m.buildProxyReq(packet, quickAck)); err != nil {
+		m.wbuf = m.frame.appendFrame(m.wbuf, m.header(packet, quickAck), packet)
+		consumed += 4 + int(length)
+	}
+
+	// Keep only the partial packet, at the front, so the buffer does not creep.
+	m.inbuf = m.inbuf[:copy(m.inbuf, m.inbuf[consumed:])]
+
+	if len(m.wbuf) > 0 {
+		if err := m.frame.writeFrames(m.wbuf); err != nil {
 			return 0, err
 		}
-
-		m.inbuf = m.inbuf[4+length:]
 	}
 
 	return len(p), nil
@@ -194,7 +212,31 @@ func (m *middleConn) baseFlags() uint32 {
 	return flags
 }
 
+// buildProxyReq is one RPC_PROXY_REQ carrying packet, as Write frames it.
 func (m *middleConn) buildProxyReq(packet []byte, quickAck bool) []byte {
+	return append(bytes.Clone(m.header(packet, quickAck)), packet...)
+}
+
+// header returns the RPC_PROXY_REQ prefix for packet: tag, flags, connection
+// id, both encoded addresses, the extra block's size and proxy-tag id, the ad
+// tag, and alignment to 4. All of it but the flags word is built on first use
+// and kept; the flags word is rewritten for each packet.
+func (m *middleConn) header(packet []byte, quickAck bool) []byte {
+	if m.reqHeader == nil {
+		h := make([]byte, 0, 84)
+		h = append(h, tagProxyRequest...)
+		h = append(h, 0, 0, 0, 0) // flags, per packet
+		h = append(h, m.connID[:]...)
+		h = append(h, encodeIPPort(m.clientAddr)...)
+		h = append(h, encodeIPPort(m.ourAddr)...)
+		h = append(h, proxyRequestExtraSize...)
+		h = append(h, proxyRequestProxyTag...)
+		h = append(h, byte(len(m.adTag)))
+		h = append(h, m.adTag[:]...)
+		h = append(h, make([]byte, (4-len(h)%4)%4)...)
+		m.reqHeader = h
+	}
+
 	flags := m.baseFlags()
 
 	if quickAck {
@@ -205,25 +247,9 @@ func (m *middleConn) buildProxyReq(packet []byte, quickAck bool) []byte {
 		flags |= flagEncrypted
 	}
 
-	buf := &bytes.Buffer{}
+	binary.LittleEndian.PutUint32(m.reqHeader[4:8], flags)
 
-	buf.Write(tagProxyRequest)
-	binary.Write(buf, binary.LittleEndian, flags) //nolint: errcheck
-	buf.Write(m.connID[:])
-	buf.Write(encodeIPPort(m.clientAddr))
-	buf.Write(encodeIPPort(m.ourAddr))
-	buf.Write(proxyRequestExtraSize)
-	buf.Write(proxyRequestProxyTag)
-	buf.WriteByte(byte(len(m.adTag)))
-	buf.Write(m.adTag[:])
-
-	if pad := (4 - buf.Len()%4) % 4; pad > 0 {
-		buf.Write(make([]byte, pad))
-	}
-
-	buf.Write(packet)
-
-	return buf.Bytes()
+	return m.reqHeader
 }
 
 func (m *middleConn) Close() error                       { return m.raw.Close() }

@@ -43,6 +43,10 @@ type cbcConn struct {
 
 	plain   [2 * aes.BlockSize]byte
 	pending []byte
+
+	// wbuf is Write's copy of what it encrypts, reused so a write allocates
+	// nothing once it has grown.
+	wbuf []byte
 }
 
 func newCBCConn(raw io.ReadWriter, enc, dec cipher.BlockMode) *cbcConn {
@@ -152,18 +156,28 @@ func (c *cbcConn) frameBuffered() bool {
 }
 
 func (c *cbcConn) Write(p []byte) (int, error) {
-	if len(p)%aes.BlockSize != 0 {
-		return 0, fmt.Errorf("cbc write of non-block-aligned length %d", len(p))
-	}
+	c.wbuf = append(c.wbuf[:0], p...)
 
-	encrypted := make([]byte, len(p))
-	c.enc.CryptBlocks(encrypted, p)
-
-	if _, err := c.raw.Write(encrypted); err != nil {
-		return 0, err //nolint: wrapcheck
+	if err := c.writeEncrypted(c.wbuf); err != nil {
+		return 0, err
 	}
 
 	return len(p), nil
+}
+
+// writeEncrypted encrypts buf in place -- it must be a whole number of
+// blocks -- and sends it with one write. CBC chains across calls, so frames
+// encrypted together come out exactly as they would one at a time.
+func (c *cbcConn) writeEncrypted(buf []byte) error {
+	if len(buf)%aes.BlockSize != 0 {
+		return fmt.Errorf("cbc write of non-block-aligned length %d", len(buf))
+	}
+
+	c.enc.CryptBlocks(buf, buf)
+
+	_, err := c.raw.Write(buf)
+
+	return err //nolint: wrapcheck
 }
 
 // frameConn layers the MTProto RPC transport frame over an io.ReadWriter:
@@ -181,6 +195,9 @@ type frameConn struct {
 	// body holds the frame readPacket last read. The message it returns is a
 	// slice of it, valid until the next readPacket.
 	body []byte
+
+	// wbuf is where writePacket builds its frame, reused.
+	wbuf []byte
 }
 
 func newFrameConn(raw io.ReadWriter, seqNo int32) *frameConn {
@@ -188,26 +205,54 @@ func newFrameConn(raw io.ReadWriter, seqNo int32) *frameConn {
 }
 
 func (f *frameConn) writePacket(msg []byte) error {
-	messageLength := 4 + 4 + len(msg) + 4
+	f.wbuf = f.appendFrame(f.wbuf[:0], msg)
+
+	return f.writeFrames(f.wbuf)
+}
+
+// appendFrame appends one plaintext frame carrying the concatenation of parts
+// -- length, sequence number, the parts, CRC32, padding words to a 16-byte
+// multiple -- to dst, and advances the write sequence number.
+func (f *frameConn) appendFrame(dst []byte, parts ...[]byte) []byte {
+	msgLength := 0
+	for _, part := range parts {
+		msgLength += len(part)
+	}
+
+	messageLength := 4 + 4 + msgLength + 4
 	paddingLength := (aes.BlockSize - messageLength%aes.BlockSize) % aes.BlockSize
+	start := len(dst)
 
-	buf := &bytes.Buffer{}
+	// G115: messageLength is 12 plus a message this process assembled;
+	// readPacket rejects anything above frameMaxMessageLength (16 MiB) on the
+	// way in, and nothing here builds a larger one. The sequence number is a
+	// signed 32-bit wire field written as its two's complement.
+	dst = binary.LittleEndian.AppendUint32(dst, uint32(messageLength)) //nolint: gosec
+	dst = binary.LittleEndian.AppendUint32(dst, uint32(f.writeSeqNo))  //nolint: gosec
 
-	// G115: messageLength is 12+len(msg) for a message this process just
-	// assembled; readPacket rejects anything above frameMaxMessageLength
-	// (16 MiB) on the way in, and nothing here builds a larger one.
-	binary.Write(buf, binary.LittleEndian, uint32(messageLength)) //nolint: errcheck,gosec
-	binary.Write(buf, binary.LittleEndian, f.writeSeqNo)          //nolint: errcheck
-	buf.Write(msg)
+	for _, part := range parts {
+		dst = append(dst, part...)
+	}
 
-	checksum := crc32.ChecksumIEEE(buf.Bytes())
-	binary.Write(buf, binary.LittleEndian, checksum) //nolint: errcheck
+	dst = binary.LittleEndian.AppendUint32(dst, crc32.ChecksumIEEE(dst[start:]))
 
-	buf.Write(bytes.Repeat(framePadding, paddingLength/4))
+	for range paddingLength / 4 {
+		dst = append(dst, framePadding...)
+	}
 
 	f.writeSeqNo++
 
-	_, err := f.raw.Write(buf.Bytes())
+	return dst
+}
+
+// writeFrames sends frames built by appendFrame with one write: encrypted in
+// place on the AES-CBC channel, as they are before it.
+func (f *frameConn) writeFrames(frames []byte) error {
+	if cbc, ok := f.raw.(*cbcConn); ok {
+		return cbc.writeEncrypted(frames)
+	}
+
+	_, err := f.raw.Write(frames)
 
 	return err //nolint: wrapcheck
 }
