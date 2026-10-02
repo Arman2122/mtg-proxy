@@ -146,6 +146,9 @@ type Config struct {
 			UpdateEach TypeDuration      `json:"raid_each"`
 			DRS        TypeBool          `json:"drs"`
 			Shaping    TypeDoppelShaping `json:"shaping"`
+			// ScoutCovers is nil when the config does not say: the cover
+			// sites are then measured. Only an explicit false turns it off.
+			ScoutCovers *TypeBool `json:"scout_covers"`
 		} `json:"doppelganger"`
 	} `json:"defense"`
 	Network struct {

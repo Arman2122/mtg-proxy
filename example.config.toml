@@ -575,8 +575,15 @@ count = 9
 urls = [
     # "https://st-ok.cdn-vk.ru/res/react/vendor/clsx-2.1.1-amd.js"
 ]
+# With no urls, the cover sites your ee secrets name are fetched instead
+# (https://<host>/, through the address domain fronting would dial), to size
+# the fake handshake's certificate record like the real site's. Only that size
+# is taken: record timing keeps the built-in model. "false" makes no such
+# requests, and handshakes use a generic size.
+# scout-covers = true
 # A collection is done in raids. Each raid makes this number of requests to
-# each URL in this list. Do not use a huge number, 10 is probably ok.
+# each URL in this list, or to each cover site. Do not use a huge number, 10
+# is probably ok.
 repeats-per-raid = 10
 # This is a duration between each raid. It makes no sense to have a small number
 # here as you would start to make a noticeable activity. Usually traffic patterns

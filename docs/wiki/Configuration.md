@@ -537,8 +537,9 @@ statistics and mimic them.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `urls` | array of **HTTPS** URLs | empty (subsystem idle) | Pages to crawl for delay statistics. Mix light and heavy content; CDN assets are a good source. |
-| `repeats-per-raid` | integer, 1–65535 | `10` | Requests made to each URL per raid. Keep it small. |
+| `urls` | array of **HTTPS** URLs | empty | Pages to crawl for delay statistics, which then replace the built-in timing model. Mix light and heavy content; CDN assets are a good source. Empty keeps the built-in model. |
+| `scout-covers` | bool | `true` | With `urls` empty, fetch `https://<host>/` for each cover host the `ee` secrets name, through the address domain fronting would dial, to size the fake handshake's certificate record like that site's. Only the size is taken; record timing keeps the built-in model. `false` makes no such requests, and handshakes use a generic 2,500–4,700 bytes. |
+| `repeats-per-raid` | integer, 1–65535 | `10` | Requests made to each URL, or each cover host, per raid. Keep it small. |
 | `raid-each` | duration | `6h` | Interval between raids. A short interval produces noticeable activity for no benefit; traffic patterns do not change quickly. |
 | `drs` | bool | `false` | Dynamic TLS record sizing: start with small records and ramp up. |
 | `shaping` | `"record"` \| `"burst"` | `"record"` | How the doppelganger spaces its TLS records in time. See below. |
@@ -556,8 +557,9 @@ way a server streams a response, leaving the pace to TCP, so downloads run at
 the speed of the link. Each record's size is drawn the same way in both modes —
 16 KiB, or the `drs` ramp — and both send a shorter record when less is waiting
 than was drawn. Without a wait before every record less has piled up, so
-`burst` sends more of those short records. `burst` is being canaried: it changes timing a censor can
-observe, so it becomes the default only after running on real networks without
+`burst` sends more of those short records. `burst` is being canaried: it
+changes timing a censor can observe, so it becomes the default only after
+running on real networks without
 connections being blocked.
 
 ## `[throttle]`

@@ -183,7 +183,10 @@ measured for the host in its client's SNI. Until a host has been measured
 (it is measured as soon as a secret names it) the record falls back to a
 generic 2,500–4,700 bytes. Configured `urls` are scouted instead, and give one
 size for every host, as before. The fetches are ordinary page loads every
-`raid-each` (6 h), `repeats-per-raid` times.
+`raid-each` (6 h), `repeats-per-raid` times. Only the certificate flight's size
+is taken from a cover site; record timing keeps the built-in model unless
+`urls` are configured. `scout-covers = false` turns the fetches off, and
+handshakes use the generic size.
 
 **Record timing is `[defense.doppelganger] shaping`.** `record` (the default)
 waits a delay drawn from a web page's record timing before every record, which

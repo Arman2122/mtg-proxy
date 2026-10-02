@@ -98,6 +98,9 @@ type tomlConfig struct {
 			UpdateEach string   `toml:"raid-each" json:"raid_each,omitempty"`
 			DRS        bool     `toml:"drs" json:"drs,omitempty"`
 			Shaping    string   `toml:"shaping" json:"shaping,omitempty"`
+			// A pointer, like anti-replay's: unset means on, and only an
+			// explicit "scout-covers = false" turns it off.
+			ScoutCovers *bool `toml:"scout-covers" json:"scout_covers,omitempty"`
 		} `toml:"doppelganger" json:"doppelganger"`
 	} `toml:"defense" json:"defense"`
 	Network struct {

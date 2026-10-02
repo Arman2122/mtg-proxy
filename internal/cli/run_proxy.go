@@ -102,6 +102,14 @@ func makeNetwork(conf *config.Config, version string) (mtglib.Network, error) {
 	return value, nil
 }
 
+// scoutCovers is whether the doppelganger measures the cover sites the ee
+// secrets name: on unless [defense.doppelganger] scout-covers = false.
+func scoutCovers(conf *config.Config) bool {
+	enabled := conf.Defense.Doppelganger.ScoutCovers
+
+	return enabled == nil || enabled.Get(false)
+}
+
 func makeAntiReplayCache(conf *config.Config) (mtglib.AntiReplayCache, error) {
 	// On unless the config turns it off. A proxy that answers a replayed
 	// ClientHello within the clock-skew window confirms itself to whoever
@@ -611,7 +619,7 @@ func runProxyWith( //nolint: funlen, cyclop
 		DoppelGangerShaping: conf.Defense.Doppelganger.Shaping.Get(config.TypeDoppelShapingRecord),
 		// Measure the cover sites when no URLs are configured: the fake
 		// handshake's noise record is then sized like the real site's.
-		DoppelGangerScoutCovers: true,
+		DoppelGangerScoutCovers: scoutCovers(conf),
 
 		APIBindTo:       conf.APIBindTo.Get(""),
 		APIToken:        conf.GetAPIToken(),
