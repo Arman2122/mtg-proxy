@@ -36,18 +36,21 @@ func (suite *RelayTestSuite) TearDownTest() {
 	suite.clientConnMock.AssertExpectations(suite.T())
 }
 
+// Both sides end at once. Which direction finishes first is a race, and only
+// a direction that finishes before the stream is torn down closes its
+// destination's write side, so each CloseWrite is "maybe". CloseRead is never
+// used: the stream ends whole. relay_close_test.go pins the real contract on
+// real sockets; this only proves the relay returns and closes both conns.
 func (suite *RelayTestSuite) TestExit() {
 	suite.telegramConnMock.On("Close").Return(nil)
-	suite.telegramConnMock.On("CloseRead").Return(nil).Once()
-	suite.telegramConnMock.On("CloseWrite").Return(nil).Once()
+	suite.telegramConnMock.On("CloseWrite").Return(nil).Maybe()
 	suite.telegramConnMock.On("Read", mock.Anything).Return(10, io.EOF).Once()
 	suite.telegramConnMock.On("Write", mock.Anything).Return(10, io.EOF).Maybe()
 
 	suite.clientConnMock.On("Read", mock.Anything).Return(0, io.EOF).Once()
 	suite.clientConnMock.On("Write", mock.Anything).Return(10, io.EOF).Maybe()
 	suite.clientConnMock.On("Close").Return(nil)
-	suite.clientConnMock.On("CloseRead").Return(nil).Once()
-	suite.clientConnMock.On("CloseWrite").Return(nil).Once()
+	suite.clientConnMock.On("CloseWrite").Return(nil).Maybe()
 
 	relay.Relay(suite.ctx, suite.loggerMock, suite.telegramConnMock, suite.clientConnMock)
 }
