@@ -109,11 +109,21 @@ func (m *middleConn) Write(p []byte) (int, error) {
 		consumed += 4 + int(length)
 	}
 
-	// Keep only the partial packet, at the front, so the buffer does not creep.
+	// Keep only the partial packet, at the front, so the buffer does not creep;
+	// and if a large packet grew it, let that size go once it has passed.
 	m.inbuf = m.inbuf[:copy(m.inbuf, m.inbuf[consumed:])]
+	if cap(m.inbuf) > keepBufferMax && len(m.inbuf) <= keepBufferMax {
+		m.inbuf = append([]byte(nil), m.inbuf...)
+	}
 
 	if len(m.wbuf) > 0 {
-		if err := m.frame.writeFrames(m.wbuf); err != nil {
+		err := m.frame.writeFrames(m.wbuf)
+
+		if cap(m.wbuf) > keepBufferMax {
+			m.wbuf = nil
+		}
+
+		if err != nil {
 			return 0, err
 		}
 	}
@@ -157,6 +167,10 @@ func (m *middleConn) Read(dst []byte) (int, error) {
 		}
 
 		if err := m.nextAnswer(); err != nil {
+			// With bytes in hand nextAnswer only runs on a frame that is wholly
+			// buffered, so it does no socket I/O: what it can fail with is the
+			// stream itself -- a bad frame, RPC_CLOSE_EXT -- never a timeout a
+			// caller might retry. Keeping that for the next Read is final.
 			if n > 0 {
 				m.readErr = err
 

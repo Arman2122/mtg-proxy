@@ -20,6 +20,13 @@ const (
 	// call may bring in. Every ad-tagged connection holds one, so it is sized
 	// for memory per connection as much as for throughput.
 	cbcReadBuffer = 16 << 10
+
+	// keepBufferMax is the most a connection keeps of a buffer between uses.
+	// One that grew past it for a single large frame or packet -- a media
+	// answer, a big upload -- is let go afterwards rather than held for the
+	// connection's life; small and medium traffic reuses its buffers and
+	// allocates nothing.
+	keepBufferMax = 64 << 10
 )
 
 // framePadding is the 4-byte word repeated to pad a frame up to a 16-byte
@@ -152,7 +159,9 @@ func (c *cbcConn) frameBuffered() bool {
 		return false
 	}
 
-	return int(length) <= len(c.pending)+r.Buffered()
+	// Only whole blocks count: a block that has only partly arrived cannot be
+	// decrypted, so a frame that ends in one is not readable yet.
+	return int(length) <= len(c.pending)+r.Buffered()&^(aes.BlockSize-1)
 }
 
 func (c *cbcConn) Write(p []byte) (int, error) {
@@ -275,11 +284,18 @@ func (f *frameConn) readPacket() ([]byte, error) {
 		return nil, fmt.Errorf("incorrect frame message length %d", messageLength)
 	}
 
-	if cap(f.body) < int(messageLength-4) {
-		f.body = make([]byte, messageLength-4)
-	}
+	var rest []byte
 
-	rest := f.body[:messageLength-4]
+	if need := int(messageLength - 4); need <= keepBufferMax {
+		if cap(f.body) < need {
+			f.body = make([]byte, need)
+		}
+
+		rest = f.body[:need]
+	} else {
+		// A large frame gets a buffer of its own, so its size does not stay.
+		rest = make([]byte, need)
+	}
 	if _, err := io.ReadFull(f.raw, rest); err != nil {
 		return nil, fmt.Errorf("cannot read frame body: %w", err)
 	}
