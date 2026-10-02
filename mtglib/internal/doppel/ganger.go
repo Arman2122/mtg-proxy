@@ -273,7 +273,7 @@ func (g *Ganger) run() {
 				}
 			})
 		case stats := <-updatedStatsChan:
-			g.stats = stats
+			g.adopt(stats)
 			currentScoutCollectedChan = scoutCollectedChan
 		case <-scoutTicker.C:
 			var all []CoverHost
@@ -291,6 +291,19 @@ func (g *Ganger) run() {
 			}
 		}
 	}
+}
+
+// adopt makes a fitted model the one new connections are paced by, if it is
+// usable; otherwise the current one stays. Run loop only.
+func (g *Ganger) adopt(stats Stats) {
+	if !stats.usable() {
+		g.logger.WarningError("measured record timing does not fit; keeping the current model",
+			fmt.Errorf("k=%g lambda=%g", stats.k, stats.lambda)) //nolint: err113
+
+		return
+	}
+
+	g.stats = stats
 }
 
 func (g *Ganger) updateNoiseParams() {
@@ -385,7 +398,11 @@ func noiseFromSizes(sizes []int) (NoiseParams, bool) {
 }
 
 // runScoutRaid measures, scoutRaidRepeats times: the cover hosts given, in
-// cover mode, or the configured URLs otherwise.
+// cover mode, or the configured URLs otherwise. Cover raids measure
+// certificate flights only. Their record timing is left out: it would replace
+// the model every connection is paced by, a change a censor can see, as a
+// side effect of naming a cover host -- timing changes ship behind shaping
+// and a canary. Configured URLs feed the timing model, as they always have.
 func (g *Ganger) runScoutRaid(rvChan chan<- scoutRaidResult, covers []CoverHost) {
 	var result scoutRaidResult
 
@@ -400,8 +417,6 @@ func (g *Ganger) runScoutRaid(rvChan chan<- scoutRaidResult, covers []CoverHost)
 
 					continue
 				}
-
-				result.durations = append(result.durations, learned.Durations...)
 
 				if learned.CertSize > 0 {
 					result.hostCertSizes[h.Host] = append(result.hostCertSizes[h.Host], learned.CertSize)

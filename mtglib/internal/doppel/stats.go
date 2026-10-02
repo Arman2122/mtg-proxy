@@ -20,6 +20,13 @@ const (
 
 	// how many bytes should we drift
 	DRSNoise = 100
+
+	// MaxDelay is the longest wait Delay draws. No web server pauses that
+	// long between the records of one response, and the default model waits
+	// longer about once in sixty thousand records; the cap is there so a wide
+	// fitted model cannot stall a connection for minutes, or overflow a
+	// Duration into a negative wait.
+	MaxDelay = time.Second
 )
 
 // Stats is responsible for generating values that are distributed according
@@ -87,7 +94,22 @@ func (d *Stats) Delay() time.Duration {
 	generated := d.lambda * math.Pow(-math.Log(u), 1.0/d.k)
 
 	// generated is in milliseconds
+	if limit := float64(MaxDelay) / float64(time.Millisecond); math.IsNaN(generated) || generated >= limit {
+		return MaxDelay
+	}
+
 	return time.Duration(generated * float64(time.Millisecond))
+}
+
+// usable reports whether a fitted model can pace connections: a shape inside
+// the search bounds, not pinned to one, and a finite, positive scale. Gaps
+// that are all the same pin the shape to its upper bound; nothing to fit
+// leaves the scale NaN.
+func (d Stats) usable() bool {
+	const margin = 1e-6
+
+	return d.k > StatsLowK*(1+margin) && d.k < StatsHighK*(1-margin) &&
+		d.lambda > 0 && !math.IsInf(d.lambda, 0)
 }
 
 func (d *Stats) Size() int {
@@ -112,14 +134,23 @@ func (d *Stats) Size() int {
 	return TLSRecordSizeMax
 }
 
+// NewStats fits the model to measured gaps between records. A gap of zero --
+// records that arrived in one read, as nearly all do on Windows -- carries no
+// timing and cannot be fitted (log 0 is -Inf), so it is left out; the rest are
+// kept at full precision rather than truncated to whole microseconds, which
+// would turn every sub-microsecond gap into such a zero. The result can still
+// be unusable; see usable.
 func NewStats(durations []time.Duration, drs bool) Stats {
-	n := float64(len(durations))
-
 	// in milliseconds
-	durFloats := make([]float64, len(durations))
-	for i, v := range durations {
-		durFloats[i] = float64(v.Microseconds()) / 1000.0
+	durFloats := make([]float64, 0, len(durations))
+
+	for _, v := range durations {
+		if v > 0 {
+			durFloats = append(durFloats, float64(v)/float64(time.Millisecond))
+		}
 	}
+
+	n := float64(len(durFloats))
 
 	// The bisection solves the standard Weibull MLE equation for shape
 	// parameter k. There is no any good formula for doing that so we

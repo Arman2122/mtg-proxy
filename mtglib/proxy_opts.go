@@ -319,10 +319,11 @@ type ProxyOpts struct {
 	DoppelGangerShaping string
 
 	// DoppelGangerScoutCovers measures the cover sites the ee secrets name --
-	// their certificate flight's size, for the fake handshake's noise record,
-	// and their record timing -- when DoppelGangerURLs is empty. It makes
-	// outbound HTTPS requests to those sites, so a library caller has to ask;
-	// the mtg-proxy binary always does.
+	// their certificate flight's size, for the fake handshake's noise record
+	// -- when DoppelGangerURLs is empty. Their record timing is not taken:
+	// pacing keeps the built-in model. It makes outbound HTTPS requests to
+	// those sites, so a library caller has to ask; the mtg-proxy binary does
+	// unless [defense.doppelganger] scout-covers = false.
 	DoppelGangerScoutCovers bool
 
 	// APIBindTo is the address to bind the stats HTTP API server to.

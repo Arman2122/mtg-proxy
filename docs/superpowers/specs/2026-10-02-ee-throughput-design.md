@@ -86,7 +86,8 @@ record, at most one record per read (`mtglib/internal/tls/conn.go`).
 - **The bounded buffer** applies in both modes. `Write` blocks while 256 KiB is
   queued, until the writer drains it, the conn is stopped, or its context ends;
   the relay therefore stops reading from Telegram, and memory per connection is
-  fixed. The speed cap still meters bytes in `countingConn` before they reach
+  bounded: the buffer holding the queue grows by doubling, so it peaks near
+  twice the bound, about 512 KiB. The speed cap still meters bytes in `countingConn` before they reach
   the doppelganger, so with the bound nothing is charged long before it is sent.
 - **Ending a stream** is unchanged in meaning: `CloseWrite` delivers everything
   buffered before the FIN, bounded by `DrainTimeout`; under `"burst"` it drains
@@ -171,8 +172,12 @@ size for the whole process, though secrets can name different cover sites.
   unmeasured.
 - A host seen for the first time — at start, or when a secret change brings a
   new one — is measured promptly; after that, on the existing raid cadence
-  (every 6 h, `repeats_per_raid` requests). With no configured URLs, the same
-  raids also supply the delay statistics.
+  (every 6 h, `repeats_per_raid` requests). Cover raids supply certificate
+  sizes only; record timing keeps the built-in model. *(Amended in the final
+  review: taking timing from the cover sites would change ee timing for every
+  deployment as a side effect of naming a cover host, which the rollout
+  decision reserves for `shaping` and the canary.)* `scout-covers = false`
+  turns the fetches off.
 - Configured `urls` keep working as today and take precedence for timing.
 
 **Open question, not in scope:** the fake ServerHello always answers with an
