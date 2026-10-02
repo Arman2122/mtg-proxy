@@ -613,9 +613,11 @@ drs = false
 #
 # "burst" waits one such delay when a connection wakes from idle (nothing sent
 # for a second) and then sends records back to back, the way a server streams
-# a response, leaving the pace to TCP. Record sizes do not change -- 16 KiB, or
-# the drs ramp -- only the waits between them. Downloads run at the speed of
-# the link.
+# a response, leaving the pace to TCP. Downloads run at the speed of the link.
+# Each record's size is drawn the same way in both -- 16 KiB, or the drs ramp
+# -- and both send a shorter record when less is waiting than was drawn. With
+# no wait before each record less has piled up, so "burst" sends more of
+# those short records.
 #
 # "burst" is being canaried: it changes timing a censor can observe, so it
 # becomes the default only after it has run on real networks without

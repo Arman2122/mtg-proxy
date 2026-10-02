@@ -21,6 +21,12 @@ const DrainTimeout = 5 * time.Second
 // limit charges is never far ahead of what is sent.
 const MaxBuffered = 256 << 10
 
+// keepQueueMax is the most queue capacity a connection keeps once its queue has
+// drained. A queue that grew to the bound for a download is let go of after
+// it, rather than held -- at twice its size, as buffers grow -- for the
+// connection's life.
+const keepQueueMax = 64 << 10
+
 var (
 	errDrainTimeout = errors.New("the client did not take the rest of the response in time")
 	errWriteClosed  = errors.New("write after CloseWrite")
@@ -142,6 +148,7 @@ func (c Conn) startRecord() {
 		}
 		n, _ := c.p.writeStream.Read(buf[tls.SizeHeader : tls.SizeHeader+size])
 		closing := c.p.closing
+		c.p.releaseDrained()
 		c.p.writtenCond.L.Unlock()
 
 		// Room in the queue: wake any Write waiting on the bound.
@@ -185,8 +192,10 @@ func (c Conn) startBurst() {
 			c.p.writtenCond.Wait()
 		}
 
-		if c.p.writeStream.Len() == 0 {
-			// Closing with nothing left, stopped, or the context ended.
+		if c.p.writeStream.Len() == 0 || c.p.done || c.p.ctx.Err() != nil {
+			// Closing with nothing left, stopped, or the context ended. Stopped
+			// and the context ending cut whatever is still queued: the bursts
+			// are back to back, so this is the only place a burst sees them.
 			c.p.writtenCond.L.Unlock()
 
 			return
@@ -238,6 +247,7 @@ func (c Conn) startBurst() {
 
 			batch = buf[:len(batch)+len(record)]
 		}
+		c.p.releaseDrained()
 		c.p.writtenCond.L.Unlock()
 
 		// Room in the queue: wake any Write waiting on the bound.
@@ -254,6 +264,14 @@ func (c Conn) startBurst() {
 		}
 
 		lastWrite = time.Now()
+	}
+}
+
+// releaseDrained lets go of the queue's peak once the writer has emptied it,
+// keeping at most keepQueueMax. The caller holds the queue's lock.
+func (p *connPayload) releaseDrained() {
+	if p.writeStream.Len() == 0 && p.writeStream.Cap() > keepQueueMax {
+		p.writeStream = bytes.Buffer{}
 	}
 }
 

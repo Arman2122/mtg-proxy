@@ -62,7 +62,7 @@ record, at most one record per read (`mtglib/internal/tls/conn.go`).
 
 | | `shaping = "record"` (today, default) | `shaping = "burst"` |
 |---|---|---|
-| Record sizes | 16 KiB max; optional DRS ramp; cover-calibrated noise | identical |
+| Record sizes | 16 KiB max; optional DRS ramp; cover-calibrated noise | drawn the same way; more short records (see below) |
 | Wait | one `Delay()` draw before every record | one draw when the connection wakes from idle |
 | Within a burst | one record per wait | records back to back, up to 64 KiB of records per system call; TCP paces them |
 | Buffer | capped at 256 KiB (new in both modes) | same |
@@ -74,9 +74,15 @@ record, at most one record per read (`mtglib/internal/tls/conn.go`).
   new burst and bring the ceiling back. A media download is one burst at full
   speed; a chat message after a quiet second gets one website-like wait,
   typically under a millisecond.
-- **Records are sized exactly as before**: each record's payload comes from
-  `Stats.Size()`, so the DRS ramp and its idle reset are unchanged. Coalescing
-  changes how many records share a system call, never their boundaries.
+- **Record sizes are drawn exactly as before**: each record's payload comes
+  from `Stats.Size()`, so the DRS ramp and its idle reset are unchanged, and a
+  drawn size that does not fit one system call carries to the next. In both
+  modes a record is cut short when less is queued than was drawn. Record
+  shaping's wait lets the queue fill first; burst shaping sends what is
+  queued, so it cuts more records short when Telegram's answer arrives in
+  pieces. That difference is accepted, not engineered away: holding a record
+  back until it fills would add latency to every small exchange, which is
+  what burst shaping exists to remove. The canary watches for it.
 - **The bounded buffer** applies in both modes. `Write` blocks while 256 KiB is
   queued, until the writer drains it, the conn is stopped, or its context ends;
   the relay therefore stops reading from Telegram, and memory per connection is

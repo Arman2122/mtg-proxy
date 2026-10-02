@@ -552,9 +552,11 @@ record. The statistics describe a web page's records, so a bulk download is
 paced like a page too — about 20 Mbit/s per ee connection with the built-in
 statistics. `shaping = "burst"` waits one such delay when a connection wakes
 from idle (nothing sent for a second) and then sends records back to back, the
-way a server streams a response, leaving the pace to TCP. Record sizes are the
-same either way; only the waits between records change, so downloads run at the
-speed of the link. `burst` is being canaried: it changes timing a censor can
+way a server streams a response, leaving the pace to TCP, so downloads run at
+the speed of the link. Each record's size is drawn the same way in both modes —
+16 KiB, or the `drs` ramp — and both send a shorter record when less is waiting
+than was drawn. Without a wait before every record less has piled up, so
+`burst` sends more of those short records. `burst` is being canaried: it changes timing a censor can
 observe, so it becomes the default only after running on real networks without
 connections being blocked.
 
