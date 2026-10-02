@@ -21,10 +21,13 @@
 # They match mise.lock deliberately, so the two cannot disagree. Upgrading is a
 # deliberate commit: change the version here, run `mise run fmt` and
 # `mise run lint`, and fix whatever the new version finds in that same change.
-# The tree is currently clean under 2.13.2 as well, so that upgrade is a
-# one-line change whenever it is wanted.
+#
+# .golangci.yml is part of that pairing: a config key the pinned version does
+# not know fails `golangci-lint config verify`, the first step of the lint task,
+# even when `golangci-lint run` alone reports 0 issues. Check both steps under
+# the pinned version, not only `run`.
 go = "1.26.8"
-golangci-lint = "2.12.2"
+golangci-lint = "2.13.2"
 
 [vars]
 fuzzflags = "-fuzztime=120s"
