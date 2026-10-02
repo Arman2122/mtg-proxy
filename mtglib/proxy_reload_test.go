@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/doppel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -44,10 +46,17 @@ func TestBuildSecretSet(t *testing.T) {
 	assert.Equal(t, []string{"carol.example.com", "shared.example.com"}, set.hostnames)
 }
 
+// idleGanger is a doppelganger that is never run: enough for a proxy built by
+// hand whose secret swaps tell it the cover hosts.
+func idleGanger() *doppel.Ganger {
+	return doppel.NewGanger(context.Background(), nil, testLogger(), time.Hour, 1, nil, false, doppel.ShapingRecord, false)
+}
+
 func newReloadTestProxy(secrets map[string]Secret) *Proxy {
 	p := &Proxy{
-		stats:     NewProxyStats(),
-		liveConns: make(map[string]map[*streamContext]struct{}),
+		stats:        NewProxyStats(),
+		liveConns:    make(map[string]map[*streamContext]struct{}),
+		doppelGanger: idleGanger(),
 	}
 	set := buildSecretSet(secrets, nil, nil, nil)
 

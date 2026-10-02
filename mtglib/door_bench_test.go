@@ -86,7 +86,7 @@ func shapedHarness(
 	tb.Helper()
 
 	h := newEntryHarness(tb, secrets, limits)
-	h.proxy.doppelGanger = doppel.NewGanger(h.proxy.ctx, h.network, testLogger(), time.Hour, 1, nil, false, shaping)
+	h.proxy.doppelGanger = doppel.NewGanger(h.proxy.ctx, h.network, testLogger(), time.Hour, 1, nil, false, shaping, false)
 	h.proxy.doppelGanger.Run()
 	tb.Cleanup(h.proxy.doppelGanger.Shutdown)
 	h.proxy.idleTimeout = time.Minute

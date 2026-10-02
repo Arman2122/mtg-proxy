@@ -72,7 +72,7 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		return false
 	}
 
-	gangerNoise := p.doppelGanger.NoiseParams()
+	gangerNoise := p.doppelGanger.NoiseParamsFor(result.MatchedHost)
 	noiseParams := fake.NoiseParams{Mean: gangerNoise.Mean, Jitter: gangerNoise.Jitter}
 
 	if err := fake.SendServerHello(ctx.client(), set.secrets[idx].Key[:], result.Hello, noiseParams); err != nil {

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/doppel"
 )
 
 // The secret set: the immutable snapshot every handshake reads, how it is
@@ -211,6 +213,8 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	newSet := buildSecretSet(cfg.Secrets, cfg.SecretAdTags, cfg.GlobalAdTag, cfg.Limits)
 	oldSet := p.secrets.Swap(newSet)
 
+	p.doppelGanger.SetCoverHosts(p.coverHosts(newSet))
+
 	for _, name := range newSet.names {
 		p.stats.PreRegister(name)
 	}
@@ -220,6 +224,30 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	p.closeDeniedConns()
 
 	return nil
+}
+
+// coverHosts lists the cover sites the set's ee secrets name, each once, in
+// name order, with the address domain fronting would dial for it -- where the
+// doppelganger measures it. A host with no fronting address is left out.
+func (p *Proxy) coverHosts(set *secretSet) []doppel.CoverHost {
+	seen := make(map[string]bool)
+
+	var hosts []doppel.CoverHost
+
+	for _, idx := range set.hosted {
+		host := set.secrets[idx].Host
+		if host == "" || seen[host] {
+			continue
+		}
+
+		seen[host] = true
+
+		if addr := p.domainFrontingAddressForHost(host); addr != "" {
+			hosts = append(hosts, doppel.CoverHost{Host: host, Addr: addr})
+		}
+	}
+
+	return hosts
 }
 
 // applyLimits installs, from the set just swapped in, the limits that are

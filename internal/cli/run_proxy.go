@@ -609,6 +609,9 @@ func runProxyWith( //nolint: funlen, cyclop
 		DoppelGangerEach:    conf.Defense.Doppelganger.UpdateEach.Get(mtglib.DoppelGangerEach),
 		DoppelGangerDRS:     conf.Defense.Doppelganger.DRS.Get(false),
 		DoppelGangerShaping: conf.Defense.Doppelganger.Shaping.Get(config.TypeDoppelShapingRecord),
+		// Measure the cover sites when no URLs are configured: the fake
+		// handshake's noise record is then sized like the real site's.
+		DoppelGangerScoutCovers: true,
 
 		APIBindTo:       conf.APIBindTo.Get(""),
 		APIToken:        conf.GetAPIToken(),

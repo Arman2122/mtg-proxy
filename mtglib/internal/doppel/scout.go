@@ -42,8 +42,20 @@ func (s Scout) Learn(ctx context.Context) (ScoutResult, error) {
 	return combined, nil
 }
 
+// LearnCover measures the cover site h: GET https://<Host>/, with SNI and the
+// Host header from h.Host, dialling h.Addr instead of what DNS says.
+func (s Scout) LearnCover(ctx context.Context, h CoverHost) (ScoutResult, error) {
+	return s.learnVia(ctx, "https://"+h.Host+"/", h.Addr)
+}
+
 func (s Scout) learn(ctx context.Context, url string) (ScoutResult, error) {
-	client, results := s.makeClient()
+	return s.learnVia(ctx, url, "")
+}
+
+// learnVia fetches url and measures it; a non-empty dialAddr replaces the
+// address the URL's host resolves to.
+func (s Scout) learnVia(ctx context.Context, url, dialAddr string) (ScoutResult, error) {
+	client, results := s.makeClient(dialAddr)
 
 	if !strings.HasPrefix(url, "https://") {
 		return ScoutResult{}, fmt.Errorf("url %s must be https", url)
@@ -119,7 +131,7 @@ func (s Scout) learn(ctx context.Context, url string) (ScoutResult, error) {
 	return result, nil
 }
 
-func (s Scout) makeClient() (*http.Client, *ScoutConnCollected) {
+func (s Scout) makeClient(dialAddr string) (*http.Client, *ScoutConnCollected) {
 	dialer := s.network.NativeDialer()
 	collected := NewScoutConnCollected()
 	client := s.network.MakeHTTPClient(func(
@@ -127,6 +139,10 @@ func (s Scout) makeClient() (*http.Client, *ScoutConnCollected) {
 		network string,
 		address string,
 	) (essentials.Conn, error) {
+		if dialAddr != "" {
+			address = dialAddr
+		}
+
 		conn, err := dialer.DialContext(ctx, network, address)
 		if err != nil {
 			return nil, err

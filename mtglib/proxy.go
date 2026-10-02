@@ -195,6 +195,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			opts.DoppelGangerURLs,
 			opts.DoppelGangerDRS,
 			shaping,
+			opts.DoppelGangerScoutCovers,
 		),
 		configUpdater: dc.NewPublicConfigUpdater(
 			tg,
@@ -257,6 +258,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 
 	proxy.secrets.Store(initialSet)
 	proxy.applyLimits(initialSet)
+	proxy.doppelGanger.SetCoverHosts(proxy.coverHosts(initialSet))
 
 	// Start the management API only now that the proxy exists, so the routes
 	// can drive ReloadSecrets and the secrets/adtag mutators. /stats, /reload,

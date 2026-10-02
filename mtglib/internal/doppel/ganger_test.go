@@ -31,7 +31,7 @@ func (suite *GangerTestSuite) SetupTest() {
 		On("WarningError", mock.AnythingOfType("string"), mock.Anything).
 		Maybe()
 
-	suite.g = NewGanger(suite.ctx, suite.network, suite.log, time.Hour, 1, suite.urls, true, ShapingRecord)
+	suite.g = NewGanger(suite.ctx, suite.network, suite.log, time.Hour, 1, suite.urls, true, ShapingRecord, false)
 	suite.g.Run()
 }
 
@@ -114,7 +114,7 @@ func TestGangerUnpace(t *testing.T) {
 	t.Parallel()
 
 	for _, drs := range []bool{false, true} {
-		g := NewGanger(t.Context(), nil, nil, time.Hour, 1, nil, drs, ShapingRecord)
+		g := NewGanger(t.Context(), nil, nil, time.Hour, 1, nil, drs, ShapingRecord, false)
 		g.Unpace()
 
 		for range 1000 {

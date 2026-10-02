@@ -224,7 +224,7 @@ func newEntryHarness(t testing.TB, secrets map[string]Secret, limits map[string]
 		// doppelganger wrap in ServeConn -- must Run it, because NewConn is a
 		// channel round-trip with that run loop. With no scout URLs the raid it
 		// starts is a no-op.
-		doppelGanger: doppel.NewGanger(ctx, network, testLogger(), time.Hour, 1, nil, false, doppel.ShapingRecord),
+		doppelGanger: doppel.NewGanger(ctx, network, testLogger(), time.Hour, 1, nil, false, doppel.ShapingRecord, false),
 	}
 
 	set := buildSecretSet(secrets, nil, nil, limits)

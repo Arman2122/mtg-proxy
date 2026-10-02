@@ -15,9 +15,10 @@ import (
 
 func newLimitTestProxy(secrets map[string]Secret, limits map[string]SecretLimits) *Proxy {
 	p := &Proxy{
-		stats:     NewProxyStats(),
-		liveConns: make(map[string]map[*streamContext]struct{}),
-		logger:    testLogger(),
+		stats:        NewProxyStats(),
+		liveConns:    make(map[string]map[*streamContext]struct{}),
+		logger:       testLogger(),
+		doppelGanger: idleGanger(),
 	}
 
 	set := buildSecretSet(secrets, nil, nil, limits)
