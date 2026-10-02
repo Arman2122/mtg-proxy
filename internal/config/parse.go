@@ -74,7 +74,9 @@ type tomlConfig struct {
 	} `toml:"domain-fronting" json:"domainFronting"`
 	Defense struct {
 		AntiReplay struct {
-			Enabled   bool    `toml:"enabled" json:"enabled,omitempty"`
+			// A pointer, so an explicit "enabled = false" survives into the
+			// typed config instead of reading as "not set": unset means on.
+			Enabled   *bool   `toml:"enabled" json:"enabled,omitempty"`
 			MaxSize   string  `toml:"max-size" json:"maxSize,omitempty"`
 			ErrorRate float64 `toml:"error-rate" json:"errorRate,omitempty"`
 		} `toml:"anti-replay" json:"antiReplay"`

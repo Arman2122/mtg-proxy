@@ -131,7 +131,9 @@ type Config struct {
 	} `json:"domainFronting"`
 	Defense struct {
 		AntiReplay struct {
-			Optional
+			// Enabled is nil when the config does not say: replay protection
+			// is then on. Only an explicit false turns it off.
+			Enabled *TypeBool `json:"enabled"`
 
 			MaxSize   TypeBytes     `json:"maxSize"`
 			ErrorRate TypeErrorRate `json:"errorRate"`

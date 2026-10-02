@@ -103,7 +103,10 @@ func makeNetwork(conf *config.Config, version string) (mtglib.Network, error) {
 }
 
 func makeAntiReplayCache(conf *config.Config) (mtglib.AntiReplayCache, error) {
-	if !conf.Defense.AntiReplay.Enabled.Get(false) {
+	// On unless the config turns it off. A proxy that answers a replayed
+	// ClientHello within the clock-skew window confirms itself to whoever
+	// replayed it, which is the classic way a censor probes for one.
+	if enabled := conf.Defense.AntiReplay.Enabled; enabled != nil && !enabled.Get(false) {
 		return antireplay.NewNoop(), nil
 	}
 

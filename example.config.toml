@@ -629,7 +629,10 @@ drs = false
 # of each connection. So, it stores them in some in-memory LRU+TTL cache.
 # You can configure this cache here.
 [defense.anti-replay]
-# You can enable/disable this feature.
+# On by default: a config without this table still refuses replays. Only
+# "enabled = false" turns it off. It costs about max-size of memory, and at
+# error-rate 0.001 about one genuine connection attempt in a thousand is
+# taken for a replay and sent to the cover site; the client retries.
 enabled = true
 # max size of such a cache. Please be aware that this number is
 # approximate we try hard to store data quite dense but it is possible

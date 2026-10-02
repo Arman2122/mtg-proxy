@@ -65,12 +65,14 @@ The layout that works, and the one the codebase's own tests pin:
 3. `[[listener]]` blocks, then `[web]`.
 4. `[secret-ad-tags]`, `[secret-limits.<name>]`, and `[secrets]` **last**.
 
-**Every boolean defaults to `false` when omitted.** There is no "unset" state for
-a bool in this config: `TypeBool.Get` returns the parsed value or the fallback,
-and every call site passes `false`. So `[defense.anti-replay]`,
-`[defense.blocklist]` and `[stats.prometheus]` are all *off* unless you write
-`enabled = true`. The shipped `example.config.toml` sets several of them to
-`true`; those are the example's choices, not the defaults.
+**Every boolean defaults to `false` when omitted** — with one exception. There is
+no "unset" state for most bools in this config: `TypeBool.Get` returns the
+parsed value or the fallback, and the call sites pass `false`. So
+`[defense.blocklist]` and `[stats.prometheus]` are *off* unless you write
+`enabled = true`. The exception is `[defense.anti-replay] enabled`, which is
+**on** unless you write `enabled = false` — see below. The shipped
+`example.config.toml` sets several options to `true`; those are the example's
+choices, not the defaults.
 
 **Address keys take a literal IP.** Everything typed as `host:port` here —
 `bind-to`, `api-bind-to`, `[[listener]] bind-to`, `[web] bind-to`,
@@ -475,7 +477,7 @@ repeat.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Turn the cache on. Set it to `true`; the example does. |
+| `enabled` | bool | `true` | On unless set to `false`. A config without this table is protected. |
 | `max-size` | byte size | `1mib` | Approximate cache size. Actual usage can run 10–20% over on some architectures. |
 | `error-rate` | float, `0 < x < 100` | `0.001` | Target false-positive ratio of the stable Bloom filter. |
 
