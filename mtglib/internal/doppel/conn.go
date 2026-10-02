@@ -18,7 +18,8 @@ const DrainTimeout = 5 * time.Second
 // MaxBuffered bounds the queue between the relay and the paced writer. Write
 // waits while this much is queued, so a client that reads slowly slows the
 // relay's reads from Telegram instead of growing the heap, and what the speed
-// limit charges is never far ahead of what is sent.
+// limit charges is never far ahead of what is sent. The buffer holding the
+// queue grows by doubling, so its capacity peaks near twice this.
 const MaxBuffered = 256 << 10
 
 // keepQueueMax is the most queue capacity a connection keeps once it has gone

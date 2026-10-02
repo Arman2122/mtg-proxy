@@ -60,7 +60,7 @@ trip allocates 3 times, down from 5.
 | Idle ee connection, `burst` | — | 61 KiB |
 | Idle dd / plain connection | 40 KiB | 40 KiB |
 | ee handshake, bytes allocated | 72 KiB | 80 KiB (+12%) |
-| ee connection under a slow client | grows without bound | 256 KiB plus one write, at most |
+| ee connection under a slow client | grows without bound | 256 KiB queued plus one write; the buffer, which grows by doubling, peaks near 512 KiB |
 | ee queue after a download | kept for the connection's life | let go after 1 s idle |
 
 The +9 KiB per ee connection is the record reader's buffer, which grew from
