@@ -66,6 +66,8 @@ func (suite *ConnTestSuite) TestReadTLSSkipsNonApplicationData() {
 	suite.Equal([]byte("real data"), buf[:n])
 }
 
+// Record boundaries mean nothing to the stream inside them: what arrives is
+// the payloads in order, however many records one Read happens to span.
 func (suite *ConnTestSuite) TestReadTLSMultipleRecords() {
 	raw := append(
 		MakeTLSRecord(0x17, []byte("first")),
@@ -76,13 +78,16 @@ func (suite *ConnTestSuite) TestReadTLSMultipleRecords() {
 	conn := New(suite.connMock, true, false)
 	buf := make([]byte, 128)
 
-	n, err := conn.Read(buf)
-	suite.NoError(err)
-	suite.Equal([]byte("first"), buf[:n])
+	var got []byte
 
-	n, err = conn.Read(buf)
-	suite.NoError(err)
-	suite.Equal([]byte("second"), buf[:n])
+	for len(got) < len("firstsecond") {
+		n, err := conn.Read(buf)
+		suite.Require().NoError(err)
+
+		got = append(got, buf[:n]...)
+	}
+
+	suite.Equal([]byte("firstsecond"), got)
 }
 
 func (suite *ConnTestSuite) TestReadTLSSmallBuffer() {
