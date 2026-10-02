@@ -3,12 +3,19 @@ package doppel
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls"
 )
+
+// DrainTimeout bounds how long CloseWrite keeps delivering what is buffered to
+// a client that has stopped reading. What is left after it is dropped.
+const DrainTimeout = 5 * time.Second
+
+var errDrainTimeout = errors.New("the client did not take the rest of the response in time")
 
 var doppelBufPool = sync.Pool{
 	New: func() any {
@@ -31,6 +38,11 @@ type connPayload struct {
 	writeStream bytes.Buffer
 	writtenCond sync.Cond
 	done        bool
+
+	// closing is set by CloseWrite: the writer leaves once the buffer is
+	// empty instead of waiting for more. stopped is closed when it leaves.
+	closing bool
+	stopped chan struct{}
 }
 
 func (c Conn) Write(p []byte) (int, error) {
@@ -73,13 +85,18 @@ func (c Conn) start() {
 		size := c.p.stats.Size()
 
 		c.p.writtenCond.L.Lock()
-		for c.p.writeStream.Len() == 0 && !c.p.done {
+		for c.p.writeStream.Len() == 0 && !c.p.done && !c.p.closing {
 			c.p.writtenCond.Wait()
 		}
 		n, _ := c.p.writeStream.Read(buf[tls.SizeHeader : tls.SizeHeader+size])
+		closing := c.p.closing
 		c.p.writtenCond.L.Unlock()
 
 		if n == 0 {
+			if closing {
+				return
+			}
+
 			continue
 		}
 
@@ -88,6 +105,28 @@ func (c Conn) start() {
 			return
 		}
 	}
+}
+
+// CloseWrite ends the response rather than aborting it. What is buffered keeps
+// going out at the pace it was going, and once all of it is on the wire the
+// client is sent EOF. A client that has stopped reading cannot hold this up for
+// longer than DrainTimeout; whatever is still buffered then is dropped.
+func (c Conn) CloseWrite() error {
+	c.p.writtenCond.L.Lock()
+	c.p.closing = true
+	c.p.writtenCond.L.Unlock()
+	c.p.writtenCond.Broadcast()
+
+	timer := time.NewTimer(DrainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-c.p.stopped:
+	case <-timer.C:
+		c.p.ctxCancel(errDrainTimeout)
+	}
+
+	return c.Conn.CloseWrite() //nolint: wrapcheck // the underlying connection's own error
 }
 
 func (c Conn) Stop() {
@@ -112,12 +151,15 @@ func NewConn(ctx context.Context, conn essentials.Conn, stats Stats) Conn {
 			writtenCond: sync.Cond{
 				L: &sync.Mutex{},
 			},
+			stopped: make(chan struct{}),
 		},
 	}
 
 	rv.p.writeStream.Grow(tls.DefaultBufferSize)
 
 	rv.p.wg.Go(func() {
+		defer close(rv.p.stopped)
+
 		rv.start()
 	})
 
