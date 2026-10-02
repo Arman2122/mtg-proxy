@@ -99,14 +99,17 @@ func ServePeer(conn net.Conn, secret []byte) (*Peer, error) {
 	return &Peer{frame: frame}, nil
 }
 
-// ReadPacket returns the next RPC message, whatever its kind.
+// ReadPacket returns the next RPC message, whatever its kind. It is a copy:
+// tests hand it to other goroutines, and the frame reader reuses its buffer.
 func (p *Peer) ReadPacket() ([]byte, error) {
-	return p.frame.readPacket()
+	msg, err := p.frame.readPacket()
+
+	return bytes.Clone(msg), err
 }
 
 // ReadRequest returns the next message, which must be an RPC_PROXY_REQ.
 func (p *Peer) ReadRequest() (PeerRequest, error) {
-	msg, err := p.frame.readPacket()
+	msg, err := p.ReadPacket()
 	if err != nil {
 		return PeerRequest{}, err
 	}

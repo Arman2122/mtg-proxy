@@ -40,8 +40,19 @@ type middleConn struct {
 	// may declare RPC_F_PAD or have its packets trimmed.
 	padded bool
 
-	inbuf  []byte
-	outbuf []byte
+	inbuf []byte
+
+	// What the client has yet to receive of the current answer: the last
+	// headLeft bytes of head (the intermediate length prefix), then out, a
+	// slice of the frame reader's buffer that stays valid until it reads the
+	// next frame -- which Read does only once out is drained.
+	head     [4]byte
+	headLeft int
+	out      []byte
+
+	// readErr is an error met after Read had already copied bytes; it is
+	// returned by the next Read instead of being lost.
+	readErr error
 }
 
 func newMiddleConn(raw essentials.Conn, frame *frameConn, connID [8]byte, adTag [adTagLength]byte, clientAddr, ourAddr *net.TCPAddr, padded bool) *middleConn {
@@ -92,34 +103,83 @@ func (m *middleConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// Read hands the client RPC_PROXY_ANS payloads reframed as intermediate
+// packets (a 4-byte little-endian length, then the payload; no random padding
+// -- the outer obfuscated2 and FakeTLS layers already randomise the stream)
+// and RPC_SIMPLE_ACK payloads verbatim. Each byte is copied once, from the
+// frame reader's buffer into dst. When dst has room and the next frame has
+// already arrived in full, that frame is taken in the same call, so the client
+// gets fewer, larger writes; Read never blocks for more once it has bytes.
 func (m *middleConn) Read(dst []byte) (int, error) {
-	for len(m.outbuf) == 0 {
-		msg, err := m.frame.readPacket()
-		if err != nil {
-			return 0, err
-		}
-
-		typ, payload, err := parseProxyResponse(msg)
-		if err != nil {
-			return 0, err
-		}
-
-		switch typ {
-		case respAns:
-			m.outbuf = append(m.outbuf, frameIntermediate(payload)...)
-		case respSimpleAck:
-			// A quick-ack is forwarded to the client verbatim, without an
-			// intermediate length prefix.
-			m.outbuf = append(m.outbuf, payload...)
-		case respCloseExt:
-			return 0, io.EOF
-		}
+	if m.readErr != nil {
+		return 0, m.readErr
 	}
 
-	n := copy(dst, m.outbuf)
-	m.outbuf = m.outbuf[n:]
+	n := 0
 
-	return n, nil
+	for {
+		if m.headLeft > 0 {
+			c := copy(dst[n:], m.head[len(m.head)-m.headLeft:])
+			m.headLeft -= c
+			n += c
+		}
+
+		if m.headLeft == 0 && len(m.out) > 0 {
+			c := copy(dst[n:], m.out)
+			m.out = m.out[c:]
+			n += c
+		}
+
+		if n == len(dst) || m.headLeft > 0 || len(m.out) > 0 {
+			return n, nil
+		}
+
+		if n > 0 && !m.frame.nextFrameBuffered() {
+			return n, nil
+		}
+
+		if err := m.nextAnswer(); err != nil {
+			if n > 0 {
+				m.readErr = err
+
+				return n, nil
+			}
+
+			return 0, err
+		}
+	}
+}
+
+// nextAnswer reads one frame and queues what it carries for the client, which
+// may be nothing: Read's loop then decides whether waiting for another frame
+// is allowed.
+func (m *middleConn) nextAnswer() error {
+	msg, err := m.frame.readPacket()
+	if err != nil {
+		return err
+	}
+
+	typ, payload, err := parseProxyResponse(msg)
+	if err != nil {
+		return err
+	}
+
+	switch typ {
+	case respAns:
+		// G115: payload comes from parseProxyResponse over a frame readPacket
+		// already clamped to frameMaxMessageLength (16 MiB).
+		binary.LittleEndian.PutUint32(m.head[:], uint32(len(payload))) //nolint:gosec
+		m.headLeft = len(m.head)
+		m.out = payload
+	case respSimpleAck:
+		// A quick-ack is forwarded to the client verbatim, without an
+		// intermediate length prefix.
+		m.out = payload
+	case respCloseExt:
+		return io.EOF
+	}
+
+	return nil
 }
 
 // baseFlags mirrors MTProxy's tag->flags mapping. RPC_F_PAD tells the middle
@@ -203,20 +263,6 @@ func parseProxyResponse(packet []byte) (proxyResponseType, []byte, error) {
 	}
 
 	return 0, nil, io.ErrUnexpectedEOF
-}
-
-// frameIntermediate wraps payload as a padded-intermediate packet for the
-// client: a 4-byte little-endian length followed by the payload. No random
-// padding is added; the outer obfuscated2/faketls layers already randomize the
-// stream.
-func frameIntermediate(payload []byte) []byte {
-	out := make([]byte, 4+len(payload))
-	// G115: payload comes from parseProxyResponse over a frame readPacket
-	// already clamped to frameMaxMessageLength (16 MiB).
-	binary.LittleEndian.PutUint32(out[:4], uint32(len(payload))) //nolint:gosec
-	copy(out[4:], payload)
-
-	return out
 }
 
 // encodeIPPort serializes addr as 16 bytes of IPv6-mapped address followed by a
