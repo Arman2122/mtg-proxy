@@ -68,6 +68,21 @@ func (g *Ganger) Run() {
 	})
 }
 
+// Unpace makes the connections this ganger hands out emit their records back
+// to back: no delay is drawn between them. Record sizing is left as it was.
+//
+// No production caller uses it. It is for a harness that times something else
+// through a FakeTLS stream -- a speed limit -- where the deliberate,
+// heavy-tailed delay between records would otherwise be part of the number:
+// under the default model a single record waits over half a second about once
+// in five thousand. Call it before Run; from then on the run loop owns the
+// timing model, and a scout raid that gathers enough samples replaces it.
+func (g *Ganger) Unpace() {
+	// k = 1 rather than the zero value: Delay raises to 1/k, and 1/0 would turn
+	// λ = 0 into 0·Inf = NaN instead of a zero wait.
+	g.stats = Stats{k: 1, lambda: 0, drs: g.drs}
+}
+
 // NoiseParams returns the current cert-size-based noise parameters.
 // Returns zero-value NoiseParams if not yet measured (caller should use fallback).
 func (g *Ganger) NoiseParams() NoiseParams {

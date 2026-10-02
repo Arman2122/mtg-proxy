@@ -329,8 +329,9 @@ func TestSpeedLimitAppliesThroughTheProxy(t *testing.T) {
 			bob := entry.secret(t)
 
 			// The case's own harness: it runs the doppelganger, which the FakeTLS door
-			// cannot get past without, and pins the idle and handshake timeouts so
-			// nothing but the cap can pace these streams.
+			// cannot get past without, and pins the idle and handshake timeouts and
+			// the doppelganger's own wait between records, so nothing but the cap
+			// can pace these streams.
 			h := entry.harness(t,
 				map[string]Secret{"alice": alice, "bob": bob},
 				map[string]SecretLimits{"alice": {SpeedBytesPerSecond: rateBytes}})

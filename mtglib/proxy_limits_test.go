@@ -277,6 +277,16 @@ func (ec govEntryCase) harness(
 	t.Helper()
 
 	h := newEntryHarness(t, secrets, limits)
+
+	// The doppelganger paces the ee write path on purpose, drawing a wait
+	// before every record from a heavy-tailed model: half a megabyte took 200ms
+	// on average and over 500ms in about one run in twenty-five, which is a
+	// speed limit nobody set. Like the two timeouts below it is pinned, so that
+	// the cap is the only thing that can pace these streams; the records are
+	// still framed by the same write loop, only without the wait. Pinned here
+	// and not in newEntryHarness: the golden test leaves record segmentation to
+	// that race on purpose.
+	h.proxy.doppelGanger.Unpace()
 	h.proxy.doppelGanger.Run()
 	t.Cleanup(h.proxy.doppelGanger.Shutdown)
 

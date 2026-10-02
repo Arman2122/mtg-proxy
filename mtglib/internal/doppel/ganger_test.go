@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/internal/testlib"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -104,4 +106,21 @@ func TestGanger(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &GangerTestSuite{})
+}
+
+// Unpace takes the wait out from between records and nothing else: the record
+// sizing is the ganger's own, so a DRS ganger still ramps up after it.
+func TestGangerUnpace(t *testing.T) {
+	t.Parallel()
+
+	for _, drs := range []bool{false, true} {
+		g := NewGanger(t.Context(), nil, nil, time.Hour, 1, nil, drs)
+		g.Unpace()
+
+		for range 1000 {
+			require.Zero(t, g.stats.Delay())
+		}
+
+		assert.Equal(t, drs, g.stats.drs)
+	}
 }
