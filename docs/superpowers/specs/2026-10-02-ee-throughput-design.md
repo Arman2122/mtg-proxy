@@ -54,6 +54,9 @@ record, at most one record per read (`mtglib/internal/tls/conn.go`).
   days; the default flips in a later release only if nothing drops. Changes
   that alter nothing a censor can see — the middle-proxy leg, the ee read path,
   the bounded buffer — go straight to default.
+- **Stealth defaults (section 4): replay protection on, and the fake
+  certificate sized from each cover site automatically.** Both reduce what a
+  censor can learn, so they ship on by default.
 
 ## 1. ee write path: burst-aware shaping
 
@@ -127,6 +130,49 @@ The wire does not change; on by default.
 - Acceptance is unchanged: the same version check, and records that are not
   application data are still discarded.
 
+## 4. Stealth defaults
+
+Added after reviewing what an ee deployment exposes today. Both change a
+default; both reduce what a censor can learn, so neither waits for the canary.
+
+**Replay protection on by default.** `[defense.anti-replay] enabled` defaults
+to `false` in the code (`internal/cli/run_proxy.go`); only the example config
+sets it. The Penhoon panel never writes that section, so every panel-managed
+proxy runs without it: a censor that records a real user's ClientHello and
+replays it within the time-skew window (3 s by default) gets a proxy answer —
+the classic way to confirm a proxy. With protection on, a replayed hello is
+handed to the cover site like any other stranger.
+- The default becomes `true`; `enabled = false` still turns it off.
+- Cost, stated in the docs: 1 MiB per proxy process (the stable Bloom filter's
+  default size), and at its default error rate about one genuine connection
+  attempt in a thousand is taken for a replay and fronted; the client retries
+  with a fresh hello.
+
+**The fake certificate sized from the cover site, out of the box.** The
+handshake's single application-data record stands in for the real server's
+encrypted handshake (certificate chain and the rest). Today it is sized from a
+cover site only when `[defense.doppelganger] urls` is configured, otherwise
+from a generic 2,500–4,700 byte range; and even when configured there is one
+size for the whole process, though secrets can name different cover sites.
+- With `urls` empty, the scout measures each distinct cover host named by the
+  ee secrets, at `https://<host>/`, dialling the same address domain fronting
+  would use — so a deployment whose cover host resolves back to this server
+  (an SNI router) does not scout itself.
+- Sizes are kept per host; a handshake uses the size measured for the host in
+  the client's SNI, and falls back to today's behaviour while a host is
+  unmeasured.
+- A host seen for the first time — at start, or when a secret change brings a
+  new one — is measured promptly; after that, on the existing raid cadence
+  (every 6 h, `repeats_per_raid` requests). With no configured URLs, the same
+  raids also supply the delay statistics.
+- Configured `urls` keep working as today and take precedence for timing.
+
+**Open question, not in scope:** the fake ServerHello always answers with an
+x25519 key share. Every Telegram ClientHello on file offers x25519 only, so
+that matches; whether current app versions now offer a post-quantum group
+(which a modern cover site would pick) is unverified, and needs a capture from
+current apps before anything changes.
+
 ## Ad tags on ee, proven
 
 A new end-to-end test: an ee client through the real FakeTLS door, with an
@@ -147,8 +193,10 @@ Each step is test-first and measured against the baseline before the next.
 3. The middle-proxy leg (section 2).
 4. The ee read path (section 3).
 5. Burst shaping behind `shaping` (section 1), default `"record"`.
-6. The full gate on Windows (`-race`) and Linux, and a before/after report.
-7. Release and canary, each with the user's go-ahead at the time: deploy with
+6. Stealth defaults (section 4): replay protection on by default; per-host
+   certificate-size calibration from the cover sites.
+7. The full gate on Windows (`-race`) and Linux, and a before/after report.
+8. Release and canary, each with the user's go-ahead at the time: deploy with
    `shaping = "burst"`, compare `/stats` — per-user connections, bytes,
    handshakes, frontings — over 3–7 days against the week before, then flip the
    default in a later release.
@@ -163,6 +211,11 @@ Each step is test-first and measured against the baseline before the next.
 - The ee read path makes zero allocations per record, at no lower throughput.
 - The only change on the wire is burst timing: the golden tests pass untouched.
 - Every byte is delivered in every test and benchmark.
+- Replay protection is on without configuration: a replayed hello is fronted
+  in a test against a proxy built from a config with no `[defense]` section.
+- A proxy with no doppelganger URLs sizes its fake certificate from the cover
+  host the client named: tested with two secrets naming two hosts of different
+  certificate sizes.
 
 ## Risks
 
@@ -171,6 +224,11 @@ Each step is test-first and measured against the baseline before the next.
 - **Backpressure.** A bounded buffer means a slow client now slows the relay's
   reads from Telegram. That is the intended behaviour, and the reason memory
   stops growing; the speed-limit and stream-end tests cover the edges.
+- **Replay false positives.** About one genuine connection attempt in a
+  thousand is fronted and retried by the client; the error rate stays
+  configurable.
+- **Scouting is outbound traffic.** The server periodically fetches its cover
+  sites' front pages, as monitoring would; the cadence is the existing one.
 - **2 vCPU and loopback.** The bench box measures per-core cost, not 4–8 core
   scaling or the NIC.
 
