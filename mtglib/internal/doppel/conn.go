@@ -21,10 +21,13 @@ const DrainTimeout = 5 * time.Second
 // limit charges is never far ahead of what is sent.
 const MaxBuffered = 256 << 10
 
-// keepQueueMax is the most queue capacity a connection keeps once its queue has
-// drained. A queue that grew to the bound for a download is let go of after
-// it, rather than held -- at twice its size, as buffers grow -- for the
-// connection's life.
+// keepQueueMax is the most queue capacity a connection keeps once it has gone
+// idle. A queue that grew to the bound for a download is let go of after it,
+// rather than held -- at twice its size, as buffers grow -- for the
+// connection's life. Idle is TLSRecordSizeResetAfter without a Write, the
+// threshold DRS and burst shaping already use: the queue empties many times a
+// second inside a transfer, and letting go of it there would regrow it for
+// every piece of the answer.
 const keepQueueMax = 64 << 10
 
 var (
@@ -68,6 +71,16 @@ type connPayload struct {
 	// empty instead of waiting for more. stopped is closed when it leaves.
 	closing bool
 	stopped chan struct{}
+
+	// writes counts Writes; release lets go of the queue's peak once a
+	// connection has gone idle, armed with the count it saw (releaseMark)
+	// while releaseArmed. All under writtenCond.L; release is created the
+	// first time a queue outgrows keepQueueMax, so most connections never
+	// have one.
+	writes       uint64
+	release      *time.Timer
+	releaseArmed bool
+	releaseMark  uint64
 }
 
 // Write queues p for the paced writer. It waits while MaxBuffered bytes are
@@ -97,6 +110,7 @@ func (c Conn) Write(p []byte) (int, error) {
 	}
 
 	c.p.writeStream.Write(p)
+	c.p.writes++
 	c.p.writtenCond.L.Unlock()
 
 	// Broadcast, not Signal: the paced writer and blocked Writes wait on the
@@ -144,11 +158,11 @@ func (c Conn) startRecord() {
 
 		c.p.writtenCond.L.Lock()
 		for c.p.writeStream.Len() == 0 && !c.p.done && !c.p.closing && c.p.ctx.Err() == nil {
+			c.p.armRelease()
 			c.p.writtenCond.Wait()
 		}
 		n, _ := c.p.writeStream.Read(buf[tls.SizeHeader : tls.SizeHeader+size])
 		closing := c.p.closing
-		c.p.releaseDrained()
 		c.p.writtenCond.L.Unlock()
 
 		// Room in the queue: wake any Write waiting on the bound.
@@ -189,6 +203,7 @@ func (c Conn) startBurst() {
 	for {
 		c.p.writtenCond.L.Lock()
 		for c.p.writeStream.Len() == 0 && !c.p.done && !c.p.closing && c.p.ctx.Err() == nil {
+			c.p.armRelease()
 			c.p.writtenCond.Wait()
 		}
 
@@ -247,7 +262,6 @@ func (c Conn) startBurst() {
 
 			batch = buf[:len(batch)+len(record)]
 		}
-		c.p.releaseDrained()
 		c.p.writtenCond.L.Unlock()
 
 		// Room in the queue: wake any Write waiting on the bound.
@@ -267,10 +281,39 @@ func (c Conn) startBurst() {
 	}
 }
 
-// releaseDrained lets go of the queue's peak once the writer has emptied it,
-// keeping at most keepQueueMax. The caller holds the queue's lock.
-func (p *connPayload) releaseDrained() {
-	if p.writeStream.Len() == 0 && p.writeStream.Cap() > keepQueueMax {
+// armRelease is called, with the queue's lock held, by a writer about to wait
+// on an empty queue. If the queue has outgrown keepQueueMax it schedules a
+// check, one at a time, for when the connection may have gone idle.
+func (p *connPayload) armRelease() {
+	if p.releaseArmed || p.done || p.writeStream.Cap() <= keepQueueMax {
+		return
+	}
+
+	p.releaseArmed = true
+	p.releaseMark = p.writes
+
+	if p.release == nil {
+		p.release = time.AfterFunc(TLSRecordSizeResetAfter, p.releaseIfIdle)
+	} else {
+		p.release.Reset(TLSRecordSizeResetAfter)
+	}
+}
+
+// releaseIfIdle lets go of the queue's peak if nothing was written since the
+// check was armed. Written since and empty again: check again later. Not
+// empty: a transfer is on, and the writer arms a new check when it next
+// waits.
+func (p *connPayload) releaseIfIdle() {
+	p.writtenCond.L.Lock()
+	defer p.writtenCond.L.Unlock()
+
+	p.releaseArmed = false
+
+	switch {
+	case p.writeStream.Len() > 0 || p.writeStream.Cap() <= keepQueueMax:
+	case p.writes != p.releaseMark:
+		p.armRelease()
+	default:
 		p.writeStream = bytes.Buffer{}
 	}
 }
@@ -302,6 +345,10 @@ func (c Conn) Stop() {
 
 	c.p.writtenCond.L.Lock()
 	c.p.done = true
+
+	if c.p.release != nil {
+		c.p.release.Stop()
+	}
 	c.p.writtenCond.L.Unlock()
 	c.p.writtenCond.Broadcast()
 

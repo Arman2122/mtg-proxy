@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -238,8 +239,9 @@ func TestConnStopIsPromptWhileSending(t *testing.T) {
 	}
 }
 
-// The queue lets go of its peak once it has drained: a connection that once
-// buffered a download does not keep that memory for the rest of its life.
+// The queue lets go of its peak once the connection has gone idle: one that
+// once buffered a download does not keep that memory for the rest of its
+// life, and needs no further traffic to give it back.
 func TestConnQueueLetsGoOfItsPeak(t *testing.T) {
 	t.Parallel()
 
@@ -260,7 +262,62 @@ func TestConnQueueLetsGoOfItsPeak(t *testing.T) {
 			require.NoError(t, <-done)
 			require.Eventually(t, func() bool { return conn.queued() == 0 }, 5*time.Second, 10*time.Millisecond)
 
-			assert.LessOrEqual(t, conn.queueCap(), keepQueueMax, "a drained queue must let go of its peak")
+			assert.Eventually(t, func() bool { return conn.queueCap() <= keepQueueMax },
+				TLSRecordSizeResetAfter+2*time.Second, 20*time.Millisecond,
+				"an idle queue must let go of its peak")
+		})
+	}
+}
+
+// But not during a transfer. Telegram's answer arrives in pieces and the
+// writer catches up between them, so the queue empties many times a second;
+// letting go of it each time regrows it from nothing for the next piece --
+// on the bench box, half an ee download's speed, and here over four times the
+// bytes moved in allocations. Kept, they are a tenth of the bytes moved; under
+// the race detector, whose sync.Pool drops buffers on purpose, up to about
+// half.
+func TestConnQueueKeepsItsBufferThroughATransfer(t *testing.T) { //nolint: paralleltest // measures the process's allocations
+	for _, s := range shapings {
+		t.Run(s.name, func(t *testing.T) {
+			const (
+				round  = 256 << 10
+				rounds = 32
+			)
+
+			conn, far, _ := boundPair(t, t.Context(), Stats{k: 2, lambda: 1}, s.shaping)
+
+			go io.Copy(io.Discard, far) //nolint: errcheck
+
+			piece := make([]byte, 16<<10)
+
+			var before, after runtime.MemStats
+
+			runtime.ReadMemStats(&before)
+
+			for range rounds {
+				for written := 0; written < round; written += len(piece) {
+					_, err := conn.Write(piece)
+					require.NoError(t, err)
+				}
+
+				// Polled by hand: require.Eventually allocates a goroutine per tick,
+				// which this test would count.
+				for deadline := time.Now().Add(5 * time.Second); conn.queued() > 0; {
+					require.True(t, time.Now().Before(deadline), "the queue never drained")
+					time.Sleep(time.Millisecond)
+				}
+
+				require.Greater(t, conn.queueCap(), keepQueueMax,
+					"a queue emptied mid-transfer must keep its buffer for the next piece")
+			}
+
+			runtime.ReadMemStats(&after)
+
+			allocated := after.TotalAlloc - before.TotalAlloc
+
+			t.Logf("%d KiB allocated to move %d KiB", allocated>>10, round*rounds>>10)
+			assert.Less(t, allocated, uint64(round*rounds),
+				"the queue is being regrown mid-transfer")
 		})
 	}
 }
