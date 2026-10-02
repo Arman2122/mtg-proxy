@@ -890,6 +890,47 @@ func TestObfuscatedReplayIsRefusedAfterFirstUse(t *testing.T) {
 	<-firstDone
 }
 
+// TestFakeTLSReplayIsFronted: a censor that records a real client's hello and
+// replays it within the clock-skew window must get the cover site, not the
+// proxy's answer. With replay protection on by default
+// (TestAntiReplayIsOnWithoutConfiguration in internal/cli), this is what a
+// proxy built from a config with no [defense] section does.
+func TestFakeTLSReplayIsFronted(t *testing.T) {
+	t.Parallel()
+
+	hosted := GenerateSecret("cover.example.com")
+	h := newEntryHarness(t, map[string]Secret{"alice": hosted}, nil)
+
+	h.proxy.doppelGanger.Run()
+	t.Cleanup(h.proxy.doppelGanger.Shutdown)
+
+	hello := fakeTLSClientHello(t, hosted.Key, "cover.example.com", bytes.Repeat([]byte{0x44}, 32))
+
+	first, firstDone := h.dialProxy(t, nil)
+
+	_, err := first.Write(hello)
+	require.NoError(t, err)
+	require.NoError(t, first.SetReadDeadline(time.Now().Add(5*time.Second)))
+
+	var serverHello [1]byte
+
+	_, err = io.ReadFull(first, serverHello[:])
+	require.NoError(t, err, "the first sight of a hello gets the proxy's answer")
+
+	second, secondDone := h.dialProxy(t, nil)
+
+	_, err = second.Write(hello)
+	require.NoError(t, err)
+
+	<-secondDone
+
+	assert.Equal(t, 1, h.events.replays())
+	assert.Equal(t, 1, h.events.frontings(), "a replayed hello must be handed to the cover site")
+
+	first.Close() //nolint: errcheck
+	<-firstDone
+}
+
 // tlsApplicationRecord frames a payload as one TLS 1.2 application-data
 // record. After SendServerHello the ee entry reads through the faketls record
 // layer, so this is how a real client's obfuscated handshake arrives.
