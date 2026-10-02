@@ -15,7 +15,16 @@ import (
 // a client that has stopped reading. What is left after it is dropped.
 const DrainTimeout = 5 * time.Second
 
-var errDrainTimeout = errors.New("the client did not take the rest of the response in time")
+// MaxBuffered bounds the queue between the relay and the paced writer. Write
+// waits while this much is queued, so a client that reads slowly slows the
+// relay's reads from Telegram instead of growing the heap, and what the speed
+// limit charges is never far ahead of what is sent.
+const MaxBuffered = 256 << 10
+
+var (
+	errDrainTimeout = errors.New("the client did not take the rest of the response in time")
+	errWriteClosed  = errors.New("write after CloseWrite")
+)
 
 var doppelBufPool = sync.Pool{
 	New: func() any {
@@ -45,18 +54,40 @@ type connPayload struct {
 	stopped chan struct{}
 }
 
+// Write queues p for the paced writer. It waits while MaxBuffered bytes are
+// already queued, so the queue peaks at MaxBuffered plus one write; Stop,
+// CloseWrite and the end of the conn's context all release it with an error.
 func (c Conn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, context.Cause(c.p.ctx)
 	}
 
 	c.p.writtenCond.L.Lock()
+
+	for c.p.writeStream.Len() >= MaxBuffered && !c.p.done && !c.p.closing && c.p.ctx.Err() == nil {
+		c.p.writtenCond.Wait()
+	}
+
+	if err := context.Cause(c.p.ctx); err != nil {
+		c.p.writtenCond.L.Unlock()
+
+		return 0, err
+	}
+
+	if c.p.done || c.p.closing {
+		c.p.writtenCond.L.Unlock()
+
+		return 0, errWriteClosed
+	}
+
 	c.p.writeStream.Write(p)
 	c.p.writtenCond.L.Unlock()
 
-	c.p.writtenCond.Signal()
+	// Broadcast, not Signal: the paced writer and blocked Writes wait on the
+	// same condition, and a Signal could wake the wrong one.
+	c.p.writtenCond.Broadcast()
 
-	return len(p), context.Cause(c.p.ctx)
+	return len(p), nil
 }
 
 func (c Conn) start() {
@@ -85,12 +116,15 @@ func (c Conn) start() {
 		size := c.p.stats.Size()
 
 		c.p.writtenCond.L.Lock()
-		for c.p.writeStream.Len() == 0 && !c.p.done && !c.p.closing {
+		for c.p.writeStream.Len() == 0 && !c.p.done && !c.p.closing && c.p.ctx.Err() == nil {
 			c.p.writtenCond.Wait()
 		}
 		n, _ := c.p.writeStream.Read(buf[tls.SizeHeader : tls.SizeHeader+size])
 		closing := c.p.closing
 		c.p.writtenCond.L.Unlock()
+
+		// Room in the queue: wake any Write waiting on the bound.
+		c.p.writtenCond.Broadcast()
 
 		if n == 0 {
 			if closing {
@@ -156,6 +190,16 @@ func NewConn(ctx context.Context, conn essentials.Conn, stats Stats) Conn {
 	}
 
 	rv.p.writeStream.Grow(tls.DefaultBufferSize)
+
+	// The context ending must wake whoever waits on the queue -- a Write held
+	// at the bound, or the writer waiting for data. Taking the lock first means
+	// a waiter is either before its check, and sees the context done, or
+	// already waiting, and gets this broadcast: never in between.
+	context.AfterFunc(ctx, func() {
+		rv.p.writtenCond.L.Lock()
+		rv.p.writtenCond.L.Unlock() //nolint: staticcheck // an empty critical section is the point
+		rv.p.writtenCond.Broadcast()
+	})
 
 	rv.p.wg.Go(func() {
 		defer close(rv.p.stopped)
