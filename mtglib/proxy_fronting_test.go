@@ -161,7 +161,7 @@ func TestDomainFrontingWithNoTargetClosesWithoutDialling(t *testing.T) {
 // nullified) XORed with a little-endian timestamp. It is the inverse of
 // fake.ReadClientHelloMulti, and it is what makes the ee entry testable without
 // a live client.
-func fakeTLSClientHello(t *testing.T, key [SecretKeyLength]byte, sni string, sessionID []byte) []byte {
+func fakeTLSClientHello(t testing.TB, key [SecretKeyLength]byte, sni string, sessionID []byte) []byte {
 	t.Helper()
 
 	var extensions bytes.Buffer

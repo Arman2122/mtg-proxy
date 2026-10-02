@@ -254,7 +254,7 @@ func govEntryCases() []govEntryCase {
 }
 
 // secret mints a secret of this case's wire form.
-func (ec govEntryCase) secret(t *testing.T) Secret {
+func (ec govEntryCase) secret(t testing.TB) Secret {
 	t.Helper()
 
 	if ec.mode == SecretModeFakeTLS {
@@ -272,7 +272,7 @@ func (ec govEntryCase) secret(t *testing.T) Secret {
 // is a channel round-trip with that run loop. Running it for dd as well costs
 // nothing and keeps the two rows built by identical code.
 func (ec govEntryCase) harness(
-	t *testing.T, secrets map[string]Secret, limits map[string]SecretLimits,
+	t testing.TB, secrets map[string]Secret, limits map[string]SecretLimits,
 ) *entryHarness {
 	t.Helper()
 
@@ -311,7 +311,7 @@ func (ec govEntryCase) harness(
 // openEntry writes the first flight this door expects: a forged ClientHello on
 // ee, the 64-byte obfuscated2 frame on dd. It is everything the proxy needs to
 // attribute the stream and run the per-user limit check, on either path.
-func (ec govEntryCase) openEntry(t *testing.T, client net.Conn, key [SecretKeyLength]byte) {
+func (ec govEntryCase) openEntry(t testing.TB, client net.Conn, key [SecretKeyLength]byte) {
 	t.Helper()
 
 	var flight []byte

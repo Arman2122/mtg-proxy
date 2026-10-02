@@ -181,7 +181,7 @@ func (c readCountingConn) Read(b []byte) (int, error) {
 	return n, err //nolint: wrapcheck
 }
 
-func newEntryHarness(t *testing.T, secrets map[string]Secret, limits map[string]SecretLimits) *entryHarness {
+func newEntryHarness(t testing.TB, secrets map[string]Secret, limits map[string]SecretLimits) *entryHarness {
 	t.Helper()
 
 	upstream, err := net.Listen("tcp", "127.0.0.1:0")
@@ -249,7 +249,7 @@ func newEntryHarness(t *testing.T, secrets map[string]Secret, limits map[string]
 // dialProxy hands one accepted TCP connection to ServeConn (optionally stamped
 // with a policy) and returns the client end. A real TCP pair is used so
 // RemoteAddr is a *net.TCPAddr, which is what the policy layer reads.
-func (h *entryHarness) dialProxy(t *testing.T, policy *ListenerPolicy) (net.Conn, <-chan struct{}) {
+func (h *entryHarness) dialProxy(t testing.TB, policy *ListenerPolicy) (net.Conn, <-chan struct{}) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -287,7 +287,7 @@ func (h *entryHarness) dialProxy(t *testing.T, policy *ListenerPolicy) (net.Conn
 
 // obfuscatedFrame produces exactly the 64 bytes a client sends for this key,
 // transport tag and DC.
-func obfuscatedFrame(t *testing.T, key [SecretKeyLength]byte, tag obfuscation.ConnectionTag, dcID int) []byte {
+func obfuscatedFrame(t testing.TB, key [SecretKeyLength]byte, tag obfuscation.ConnectionTag, dcID int) []byte {
 	t.Helper()
 
 	sink := &frameSink{}
@@ -316,7 +316,7 @@ func obfuscatedPolicy(modes ModeSet, action UnknownSecretAction) *ListenerPolicy
 
 // liveStream returns the single registered stream for a secret name, waiting a
 // short while for ServeConn to get there.
-func (h *entryHarness) liveStream(t *testing.T, name string) *streamContext {
+func (h *entryHarness) liveStream(t testing.TB, name string) *streamContext {
 	t.Helper()
 
 	for range 200 {

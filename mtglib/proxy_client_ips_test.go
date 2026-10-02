@@ -82,7 +82,7 @@ func dialProxyFrom(
 // connect dials its own socket, which is exactly what these tests cannot use --
 // the whole point here is a connection whose reported address the test chose.
 func connectThrough(
-	t *testing.T, ec govEntryCase, h *entryHarness, client net.Conn,
+	t testing.TB, ec govEntryCase, h *entryHarness, client net.Conn,
 	name string, key [SecretKeyLength]byte,
 ) net.Conn {
 	t.Helper()

@@ -1,7 +1,6 @@
 package mtglib
 
 import (
-	"encoding/binary"
 	"io"
 	"net"
 	"testing"
@@ -30,10 +29,7 @@ func TestStreamEndDeliversTheWholeAnswer(t *testing.T) {
 
 			// Not entry.harness: that one unpaces the doppelganger, and the pacing
 			// is the point here.
-			h := newEntryHarness(t, map[string]Secret{"alice": secret}, nil)
-			h.proxy.doppelGanger.Run()
-			t.Cleanup(h.proxy.doppelGanger.Shutdown)
-			h.proxy.idleTimeout = time.Minute
+			h := pacedHarness(t, map[string]Secret{"alice": secret}, nil)
 
 			client, done := h.dialProxy(t, entry.policy)
 			upstream := connectThrough(t, entry, h, client, "alice", secret.Key)
@@ -65,20 +61,7 @@ func answerBytesToEOF(t *testing.T, entry govEntryCase, client net.Conn) int {
 		return len(got)
 	}
 
-	// The rest of the server flight. connectThrough read only the first byte
-	// of the handshake record; the change-cipher-spec and noise records follow.
-	var header [tls.SizeHeader - 1]byte
-
-	_, err := io.ReadFull(client, header[:])
-	require.NoError(t, err)
-
-	_, err = io.CopyN(io.Discard, client, int64(binary.BigEndian.Uint16(header[2:])))
-	require.NoError(t, err)
-
-	for range 2 {
-		_, _, err = tls.ReadRecord(client, io.Discard)
-		require.NoError(t, err)
-	}
+	skipServerFlight(t, client)
 
 	total := 0
 
