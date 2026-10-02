@@ -604,6 +604,23 @@ raid-each = "6h"
 #      https://aws.github.io/s2n-tls/usage-guide/ch08-record-sizes.html
 #      https://github.com/cloudflare/sslconfig/blob/master/patches/nginx__dynamic_tls_records.patch
 drs = false
+# How the doppelganger spaces the TLS records it writes to ee clients.
+#
+# "record" (the default) waits a delay drawn from the statistics above before
+# EVERY record. Those statistics describe a web page's records, so a bulk
+# download -- a video, a large file -- is paced like a page too: about 20 Mbit/s
+# per connection with the built-in statistics.
+#
+# "burst" waits one such delay when a connection wakes from idle (nothing sent
+# for a second) and then sends records back to back, the way a server streams
+# a response, leaving the pace to TCP. Record sizes do not change -- 16 KiB, or
+# the drs ramp -- only the waits between them. Downloads run at the speed of
+# the link.
+#
+# "burst" is being canaried: it changes timing a censor can observe, so it
+# becomes the default only after it has run on real networks without
+# connections being blocked.
+# shaping = "record"
 
 # Some countries do active probing on Telegram connections. This technique
 # allows to protect from such effort.

@@ -605,6 +605,7 @@ func runProxyWith( //nolint: funlen, cyclop
 		DoppelGangerPerRaid: conf.Defense.Doppelganger.Repeats.Get(mtglib.DoppelGangerPerRaid),
 		DoppelGangerEach:    conf.Defense.Doppelganger.UpdateEach.Get(mtglib.DoppelGangerEach),
 		DoppelGangerDRS:     conf.Defense.Doppelganger.DRS.Get(false),
+		DoppelGangerShaping: conf.Defense.Doppelganger.Shaping.Get(config.TypeDoppelShapingRecord),
 
 		APIBindTo:       conf.APIBindTo.Get(""),
 		APIToken:        conf.GetAPIToken(),

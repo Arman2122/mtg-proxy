@@ -539,10 +539,22 @@ statistics and mimic them.
 | `repeats-per-raid` | integer, 1–65535 | `10` | Requests made to each URL per raid. Keep it small. |
 | `raid-each` | duration | `6h` | Interval between raids. A short interval produces noticeable activity for no benefit; traffic patterns do not change quickly. |
 | `drs` | bool | `false` | Dynamic TLS record sizing: start with small records and ramp up. |
+| `shaping` | `"record"` \| `"burst"` | `"record"` | How the doppelganger spaces its TLS records in time. See below. |
 
 `drs` is off because roughly 90% of servers do not do it — nginx, Apache and the
 Java stacks all use the maximum record size always. Go tools, angie and some
 patched builds do ramp. Enable it only if the site you are imitating does.
+
+`shaping = "record"` waits a delay drawn from the statistics before **every**
+record. The statistics describe a web page's records, so a bulk download is
+paced like a page too — about 20 Mbit/s per ee connection with the built-in
+statistics. `shaping = "burst"` waits one such delay when a connection wakes
+from idle (nothing sent for a second) and then sends records back to back, the
+way a server streams a response, leaving the pace to TCP. Record sizes are the
+same either way; only the waits between records change, so downloads run at the
+speed of the link. `burst` is being canaried: it changes timing a censor can
+observe, so it becomes the default only after running on real networks without
+connections being blocked.
 
 ## `[throttle]`
 

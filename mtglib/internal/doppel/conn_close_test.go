@@ -14,7 +14,7 @@ import (
 
 // doppelPair is a doppelganger conn over the near end of a loopback pair, and
 // the far end the client reads.
-func doppelPair(t *testing.T, stats Stats) (Conn, net.Conn) {
+func doppelPair(t *testing.T, stats Stats, shaping Shaping) (Conn, net.Conn) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -33,7 +33,7 @@ func doppelPair(t *testing.T, stats Stats) (Conn, net.Conn) {
 		near.Close() //nolint: errcheck
 	})
 
-	conn := NewConn(t.Context(), essentials.WrapNetConn(near), stats)
+	conn := NewConn(t.Context(), essentials.WrapNetConn(near), stats, shaping)
 	t.Cleanup(conn.Stop)
 
 	return conn, far
@@ -81,7 +81,7 @@ func TestConnCloseWriteDeliversWhatIsBuffered(t *testing.T) {
 	t.Parallel()
 
 	// About a millisecond between records: paced, but quick to drain.
-	conn, far := doppelPair(t, Stats{k: 2, lambda: 1})
+	conn, far := doppelPair(t, Stats{k: 2, lambda: 1}, ShapingRecord)
 	total := recordPayloadToEOF(t, far)
 
 	payload := make([]byte, 200_000)
@@ -99,7 +99,7 @@ func TestConnCloseWriteGivesUpAfterTheDrainTimeout(t *testing.T) {
 	t.Parallel()
 
 	// A minute between records on average: the buffer cannot drain in time.
-	conn, _ := doppelPair(t, Stats{k: 1, lambda: 60_000})
+	conn, _ := doppelPair(t, Stats{k: 1, lambda: 60_000}, ShapingRecord)
 
 	_, err := conn.Write(make([]byte, 200_000))
 	require.NoError(t, err)

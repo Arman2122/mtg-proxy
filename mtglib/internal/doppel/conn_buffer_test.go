@@ -33,7 +33,7 @@ func boundPair(t *testing.T, ctx context.Context, stats Stats) (Conn, net.Conn) 
 	require.NoError(t, near.(*net.TCPConn).SetWriteBuffer(64<<10)) //nolint: forcetypeassert
 	require.NoError(t, far.(*net.TCPConn).SetReadBuffer(64<<10))   //nolint: forcetypeassert
 
-	conn := NewConn(ctx, essentials.WrapNetConn(near), stats)
+	conn := NewConn(ctx, essentials.WrapNetConn(near), stats, ShapingRecord)
 
 	t.Cleanup(conn.Stop)
 	t.Cleanup(func() {

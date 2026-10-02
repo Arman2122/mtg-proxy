@@ -33,6 +33,15 @@ var doppelBufPool = sync.Pool{
 	},
 }
 
+// burstBufPool holds the batches burst shaping builds: records, headers and
+// all, up to BurstWriteMax.
+var burstBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, BurstWriteMax)
+		return &b
+	},
+}
+
 type Conn struct {
 	essentials.Conn
 
@@ -43,6 +52,7 @@ type connPayload struct {
 	ctx         context.Context
 	ctxCancel   context.CancelCauseFunc
 	stats       Stats
+	shaping     Shaping
 	wg          sync.WaitGroup
 	writeStream bytes.Buffer
 	writtenCond sync.Cond
@@ -91,6 +101,17 @@ func (c Conn) Write(p []byte) (int, error) {
 }
 
 func (c Conn) start() {
+	if c.p.shaping == ShapingBurst {
+		c.startBurst()
+
+		return
+	}
+
+	c.startRecord()
+}
+
+// startRecord is record shaping: a delay drawn before every record.
+func (c Conn) startRecord() {
 	bp, ok := doppelBufPool.Get().(*[]byte)
 	if !ok {
 		// Unreachable: doppelBufPool.New only ever returns a *[]byte.
@@ -141,6 +162,101 @@ func (c Conn) start() {
 	}
 }
 
+// startBurst is burst shaping: one delay when the connection wakes from
+// idle, then records back to back, several to a write. Record sizes are drawn
+// from Stats exactly as record shaping draws them -- DRS ramp and idle reset
+// included -- and a record that does not fit the current batch keeps its
+// drawn size for the next one, so batching never changes a record's size.
+// Like record shaping, it sends a shorter record when the queue holds less
+// than the size drawn.
+func (c Conn) startBurst() {
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+
+	defer timer.Stop()
+
+	var lastWrite time.Time
+
+	pending := 0 // a drawn record size that did not fit the last batch
+
+	for {
+		c.p.writtenCond.L.Lock()
+		for c.p.writeStream.Len() == 0 && !c.p.done && !c.p.closing && c.p.ctx.Err() == nil {
+			c.p.writtenCond.Wait()
+		}
+
+		if c.p.writeStream.Len() == 0 {
+			// Closing with nothing left, stopped, or the context ended.
+			c.p.writtenCond.L.Unlock()
+
+			return
+		}
+		c.p.writtenCond.L.Unlock()
+
+		if lastWrite.IsZero() || time.Since(lastWrite) >= TLSRecordSizeResetAfter {
+			timer.Reset(c.p.stats.Delay())
+
+			select {
+			case <-c.p.ctx.Done():
+				return
+			case <-timer.C:
+			}
+		}
+
+		// The batch buffer is taken for the write and given back after it, so
+		// a connection between bursts -- most of them, most of the time --
+		// holds none.
+		bp, ok := burstBufPool.Get().(*[]byte)
+		if !ok {
+			// Unreachable: burstBufPool.New only ever returns a *[]byte.
+			b := make([]byte, BurstWriteMax)
+			bp = &b
+		}
+
+		buf := *bp
+		batch := buf[:0]
+
+		c.p.writtenCond.L.Lock()
+		for queued := c.p.writeStream.Len(); queued > 0; queued = c.p.writeStream.Len() {
+			size := pending
+			if size == 0 {
+				size = c.p.stats.Size()
+			}
+
+			n := min(size, queued)
+			if len(batch) > 0 && len(batch)+tls.SizeHeader+n > len(buf) {
+				pending = size
+
+				break
+			}
+
+			pending = 0
+			record := buf[len(batch) : len(batch)+tls.SizeHeader+n]
+
+			tls.PutRecordHeader(record, n)                //nolint: errcheck // n <= TLSRecordSizeMax
+			c.p.writeStream.Read(record[tls.SizeHeader:]) //nolint: errcheck // n <= queued
+
+			batch = buf[:len(batch)+len(record)]
+		}
+		c.p.writtenCond.L.Unlock()
+
+		// Room in the queue: wake any Write waiting on the bound.
+		c.p.writtenCond.Broadcast()
+
+		_, err := c.Conn.Write(batch)
+
+		burstBufPool.Put(bp)
+
+		if err != nil {
+			c.p.ctxCancel(err)
+
+			return
+		}
+
+		lastWrite = time.Now()
+	}
+}
+
 // CloseWrite ends the response rather than aborting it. What is buffered keeps
 // going out at the pace it was going, and once all of it is on the wire the
 // client is sent EOF. A client that has stopped reading cannot hold this up for
@@ -174,7 +290,7 @@ func (c Conn) Stop() {
 	c.p.wg.Wait()
 }
 
-func NewConn(ctx context.Context, conn essentials.Conn, stats Stats) Conn {
+func NewConn(ctx context.Context, conn essentials.Conn, stats Stats, shaping Shaping) Conn {
 	ctx, cancel := context.WithCancelCause(ctx)
 	rv := Conn{
 		Conn: conn,
@@ -182,6 +298,7 @@ func NewConn(ctx context.Context, conn essentials.Conn, stats Stats) Conn {
 			ctx:       ctx,
 			ctxCancel: cancel,
 			stats:     stats,
+			shaping:   shaping,
 			writtenCond: sync.Cond{
 				L: &sync.Mutex{},
 			},

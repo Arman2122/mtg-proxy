@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/doppel"
 	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls"
 	"github.com/stretchr/testify/require"
 )
@@ -46,18 +47,46 @@ func doorCases() []doorCase {
 
 	return []doorCase{
 		{name: "ee-record", entry: cases[0], build: pacedHarness},
+		{name: "ee-burst", entry: cases[0], build: burstHarness},
 		{name: "ee-unpaced", entry: cases[0], build: cases[0].harness},
 		{name: "dd", entry: cases[1], build: cases[1].harness},
 		{name: "plain", entry: cases[2], build: cases[2].harness},
 	}
 }
 
+func doorNamed(name string) doorCase {
+	for _, dc := range doorCases() {
+		if dc.name == name {
+			return dc
+		}
+	}
+
+	panic("no door case " + name)
+}
+
 // pacedHarness is govEntryCase.harness without Unpace: the doppelganger paces
-// the ee write path exactly as it does in production.
+// the ee write path exactly as it does in production by default.
 func pacedHarness(tb testing.TB, secrets map[string]Secret, limits map[string]SecretLimits) *entryHarness {
 	tb.Helper()
 
+	return shapedHarness(tb, secrets, limits, doppel.ShapingRecord)
+}
+
+// burstHarness runs the doppelganger as [defense.doppelganger] shaping =
+// "burst" does.
+func burstHarness(tb testing.TB, secrets map[string]Secret, limits map[string]SecretLimits) *entryHarness {
+	tb.Helper()
+
+	return shapedHarness(tb, secrets, limits, doppel.ShapingBurst)
+}
+
+func shapedHarness(
+	tb testing.TB, secrets map[string]Secret, limits map[string]SecretLimits, shaping doppel.Shaping,
+) *entryHarness {
+	tb.Helper()
+
 	h := newEntryHarness(tb, secrets, limits)
+	h.proxy.doppelGanger = doppel.NewGanger(h.proxy.ctx, h.network, testLogger(), time.Hour, 1, nil, false, shaping)
 	h.proxy.doppelGanger.Run()
 	tb.Cleanup(h.proxy.doppelGanger.Shutdown)
 	h.proxy.idleTimeout = time.Minute
@@ -284,7 +313,7 @@ func BenchmarkDoor(b *testing.B) {
 		}
 	}
 
-	dd := doorCases()[2]
+	dd := doorNamed("dd")
 
 	// The same bytes, through one user's sixteen connections and through
 	// sixteen users: the difference is what sharing a user's counters and

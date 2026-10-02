@@ -21,15 +21,22 @@ func TestStreamEndDeliversTheWholeAnswer(t *testing.T) {
 
 	const answer = 512 << 10
 
-	for _, entry := range govEntryCases()[:2] {
-		t.Run(entry.name, func(t *testing.T) {
+	cases := govEntryCases()
+
+	// Not entry.harness: that one unpaces the doppelganger, and the pacing is
+	// the point here -- record shaping as shipped, and burst shaping.
+	for _, door := range []doorCase{
+		{name: "ee", entry: cases[0], build: pacedHarness},
+		{name: "ee-burst", entry: cases[0], build: burstHarness},
+		{name: "dd", entry: cases[1], build: pacedHarness},
+	} {
+		entry := door.entry
+
+		t.Run(door.name, func(t *testing.T) {
 			t.Parallel()
 
 			secret := entry.secret(t)
-
-			// Not entry.harness: that one unpaces the doppelganger, and the pacing
-			// is the point here.
-			h := pacedHarness(t, map[string]Secret{"alice": secret}, nil)
+			h := door.build(t, map[string]Secret{"alice": secret}, nil)
 
 			client, done := h.dialProxy(t, entry.policy)
 			upstream := connectThrough(t, entry, h, client, "alice", secret.Key)

@@ -138,6 +138,8 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		return nil, fmt.Errorf("cannot build telegram dc fetcher: %w", err)
 	}
 
+	shaping, _ := doppel.ParseShaping(opts.DoppelGangerShaping) // valid() checked it
+
 	ctx, cancel := context.WithCancel(context.Background())
 	logger := opts.getLogger("proxy")
 	updatersLogger := logger.Named("telegram-updaters")
@@ -192,6 +194,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 			int(opts.DoppelGangerPerRaid),
 			opts.DoppelGangerURLs,
 			opts.DoppelGangerDRS,
+			shaping,
 		),
 		configUpdater: dc.NewPublicConfigUpdater(
 			tg,

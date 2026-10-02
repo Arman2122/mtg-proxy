@@ -1,9 +1,11 @@
 package mtglib
 
 import (
+	"fmt"
 	"net"
 	"time"
 
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/doppel"
 	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
 )
 
@@ -310,6 +312,12 @@ type ProxyOpts struct {
 	// DoppelGangerDRS defines if TLS Dynamic Record Sizing is active.
 	DoppelGangerDRS bool
 
+	// DoppelGangerShaping is how the doppelganger spaces its records in time:
+	// "record" (or empty, the default) waits a drawn delay before every
+	// record; "burst" waits once when a connection wakes from idle and then
+	// sends records back to back.
+	DoppelGangerShaping string
+
 	// APIBindTo is the address to bind the stats HTTP API server to.
 	// If empty, the stats API server is not started.
 	//
@@ -438,6 +446,10 @@ func (p ProxyOpts) valid() error {
 		return ErrEventStreamIsNotDefined
 	case p.Logger == nil:
 		return ErrLoggerIsNotDefined
+	}
+
+	if _, err := doppel.ParseShaping(p.DoppelGangerShaping); err != nil {
+		return fmt.Errorf("invalid doppelganger shaping: %w", err)
 	}
 
 	secrets := p.getSecrets()

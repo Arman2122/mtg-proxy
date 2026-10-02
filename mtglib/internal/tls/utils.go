@@ -35,6 +35,18 @@ func WriteRecord(w io.Writer, payload []byte) error {
 }
 
 func WriteRecordInPlace(w io.Writer, buf []byte, payloadLen int) error {
+	if err := PutRecordHeader(buf, payloadLen); err != nil {
+		return err
+	}
+
+	_, err := w.Write(buf[:SizeHeader+payloadLen])
+
+	return err
+}
+
+// PutRecordHeader writes an application-data record header for payloadLen
+// bytes into buf[:SizeHeader].
+func PutRecordHeader(buf []byte, payloadLen int) error {
 	if payloadLen > MaxRecordPayloadSize {
 		return fmt.Errorf("payload %d exceeds max %d", payloadLen, MaxRecordPayloadSize)
 	}
@@ -43,13 +55,10 @@ func WriteRecordInPlace(w io.Writer, buf []byte, payloadLen int) error {
 	copy(buf[SizeRecordType:SizeRecordType+SizeVersion], TLSVersion[:])
 	binary.BigEndian.PutUint16(
 		buf[SizeRecordType+SizeVersion:SizeRecordType+SizeVersion+SizeSize],
-		//nolint:gosec // G115: guarded by the MaxRecordPayloadSize check at
-		// the top of this function (16379), and both callers pass a len() or
-		// a Read count, so payloadLen is 0..16379.
+		//nolint:gosec // G115: guarded by the MaxRecordPayloadSize check
+		// above (16379), so payloadLen is 0..16379.
 		uint16(payloadLen),
 	)
 
-	_, err := w.Write(buf[:SizeHeader+payloadLen])
-
-	return err
+	return nil
 }
