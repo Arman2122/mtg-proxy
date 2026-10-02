@@ -3,11 +3,7 @@ package middleproxy
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"encoding/binary"
-	"hash/crc32"
-	"io"
 	"net"
 	"testing"
 	"time"
@@ -31,16 +27,15 @@ type addressedConn struct {
 func (c addressedConn) LocalAddr() net.Addr  { return c.local }
 func (c addressedConn) RemoteAddr() net.Addr { return c.remote }
 
-// fakeMiddleProxy is an in-process middle proxy. It speaks the real RPC nonce
-// and handshake exchange using this package's own frame, CBC and key-schedule
-// code -- so a dial only completes here if doHandshake genuinely completed --
-// and then publishes every RPC_PROXY_REQ it receives on reqs.
+// fakeMiddleProxy is an in-process middle proxy over a net.Pipe: ServePeer
+// answers the real RPC nonce and handshake exchange with this package's own
+// frame, CBC and key-schedule code -- so a dial only completes here if
+// doHandshake genuinely completed -- and every RPC_PROXY_REQ it receives is
+// published on reqs.
 type fakeMiddleProxy struct {
 	t      *testing.T
 	conn   net.Conn
 	secret []byte
-	local  *net.TCPAddr
-	remote *net.TCPAddr
 	reqs   chan<- []byte
 	done   chan struct{}
 }
@@ -49,50 +44,15 @@ func (f *fakeMiddleProxy) serve() {
 	defer close(f.done)
 	defer f.conn.Close() //nolint: errcheck
 
-	msg, ok := f.readNonceRequest()
-	if !ok {
-		return
-	}
-
-	req := &nonceRequest{keySelector: msg[4:8], cryptoTS: msg[12:16], nonce: msg[16:32]}
-	resp := &nonceResponse{nonce: bytes.Repeat([]byte{0x5a}, 16)}
-
-	if !f.writeNonceResponse(req, resp) {
-		return
-	}
-
-	rpc, ok := f.mirrorCiphers(req, resp)
-	if !ok {
-		return
-	}
-
-	hs, err := rpc.readPacket()
+	peer, err := ServePeer(f.conn, f.secret)
 	if err != nil {
-		f.t.Errorf("fake middle proxy: cannot read handshake request: %v", err)
-
-		return
-	}
-
-	if len(hs) < 4 || !bytes.Equal(hs[:4], tagHandshake) {
-		f.t.Errorf("fake middle proxy: malformed handshake request %x", hs)
-
-		return
-	}
-
-	// validateHandshakeResponse wants 32 bytes with the tag first and the peer
-	// PID in the last 12.
-	ans := make([]byte, 32)
-	copy(ans[:4], tagHandshake)
-	copy(ans[20:], handshakePID)
-
-	if err := rpc.writePacket(ans); err != nil {
-		f.t.Errorf("fake middle proxy: cannot send handshake response: %v", err)
+		f.t.Errorf("fake middle proxy: %v", err)
 
 		return
 	}
 
 	for {
-		packet, err := rpc.readPacket()
+		packet, err := peer.ReadPacket()
 		if err != nil {
 			return // the client hung up; that is how this loop ends
 		}
@@ -102,90 +62,6 @@ func (f *fakeMiddleProxy) serve() {
 		default:
 		}
 	}
-}
-
-func (f *fakeMiddleProxy) readNonceRequest() ([]byte, bool) {
-	msg, err := newFrameConn(f.conn, seqNoNonce).readPacket()
-	if err != nil {
-		f.t.Errorf("fake middle proxy: cannot read nonce request: %v", err)
-
-		return nil, false
-	}
-
-	if len(msg) != 32 || !bytes.Equal(msg[:4], tagNonce) {
-		f.t.Errorf("fake middle proxy: malformed nonce request %x", msg)
-
-		return nil, false
-	}
-
-	// writePacket pads every frame up to a 16-byte multiple, but readPacket only
-	// skips padding at the START of the next frame -- and the client's next
-	// reader is cbcConn, pulling whole 16-byte blocks straight off the raw
-	// stream. Leaving these bytes here would shift every block boundary.
-	if pad := (aes.BlockSize - (12+len(msg))%aes.BlockSize) % aes.BlockSize; pad > 0 {
-		if _, err := io.ReadFull(f.conn, make([]byte, pad)); err != nil {
-			f.t.Errorf("fake middle proxy: cannot read nonce frame padding: %v", err)
-
-			return nil, false
-		}
-	}
-
-	return msg, true
-}
-
-// writeNonceResponse emits the nonce response frame WITHOUT writePacket's
-// trailing alignment padding: the client's own reader does not consume a peer's
-// trailing padding across the plaintext to CBC switch (the mirror image of the
-// read above), so a padded response desynchronises its CBC stream. See the
-// concern raised alongside this test.
-func (f *fakeMiddleProxy) writeNonceResponse(req *nonceRequest, resp *nonceResponse) bool {
-	msg := make([]byte, 0, 32)
-	msg = append(msg, tagNonce...)
-	msg = append(msg, req.keySelector...)
-	msg = append(msg, nonceCryptoAES...)
-	msg = append(msg, req.cryptoTS...)
-	msg = append(msg, resp.nonce...)
-
-	buf := &bytes.Buffer{}
-
-	binary.Write(buf, binary.LittleEndian, uint32(4+4+len(msg)+4)) //nolint: errcheck
-	binary.Write(buf, binary.LittleEndian, seqNoNonce)             //nolint: errcheck
-	buf.Write(msg)
-	binary.Write(buf, binary.LittleEndian, crc32.ChecksumIEEE(buf.Bytes())) //nolint: errcheck
-
-	if _, err := f.conn.Write(buf.Bytes()); err != nil {
-		f.t.Errorf("fake middle proxy: cannot send nonce response: %v", err)
-
-		return false
-	}
-
-	return true
-}
-
-// mirrorCiphers builds the RPC channel from the server's side: the client
-// encrypts with the CLIENT-purpose key and decrypts with the SERVER one, so we
-// are that pair swapped.
-func (f *fakeMiddleProxy) mirrorCiphers(req *nonceRequest, resp *nonceResponse) (*frameConn, bool) {
-	clientKey, clientIV := deriveKey(purposeClient, req, resp, f.local, f.remote, f.secret)
-	serverKey, serverIV := deriveKey(purposeServer, req, resp, f.local, f.remote, f.secret)
-
-	clientBlock, err := aes.NewCipher(clientKey)
-	if err != nil {
-		f.t.Errorf("fake middle proxy: client cipher: %v", err)
-
-		return nil, false
-	}
-
-	serverBlock, err := aes.NewCipher(serverKey)
-	if err != nil {
-		f.t.Errorf("fake middle proxy: server cipher: %v", err)
-
-		return nil, false
-	}
-
-	return newFrameConn(newCBCConn(f.conn,
-		cipher.NewCBCEncrypter(serverBlock, serverIV),
-		cipher.NewCBCDecrypter(clientBlock, clientIV)), seqNoHandshake), true
 }
 
 // pipeDialer hands DialProxyStream one end of a net.Pipe and runs a
@@ -207,12 +83,12 @@ func (d pipeDialer) Dial(_, _ string) (essentials.Conn, error) {
 	clientEnd.SetDeadline(deadline) //nolint: errcheck
 	serverEnd.SetDeadline(deadline) //nolint: errcheck
 
+	// The middle proxy's end sees the client as its remote and itself as local:
+	// ServePeer keys the schedule from those, mirroring the client's view.
 	proxy := &fakeMiddleProxy{
 		t:      d.t,
-		conn:   serverEnd,
+		conn:   addressedConn{Conn: serverEnd, local: d.remote, remote: d.local},
 		secret: d.secret,
-		local:  d.local,
-		remote: d.remote,
 		reqs:   d.reqs,
 		done:   make(chan struct{}),
 	}
