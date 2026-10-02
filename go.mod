@@ -1,6 +1,6 @@
 module github.com/Arman2122/mtg-proxy
 
-go 1.26.6
+go 1.26.8
 
 require (
 	github.com/OneOfOne/xxhash v1.2.8

@@ -24,11 +24,14 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    # Patch and digest bumps only, on purpose. The base image tracks the Go
-    # MINOR line named in go.mod so the image and the release binaries are the
-    # same program; a patch bump keeps them together (the release job resolves
-    # go.mod with check-latest, so it moves too), while a 1.27 bump here would
-    # put them on different lines. Move go.mod first, then let this follow.
+    # Patch and digest bumps only, on purpose. The base image is pinned to the
+    # exact Go release named in go.mod so the image and the release binaries
+    # are the same program. go.mod names a full patch version, and setup-go
+    # installs exactly that one even with check-latest (which only moves a
+    # bare minor like `1.26`), so a patch bump here does NOT carry the release
+    # job along: land it together with the same bump to go.mod, .mise.toml and
+    # mise.lock. A 1.27 bump would put them on different lines altogether --
+    # move go.mod first, then let this follow.
     ignore:
       - dependency-name: "golang"
         update-types:

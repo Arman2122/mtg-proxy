@@ -23,7 +23,7 @@
 # `mise run lint`, and fix whatever the new version finds in that same change.
 # The tree is currently clean under 2.13.2 as well, so that upgrade is a
 # one-line change whenever it is wanted.
-go = "1.26.6"
+go = "1.26.8"
 golangci-lint = "2.12.2"
 
 [vars]
