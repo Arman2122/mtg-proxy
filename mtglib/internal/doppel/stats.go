@@ -138,8 +138,9 @@ func (d *Stats) Size() int {
 // records that arrived in one read, as nearly all do on Windows -- carries no
 // timing and cannot be fitted (log 0 is -Inf), so it is left out; the rest are
 // kept at full precision rather than truncated to whole microseconds, which
-// would turn every sub-microsecond gap into such a zero. The result can still
-// be unusable; see usable.
+// would turn every sub-microsecond gap into such a zero. Fewer than
+// MinDurationsToCalculate real gaps give no fit at all. The result can be
+// unusable; see usable.
 func NewStats(durations []time.Duration, drs bool) Stats {
 	// in milliseconds
 	durFloats := make([]float64, 0, len(durations))
@@ -148,6 +149,12 @@ func NewStats(durations []time.Duration, drs bool) Stats {
 		if v > 0 {
 			durFloats = append(durFloats, float64(v)/float64(time.Millisecond))
 		}
+	}
+
+	// Too few real gaps once the zeros are out: the zero model, which is not
+	// usable, rather than a fit to a handful.
+	if len(durFloats) < MinDurationsToCalculate {
+		return Stats{drs: drs}
 	}
 
 	n := float64(len(durFloats))

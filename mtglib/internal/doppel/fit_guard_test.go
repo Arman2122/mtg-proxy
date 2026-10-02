@@ -54,6 +54,17 @@ func TestNewStatsKeepsSubMicrosecondDurations(t *testing.T) {
 	assert.True(t, stats.usable())
 }
 
+// The ganger asks for MinDurationsToCalculate gaps before fitting, but counts
+// them before the zeros are left out: a raid of 97 zeros and 3 real gaps must
+// not be fitted to those three.
+func TestTooFewRealGapsAreNotUsable(t *testing.T) {
+	t.Parallel()
+
+	samples := append(make([]time.Duration, MinDurationsToCalculate-3), weibull(0.6, 100, 3, 1)...)
+
+	assert.False(t, NewStats(samples, false).usable())
+}
+
 // A fit that lands on a search bound, or has no finite scale, would pace
 // connections with nonsense -- minutes between records, or none. It is not
 // usable.
