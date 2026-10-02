@@ -28,7 +28,8 @@ Telegram never decrypts and the load generator keeps its buffers from setup,
 so the CPU and allocations measured are the proxy's.
 
 Doors: `ee-record` (FakeTLS with the doppelganger pacing as shipped),
-`ee-unpaced` (the same with `Ganger.Unpace`), `dd`, `plain`.
+`ee-burst` (the same with `shaping = "burst"`), `ee-unpaced` (the same with
+`Ganger.Unpace`), `dd`, `plain`.
 
 Take latency numbers on Linux: Go's clock on Windows advances in steps of
 about half a millisecond.

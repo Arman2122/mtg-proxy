@@ -128,30 +128,30 @@ BenchmarkDoor/dd/cap-far-above-2                   	     471	   2668111 ns/op	 3
 BenchmarkDoor/dd/cap-far-above-2                   	     420	   2583596 ns/op	 405.86 MB/s	    1305 B/op	      74 allocs/op
 BenchmarkDoor/dd/cap-far-above-2                   	     399	   2806757 ns/op	 373.59 MB/s	    1357 B/op	      76 allocs/op
 BenchmarkDoor/dd/cap-far-above-2                   	     442	   2558845 ns/op	 409.78 MB/s	    1323 B/op	      74 allocs/op
-BenchmarkDoorRoundTrip/ee-record-2                 	     162	   8549915 ns/op	      1384 p50-µs	    144778 p99-µs	    171930 p999-µs	      69 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record-2                 	     178	   7883936 ns/op	      1470 p50-µs	    113768 p99-µs	    180706 p999-µs	      69 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record-2                 	     277	   5577107 ns/op	      1416 p50-µs	     92556 p99-µs	    158817 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record-2                 	     130	   8208045 ns/op	      1519 p50-µs	    110640 p99-µs	    131585 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record-2                 	     176	   6489463 ns/op	      1316 p50-µs	     85536 p99-µs	    108656 p999-µs	      67 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record-2                 	     133	   7682916 ns/op	      1365 p50-µs	     79154 p99-µs	    152019 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced-2                	   12048	     99575 ns/op	        86.15 p50-µs	       290.5 p99-µs	       563.6 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced-2                	   12301	     93512 ns/op	        80.75 p50-µs	       267.1 p99-µs	       438.7 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced-2                	   12582	     95637 ns/op	        81.45 p50-µs	       275.4 p99-µs	       487.7 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced-2                	   13755	     94321 ns/op	        78.23 p50-µs	       268.2 p99-µs	       422.5 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced-2                	   10000	    106247 ns/op	        94.04 p50-µs	       295.3 p99-µs	       457.8 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced-2                	   10000	    105243 ns/op	        91.17 p50-µs	       294.2 p99-µs	       551.2 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/dd-2                        	   20328	     58112 ns/op	        45.37 p50-µs	       175.2 p99-µs	       331.9 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd-2                        	   19982	     57592 ns/op	        45.66 p50-µs	       165.4 p99-µs	       293.8 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd-2                        	   21819	     56371 ns/op	        45.42 p50-µs	       160.0 p99-µs	       399.9 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd-2                        	   20437	     60387 ns/op	        50.07 p50-µs	       174.8 p99-µs	       283.6 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd-2                        	   20176	     59197 ns/op	        45.34 p50-µs	       170.9 p99-µs	       263.8 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd-2                        	   20527	     57535 ns/op	        45.20 p50-µs	       173.3 p99-µs	       278.3 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain-2                     	   20160	     57142 ns/op	        45.25 p50-µs	       169.3 p99-µs	       285.5 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain-2                     	   20439	     59999 ns/op	        45.61 p50-µs	       173.9 p99-µs	       260.2 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain-2                     	   19730	     58828 ns/op	        45.49 p50-µs	       172.1 p99-µs	       438.9 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain-2                     	   21060	     57285 ns/op	        45.32 p50-µs	       153.0 p99-µs	       279.7 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain-2                     	   20990	     56212 ns/op	        45.17 p50-µs	       155.3 p99-µs	       304.2 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain-2                     	   20298	     57920 ns/op	        45.32 p50-µs	       183.8 p99-µs	       344.2 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2                 	     162	   8549915 ns/op	      1384 p50-Âµs	    144778 p99-Âµs	    171930 p999-Âµs	      69 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2                 	     178	   7883936 ns/op	      1470 p50-Âµs	    113768 p99-Âµs	    180706 p999-Âµs	      69 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2                 	     277	   5577107 ns/op	      1416 p50-Âµs	     92556 p99-Âµs	    158817 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2                 	     130	   8208045 ns/op	      1519 p50-Âµs	    110640 p99-Âµs	    131585 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2                 	     176	   6489463 ns/op	      1316 p50-Âµs	     85536 p99-Âµs	    108656 p999-Âµs	      67 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2                 	     133	   7682916 ns/op	      1365 p50-Âµs	     79154 p99-Âµs	    152019 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2                	   12048	     99575 ns/op	        86.15 p50-Âµs	       290.5 p99-Âµs	       563.6 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2                	   12301	     93512 ns/op	        80.75 p50-Âµs	       267.1 p99-Âµs	       438.7 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2                	   12582	     95637 ns/op	        81.45 p50-Âµs	       275.4 p99-Âµs	       487.7 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2                	   13755	     94321 ns/op	        78.23 p50-Âµs	       268.2 p99-Âµs	       422.5 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2                	   10000	    106247 ns/op	        94.04 p50-Âµs	       295.3 p99-Âµs	       457.8 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2                	   10000	    105243 ns/op	        91.17 p50-Âµs	       294.2 p99-Âµs	       551.2 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/dd-2                        	   20328	     58112 ns/op	        45.37 p50-Âµs	       175.2 p99-Âµs	       331.9 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                        	   19982	     57592 ns/op	        45.66 p50-Âµs	       165.4 p99-Âµs	       293.8 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                        	   21819	     56371 ns/op	        45.42 p50-Âµs	       160.0 p99-Âµs	       399.9 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                        	   20437	     60387 ns/op	        50.07 p50-Âµs	       174.8 p99-Âµs	       283.6 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                        	   20176	     59197 ns/op	        45.34 p50-Âµs	       170.9 p99-Âµs	       263.8 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                        	   20527	     57535 ns/op	        45.20 p50-Âµs	       173.3 p99-Âµs	       278.3 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2                     	   20160	     57142 ns/op	        45.25 p50-Âµs	       169.3 p99-Âµs	       285.5 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2                     	   20439	     59999 ns/op	        45.61 p50-Âµs	       173.9 p99-Âµs	       260.2 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2                     	   19730	     58828 ns/op	        45.49 p50-Âµs	       172.1 p99-Âµs	       438.9 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2                     	   21060	     57285 ns/op	        45.32 p50-Âµs	       153.0 p99-Âµs	       279.7 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2                     	   20990	     56212 ns/op	        45.17 p50-Âµs	       155.3 p99-Âµs	       304.2 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2                     	   20298	     57920 ns/op	        45.32 p50-Âµs	       183.8 p99-Âµs	       344.2 p999-Âµs	      32 B/op	       2 allocs/op
 BenchmarkDoorHandshake/ee-record-2                 	     415	   3411869 ns/op	   73786 B/op	     268 allocs/op
 BenchmarkDoorHandshake/ee-record-2                 	     271	   3754400 ns/op	   73452 B/op	     267 allocs/op
 BenchmarkDoorHandshake/ee-record-2                 	     456	   3413158 ns/op	   73477 B/op	     267 allocs/op
@@ -321,30 +321,30 @@ BenchmarkDoor/dd/cap-far-above                   	     548	   2144216 ns/op	 489
 BenchmarkDoor/dd/cap-far-above                   	     578	   2152959 ns/op	 487.04 MB/s	    1336 B/op	      76 allocs/op
 BenchmarkDoor/dd/cap-far-above                   	     570	   2148083 ns/op	 488.15 MB/s	    1336 B/op	      76 allocs/op
 BenchmarkDoor/dd/cap-far-above                   	     580	   2114733 ns/op	 495.84 MB/s	    1336 B/op	      76 allocs/op
-BenchmarkDoorRoundTrip/ee-record                 	     147	   7896385 ns/op	      1284 p50-µs	    118551 p99-µs	    188905 p999-µs	      67 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record                 	     183	   6832081 ns/op	      1360 p50-µs	    137752 p99-µs	    232017 p999-µs	      67 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record                 	     219	   6739618 ns/op	      1384 p50-µs	     67396 p99-µs	    225896 p999-µs	      67 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record                 	     174	  12870042 ns/op	      1283 p50-µs	    327287 p99-µs	    671265 p999-µs	      67 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record                 	     176	   6713766 ns/op	      1279 p50-µs	    140474 p99-µs	    153698 p999-µs	      67 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-record                 	     148	   7289077 ns/op	      1349 p50-µs	     96610 p99-µs	    148604 p999-µs	      67 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced                	   20182	     60900 ns/op	        48.12 p50-µs	       174.2 p99-µs	       283.8 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced                	   20667	     59072 ns/op	        47.85 p50-µs	       173.5 p99-µs	       273.3 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced                	   19926	     60609 ns/op	        47.96 p50-µs	       187.1 p99-µs	       360.2 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced                	   20028	     60972 ns/op	        48.38 p50-µs	       194.1 p99-µs	       306.1 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced                	   20169	     59407 ns/op	        47.95 p50-µs	       171.6 p99-µs	       316.4 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/ee-unpaced                	   21330	     57315 ns/op	        47.94 p50-µs	       152.5 p99-µs	       292.1 p999-µs	      66 B/op	       5 allocs/op
-BenchmarkDoorRoundTrip/dd                        	   21340	     58128 ns/op	        45.14 p50-µs	       178.2 p99-µs	       274.2 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd                        	   20600	     58602 ns/op	        45.13 p50-µs	       182.2 p99-µs	       294.0 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd                        	   20454	     56580 ns/op	        45.21 p50-µs	       162.7 p99-µs	       267.7 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd                        	   20023	     58392 ns/op	        45.81 p50-µs	       162.3 p99-µs	       270.3 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd                        	   20872	     56416 ns/op	        45.35 p50-µs	       168.7 p99-µs	       275.0 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/dd                        	   20446	     56626 ns/op	        45.14 p50-µs	       173.2 p99-µs	       323.1 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain                     	   21241	     55840 ns/op	        45.22 p50-µs	       157.0 p99-µs	       283.6 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain                     	   20530	     56440 ns/op	        45.24 p50-µs	       165.9 p99-µs	       276.4 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain                     	   21762	     56541 ns/op	        45.24 p50-µs	       157.6 p99-µs	       263.5 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain                     	   20577	     53022 ns/op	        45.06 p50-µs	       144.2 p99-µs	       272.7 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain                     	   25399	     51090 ns/op	        44.75 p50-µs	       144.2 p99-µs	       224.8 p999-µs	      32 B/op	       2 allocs/op
-BenchmarkDoorRoundTrip/plain                     	   21096	     57340 ns/op	        45.27 p50-µs	       171.0 p99-µs	       327.1 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/ee-record                 	     147	   7896385 ns/op	      1284 p50-Âµs	    118551 p99-Âµs	    188905 p999-Âµs	      67 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record                 	     183	   6832081 ns/op	      1360 p50-Âµs	    137752 p99-Âµs	    232017 p999-Âµs	      67 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record                 	     219	   6739618 ns/op	      1384 p50-Âµs	     67396 p99-Âµs	    225896 p999-Âµs	      67 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record                 	     174	  12870042 ns/op	      1283 p50-Âµs	    327287 p99-Âµs	    671265 p999-Âµs	      67 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record                 	     176	   6713766 ns/op	      1279 p50-Âµs	    140474 p99-Âµs	    153698 p999-Âµs	      67 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-record                 	     148	   7289077 ns/op	      1349 p50-Âµs	     96610 p99-Âµs	    148604 p999-Âµs	      67 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced                	   20182	     60900 ns/op	        48.12 p50-Âµs	       174.2 p99-Âµs	       283.8 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced                	   20667	     59072 ns/op	        47.85 p50-Âµs	       173.5 p99-Âµs	       273.3 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced                	   19926	     60609 ns/op	        47.96 p50-Âµs	       187.1 p99-Âµs	       360.2 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced                	   20028	     60972 ns/op	        48.38 p50-Âµs	       194.1 p99-Âµs	       306.1 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced                	   20169	     59407 ns/op	        47.95 p50-Âµs	       171.6 p99-Âµs	       316.4 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced                	   21330	     57315 ns/op	        47.94 p50-Âµs	       152.5 p99-Âµs	       292.1 p999-Âµs	      66 B/op	       5 allocs/op
+BenchmarkDoorRoundTrip/dd                        	   21340	     58128 ns/op	        45.14 p50-Âµs	       178.2 p99-Âµs	       274.2 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                        	   20600	     58602 ns/op	        45.13 p50-Âµs	       182.2 p99-Âµs	       294.0 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                        	   20454	     56580 ns/op	        45.21 p50-Âµs	       162.7 p99-Âµs	       267.7 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                        	   20023	     58392 ns/op	        45.81 p50-Âµs	       162.3 p99-Âµs	       270.3 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                        	   20872	     56416 ns/op	        45.35 p50-Âµs	       168.7 p99-Âµs	       275.0 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                        	   20446	     56626 ns/op	        45.14 p50-Âµs	       173.2 p99-Âµs	       323.1 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain                     	   21241	     55840 ns/op	        45.22 p50-Âµs	       157.0 p99-Âµs	       283.6 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain                     	   20530	     56440 ns/op	        45.24 p50-Âµs	       165.9 p99-Âµs	       276.4 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain                     	   21762	     56541 ns/op	        45.24 p50-Âµs	       157.6 p99-Âµs	       263.5 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain                     	   20577	     53022 ns/op	        45.06 p50-Âµs	       144.2 p99-Âµs	       272.7 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain                     	   25399	     51090 ns/op	        44.75 p50-Âµs	       144.2 p99-Âµs	       224.8 p999-Âµs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain                     	   21096	     57340 ns/op	        45.27 p50-Âµs	       171.0 p99-Âµs	       327.1 p999-Âµs	      32 B/op	       2 allocs/op
 BenchmarkDoorHandshake/ee-record                 	     166	   8906739 ns/op	   73438 B/op	     270 allocs/op
 BenchmarkDoorHandshake/ee-record                 	     136	  13866306 ns/op	   73054 B/op	     270 allocs/op
 BenchmarkDoorHandshake/ee-record                 	     145	   9056485 ns/op	   73215 B/op	     270 allocs/op

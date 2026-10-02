@@ -166,6 +166,42 @@ actually serves TLS on the chosen port. `mtg-proxy doctor <config-path>` checks
 that the hostname resolves and that the SNI matches. See [[Configuration]] and
 [[Troubleshooting]].
 
+## The ee handshake and its traffic 🧥
+
+A client that does hold the secret gets a TLS 1.3 ServerHello, a
+change-cipher-spec record and exactly **one** application-data record, signed
+over all three — the shape Telegram's apps require. That last record stands in
+for the real server's encrypted handshake, its certificate chain above all, so
+its size should be the cover site's.
+
+**It is measured from the cover site itself.** With no
+`[defense.doppelganger] urls` configured, the proxy fetches `https://<host>/`
+for each distinct cover host its `ee` secrets name — dialling the address
+domain fronting would use, so a host that resolves back to this server is not
+measured against itself — and keeps a size per host. A handshake gets the size
+measured for the host in its client's SNI. Until a host has been measured
+(it is measured as soon as a secret names it) the record falls back to a
+generic 2,500–4,700 bytes. Configured `urls` are scouted instead, and give one
+size for every host, as before. The fetches are ordinary page loads every
+`raid-each` (6 h), `repeats-per-raid` times.
+
+**Record timing is `[defense.doppelganger] shaping`.** `record` (the default)
+waits a delay drawn from a web page's record timing before every record, which
+caps an ee download near 20 Mbit/s per connection and adds milliseconds to every
+exchange. `burst` waits once when a connection wakes from idle and then sends
+records back to back, the way a server streams a response, at the speed of the
+link. Record sizes are drawn the same way in both, but a record is cut short
+when less is waiting than was drawn, and with no wait before each record that
+happens more often under `burst`. `burst` is being run on real networks before
+it becomes the default, because timing and those short records are things a
+censor can see.
+
+**An open question, stated plainly.** The fake ServerHello always answers with
+an x25519 key share. Every Telegram ClientHello this project has on record
+offers x25519 only, so the answer matches the question. Whether current app
+versions now offer a post-quantum group — which a modern cover site would pick
+instead — has not been checked against a capture from current apps.
+
 ## The obfuscated2 door
 
 The `bind-to` port speaks FakeTLS and only FakeTLS. There is no configuration
