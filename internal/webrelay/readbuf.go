@@ -20,10 +20,21 @@ const (
 	largeRead = frame.MaxRelayDataChunk
 )
 
-var readPools = [2]sync.Pool{
-	{New: func() any { return make([]byte, smallRead) }},
-	{New: func() any { return make([]byte, largeRead) }},
+// readBufferPools is one pool per size. The relay uses one set, readBuffers;
+// a test that checks the pools' own rules makes its own, so no buffer it
+// touches after a release can be one a stream has since taken.
+type readBufferPools struct {
+	small, large sync.Pool
 }
+
+func newReadBufferPools() *readBufferPools {
+	return &readBufferPools{
+		small: sync.Pool{New: func() any { return make([]byte, smallRead) }},
+		large: sync.Pool{New: func() any { return make([]byte, largeRead) }},
+	}
+}
+
+var readBuffers = newReadBufferPools()
 
 // poisonReleased is set by this package's tests: every released buffer is then
 // overwritten with poison, so a buffer used after its release corrupts what
@@ -33,10 +44,16 @@ var poisonReleased bool
 
 const poison = 0xA5
 
-func getReadBuffer(large bool) []byte {
-	pool := &readPools[0]
+func getReadBuffer(large bool) []byte { return readBuffers.get(large) }
+
+// releaseReadBuffer returns b to the pool its capacity names. A slice of any
+// other capacity is not the pools' and is ignored. b must not be used again.
+func releaseReadBuffer(b []byte) { readBuffers.release(b) }
+
+func (p *readBufferPools) get(large bool) []byte {
+	pool := &p.small
 	if large {
-		pool = &readPools[1]
+		pool = &p.large
 	}
 
 	buf := pool.Get().([]byte) //nolint: forcetypeassert // the pool's own New
@@ -49,18 +66,16 @@ func getReadBuffer(large bool) []byte {
 	return buf
 }
 
-// releaseReadBuffer returns b to the pool its capacity names. A slice of any
-// other capacity is not the pools' and is ignored. b must not be used again.
-func releaseReadBuffer(b []byte) {
+func (p *readBufferPools) release(b []byte) {
 	b = b[:cap(b)]
 
 	var pool *sync.Pool
 
 	switch len(b) {
 	case smallRead:
-		pool = &readPools[0]
+		pool = &p.small
 	case largeRead:
-		pool = &readPools[1]
+		pool = &p.large
 	default:
 		return
 	}

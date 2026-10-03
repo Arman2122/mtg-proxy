@@ -278,9 +278,17 @@ type Conn struct {
 	closeMu sync.Mutex
 	closed  bool
 
-	// header and vecs are WriteBuffers' own scratch, reused under writeMu.
+	// header, vecs and joined are WriteBuffers' own scratch, reused under
+	// writeMu.
 	header [10]byte
 	vecs   [][]byte
+	joined []byte
+
+	// vectored is the TCP socket under conn, when there is one, for writev.
+	// A listener's wrapper -- the PROXY-protocol one, in front of most
+	// relays -- has no vectored write of its own, and Go would write each
+	// piece separately through it.
+	vectored *net.TCPConn
 
 	// pinged is set when a ping went out for the current silence period and
 	// cleared by any traffic. It is touched only by the reader.
@@ -288,7 +296,18 @@ type Conn struct {
 }
 
 func newConn(conn net.Conn, reader *bufio.Reader, opts Options) *Conn {
-	return &Conn{conn: conn, reader: reader, opts: opts}
+	c := &Conn{conn: conn, reader: reader, opts: opts}
+
+	switch raw := conn.(type) {
+	case *net.TCPConn:
+		c.vectored = raw
+	case interface{ TCPConn() (*net.TCPConn, bool) }:
+		if tcp, ok := raw.TCPConn(); ok {
+			c.vectored = tcp
+		}
+	}
+
+	return c
 }
 
 // RemoteAddr is the peer address as the listener saw it.
@@ -422,9 +441,10 @@ func (c *Conn) handleControl(header frameHeader) error {
 }
 
 // WriteBuffers sends one whole binary message whose payload is bufs, joined,
-// in a single vectored write: on a TCP socket, one writev of the header and
-// every slice, with nothing copied. The bytes on the wire are exactly those
-// Write would send for the joined payload.
+// in a single write: on a TCP socket, even one under a listener's wrapper, one
+// writev of the header and every slice, with nothing copied; on anything else,
+// the pieces joined into one buffer and written once. The bytes on the wire are
+// exactly those Write would send for the joined payload.
 func (c *Conn) WriteBuffers(bufs [][]byte) error {
 	total := 0
 	for _, b := range bufs {
@@ -445,8 +465,21 @@ func (c *Conn) WriteBuffers(bufs [][]byte) error {
 		return fmt.Errorf("cannot set a write deadline: %w", err)
 	}
 
-	vectors := net.Buffers(c.vecs)
-	if _, err := vectors.WriteTo(c.conn); err != nil {
+	if c.vectored != nil {
+		vectors := net.Buffers(c.vecs)
+		if _, err := vectors.WriteTo(c.vectored); err != nil {
+			return fmt.Errorf("cannot write a websocket message: %w", err)
+		}
+
+		return nil
+	}
+
+	c.joined = c.joined[:0]
+	for _, v := range c.vecs {
+		c.joined = append(c.joined, v...)
+	}
+
+	if _, err := c.conn.Write(c.joined); err != nil {
 		return fmt.Errorf("cannot write a websocket message: %w", err)
 	}
 

@@ -1,6 +1,7 @@
 package webrelay
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -210,6 +211,8 @@ func (s *session) readLoop() error {
 			return err
 		}
 
+		unpinSmallPayloads(frames, message)
+
 		if err := s.apply(frames); err != nil {
 			return err
 		}
@@ -262,6 +265,20 @@ func (s *session) writeLoop() {
 			if batch[i].Type == frame.TypeData {
 				releaseReadBuffer(batch[i].Payload)
 			}
+		}
+	}
+}
+
+// unpinSmallPayloads copies out every DATA payload smaller than a quarter of
+// the message it was sliced from. A queued payload keeps its whole message
+// alive until its stream writes it, and credit counts the payload, not the
+// message: without this, a byte of credit could hold megabytes. With it, what
+// queued payloads pin is at most four times the credit they spend, and bulk
+// DATA -- a frame that is most of its message -- stays zero-copy.
+func unpinSmallPayloads(frames []frame.Frame, message []byte) {
+	for i := range frames {
+		if frames[i].Type == frame.TypeData && 4*len(frames[i].Payload) < len(message) {
+			frames[i].Payload = bytes.Clone(frames[i].Payload)
 		}
 	}
 }

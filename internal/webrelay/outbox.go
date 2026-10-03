@@ -171,8 +171,23 @@ func (o *outbox) PushControl(f frame.Frame) error {
 	return o.push(f, 0, 0)
 }
 
-func (o *outbox) push(f frame.Frame, reserveBytes, reserveItems int64) error {
+// heldCost is what a queued frame holds: its encoding, and for DATA the whole
+// buffer its payload is a slice of. A pooled read buffer is 4 or 64 KiB
+// whatever the read put in it, and the proxy hands the relay 16 KiB at a time,
+// so charging the bytes carried would let the queue hold several times its
+// budget. Push and Take charge and release by this one function.
+func heldCost(f frame.Frame) int64 {
 	cost := int64(f.EncodedLen()) + QueueItemCharge
+
+	if f.Type == frame.TypeData {
+		cost += int64(cap(f.Payload) - len(f.Payload))
+	}
+
+	return cost
+}
+
+func (o *outbox) push(f frame.Frame, reserveBytes, reserveItems int64) error {
+	cost := heldCost(f)
 
 	// The global budget is acquired first and always in this order, so two
 	// sessions cannot hold each other's half.
@@ -244,7 +259,7 @@ func (o *outbox) Take() []frame.Frame {
 
 	var released int64
 	for _, f := range batch {
-		released += int64(f.EncodedLen()) + QueueItemCharge
+		released += heldCost(f)
 	}
 
 	o.frames = append(o.frames[:0], o.frames[taken:]...)

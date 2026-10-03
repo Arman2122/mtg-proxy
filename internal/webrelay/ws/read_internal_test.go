@@ -101,10 +101,16 @@ func clientFrame(fin bool, opcode byte, payload []byte, mask [4]byte) []byte {
 type recordConn struct {
 	net.Conn
 
-	out bytes.Buffer
+	out    bytes.Buffer
+	writes int
 }
 
-func (c *recordConn) Write(p []byte) (int, error)      { return c.out.Write(p) }
+func (c *recordConn) Write(p []byte) (int, error) {
+	c.writes++
+
+	return c.out.Write(p) //nolint: wrapcheck
+}
+
 func (c *recordConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *recordConn) SetWriteDeadline(time.Time) error { return nil }
 
