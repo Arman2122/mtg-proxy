@@ -2,15 +2,10 @@ package mtglib
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/binary"
 	"net"
 	"testing"
-	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
-	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls/fake"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -153,71 +148,6 @@ func TestDomainFrontingWithNoTargetClosesWithoutDialling(t *testing.T) {
 
 	assert.Equal(t, 0, h.events.frontings(), "fronting must be abandoned before it starts")
 	assert.Equal(t, 0, h.network.frontingDials(), "and no dial may be attempted")
-}
-
-// fakeTLSClientHello forges the exact bytes an mtg client sends: a TLS 1.0
-// record carrying a TLS 1.2 ClientHello with sni, whose client random is the
-// HMAC-SHA256 of the whole message under key (computed with the random
-// nullified) XORed with a little-endian timestamp. It is the inverse of
-// fake.ReadClientHelloMulti, and it is what makes the ee entry testable without
-// a live client.
-func fakeTLSClientHello(t testing.TB, key [SecretKeyLength]byte, sni string, sessionID []byte) []byte {
-	t.Helper()
-
-	var extensions bytes.Buffer
-
-	extensions.Write([]byte{0x00, 0x00})                                // extension type: server_name
-	binary.Write(&extensions, binary.BigEndian, uint16(2+1+2+len(sni))) //nolint: errcheck
-	binary.Write(&extensions, binary.BigEndian, uint16(1+2+len(sni)))   //nolint: errcheck
-	extensions.WriteByte(0x00)                                          // name type: DNS hostname
-	binary.Write(&extensions, binary.BigEndian, uint16(len(sni)))       //nolint: errcheck
-	extensions.WriteString(sni)
-
-	var body bytes.Buffer
-
-	body.Write([]byte{0x03, 0x03})           // client version: TLS 1.2
-	body.Write(make([]byte, fake.RandomLen)) // random, filled in below
-	body.WriteByte(byte(len(sessionID)))
-	body.Write(sessionID)
-	body.Write([]byte{0x00, 0x02, 0x13, 0x01})                      // one cipher suite, not GREASE
-	body.Write([]byte{0x01, 0x00})                                  // one compression method: null
-	binary.Write(&body, binary.BigEndian, uint16(extensions.Len())) //nolint: errcheck
-	body.Write(extensions.Bytes())
-
-	var record bytes.Buffer
-
-	// The record layer version has to be 3,1: that is what the reader demands
-	// and what it reconstructs before HMACing, so the bytes on the wire and the
-	// bytes under the HMAC are the same.
-	record.Write([]byte{0x16, 0x03, 0x01})
-	binary.Write(&record, binary.BigEndian, uint16(1+3+body.Len())) //nolint: errcheck
-	record.WriteByte(0x01)                                          // handshake type: ClientHello
-	record.Write([]byte{
-		byte(body.Len() >> 16), byte(body.Len() >> 8), byte(body.Len()),
-	})
-	record.Write(body.Bytes())
-
-	raw := record.Bytes()
-
-	digest := hmac.New(sha256.New, key[:])
-	digest.Write(raw)
-
-	computed := digest.Sum(nil)
-
-	var timestamp [4]byte
-
-	binary.LittleEndian.PutUint32(timestamp[:], uint32(time.Now().Unix()))
-
-	// random = digest XOR (28 zero bytes || timestamp), so the reader's
-	// digest^random recovers exactly that.
-	random := raw[fake.RandomOffset : fake.RandomOffset+fake.RandomLen]
-	copy(random, computed)
-
-	for i := range timestamp {
-		random[fake.RandomLen-4+i] ^= timestamp[i]
-	}
-
-	return raw
 }
 
 // fakeTLSAttempt runs one ClientHello through the FakeTLS entry and reports

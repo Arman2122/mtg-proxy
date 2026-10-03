@@ -96,19 +96,35 @@ compiles only the root package, so it never ships.
 - It runs the real `mtg-proxy` and, for WEB, the real `mtg-proxy web-relay` as
   separate processes, with a config it generates.
 - **Fake Telegram through SOCKS5.** The binary cannot be pointed at a fake data
-  centre, but with exactly one `[network] proxies` entry every outbound dial
-  goes through that SOCKS5 proxy — Telegram, the startup config fetch, the
-  cover site — and the SOCKS connection gets the same socket options a direct
-  Telegram connection would. mtgbench's SOCKS5 server answers "connected" for
+  centre, but with exactly one `[network] proxies` entry every Telegram-bound
+  dial goes through that SOCKS5 proxy — the data centres, the middle proxy and
+  the HTTP fetches. mtgbench's SOCKS5 server answers "connected" for
   Telegram's data-centre addresses and then *is* the data centre on that same
   socket: it reads the 64-byte handshake, then pushes, sinks or echoes for the
-  scenario. Every other destination is refused, so the proxy falls back to its
-  built-in data-centre list. No extra copy hop, no production change.
+  scenario. Every other destination is refused. No extra copy hop, no
+  production change.
+  *Corrected 2026-10-03, after mapping the code:*
+  - Domain fronting, the doppelganger scout and the public-IP lookup dial
+    directly (`NativeDialer`), so mtgbench's config disables the scout, sets
+    `public-ipv4`, and points `[domain-fronting]` at a local listener of its
+    own.
+  - The SOCKS socket does not get the Telegram socket options, so
+    `TCP_NOTSENT_LOWAT` cannot be measured this way.
 - **Client side, shared with the tests.** The code that speaks each door — the
   forged FakeTLS hello, obfuscated2 frames, TLS record framing, the WEB session
   protocol — lives only in `_test.go` files today. It moves into a new internal
-  package, `internal/testclient`, that both the tests and mtgbench import, so the tests lose their
-  copies rather than a second copy appearing.
+  package, `internal/testclient`, that both the tests and mtgbench import, so
+  the tests lose their copies rather than a second copy appearing.
+  *Corrected 2026-10-03:*
+  - testclient cannot import `mtglib/internal/...` (Go's internal rule), nor
+    `mtglib` or `internal/webrelay` (their in-package tests would form import
+    cycles). It copies four TLS constants and a small record reader, and
+    returns errors instead of taking `testing.TB`.
+  - The existing WEB test client never returned flow-control credit, so it
+    stalled after the relay's 4 MiB initial window. It gains real flow
+    control.
+- **ee runs as shipped (`record`) and as `burst`.** Unpaced has no config
+  switch (`Ganger.Unpace` is a test seam), so it stays Tier A only.
 - **Measurement.** The proxy is pinned to one core with `taskset`, mtgbench to
   the other: the result is per-core capacity. CPU time and RSS come from the
   proxy's `/proc/<pid>` files; latency is a histogram in mtgbench; the proxy's

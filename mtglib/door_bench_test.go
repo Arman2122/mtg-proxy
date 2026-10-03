@@ -441,15 +441,6 @@ func BenchmarkDoorHandshake(b *testing.B) {
 	}
 }
 
-// resetOnClose makes conn's Close send a reset, so it leaves no TIME_WAIT.
-func resetOnClose(tb testing.TB, conn net.Conn) {
-	tb.Helper()
-
-	tcp, ok := conn.(*net.TCPConn)
-	require.True(tb, ok, "the harness hands out TCP connections")
-	require.NoError(tb, tcp.SetLinger(0))
-}
-
 // BenchmarkDoorIdle holds 1,000 streams open and reports what each costs. The
 // figures include the test's own two sockets per stream, a few hundred bytes.
 func BenchmarkDoorIdle(b *testing.B) {

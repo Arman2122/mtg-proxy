@@ -116,68 +116,6 @@ func (g goldenFrameSource) Read(p []byte) (int, error) {
 	return g.r.Read(p) //nolint: wrapcheck
 }
 
-// goldenRecord is one TLS record as it arrived, kept whole because the
-// ServerHello digest is computed over the concatenation of all three.
-type goldenRecord struct {
-	recordType byte
-	version    [2]byte
-	payload    []byte
-	raw        []byte
-}
-
-// goldenReadRecord reads exactly one TLS record. The length bound is what turns
-// "the doppelganger wrap was removed" into a named failure instead of a hang:
-// raw obfuscated2 or raw relayed bytes read as a header declaring far more than
-// a record may carry.
-func goldenReadRecord(t *testing.T, r io.Reader) goldenRecord {
-	t.Helper()
-
-	var header [tls.SizeHeader]byte
-
-	_, err := io.ReadFull(r, header[:])
-	require.NoError(t, err, "a TLS record header must be readable")
-
-	length := int(header[3])<<8 | int(header[4])
-	require.Positive(t, length, "a record of type %#x must carry a payload", header[0])
-	require.LessOrEqualf(t, length, tls.MaxRecordPayloadSize,
-		"record of type %#x declares %d bytes: this is not a TLS record layer", header[0], length)
-
-	payload := make([]byte, length)
-
-	_, err = io.ReadFull(r, payload)
-	require.NoError(t, err, "a record must carry the length it declares")
-
-	raw := make([]byte, 0, tls.SizeHeader+length)
-	raw = append(raw, header[:]...)
-	raw = append(raw, payload...)
-
-	return goldenRecord{
-		recordType: header[0],
-		version:    [2]byte{header[1], header[2]},
-		payload:    payload,
-		raw:        raw,
-	}
-}
-
-// goldenReadFlight reads the whole server flight: exactly three records --
-// ServerHello, ChangeCipherSpec and ONE fake ApplicationData. The client HMACs
-// over all three, so a fourth record, or a missing one, breaks every real
-// client. The concatenation is returned because that is what the HMAC covers.
-func goldenReadFlight(t *testing.T, r io.Reader) ([]goldenRecord, []byte) {
-	t.Helper()
-
-	records := make([]goldenRecord, 0, 3)
-	flight := make([]byte, 0, 8192)
-
-	for range 3 {
-		record := goldenReadRecord(t, r)
-		records = append(records, record)
-		flight = append(flight, record.raw...)
-	}
-
-	return records, flight
-}
-
 // assertFakeTLSDigest is the client-side check of the server flight, done the
 // way a real Telegram client does it: HMAC-SHA256 under the matched secret over
 // the client's own random followed by the whole three-record flight with the

@@ -285,31 +285,6 @@ func (h *entryHarness) dialProxy(t testing.TB, policy *ListenerPolicy) (net.Conn
 	return client, done
 }
 
-// obfuscatedFrame produces exactly the 64 bytes a client sends for this key,
-// transport tag and DC.
-func obfuscatedFrame(t testing.TB, key [SecretKeyLength]byte, tag obfuscation.ConnectionTag, dcID int) []byte {
-	t.Helper()
-
-	sink := &frameSink{}
-
-	_, err := obfuscation.Obfuscator{Secret: key[:]}.SendHandshake(sink, dcID, tag)
-	require.NoError(t, err)
-
-	return sink.wrote.Bytes()
-}
-
-// frameSink is an essentials.Conn that only supports Write. The embedded
-// interface is nil on purpose so any other call panics loudly.
-type frameSink struct {
-	essentials.Conn
-
-	wrote bytes.Buffer
-}
-
-func (f *frameSink) Write(p []byte) (int, error) {
-	return f.wrote.Write(p) //nolint: wrapcheck
-}
-
 func obfuscatedPolicy(modes ModeSet, action UnknownSecretAction) *ListenerPolicy {
 	return &ListenerPolicy{Modes: modes, OnUnknownSecret: action}
 }
@@ -929,19 +904,6 @@ func TestFakeTLSReplayIsFronted(t *testing.T) {
 
 	first.Close() //nolint: errcheck
 	<-firstDone
-}
-
-// tlsApplicationRecord frames a payload as one TLS 1.2 application-data
-// record. After SendServerHello the ee entry reads through the faketls record
-// layer, so this is how a real client's obfuscated handshake arrives.
-func tlsApplicationRecord(payload []byte) []byte {
-	record := []byte{
-		tls.TypeApplicationData,
-		tls.TLSVersion[0], tls.TLSVersion[1],
-		byte(len(payload) >> 8), byte(len(payload)),
-	}
-
-	return append(record, payload...)
 }
 
 // TestFakeTLSEntryEndToEndThroughServeConn drives the whole ee path through the
