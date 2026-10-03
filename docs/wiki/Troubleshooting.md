@@ -273,13 +273,18 @@ then checked the same way, on its own.
 fails, every rejected handshake has nowhere to go.
 
 **SNI-DNS match.** Resolves the secret's hostname and compares the answers against this
-server's public addresses. It is expected to fail on an ordinary deployment and that is
-fine: FakeTLS fronts a hostname you do not own. It matters only when you *do* point that
-name at this server, which is the SNI-router arrangement.
+server's public addresses. It fails whenever the secret names a site you do not own. That
+is the commonest setup and it works, but the failure is real. The hostname travels in the
+clear in every ClientHello, so a censor that resolves it sees a well-known site's name on
+its way to an address that is not that site's.
 
-Because that check fails by design on a normal proxy, `doctor` exits non-zero on a
-perfectly healthy deployment. Read its output; do not wire its exit status into a health
-check or a deploy gate.
+To pass it, use a domain that resolves to this server and put a real website behind the
+proxy. `contrib/cover-site` does that on a single host. `contrib/sni-router` does it when
+other hostnames need port 443 as well.
+
+On a proxy fronting a site it does not own, `doctor` therefore exits non-zero although
+everything works. Read its output; do not wire its exit status into a health check or a
+deploy gate.
 
 Two limitations to know about. The fronting and SNI checks use one secret's hostname
 picked out of the map, so with several secrets that use different hostnames the run may

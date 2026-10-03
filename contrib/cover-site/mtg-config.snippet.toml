@@ -1,0 +1,18 @@
+# The parts of the proxy's config this arrangement needs. Merge them into your
+# own config.toml; everything else stays as it is.
+
+# The FakeTLS door takes the public HTTPS port.
+bind-to = "0.0.0.0:443"
+
+# ee secrets name YOUR domain, the one that resolves to this server:
+#   mtg-proxy generate-secret example.com
+[secrets]
+alice = "ee..."
+
+[domain-fronting]
+# Everything on :443 that is not a Telegram client goes to the real website:
+# Caddy on loopback. Set explicitly because the name resolves to this server,
+# so dialling it would loop straight back into the proxy.
+host = "127.0.0.1"
+port = 9443
+proxy-protocol = true

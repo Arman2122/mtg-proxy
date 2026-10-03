@@ -1,0 +1,57 @@
+# example.com -- the website behind mtg-proxy's FakeTLS door.
+#
+# mtg-proxy owns :443. A Telegram client holding a valid ee secret is served by
+# the proxy. Every other TLS connection to :443 -- browsers, crawlers, a
+# censor's probe -- is handed over unchanged to this server on 127.0.0.1:9443
+# ([domain-fronting] in the proxy's config), behind a PROXY v2 header that
+# carries the visitor's real address. Caddy answers it with the real
+# certificate for the name and the real site, so anyone who is not a Telegram
+# client meets an ordinary website at the address the name resolves to.
+#
+# Replace example.com (three places). The site is whatever /var/www/cover
+# points at; publish a new version with publish-cover-site.
+{
+	https_port 9443
+
+	# The automatic http->https redirect would point at 9443, which nobody
+	# outside can reach. The redirect is written out below, to 443.
+	auto_https disable_redirects
+
+	servers 127.0.0.1:9443 {
+		listener_wrappers {
+			# mtg-proxy prepends the visitor's address. Only loopback may
+			# claim one; a connection without a header (the proxy's own cover
+			# measurements) is served as itself.
+			proxy_protocol {
+				timeout 5s
+				allow 127.0.0.1/32
+			}
+			tls
+		}
+
+		# No HTTP/3: Caddy would advertise it on 9443, a port no visitor can
+		# reach, and that advertisement alone would look odd.
+		protocols h1 h2
+	}
+}
+
+example.com {
+	bind 127.0.0.1
+
+	root * /var/www/cover
+	file_server
+
+	handle_errors 404 {
+		rewrite * /404.html
+		file_server
+	}
+
+	# Visitors of a site that fronts a proxy deserve not to be logged.
+	log {
+		output discard
+	}
+}
+
+http://example.com {
+	redir https://example.com{uri} permanent
+}

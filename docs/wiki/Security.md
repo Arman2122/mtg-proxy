@@ -166,6 +166,13 @@ actually serves TLS on the chosen port. `mtg-proxy doctor <config-path>` checks
 that the hostname resolves and that the SNI matches. See [[Configuration]] and
 [[Troubleshooting]].
 
+The strongest choice is a domain that resolves to this server, with a real
+website behind the proxy. The name in every ClientHello then matches the address
+it goes to, and anyone who connects without the secret gets that website with
+its own certificate. `contrib/cover-site` sets this up on one host: the proxy on
+443, Caddy on loopback, and a publish command for your site. Fronting must then
+point at the web server explicitly, because the name resolves back to the proxy.
+
 ## The ee handshake and its traffic 🧥
 
 A client that does hold the secret gets a TLS 1.3 ServerHello, a
