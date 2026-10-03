@@ -107,10 +107,14 @@ ssh server publish-cover-site /tmp/site.tar.gz
 - **Going back:** `publish-cover-site --rollback`. `publish-cover-site --list`
   shows the versions on disk.
 - **No restart.** Caddy serves whatever is live.
+- **Addresses are clean.** `/about` serves `about.html`, and a link to
+  `/about.html` or `/index.html` redirects to `/about` or `/`. Write links as
+  `/about`. A folder with an `index.html` (`/posts/`) works as usual.
 - **Built sites** (Hugo, Astro, Vite, Next.js static export) publish their
   output folder: `public/`, `dist/` or `out/`.
-- **A single-page app** with client-side routes needs `try_files {path}
-  /index.html` added to the site block. Without it, a deep link answers 404.
+- **A single-page app** with client-side routes needs the `try_files` line to
+  end in `/index.html` (`try_files {path} {path}.html /index.html`). Without
+  it, a deep link answers 404.
 - **A site with a backend** — PHP, Node, anything that runs — replaces
   `root`/`file_server` with `reverse_proxy` to the app.
 

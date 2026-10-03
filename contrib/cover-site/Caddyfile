@@ -39,6 +39,20 @@ example.com {
 	bind 127.0.0.1
 
 	root * /var/www/cover
+
+	# Clean addresses. /about serves about.html; /about.html and /index.html
+	# redirect to /about and /, so a link or bookmark written either way ends
+	# up at one address.
+	@index path_regexp index ^(.*/)index\.html$
+	redir @index {re.index.1}{?query} permanent
+
+	@html {
+		path_regexp html ^(.+)\.html$
+		not path */index.html /404.html
+	}
+	redir @html {re.html.1}{?query} permanent
+
+	try_files {path} {path}.html
 	file_server
 
 	handle_errors 404 {
