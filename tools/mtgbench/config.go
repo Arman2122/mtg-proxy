@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -79,6 +81,10 @@ type Setup struct {
 	Shaping  string // "record" or "burst"
 	Caps     map[string]Caps
 	BasePort int
+
+	// APIToken is the management API's bearer for the run: random, from
+	// NewAPIToken, so nobody else on the box can guess it.
+	APIToken string
 }
 
 // Ports, from BasePort.
@@ -104,12 +110,17 @@ func (s Setup) Ports() []string {
 	}
 }
 
-// APIToken is the management API's bearer for this run.
-func (s Setup) APIToken() string {
-	sum := sha256.Sum256([]byte("mtgbench-api:" + s.Dir))
+// NewAPIToken is a fresh random bearer for a run's management API.
+func NewAPIToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("cannot make an API token: %w", err)
+	}
 
-	return hex.EncodeToString(sum[:16])
+	return hex.EncodeToString(b), nil
 }
+
+var errNoToken = errors.New("the setup has no API token")
 
 // WriteConfig writes the run's config.toml, the relay's token key and a cover
 // site into s.Dir, and returns the config's path.
@@ -119,6 +130,15 @@ func (s Setup) APIToken() string {
 // the doppelganger does not scout, the public address is given, and the public
 // config is not fetched.
 func WriteConfig(s Setup) (string, error) {
+	if s.APIToken == "" {
+		return "", errNoToken
+	}
+
+	_, coverPort, err := net.SplitHostPort(s.CoverAddr())
+	if err != nil {
+		return "", fmt.Errorf("cannot read the cover port: %w", err)
+	}
+
 	keyPath := filepath.Join(s.Dir, "web.key")
 	coverDir := filepath.Join(s.Dir, "site")
 
@@ -138,8 +158,9 @@ func WriteConfig(s Setup) (string, error) {
 
 	fmt.Fprintf(&b, "bind-to = %q\n", s.EEAddr())
 	fmt.Fprintf(&b, "api-bind-to = %q\n", s.APIAddr())
-	fmt.Fprintf(&b, "api-token = %q\n", s.APIToken())
+	fmt.Fprintf(&b, "api-token = %q\n", s.APIToken)
 	b.WriteString("public-ipv4 = \"127.0.0.1\"\n")
+	b.WriteString("public-ipv6 = \"::1\"\n")
 	b.WriteString("concurrency = 16384\n")
 	b.WriteString("track-client-ips = true\n\n")
 
@@ -151,13 +172,14 @@ func WriteConfig(s Setup) (string, error) {
 	fmt.Fprintf(&b, "token-key = %q\ncover-dir = %q\n", filepath.ToSlash(keyPath), filepath.ToSlash(coverDir))
 	fmt.Fprintf(&b, "client-ip = \"x-forwarded-for\"\nstats-bind-to = %q\n\n", s.RelayStatsAddr())
 
-	fmt.Fprintf(&b, "[domain-fronting]\nhost = \"127.0.0.1\"\nport = %d\n\n", s.BasePort+11)
+	fmt.Fprintf(&b, "[domain-fronting]\nhost = \"127.0.0.1\"\nport = %s\n\n", coverPort)
 
 	b.WriteString("[defense.doppelganger]\nscout-covers = false\n")
 	fmt.Fprintf(&b, "shaping = %q\n\n", s.Shaping)
 
 	fmt.Fprintf(&b, "[network]\nproxies = [\"socks5://%s\"]\n\n", s.SOCKSAddr())
-	b.WriteString("[network.timeout]\nhandshake = \"10s\"\nidle = \"1m\"\n\n")
+	// Long enough for the idle scenario to hold its connections.
+	b.WriteString("[network.timeout]\nhandshake = \"10s\"\nidle = \"10m\"\n\n")
 
 	b.WriteString("[secrets]\n")
 
@@ -173,9 +195,9 @@ func WriteConfig(s Setup) (string, error) {
 
 		fmt.Fprintf(&b, "\n[secret-limits.%q]\n", u.Name)
 
-		for key, value := range map[string]string{"speed": caps.Speed, "speed-up": caps.Up, "speed-down": caps.Down} {
-			if value != "" {
-				fmt.Fprintf(&b, "%s = %q\n", key, value)
+		for _, kv := range [][2]string{{"speed", caps.Speed}, {"speed-up", caps.Up}, {"speed-down", caps.Down}} {
+			if kv[1] != "" {
+				fmt.Fprintf(&b, "%s = %q\n", kv[0], kv[1])
 			}
 		}
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,15 +14,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestHelperProcess is not a test: it is the stand-in child the runner tests
-// start, re-running this test binary. It sleeps until it is killed.
+// TestHelperProcess is not a test: it is the stand-in process the runner tests
+// start, re-running this test binary, in the mode MTGBENCH_HELPER names.
 func TestHelperProcess(t *testing.T) { //nolint: paralleltest
-	if os.Getenv("MTGBENCH_HELPER") != "sleep" {
-		return
-	}
+	switch os.Getenv("MTGBENCH_HELPER") {
+	case "sleep":
+		time.Sleep(time.Hour)
+		os.Exit(0)
+	case "env":
+		for _, kv := range os.Environ() {
+			os.Stdout.WriteString(kv + "\n") //nolint: errcheck
+		}
 
-	time.Sleep(time.Hour)
-	os.Exit(0)
+		os.Exit(0)
+	case "parent":
+		// A stand-in mtgbench: it starts a child, says its pid, and waits to
+		// be killed.
+		r, err := StartProcesses(context.Background(), os.Getenv("MTGBENCH_DIR"), helperSpec("child"))
+		if err != nil {
+			os.Exit(2)
+		}
+
+		fmt.Println(r.PIDs()[0]) //nolint: forbidigo
+		time.Sleep(time.Hour)
+		os.Exit(0)
+	}
 }
 
 func helperSpec(name string) ProcSpec {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync/atomic"
@@ -77,7 +78,7 @@ func StartStack(ctx context.Context, s Setup, bin string, core int) (*Stack, err
 		return nil, err
 	}
 
-	ready := []string{s.EEAddr(), s.APIAddr(), s.ObfuscatedAddr()}
+	ready := []string{s.APIAddr(), s.ObfuscatedAddr()}
 	if web {
 		ready = append(ready, s.RelayAddr())
 	}
@@ -88,16 +89,45 @@ func StartStack(ctx context.Context, s Setup, bin string, core int) (*Stack, err
 		return nil, err
 	}
 
-	// The readiness probe that reached the ee port connected and hung up
-	// without a hello, and the proxy fronted it, as it should. That one is the
-	// probe's, not the run's: wait for it to land, then start counting.
-	for deadline := time.Now().Add(2 * time.Second); st.fronted.Load() == 0 && time.Now().Before(deadline); {
-		time.Sleep(10 * time.Millisecond)
+	// The ee port last, and once: a probe there connects and hangs up without
+	// a hello, and the proxy fronts it, as it should. That one front is the
+	// probe's, and it doubles as a check that fronting works at all. Then the
+	// count is the run's.
+	if err := st.Runner.WaitReady(ctx, []string{s.EEAddr()}, 15*time.Second); err != nil {
+		st.Close() //nolint: errcheck
+
+		return nil, err
+	}
+
+	if err := st.waitFronted(ctx, 1, 5*time.Second); err != nil {
+		st.Close() //nolint: errcheck
+
+		return nil, err
 	}
 
 	st.fronted.Store(0)
 
 	return st, nil
+}
+
+var errNotFronted = errors.New("the readiness probe was never fronted: is fronting broken?")
+
+func (st *Stack) waitFronted(ctx context.Context, n int64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for st.fronted.Load() < n {
+		if time.Now().After(deadline) {
+			return errNotFronted
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err() //nolint: wrapcheck
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	return nil
 }
 
 func (st *Stack) serveCover() {

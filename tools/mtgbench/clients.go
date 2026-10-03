@@ -134,18 +134,25 @@ func dialWeb(ctx context.Context, s Setup, u User, clientIP string) (*Client, er
 		return nil, err //nolint: wrapcheck
 	}
 
+	// A session given up on is deleted, not just dropped: a dropped one holds a
+	// slot against the relay's session limit for its reconnect grace.
+	giveUp := func(err error) (*Client, error) {
+		deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+
+		session.Delete(deleteCtx) //nolint: errcheck
+
+		return nil, err
+	}
+
 	stream, err := session.OpenStream(1)
 	if err != nil {
-		session.Close() //nolint: errcheck
-
-		return nil, err //nolint: wrapcheck
+		return giveUp(err)
 	}
 
 	obfuscated, err := obfuscation.Obfuscator{Secret: u.Key[:]}.SendHandshake(stream, telegramDC, obfuscation.TagPaddedIntermediate)
 	if err != nil {
-		session.Close() //nolint: errcheck
-
-		return nil, fmt.Errorf("cannot send the obfuscated2 handshake: %w", err)
+		return giveUp(fmt.Errorf("cannot send the obfuscated2 handshake: %w", err))
 	}
 
 	return &Client{Conn: obfuscated, close: func() error {

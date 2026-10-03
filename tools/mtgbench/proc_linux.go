@@ -18,9 +18,14 @@ func setProcAttrs(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 }
 
+// terminate and kill signal the child through its os.Process, which since Go
+// 1.23 holds a pidfd on Linux: a child that has exited and been reaped can
+// never be confused with whoever got its id next. The binary starts no
+// children of its own -- taskset replaces itself with it -- so the process is
+// the whole tree.
 func terminate(cmd *exec.Cmd) {
 	if cmd.Process != nil {
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) //nolint: errcheck
+		cmd.Process.Signal(syscall.SIGTERM) //nolint: errcheck
 	}
 }
 
@@ -29,7 +34,7 @@ func kill(cmd *exec.Cmd) error {
 		return nil
 	}
 
-	return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) //nolint: wrapcheck
+	return cmd.Process.Kill() //nolint: wrapcheck
 }
 
 // clockTicks is USER_HZ, which Linux fixes at 100 for /proc on every

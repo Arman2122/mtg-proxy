@@ -1,7 +1,10 @@
 package main
 
 import (
+	"net"
 	"os"
+	"regexp"
+	"strconv"
 	"testing"
 
 	"github.com/Arman2122/mtg-proxy/internal/config"
@@ -19,6 +22,7 @@ func benchSetup(t *testing.T) Setup {
 		Shaping:  "burst",
 		Caps:     map[string]Caps{"bob": {Speed: "10MB", Up: "1MB", Down: "2MB"}},
 		BasePort: 47000,
+		APIToken: "test-token",
 	}
 }
 
@@ -64,5 +68,29 @@ func TestGeneratedConfigStaysOnLoopback(t *testing.T) {
 	assert.Contains(t, text, "scout-covers = false")
 	assert.Contains(t, text, `public-ipv4 = "127.0.0.1"`)
 	assert.Equal(t, "127.0.0.1", conf.DomainFronting.Host.Get(""), "fronting goes to mtgbench's cover listener")
+	assert.Equal(t, uint(47011), conf.DomainFronting.Port.Get(0), "on the cover listener's own port")
+	assert.Contains(t, text, `public-ipv6 = "::1"`, "the binary never asks the internet for its address")
 	assert.NotContains(t, text, "auto-update = true")
+
+	// Every address the binary listens on is loopback, inside the run's ports.
+	for _, m := range regexp.MustCompile(`(?m)^(?:bind-to|api-bind-to|backend|stats-bind-to) = "([^"]+)"$`).FindAllStringSubmatch(text, -1) {
+		host, port, err := net.SplitHostPort(m[1])
+		require.NoError(t, err)
+		assert.True(t, net.ParseIP(host).IsLoopback(), m[0])
+
+		n, err := strconv.Atoi(port)
+		require.NoError(t, err)
+		assert.True(t, n >= 47000 && n <= 47012, m[0])
+	}
+}
+
+// Without a token the management API would be open to anyone on the box.
+func TestGeneratedConfigNeedsAToken(t *testing.T) {
+	t.Parallel()
+
+	s := benchSetup(t)
+	s.APIToken = ""
+
+	_, err := WriteConfig(s)
+	require.ErrorIs(t, err, errNoToken)
 }

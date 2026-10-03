@@ -41,7 +41,11 @@ func run() error {
 
 	flag.Parse()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	if *basePort < 1024 || *basePort > 65535-12 {
+		return fmt.Errorf("-base-port %d: the run needs %d..%d", *basePort, *basePort, *basePort+12)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
 	workDir := *dir
@@ -60,12 +64,18 @@ func run() error {
 		return fmt.Errorf("cannot resolve %s: %w", *bin, err)
 	}
 
+	token, err := NewAPIToken()
+	if err != nil {
+		return err
+	}
+
 	setup := Setup{
 		Dir:      workDir,
 		Users:    []User{NewUser("alice")},
 		Doors:    AllDoors,
 		Shaping:  *shaping,
 		BasePort: *basePort,
+		APIToken: token,
 	}
 
 	if *smoke {

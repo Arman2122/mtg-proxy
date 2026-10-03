@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 )
 
-var errShortAck = errors.New("the data centre acknowledged a different count")
+var (
+	errShortAck = errors.New("the data centre acknowledged a different count")
+	errCorrupt  = errors.New("what arrived is not what was sent")
+)
 
 // clientChunk is the size of the client's own reads and writes.
 const clientChunk = 64 << 10
@@ -24,15 +29,26 @@ func command(op byte, n int64) []byte {
 	return b
 }
 
-// Download asks for n bytes and reads every one of them.
+// Download asks for n bytes, reads every one of them in clientChunk pieces,
+// and checks each is the zero the data centre sends.
 func Download(conn io.ReadWriter, n int64) error {
 	if _, err := conn.Write(command(cmdDownload, n)); err != nil {
 		return fmt.Errorf("cannot ask for a download: %w", err)
 	}
 
-	got, err := io.CopyBuffer(io.Discard, io.LimitReader(conn, n), make([]byte, clientChunk))
-	if err != nil || got != n {
-		return fmt.Errorf("download ended at %d of %d bytes: %w", got, n, err)
+	buf := make([]byte, clientChunk)
+
+	for got := int64(0); got < n; {
+		m, err := conn.Read(buf[:min(int64(len(buf)), n-got)])
+		if m > 0 && !bytes.Equal(buf[:m], zeros[:m]) {
+			return fmt.Errorf("download, at byte %d: %w", got, errCorrupt)
+		}
+
+		got += int64(m)
+
+		if err != nil && got < n {
+			return fmt.Errorf("download ended at %d of %d bytes: %w", got, n, cmp.Or(err, io.ErrUnexpectedEOF))
+		}
 	}
 
 	return nil
@@ -69,7 +85,8 @@ func Upload(conn io.ReadWriter, n int64) error {
 	return nil
 }
 
-// Echo sends message and reads the same number of bytes back.
+// Echo sends message and reads it back, as it went. It writes before it reads,
+// so it is for messages that fit the sockets' buffers: a ping, not a transfer.
 func Echo(conn io.ReadWriter, message []byte) error {
 	out := append(command(cmdEcho, int64(len(message))), message...)
 
@@ -77,8 +94,13 @@ func Echo(conn io.ReadWriter, message []byte) error {
 		return fmt.Errorf("cannot send the echo: %w", err)
 	}
 
-	if _, err := io.ReadFull(conn, make([]byte, len(message))); err != nil {
+	echoed := make([]byte, len(message))
+	if _, err := io.ReadFull(conn, echoed); err != nil {
 		return fmt.Errorf("no echo: %w", err)
+	}
+
+	if !bytes.Equal(echoed, message) {
+		return fmt.Errorf("echo: %w", errCorrupt)
 	}
 
 	return nil

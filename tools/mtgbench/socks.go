@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -9,6 +11,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
@@ -58,9 +61,10 @@ type DataCentre struct {
 	sent     atomic.Int64
 	received atomic.Int64
 
-	mu    sync.Mutex
-	conns map[net.Conn]struct{}
-	wg    sync.WaitGroup
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	closed bool
+	wg     sync.WaitGroup
 }
 
 // StartSOCKS starts the data centre behind a SOCKS5 server: no authentication,
@@ -97,6 +101,8 @@ func (dc *DataCentre) Close() error {
 	err := dc.ln.Close()
 
 	dc.mu.Lock()
+	dc.closed = true
+
 	for c := range dc.conns {
 		c.Close() //nolint: errcheck
 	}
@@ -115,6 +121,13 @@ func (dc *DataCentre) acceptLoop() {
 		}
 
 		dc.mu.Lock()
+		if dc.closed {
+			dc.mu.Unlock()
+			c.Close() //nolint: errcheck
+
+			return
+		}
+
 		dc.conns[c] = struct{}{}
 		dc.mu.Unlock()
 
@@ -125,6 +138,11 @@ func (dc *DataCentre) acceptLoop() {
 				dc.mu.Unlock()
 				c.Close() //nolint: errcheck
 			}()
+
+			// Both handshakes are bounded; what follows them is the run's.
+			if c.SetDeadline(time.Now().Add(10*time.Second)) != nil {
+				return
+			}
 
 			if dc.socks && !dc.socksConnect(c) {
 				return
@@ -145,6 +163,12 @@ func (dc *DataCentre) socksConnect(c net.Conn) bool {
 
 	methods := make([]byte, head[1])
 	if _, err := io.ReadFull(c, methods); err != nil {
+		return false
+	}
+
+	if !bytes.Contains(methods, []byte{0}) {
+		c.Write([]byte{5, 0xFF}) //nolint: errcheck // no acceptable method
+
 		return false
 	}
 
@@ -205,7 +229,7 @@ func (dc *DataCentre) serve(raw essentials.Conn) {
 	_, _, conn, err := obfuscation.Obfuscator{}.ReadHandshake(raw, obfuscation.TagSetOf(
 		obfuscation.TagPaddedIntermediate, obfuscation.TagIntermediate, obfuscation.TagAbridged,
 	))
-	if err != nil {
+	if err != nil || raw.SetDeadline(time.Time{}) != nil {
 		return
 	}
 
@@ -230,10 +254,12 @@ func (dc *DataCentre) serve(raw essentials.Conn) {
 func (dc *DataCentre) run(conn essentials.Conn, op byte, n int64, buf []byte) error {
 	switch op {
 	case cmdDownload:
-		clear(buf)
-
 		for left := n; left > 0; {
 			chunk := min(left, int64(len(buf)))
+
+			// Zeros every time: the writer encrypts the buffer in place.
+			clear(buf[:chunk])
+
 			if _, err := conn.Write(buf[:chunk]); err != nil {
 				return err //nolint: wrapcheck
 			}
@@ -244,7 +270,9 @@ func (dc *DataCentre) run(conn essentials.Conn, op byte, n int64, buf []byte) er
 
 		return nil
 	case cmdUpload:
-		got, err := io.CopyBuffer(io.Discard, io.LimitReader(conn, n), buf)
+		// Wrapped so CopyBuffer uses buf: io.Discard's own ReadFrom would read
+		// 8 KiB at a time.
+		got, err := io.CopyBuffer(struct{ io.Writer }{io.Discard}, io.LimitReader(conn, n), buf)
 		dc.received.Add(got)
 
 		if err != nil || got != n {
@@ -276,9 +304,9 @@ func (dc *DataCentre) run(conn essentials.Conn, op byte, n int64, buf []byte) er
 
 		return nil
 	case cmdHold:
-		_, err := conn.Read(buf[:1])
+		_, err := io.Copy(io.Discard, conn)
 
-		return err //nolint: wrapcheck
+		return cmp.Or(err, io.EOF) //nolint: wrapcheck
 	}
 
 	return fmt.Errorf("%q: %w", op, errBadCommand)

@@ -10,18 +10,44 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// ProcSpec is one child process. Core pins it to a CPU with taskset on Linux;
-// -1 leaves it unpinned.
+// ProcSpec is one child process. With Pin set, Core pins it to that CPU with
+// taskset on Linux.
 type ProcSpec struct {
 	Name string
 	Path string
 	Args []string
 	Env  []string
+	Pin  bool
 	Core int
+}
+
+// inheritedEnv are the only variables a child takes from mtgbench's own
+// environment. The binary reads its configuration from the environment as
+// well -- MTG_BIND_TO rebinds it, SECRET turns on a lookup that dials the
+// internet directly, TAG starts the ad-tag path -- so nothing else passes.
+var inheritedEnv = []string{"PATH", "HOME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "USERPROFILE", "LANG", "LC_ALL"}
+
+func childEnv(extra []string) []string {
+	env := make([]string, 0, len(inheritedEnv)+len(extra))
+
+	for _, kv := range os.Environ() {
+		key, _, _ := strings.Cut(kv, "=")
+
+		for _, allowed := range inheritedEnv {
+			if strings.EqualFold(key, allowed) {
+				env = append(env, kv)
+
+				break
+			}
+		}
+	}
+
+	return append(env, extra...)
 }
 
 type proc struct {
@@ -48,9 +74,11 @@ var (
 // StartRunner starts the binary's proxy, and its WEB relay when web is set,
 // both pinned to core.
 func StartRunner(ctx context.Context, dir, bin, cfg string, core int, web bool) (*Runner, error) {
-	specs := []ProcSpec{{Name: "proxy", Path: bin, Args: []string{"run", cfg}, Core: core}}
+	pin := core != noPin
+
+	specs := []ProcSpec{{Name: "proxy", Path: bin, Args: []string{"run", cfg}, Pin: pin, Core: core}}
 	if web {
-		specs = append(specs, ProcSpec{Name: "relay", Path: bin, Args: []string{"web-relay", cfg}, Core: core})
+		specs = append(specs, ProcSpec{Name: "relay", Path: bin, Args: []string{"web-relay", cfg}, Pin: pin, Core: core})
 	}
 
 	return StartProcesses(ctx, dir, specs...)
@@ -76,7 +104,7 @@ func StartProcesses(ctx context.Context, dir string, specs ...ProcSpec) (*Runner
 
 func startProc(ctx context.Context, dir string, spec ProcSpec) (*proc, error) {
 	path, args := spec.Path, spec.Args
-	if spec.Core >= 0 && runtime.GOOS == "linux" && spec.Core != noPin {
+	if spec.Pin && runtime.GOOS == "linux" {
 		args = append([]string{"-c", strconv.Itoa(spec.Core), path}, args...)
 		path = "taskset"
 	}
@@ -89,10 +117,16 @@ func startProc(ctx context.Context, dir string, spec ProcSpec) (*proc, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, path, args...) //nolint: gosec // the binary under test, by flag
-	cmd.Env = append(os.Environ(), spec.Env...)
+	cmd.Env = childEnv(spec.Env)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.Cancel = func() error { return kill(cmd) }
+	// A cancelled run (SIGINT included) asks politely; WaitDelay kills a child
+	// that has not gone five seconds later.
+	cmd.Cancel = func() error {
+		terminate(cmd)
+
+		return nil
+	}
 	cmd.WaitDelay = 5 * time.Second
 	setProcAttrs(cmd)
 
@@ -121,8 +155,14 @@ const noPin = -1
 // seconds. It waits for them, and is safe to call more than once.
 func (r *Runner) Close() error {
 	r.once.Do(func() {
+		// Only children still running are signalled: a process that has exited
+		// and been reaped may have had its id reused by someone else's.
 		for _, p := range r.procs {
-			terminate(p.cmd)
+			select {
+			case <-p.exited:
+			default:
+				terminate(p.cmd)
+			}
 		}
 
 		for _, p := range r.procs {
@@ -147,6 +187,10 @@ func (r *Runner) WaitReady(ctx context.Context, addrs []string, timeout time.Dur
 		for _, p := range r.procs {
 			select {
 			case <-p.exited:
+				if p.err == nil {
+					return fmt.Errorf("%s %w: %s", p.spec.Name, errExitedEarly, tail(p.log, 2048))
+				}
+
 				return fmt.Errorf("%s %w: %w: %s", p.spec.Name, errExitedEarly, p.err, tail(p.log, 2048))
 			default:
 			}
