@@ -16,10 +16,11 @@ compared with what came before it rather than with memory.
 
 | Benchmark | Reports |
 |---|---|
-| `BenchmarkDoor/<door>/<download\|upload>/conns=<1\|16>` | MB/s; B/op and allocs/op |
+| `BenchmarkDoor/<door>/<download\|upload>/conns=<1\|16\|64>` | MB/s; B/op and allocs/op |
 | `BenchmarkDoor/dd/one-user-16-conns`, `dd/16-users` | the cost of one user's shared counters and bucket |
 | `BenchmarkDoor/dd/cap-far-above` | the speed limiter's cost when it never waits |
-| `BenchmarkDoorRoundTrip/<door>` | added latency: `p50-µs`, `p99-µs`, `p999-µs` |
+| `BenchmarkDoorRoundTrip/<door>` | a 100-byte round trip: `p50-µs`, `p99-µs`, `p999-µs` |
+| `BenchmarkDoorRoundTrip/direct` | the same with no proxy: a door's added latency is its figure minus this |
 | `BenchmarkDoorHandshake/<door>` | one whole connection, set up and torn down |
 | `BenchmarkDoorIdle/<door>` | `heap-B/conn`, `stack-B/conn`, `goroutines/conn` for 1,000 open streams |
 
@@ -29,7 +30,10 @@ so the CPU and allocations measured are the proxy's.
 
 Doors: `ee-record` (FakeTLS with the doppelganger pacing as shipped),
 `ee-burst` (the same with `shaping = "burst"`), `ee-unpaced` (the same with
-`Ganger.Unpace`), `dd`, `plain`.
+`Ganger.Unpace`), `dd`, `plain`, and `web`: the WEB relay in front of the
+proxy, in `internal/webrelay/chain_bench_test.go` (run it with
+`./internal/webrelay/` beside `./mtglib/`). Its figures include the test
+client's own WebSocket work.
 
 Take latency numbers on Linux: Go's clock on Windows advances in steps of
 about half a millisecond.

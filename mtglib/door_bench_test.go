@@ -305,7 +305,7 @@ func manyUsers(n int) []string {
 func BenchmarkDoor(b *testing.B) {
 	for _, dc := range doorCases() {
 		for _, dir := range []string{"download", "upload"} {
-			for _, conns := range []int{1, 16} {
+			for _, conns := range []int{1, 16, 64} {
 				b.Run(fmt.Sprintf("%s/%s/conns=%d", dc.name, dir, conns), func(b *testing.B) {
 					benchDoorBulk(b, dc, dir == "download", repeatUser("alice", conns), nil)
 				})
@@ -394,6 +394,61 @@ func BenchmarkDoorRoundTrip(b *testing.B) {
 			reportPercentiles(b, samples)
 		})
 	}
+
+	// The same round trip with no proxy at all: a door's added latency is its
+	// figure minus this one.
+	b.Run("direct", func(b *testing.B) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(b, err)
+
+		b.Cleanup(func() { listener.Close() }) //nolint: errcheck
+
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			defer conn.Close() //nolint: errcheck
+
+			buf := make([]byte, size)
+
+			for {
+				if _, err := io.ReadFull(conn, buf); err != nil {
+					return
+				}
+
+				if _, err := conn.Write(buf); err != nil {
+					return
+				}
+			}
+		}()
+
+		client, err := net.Dial("tcp", listener.Addr().String())
+		require.NoError(b, err)
+
+		b.Cleanup(func() { client.Close() }) //nolint: errcheck
+
+		message := make([]byte, size)
+		answer := make([]byte, size)
+		samples := make([]time.Duration, 0, 1<<16)
+
+		for b.Loop() {
+			started := time.Now()
+
+			if _, err := client.Write(message); err != nil {
+				b.Fatal(err)
+			}
+
+			if _, err := io.ReadFull(client, answer); err != nil {
+				b.Fatal(err)
+			}
+
+			samples = append(samples, time.Since(started))
+		}
+
+		reportPercentiles(b, samples)
+	})
 }
 
 func reportPercentiles(b *testing.B, samples []time.Duration) {
