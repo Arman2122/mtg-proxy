@@ -33,6 +33,18 @@ func parseHeader(h []byte) (frameType Type, streamID, payloadLen uint32) {
 // an empty batch is malformed, so that judgement is left to the session layer,
 // which knows whether it just answered a poll or received a spurious wakeup.
 func (l Limits) DecodeBatch(b []byte, dir Direction) ([]Frame, error) {
+	return l.decodeBatch(b, dir, true)
+}
+
+// DecodeBatchAliased is DecodeBatch without the copies: every payload is a
+// slice of b, capped at its own end. It is for a caller that never writes b
+// again -- the relay's read loop, whose carrier hands out a fresh message per
+// read -- and it refuses exactly what DecodeBatch refuses.
+func (l Limits) DecodeBatchAliased(b []byte, dir Direction) ([]Frame, error) {
+	return l.decodeBatch(b, dir, false)
+}
+
+func (l Limits) decodeBatch(b []byte, dir Direction, copyPayloads bool) ([]Frame, error) {
 	var (
 		frames []Frame
 		offset int
@@ -75,9 +87,14 @@ func (l Limits) DecodeBatch(b []byte, dir Direction) ([]Frame, error) {
 		}
 
 		frame := Frame{Type: frameType, StreamID: streamID}
-		if length > 0 {
+
+		switch {
+		case length == 0:
+		case copyPayloads:
 			frame.Payload = make([]byte, length)
 			copy(frame.Payload, b[offset:offset+length])
+		default:
+			frame.Payload = b[offset : offset+length : offset+length]
 		}
 
 		offset += length

@@ -191,7 +191,10 @@ func (s *session) readLoop() error {
 			continue
 		}
 
-		frames, err := s.limits.DecodeBatch(message, frame.ClientToRelay)
+		// The carrier hands out a fresh message per read and never writes it
+		// again, so DATA payloads can be slices of it: queued for their
+		// backends and written from there, with no copy in between.
+		frames, err := s.limits.DecodeBatchAliased(message, frame.ClientToRelay)
 		if err != nil {
 			return err
 		}

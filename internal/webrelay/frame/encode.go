@@ -18,21 +18,26 @@ func (f Frame) appendTo(dst []byte, lim Limits, dir Direction) ([]byte, error) {
 		return dst, err
 	}
 
-	// Safe: validate bounded the id at MaxStreamID, so the u24 field holds it.
-	header := [HeaderSize]byte{
-		byte(f.Type),
-		byte(f.StreamID >> 16), //nolint:gosec // validate bounded the id at MaxStreamID
-		byte(f.StreamID >> 8),  //nolint:gosec // same
-		byte(f.StreamID),       //nolint:gosec // same
-	}
-	// Safe: validate bounded the length at lim's payload cap, itself at most
-	// MaxPayloadSize.
-	binary.BigEndian.PutUint32(header[4:], uint32(len(f.Payload))) //nolint:gosec // bounded by validate
+	var header [HeaderSize]byte
+
+	f.putHeader(header[:])
 
 	dst = append(dst, header[:]...)
 	dst = append(dst, f.Payload...)
 
 	return dst, nil
+}
+
+// putHeader writes f's 8-byte header into dst. f has passed validate.
+func (f Frame) putHeader(dst []byte) {
+	// Safe: validate bounded the id at MaxStreamID, so the u24 field holds it.
+	dst[0] = byte(f.Type)
+	dst[1] = byte(f.StreamID >> 16) //nolint:gosec // validate bounded the id at MaxStreamID
+	dst[2] = byte(f.StreamID >> 8)  //nolint:gosec // same
+	dst[3] = byte(f.StreamID)       //nolint:gosec // same
+	// Safe: validate bounded the length at the payload cap, itself at most
+	// MaxPayloadSize.
+	binary.BigEndian.PutUint32(dst[4:HeaderSize], uint32(len(f.Payload))) //nolint:gosec // bounded by validate
 }
 
 // EncodeForClient encodes one relay-to-client frame on its own -- the shape the
@@ -76,6 +81,75 @@ func (l Limits) EncodeBatch(dst []byte, frames []Frame, dir Direction) ([]byte, 
 	}
 
 	return append(dst, out...), nil
+}
+
+// inlinePayload is the largest payload BatchVectors copies beside its header
+// rather than giving it a vector of its own: WINDOW's four bytes, CLOSE's none.
+// A batch of thousands of control frames is then a handful of vectors, not
+// thousands -- a single writev takes at most 1,024 and would be split.
+const inlinePayload = 64
+
+// BatchVectors is EncodeBatch as write vectors, for a single vectored write
+// of the batch: no batch buffer, and no copy of any DATA payload. Headers, and
+// payloads of at most inlinePayload bytes, are written into scratch, which is
+// grown once to fit; every larger payload is a vector of its own, the frame's
+// own slice. It appends to vecs and returns vecs and scratch for reuse, and
+// refuses exactly what EncodeBatch refuses, leaving vecs as it was.
+//
+// The vectors alias scratch and the frames' payloads: they are valid until
+// either is written again.
+func (l Limits) BatchVectors(vecs [][]byte, scratch []byte, frames []Frame, dir Direction) ([][]byte, []byte, error) {
+	if len(frames) > MaxFramesPerBatch {
+		return vecs, scratch, fmt.Errorf("%w: %d, cap %d", ErrTooManyFrames, len(frames), MaxFramesPerBatch)
+	}
+
+	total := encodedLen(frames)
+	if budget := l.batchBytes(); total > budget {
+		return vecs, scratch, fmt.Errorf("%w: %d bytes, budget %d", ErrBatchTooLarge, total, budget)
+	}
+
+	need := 0
+
+	for i := range frames {
+		if err := frames[i].validate(l, dir); err != nil {
+			return vecs, scratch, fmt.Errorf("frame %d: %w", i, err)
+		}
+
+		need += HeaderSize
+		if len(frames[i].Payload) <= inlinePayload {
+			need += len(frames[i].Payload)
+		}
+	}
+
+	if cap(scratch) < need {
+		scratch = make([]byte, need)
+	}
+
+	scratch = scratch[:need]
+
+	// run is where the stretch of scratch not yet in a vector starts: headers
+	// and inline payloads lie contiguous, so one vector carries them all.
+	run, at := 0, 0
+
+	for i := range frames {
+		frames[i].putHeader(scratch[at : at+HeaderSize])
+		at += HeaderSize
+
+		if payload := frames[i].Payload; len(payload) <= inlinePayload {
+			at += copy(scratch[at:], payload)
+
+			continue
+		}
+
+		vecs = append(vecs, scratch[run:at:at], frames[i].Payload)
+		run = at
+	}
+
+	if at > run {
+		vecs = append(vecs, scratch[run:at:at])
+	}
+
+	return vecs, scratch, nil
 }
 
 func encodedLen(frames []Frame) int64 {

@@ -28,16 +28,24 @@ func decodeBothWith(t *testing.T, lim frame.Limits, b []byte, dir frame.Directio
 	fromBytes, errBytes := lim.DecodeBatch(b, dir)
 	fromReader, errReader := lim.DecodeBatchFrom(bytes.NewReader(b), dir)
 
+	// The relay's own decoder slices its message rather than copying; it gets
+	// a copy of b, so its frames cannot be mistaken for the others'.
+	fromAliased, errAliased := lim.DecodeBatchAliased(bytes.Clone(b), dir)
+
 	if errBytes != nil {
 		require.Error(t, errReader, "DecodeBatch rejected this input, DecodeBatchFrom accepted it")
+		require.EqualError(t, errAliased, errBytes.Error(), "DecodeBatchAliased must refuse exactly as DecodeBatch does")
 		require.Nil(t, fromBytes, "a failed decode must hand back no frames at all")
 		require.Nil(t, fromReader, "a failed decode must hand back no frames at all")
+		require.Nil(t, fromAliased, "a failed decode must hand back no frames at all")
 
 		return nil, errBytes
 	}
 
 	require.NoError(t, errReader, "DecodeBatch accepted this input, DecodeBatchFrom rejected it")
+	require.NoError(t, errAliased, "DecodeBatch accepted this input, DecodeBatchAliased rejected it")
 	require.Equal(t, fromBytes, fromReader, "the two decoders disagree on the frames")
+	require.Equal(t, fromBytes, fromAliased, "the aliasing decoder disagrees on the frames")
 
 	return fromBytes, nil
 }
