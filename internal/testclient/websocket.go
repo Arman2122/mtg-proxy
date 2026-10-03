@@ -31,6 +31,7 @@ var errUpgradeRefused = errors.New("the carrier upgrade was refused")
 // bridge script does.
 func dialWebSocket(
 	ctx context.Context, address, path, subprotocol, origin, forwardedFor string, timeout time.Duration,
+	readBuffer int,
 ) (net.Conn, *bufio.Reader, error) {
 	conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", address)
 	if err != nil {
@@ -64,7 +65,7 @@ func dialWebSocket(
 		return nil, nil, fmt.Errorf("cannot set the upgrade deadline: %w", err)
 	}
 
-	reader := bufio.NewReaderSize(conn, 256<<10)
+	reader := bufio.NewReaderSize(conn, readBuffer)
 
 	if _, err := io.WriteString(conn, request.String()); err != nil {
 		conn.Close() //nolint: errcheck

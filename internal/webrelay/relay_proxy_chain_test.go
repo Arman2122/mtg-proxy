@@ -2,6 +2,7 @@ package webrelay
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
+	"github.com/Arman2122/mtg-proxy/events"
 	"github.com/Arman2122/mtg-proxy/internal/proxyprotocol"
 	"github.com/Arman2122/mtg-proxy/internal/testclient"
 	"github.com/Arman2122/mtg-proxy/ipblocklist"
@@ -139,29 +141,81 @@ type chain struct {
 	// store is the relay's own session table, and the authority on how many
 	// sessions are live -- the counters deliberately keep no such gauge.
 	store *store
+
+	// upstreams hands over, in arrival order, each connection the proxy made
+	// to Telegram, when the chain was built with telegramHandover.
+	upstreams <-chan net.Conn
+}
+
+// telegramMode is what the stand-in Telegram does with a connection.
+type telegramMode int
+
+const (
+	// telegramEcho decrypts and echoes: what the chain tests assert through.
+	telegramEcho telegramMode = iota
+
+	// telegramHandover reads the proxy's 64-byte handshake and hands the raw
+	// socket to the test, which then pushes or sinks bytes itself without ever
+	// decrypting, so the cipher work a benchmark measures is the proxy's.
+	telegramHandover
+)
+
+// chainOptions shape a chain beyond its defaults.
+type chainOptions struct {
+	limits   map[string]mtglib.SecretLimits
+	telegram telegramMode
+
+	// quiet discards the proxy's events instead of recording client IPs, for
+	// benchmarks that make thousands of connections.
+	quiet bool
+
+	// idleTimeout is the proxy's; default 2s, which the churn test needs.
+	idleTimeout time.Duration
 }
 
 // newChain stands up Telegram (an echo), a real proxy on a PROXY-protocol dd
 // listener, and a relay origin whose backend is that listener. It is the binary
 // minus the sockets the OS would assign in production and plus a stand-in for
 // Telegram; nothing about the path between the client and the proxy is faked.
-func newChain(t *testing.T) *chain {
-	t.Helper()
+func newChain(tb testing.TB) *chain {
+	tb.Helper()
 
-	return newChainWithLimits(t, nil)
+	return newChainWith(tb, chainOptions{})
 }
 
 // newChainWithLimits is newChain with per-user limits on the proxy, for the
 // one thing the relay must inherit from the proxy without knowing it: a
 // user's speed limit, enforced on the proxy's side of the loopback hop and
 // felt by the browser through the relay's own flow control.
-func newChainWithLimits(t *testing.T, limits map[string]mtglib.SecretLimits) *chain {
+func newChainWithLimits(tb testing.TB, limits map[string]mtglib.SecretLimits) *chain {
+	tb.Helper()
+
+	return newChainWith(tb, chainOptions{limits: limits})
+}
+
+// newChainWith is newChain shaped by o.
+func newChainWith(t testing.TB, o chainOptions) *chain {
 	t.Helper()
 
-	upstream := startEchoTelegram(t)
+	var (
+		upstream  string
+		upstreams <-chan net.Conn
+	)
+
+	switch o.telegram {
+	case telegramEcho:
+		upstream = startEchoTelegram(t)
+	case telegramHandover:
+		upstream, upstreams = startHandoverTelegram(t)
+	}
 
 	network := &chainNetwork{upstream: upstream}
 	clientIPs := &clientIPRecorder{}
+
+	var eventStream mtglib.EventStream = clientIPs
+	if o.quiet {
+		eventStream = events.NewNoopStream()
+	}
 
 	// One key in three costumes: the client sends its dd handshake, the proxy
 	// matches the same key as a dd secret, and the relay derives the WEB
@@ -175,10 +229,10 @@ func newChainWithLimits(t *testing.T, limits map[string]mtglib.SecretLimits) *ch
 		AntiReplayCache: antireplay.NewNoop(),
 		IPBlocklist:     ipblocklist.NewNoop(),
 		IPAllowlist:     allowEveryIP{},
-		EventStream:     clientIPs,
+		EventStream:     eventStream,
 		Logger:          logger.NewNoopLogger(),
 		Secrets:         map[string]mtglib.Secret{"web": {Mode: mtglib.SecretModeDD, Key: key}},
-		SecretLimits:    limits,
+		SecretLimits:    o.limits,
 		TrackClientIPs:  true,
 		// Short, because the churn test measures what is left standing after a
 		// client goes away, and the default is five minutes.
@@ -189,7 +243,7 @@ func newChainWithLimits(t *testing.T, limits map[string]mtglib.SecretLimits) *ch
 		// more to say. The idle timeout is what ends that wait, so it is the
 		// real bound on how long a departed client's connections live, and the
 		// test has to be able to outlast it to tell a slow teardown from a leak.
-		IdleTimeout: 2 * time.Second,
+		IdleTimeout: cmp.Or(o.idleTimeout, 2*time.Second),
 	})
 	require.NoError(t, err)
 	t.Cleanup(proxy.Shutdown)
@@ -257,6 +311,7 @@ func newChainWithLimits(t *testing.T, limits map[string]mtglib.SecretLimits) *ch
 		network:    network,
 		clientIPs:  clientIPs,
 		store:      origin.store,
+		upstreams:  upstreams,
 	}
 }
 
@@ -265,7 +320,7 @@ func newChainWithLimits(t *testing.T, limits map[string]mtglib.SecretLimits) *ch
 // plaintext back through the same de/encrypting wrapper. Echo is enough --
 // proving a byte the client sent comes back to the client is proof it reached
 // here and returned, through both obfuscation legs and both relay directions.
-func startEchoTelegram(t *testing.T) string {
+func startEchoTelegram(t testing.TB) string {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -304,6 +359,41 @@ func startEchoTelegram(t *testing.T) string {
 	}()
 
 	return listener.Addr().String()
+}
+
+// startHandoverTelegram is a stand-in Telegram for benchmarks: it reads the
+// 64-byte handshake the proxy sends on a direct data-centre connection, without
+// decrypting it, and hands the raw socket over.
+func startHandoverTelegram(tb testing.TB) (string, <-chan net.Conn) {
+	tb.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(tb, err)
+	tb.Cleanup(func() { listener.Close() }) //nolint: errcheck
+
+	handed := make(chan net.Conn, 4096)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			go func(c net.Conn) {
+				var handshake [64]byte
+				if _, err := io.ReadFull(c, handshake[:]); err != nil {
+					c.Close() //nolint: errcheck
+
+					return
+				}
+
+				handed <- c
+			}(conn)
+		}
+	}()
+
+	return listener.Addr().String(), handed
 }
 
 // openStream walks the whole client dance -- bridge page, session bootstrap,

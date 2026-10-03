@@ -63,6 +63,11 @@ type WebOptions struct {
 	// ResetOnClose makes closing the carrier send a reset, so a run that opens
 	// thousands of sessions leaves no TIME_WAIT behind.
 	ResetOnClose bool
+
+	// ReadBufferSize is the carrier's read buffer. Default 256 KiB, for bulk
+	// transfers; a run that holds thousands of idle sessions sets it small, so
+	// the memory it measures is the relay's and not the client's.
+	ReadBufferSize int
 }
 
 // WebSession is one WEB proxy session: a bootstrap spent on a session, and the
@@ -92,6 +97,10 @@ func OpenWebSession(ctx context.Context, baseURL, capability string, o WebOption
 		return nil, fmt.Errorf("%q: %w", baseURL, errNotHTTP)
 	}
 
+	if o.ReadBufferSize == 0 {
+		o.ReadBufferSize = 256 << 10
+	}
+
 	if o.DialTimeout == 0 {
 		o.DialTimeout = 5 * time.Second
 	}
@@ -109,7 +118,7 @@ func OpenWebSession(ctx context.Context, baseURL, capability string, o WebOption
 	}
 
 	conn, reader, err := dialWebSocket(ctx, strings.TrimPrefix(baseURL, "http://"), webCarrierPath,
-		webSubprotocol+token, o.Origin, o.ForwardedFor, o.DialTimeout)
+		webSubprotocol+token, o.Origin, o.ForwardedFor, o.DialTimeout, o.ReadBufferSize)
 	if err != nil {
 		// The session exists; without a carrier it would hold a slot against
 		// the relay's session limit for its reconnect grace. Give it back.
@@ -323,7 +332,9 @@ func (s *WebSession) writeControl(opcode byte, payload []byte) error {
 // readLoop owns the carrier's read side: pings are answered, relay batches are
 // decoded and handed to their streams, and any error fails them all.
 func (s *WebSession) readLoop() {
-	buf := make([]byte, 256<<10)
+	// Grown to the largest frame seen rather than allocated up front: an idle
+	// session holds only what it has needed.
+	var buf []byte
 
 	// Whatever ends the loop ends the carrier: the socket is closed here so
 	// neither end is left holding goroutines for a carrier nobody reads.
@@ -331,6 +342,10 @@ func (s *WebSession) readLoop() {
 
 	for {
 		opcode, payload, err := readServerFrame(s.r, buf)
+		if cap(payload) > cap(buf) {
+			buf = payload[:0]
+		}
+
 		if err != nil {
 			// A carrier that ends without a close frame ended mid-stream as far
 			// as every stream on it is concerned: never the io.EOF of a clean end.

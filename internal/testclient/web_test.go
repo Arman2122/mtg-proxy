@@ -6,12 +6,15 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,7 +48,7 @@ func relayStandIn(t *testing.T, opts ws.Options, serve func(*ws.Conn)) (net.Conn
 	t.Cleanup(server.Close)
 
 	conn, reader, err := dialWebSocket(t.Context(), strings.TrimPrefix(server.URL, "http://"), "/",
-		testSubprotocol, "example.com", "", 5*time.Second)
+		testSubprotocol, "example.com", "", 5*time.Second, 256<<10)
 	require.NoError(t, err)
 
 	t.Cleanup(func() { conn.Close() }) //nolint: errcheck
@@ -353,7 +356,9 @@ func TestARelayOverrunningItsCreditFailsTheSession(t *testing.T) {
 		}
 	})
 
-	stream, err := sessionOver(conn, reader).OpenStream(1)
+	session := sessionOver(conn, reader)
+
+	stream, err := session.OpenStream(1)
 	require.NoError(t, err)
 
 	r := <-opened
@@ -364,6 +369,15 @@ func TestARelayOverrunningItsCreditFailsTheSession(t *testing.T) {
 	}
 
 	require.NoError(t, r.Write(relayFrames(t, frame.NewData(1, []byte{1}))), "one byte past the window")
+
+	// Nothing is read until the client has judged the extra byte: reading 1 MiB
+	// grants more credit, and the byte would then be within it.
+	require.Eventually(t, func() bool {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+
+		return session.err != nil
+	}, 5*time.Second, 5*time.Millisecond, "the overrun never failed the session")
 
 	require.NoError(t, stream.SetReadDeadline(time.Now().Add(5*time.Second)))
 
@@ -419,8 +433,92 @@ func TestAWrongAcceptKeyIsRefused(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	_, _, err := dialWebSocket(context.Background(), strings.TrimPrefix(server.URL, "http://"), "/",
-		testSubprotocol, "example.com", "", 5*time.Second)
+		testSubprotocol, "example.com", "", 5*time.Second, 256<<10)
 	require.ErrorIs(t, err, errUpgradeRefused)
+}
+
+// bareUpgrader answers a WebSocket upgrade by hand and then holds the socket
+// without reading it, so a heap measurement counts the client's side alone.
+func bareUpgrader(t *testing.T) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	var (
+		mu   sync.Mutex
+		held []net.Conn
+	)
+
+	t.Cleanup(func() {
+		listener.Close() //nolint: errcheck
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		for _, c := range held {
+			c.Close() //nolint: errcheck
+		}
+	})
+
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			request, err := http.ReadRequest(bufio.NewReader(c))
+			if err != nil {
+				c.Close() //nolint: errcheck
+
+				continue
+			}
+
+			fmt.Fprintf(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"+
+				"Sec-WebSocket-Accept: %s\r\nSec-WebSocket-Protocol: %s\r\n\r\n",
+				acceptKey(request.Header.Get("Sec-WebSocket-Key")), testSubprotocol)
+
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+
+	return listener.Addr().String()
+}
+
+// An idle session with a small read buffer costs the client almost nothing.
+// The idle benchmarks count every byte in the process, and a client that
+// allocated its buffers up front would be measured as the relay's cost.
+func TestAnIdleSessionHoldsLittleMemory(t *testing.T) { //nolint: paralleltest // reads the heap
+	const sessions = 64
+
+	addr := bareUpgrader(t)
+
+	var before, after runtime.MemStats
+
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	held := make([]*WebSession, 0, sessions)
+
+	for range sessions {
+		conn, reader, err := dialWebSocket(t.Context(), addr, "/", testSubprotocol, "example.com", "", 5*time.Second, 4<<10)
+		require.NoError(t, err)
+
+		held = append(held, sessionOver(conn, reader))
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+
+	perSession := (int64(after.HeapAlloc) - int64(before.HeapAlloc)) / sessions //nolint: gosec // heap sizes
+	assert.Less(t, perSession, int64(16<<10), "an idle session holds %d bytes", perSession)
+
+	for _, s := range held {
+		s.Close() //nolint: errcheck
+	}
 }
 
 var _ = errors.New
