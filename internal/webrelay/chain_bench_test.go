@@ -258,8 +258,10 @@ func BenchmarkDoorHandshake(b *testing.B) {
 		c := benchChain(b)
 
 		for b.Loop() {
+			// A small read buffer: the client's own 256 KiB default would
+			// otherwise be most of what this reports per connection.
 			session, err := testclient.OpenWebSession(b.Context(), c.server.URL, c.capability.String(),
-				testclient.WebOptions{Origin: originHost, ResetOnClose: true})
+				testclient.WebOptions{Origin: originHost, ResetOnClose: true, ReadBufferSize: 4 << 10})
 			if err != nil {
 				b.Fatal(err)
 			}
