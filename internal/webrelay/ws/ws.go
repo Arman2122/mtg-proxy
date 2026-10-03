@@ -37,6 +37,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -293,7 +294,10 @@ func (c *Conn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 // inside it and never surface: a ping is ponged, a pong marks liveness, a close
 // ends the connection with [ErrClosed].
 //
-// The returned slice is freshly allocated, so the caller may keep it.
+// The returned slice is freshly allocated and never written again, so the
+// caller may keep it, and slices of it, for as long as it likes. A message in
+// one frame -- what a browser sends -- costs that one allocation and nothing
+// else: it is read straight into the slice returned.
 func (c *Conn) Read() ([]byte, error) {
 	var (
 		message   []byte
@@ -331,13 +335,23 @@ func (c *Conn) Read() ([]byte, error) {
 
 		assembled = true
 
-		chunk := make([]byte, header.length)
-		if _, err := io.ReadFull(c.reader, chunk); err != nil {
+		// The frame's payload goes straight into the message: into a buffer
+		// of exactly its size for the first frame, onto the end of the grown
+		// message for a continuation.
+		start := len(message)
+		if message == nil {
+			message = make([]byte, header.length)
+		} else {
+			message = slices.Grow(message, int(header.length))[:start+int(header.length)]
+		}
+
+		if _, err := io.ReadFull(c.reader, message[start:]); err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrClosed, err)
 		}
 
-		unmask(chunk, header.mask, len(message))
-		message = append(message, chunk...)
+		// Every frame is masked from its own first byte (RFC 6455 §5.3), not
+		// from where it lands in the message.
+		unmask(message[start:], header.mask, 0)
 
 		if header.fin {
 			return message, nil
@@ -458,8 +472,7 @@ func (c *Conn) readHeader() (frameHeader, error) {
 
 		header, err := c.decodeHeader()
 
-		var netErr net.Error
-		if err != nil && errors.As(err, &netErr) && netErr.Timeout() {
+		if err != nil && isTimeout(err) {
 			if c.pinged {
 				return frameHeader{}, fmt.Errorf("%w: silent for two idle periods", ErrClosed)
 			}
@@ -479,11 +492,32 @@ func (c *Conn) readHeader() (frameHeader, error) {
 	}
 }
 
-func (c *Conn) decodeHeader() (frameHeader, error) {
-	var first [2]byte
+// isTimeout reports a read that ended at its deadline. It is its own function
+// so the error target escapes only on the error path, not on every header.
+func isTimeout(err error) bool {
+	var netErr net.Error
 
-	if _, err := io.ReadFull(c.reader, first[:]); err != nil {
-		return frameHeader{}, fmt.Errorf("%w: %w", ErrClosed, err)
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// peek returns the next n header bytes from the read buffer and consumes them.
+// The slice is the buffer's own memory, valid until the next read: a header
+// costs no allocation.
+func (c *Conn) peek(n int) ([]byte, error) {
+	b, err := c.reader.Peek(n)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrClosed, err)
+	}
+
+	c.reader.Discard(n) //nolint: errcheck // n bytes were just peeked
+
+	return b, nil
+}
+
+func (c *Conn) decodeHeader() (frameHeader, error) {
+	first, err := c.peek(2)
+	if err != nil {
+		return frameHeader{}, err
 	}
 
 	header := frameHeader{
@@ -507,26 +541,24 @@ func (c *Conn) decodeHeader() (frameHeader, error) {
 
 	switch length {
 	case 126:
-		var extended [2]byte
-
-		if _, err := io.ReadFull(c.reader, extended[:]); err != nil {
-			return frameHeader{}, fmt.Errorf("%w: %w", ErrClosed, err)
+		extended, err := c.peek(2)
+		if err != nil {
+			return frameHeader{}, err
 		}
 
-		length = int64(binary.BigEndian.Uint16(extended[:]))
+		length = int64(binary.BigEndian.Uint16(extended))
 
 		// The 16-bit form may not carry a length the 7-bit form could hold.
 		if length <= maxControlPayload {
 			return frameHeader{}, fmt.Errorf("%w: non-minimal length", ErrProtocol)
 		}
 	case 127:
-		var extended [8]byte
-
-		if _, err := io.ReadFull(c.reader, extended[:]); err != nil {
-			return frameHeader{}, fmt.Errorf("%w: %w", ErrClosed, err)
+		extended, err := c.peek(8)
+		if err != nil {
+			return frameHeader{}, err
 		}
 
-		unsigned := binary.BigEndian.Uint64(extended[:])
+		unsigned := binary.BigEndian.Uint64(extended)
 
 		// The high bit must be zero, and the 64-bit form may not carry a length
 		// the 16-bit form could hold.
@@ -559,9 +591,12 @@ func (c *Conn) decodeHeader() (frameHeader, error) {
 
 	header.length = length
 
-	if _, err := io.ReadFull(c.reader, header.mask[:]); err != nil {
-		return frameHeader{}, fmt.Errorf("%w: %w", ErrClosed, err)
+	mask, err := c.peek(4)
+	if err != nil {
+		return frameHeader{}, err
 	}
+
+	copy(header.mask[:], mask)
 
 	return header, nil
 }
@@ -569,8 +604,26 @@ func (c *Conn) decodeHeader() (frameHeader, error) {
 // unmask applies the frame mask in place. offset is the number of payload bytes
 // already consumed from this frame, which is zero everywhere today but keeps the
 // function correct if a caller ever streams a frame in pieces.
+//
+// It works eight bytes at a time: the mask, rotated to offset, repeated into a
+// 64-bit word. The stride is a multiple of four, so the tail continues with
+// the same rotated mask, a byte at a time.
 func unmask(payload []byte, mask [4]byte, offset int) {
-	for i := range payload {
-		payload[i] ^= mask[(i+offset)%4]
+	var rotated [4]byte
+	for i := range rotated {
+		rotated[i] = mask[(i+offset)%4]
+	}
+
+	word := uint64(binary.LittleEndian.Uint32(rotated[:]))
+	word |= word << 32
+
+	i := 0
+
+	for ; i+8 <= len(payload); i += 8 {
+		binary.LittleEndian.PutUint64(payload[i:], binary.LittleEndian.Uint64(payload[i:])^word)
+	}
+
+	for ; i < len(payload); i++ {
+		payload[i] ^= rotated[i%4]
 	}
 }
