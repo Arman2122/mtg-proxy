@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +39,8 @@ func run() error {
 		basePort  = flag.Int("base-port", 47000, fmt.Sprintf("first of the loopback ports the run uses (base..base+%d)", portSpan))
 		shapings  = flag.String("shaping", "record,burst", `the ee door's shapings, each its own process: "record", "burst" or both`)
 		dir       = flag.String("dir", "", "where configs and logs go; a fresh temporary directory if empty")
-		scenarios = flag.String("scenarios", "all", "the scenarios to run, comma-separated: bulk, handshake, latency, idle, contention, limiter, slow-reader")
+		scenarios = flag.String("scenarios", "all", "the scenarios to run, comma-separated: bulk, handshake, latency, idle, contention, limiter, slow-reader, caps, accounting")
+		doorList  = flag.String("doors", "all", "the doors to run, comma-separated: ee, dd, plain, web")
 		warmup    = flag.Duration("warmup", 2*time.Second, "each run's warm-up, whose figures are dropped")
 		measure   = flag.Duration("measure", 5*time.Second, "each run's measured stretch")
 		runs      = flag.Int("runs", 3, "runs per cell; the report gives their median and range")
@@ -59,6 +61,11 @@ func run() error {
 	}
 
 	selected, err := selectScenarios(*scenarios)
+	if err != nil {
+		return err
+	}
+
+	doors, err := selectDoors(*doorList)
 	if err != nil {
 		return err
 	}
@@ -87,9 +94,13 @@ func run() error {
 
 	if *smoke {
 		for _, shaping := range shapingList {
-			setup, err := standingSetup(workDir, shaping, *basePort, false)
+			setup, err := standingSetup(workDir, shaping, *basePort, doors, false)
 			if err != nil {
 				return err
+			}
+
+			if len(setup.Doors) == 0 {
+				continue
 			}
 
 			if err := runSmoke(ctx, setup, binary, *pin); err != nil {
@@ -103,9 +114,13 @@ func run() error {
 	report := Report{Started: time.Now(), Binary: binary, Pin: *pin, Options: opts, Limits: limits(*pin)}
 
 	for _, shaping := range shapingList {
-		setup, err := standingSetup(workDir, shaping, *basePort, true)
+		setup, err := standingSetup(workDir, shaping, *basePort, doors, true)
 		if err != nil {
 			return err
+		}
+
+		if len(setup.Doors) == 0 {
+			continue
 		}
 
 		stack, err := StartStack(ctx, setup, binary, *pin)
@@ -139,7 +154,7 @@ func run() error {
 // standingSetup is the configuration of one shaping's stack. The record stack
 // serves every door and, for the scenarios, the capped user and the crowd; the
 // burst stack serves ee alone, the one door shaping changes.
-func standingSetup(workDir, shaping string, basePort int, scenarios bool) (Setup, error) {
+func standingSetup(workDir, shaping string, basePort int, doors []Door, scenarios bool) (Setup, error) {
 	token, err := NewAPIToken()
 	if err != nil {
 		return Setup{}, err
@@ -163,6 +178,12 @@ func standingSetup(workDir, shaping string, basePort int, scenarios bool) (Setup
 		setup.Doors = []Door{DoorEE}
 	}
 
+	setup.Doors = slices.DeleteFunc(setup.Doors, func(d Door) bool { return !slices.Contains(doors, d) })
+
+	if scenarios {
+		setup.Users = append(setup.Users, NewUser(acctUser))
+	}
+
 	if scenarios && shaping == shapingRecord {
 		setup.Users = append(setup.Users, NewUser(capped))
 		setup.Caps = map[string]Caps{capped: {Speed: "10GB"}}
@@ -170,9 +191,36 @@ func standingSetup(workDir, shaping string, basePort int, scenarios bool) (Setup
 		for i := range crowdSize {
 			setup.Users = append(setup.Users, NewUser(crowdName(i)))
 		}
+
+		for _, kind := range capKinds {
+			for _, mib := range capSizes {
+				setup.Users = append(setup.Users, NewUser(capUser(kind, mib)))
+				setup.Caps[capUser(kind, mib)] = capFor(kind, mib)
+			}
+		}
 	}
 
 	return setup, nil
+}
+
+// selectDoors picks doors from a comma-separated list, or all.
+func selectDoors(list string) ([]Door, error) {
+	if list == "" || list == "all" {
+		return AllDoors, nil
+	}
+
+	var doors []Door
+
+	for name := range strings.SplitSeq(list, ",") {
+		door := Door(strings.TrimSpace(name))
+		if !slices.Contains(AllDoors, door) {
+			return nil, fmt.Errorf("no door %q: want ee, dd, plain or web", name) //nolint: err113
+		}
+
+		doors = append(doors, door)
+	}
+
+	return doors, nil
 }
 
 // freshStacks starts stacks like setup's on the ports beside it, one at a time:

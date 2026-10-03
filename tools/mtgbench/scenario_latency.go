@@ -118,8 +118,8 @@ func handshakeScenario() scenario {
 			{Key: "conn/s", Title: "connections/s"},
 			{Key: "p50-ms", Title: "first byte p50 ms"},
 			{Key: "p99-ms", Title: "p99 ms"},
-			{Key: "fronted", Title: "fronted"},
-			{Key: "cover", Title: "at the cover"},
+			{Key: "fronted", Title: "fronted", Count: true},
+			{Key: "cover", Title: "at the cover", Count: true},
 		},
 		run: func(ctx context.Context, b *Bench) []Row {
 			rows := make([]Row, 0, len(b.doors()))
@@ -196,7 +196,7 @@ func latencyScenario() scenario {
 			{Key: "p50-us", Title: "p50 µs"},
 			{Key: "p99-us", Title: "p99 µs"},
 			{Key: "p999-us", Title: "p99.9 µs"},
-			{Key: "n", Title: "samples"},
+			{Key: "n", Title: "samples", Count: true},
 		},
 		run: func(ctx context.Context, b *Bench) []Row {
 			type target struct {

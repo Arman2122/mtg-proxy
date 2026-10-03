@@ -56,6 +56,9 @@ type Row struct {
 type Metric struct {
 	Key   string `json:"key"`
 	Title string `json:"title"`
+
+	// Count is a metric that is a number of things, shown without decimals.
+	Count bool `json:"count,omitempty"`
 }
 
 // Table is one scenario's results.
@@ -111,7 +114,7 @@ func (t Table) print(p *printer) {
 
 		cells := make([]string, 0, len(t.Metrics))
 		for _, m := range t.Metrics {
-			cells = append(cells, summarize(r.Samples, m.Key))
+			cells = append(cells, summarize(r.Samples, m))
 		}
 
 		p.printf("| %s | %s |\n", r.Label, strings.Join(cells, " | "))
@@ -122,11 +125,11 @@ func (t Table) print(p *printer) {
 
 // summarize is the median of key across samples, with the range when the runs
 // disagree: "200 (100–300)".
-func summarize(samples []Sample, key string) string {
+func summarize(samples []Sample, m Metric) string {
 	values := make([]float64, 0, len(samples))
 
 	for _, s := range samples {
-		if v, ok := s[key]; ok && !math.IsNaN(v) {
+		if v, ok := s[m.Key]; ok && !math.IsNaN(v) {
 			values = append(values, v)
 		}
 	}
@@ -142,17 +145,20 @@ func summarize(samples []Sample, key string) string {
 		median = (values[len(values)/2-1] + values[len(values)/2]) / 2
 	}
 
-	if values[0] == values[len(values)-1] {
-		return num(median)
+	format := num
+	if m.Count {
+		format = func(v float64) string { return fmt.Sprintf("%.0f", v) }
 	}
 
-	return fmt.Sprintf("%s (%s–%s)", num(median), num(values[0]), num(values[len(values)-1]))
+	if values[0] == values[len(values)-1] {
+		return format(median)
+	}
+
+	return fmt.Sprintf("%s (%s–%s)", format(median), format(values[0]), format(values[len(values)-1]))
 }
 
 func num(v float64) string {
 	switch a := math.Abs(v); {
-	case a == math.Trunc(a) && a < 1e6:
-		return fmt.Sprintf("%.0f", v)
 	case a >= 100:
 		return fmt.Sprintf("%.0f", v)
 	case a >= 10:
@@ -390,6 +396,7 @@ func allScenarios() []scenario {
 	return []scenario{
 		bulkScenario(), handshakeScenario(), latencyScenario(), idleScenario(),
 		contentionScenario(), limiterScenario(), slowReaderScenario(),
+		capsScenario(), accountingScenario(),
 	}
 }
 
