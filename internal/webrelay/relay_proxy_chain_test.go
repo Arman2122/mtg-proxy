@@ -1,20 +1,21 @@
 package webrelay
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/internal/proxyprotocol"
-	"github.com/Arman2122/mtg-proxy/internal/webrelay/frame"
+	"github.com/Arman2122/mtg-proxy/internal/testclient"
 	"github.com/Arman2122/mtg-proxy/ipblocklist"
 	"github.com/Arman2122/mtg-proxy/logger"
 	"github.com/Arman2122/mtg-proxy/mtglib"
@@ -305,149 +306,41 @@ func startEchoTelegram(t *testing.T) string {
 	return listener.Addr().String()
 }
 
-// streamConn is a net.Conn over one carrier stream: a Write becomes one DATA
-// frame, a Read returns the DATA payloads for this stream in order, skipping
-// the relay's flow-control frames. Obfuscation is an ordered byte stream, so
-// reframing is invisible to it -- which is the whole reason the relay can carry
-// a transport it does not understand.
-type streamConn struct {
-	client   *wsClient
-	streamID uint32
-	buf      []byte
-}
-
-// Write cuts at the relay pump's own read size, the way the bridge cuts at
-// frame boundaries. The relay would take a frame up to a megabyte inside the
-// four-megabyte initial window; the test's minimal WebSocket writer would
-// not, since it encodes lengths in sixteen bits.
-func (s *streamConn) Write(p []byte) (int, error) {
-	const piece = 32 << 10
-
-	for sent := 0; sent < len(p); sent += piece {
-		end := min(sent+piece, len(p))
-		s.client.send(frame.NewData(s.streamID, append([]byte(nil), p[sent:end]...)))
-	}
-
-	return len(p), nil
-}
-
-func (s *streamConn) Read(p []byte) (int, error) {
-	for len(s.buf) == 0 {
-		for _, f := range s.client.receive() {
-			if f.Type == frame.TypeData && f.StreamID == s.streamID {
-				s.buf = append(s.buf, f.Payload...)
-			}
-		}
-	}
-
-	n := copy(p, s.buf)
-	s.buf = s.buf[n:]
-
-	return n, nil
-}
-
-func (s *streamConn) Close() error                       { return s.client.conn.Close() }
-func (s *streamConn) LocalAddr() net.Addr                { return s.client.conn.LocalAddr() }
-func (s *streamConn) RemoteAddr() net.Addr               { return s.client.conn.RemoteAddr() }
-func (s *streamConn) SetDeadline(_ time.Time) error      { return nil }
-func (s *streamConn) SetReadDeadline(_ time.Time) error  { return nil }
-func (s *streamConn) SetWriteDeadline(_ time.Time) error { return nil }
-
 // openStream walks the whole client dance -- bridge page, session bootstrap,
-// carrier, open -- and hands back an obfuscated conn ready to carry MTProto,
-// keyed on the shared secret exactly as a real dd client would key it. The
-// session token comes back too, so a caller can end the session cleanly the way
-// a browser does on unload.
-func (c *chain) openStream(t *testing.T, streamID uint32) (essentials.Conn, string) {
+// carrier, open -- through the shared WEB client, and hands back an obfuscated
+// conn ready to carry MTProto, keyed on the shared secret exactly as a real dd
+// client would key it. The session comes back too, so a caller can end it
+// cleanly the way a browser does on unload.
+func (c *chain) openStream(t *testing.T, streamID uint32) (essentials.Conn, *testclient.WebSession) {
 	t.Helper()
 
-	token := bootstrapFromBridge(t, c.server, c.capability)
-	sessionToken := spendBootstrap(t, c.server, token)
+	session, err := testclient.OpenWebSession(t.Context(), c.server.URL, c.capability.String(),
+		testclient.WebOptions{Origin: originHost})
+	require.NoError(t, err)
 
-	client := dialCarrier(t, c.server, sessionToken)
-	client.send(frame.NewOpen(streamID))
+	t.Cleanup(func() { session.Close() }) //nolint: errcheck
 
-	transport := essentials.WrapNetConn(&streamConn{client: client, streamID: streamID})
+	stream, err := session.OpenStream(streamID)
+	require.NoError(t, err)
 
 	// The client's own dd handshake. Its bytes become the first DATA frame; the
 	// proxy reads exactly 64 of them, matches the key, and dials out.
 	obfuscated, err := obfuscation.Obfuscator{Secret: c.key[:]}.SendHandshake(
-		transport, 2, obfuscation.TagPaddedIntermediate,
+		stream, 2, obfuscation.TagPaddedIntermediate,
 	)
 	require.NoError(t, err)
 
-	return obfuscated, sessionToken
+	return obfuscated, session
 }
 
 // deleteSession ends a session the way a browser does when its tab closes: a
 // DELETE with the session bearer, which reaps it at once rather than holding it
 // for the reconnect grace. It is what keeps the churn test's teardown
 // deterministic instead of waiting out a two-minute timer.
-func (c *chain) deleteSession(t *testing.T, sessionToken string) {
+func (c *chain) deleteSession(t *testing.T, session *testclient.WebSession) {
 	t.Helper()
 
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodDelete, c.server.URL+sessionPath, nil)
-	require.NoError(t, err)
-
-	request.Header.Set("Authorization", "Bearer "+sessionToken)
-
-	resp, err := c.server.Client().Do(request)
-	require.NoError(t, err)
-
-	defer resp.Body.Close() //nolint: errcheck
-
-	require.Equal(t, http.StatusNoContent, resp.StatusCode)
-}
-
-// bootstrapFromBridge fetches the bridge page and pulls the single-use token
-// the script embeds, the same one the browser would spend.
-func bootstrapFromBridge(t *testing.T, server *httptest.Server, capability Capability) string {
-	t.Helper()
-
-	resp, err := server.Client().Get(server.URL + "/?bridge=" + capability.String()) //nolint:noctx // a test request
-	require.NoError(t, err)
-
-	defer resp.Body.Close() //nolint: errcheck
-
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	const marker = `"token":"`
-
-	start := strings.Index(string(body), marker)
-	require.Positive(t, start, "the bridge page carried no bootstrap token")
-
-	rest := string(body)[start+len(marker):]
-
-	return rest[:strings.IndexByte(rest, '"')]
-}
-
-// spendBootstrap exchanges the bootstrap token for a session, exactly as the
-// bridge does, and returns the carrier's bearer.
-func spendBootstrap(t *testing.T, server *httptest.Server, bootstrapToken string) string {
-	t.Helper()
-
-	hello, err := frame.Limits{}.EncodeBatch(nil, []frame.Frame{frame.NewHello()}, frame.ClientToRelay)
-	require.NoError(t, err)
-
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		server.URL+sessionPath, strings.NewReader(string(hello)))
-	require.NoError(t, err)
-
-	request.Header.Set("Authorization", "Bearer "+bootstrapToken)
-
-	resp, err := server.Client().Do(request)
-	require.NoError(t, err)
-
-	defer resp.Body.Close() //nolint: errcheck
-
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	sessionToken := resp.Header.Get("X-Session-Token")
-	require.Len(t, sessionToken, TokenLength)
-
-	return sessionToken
+	require.NoError(t, session.Delete(t.Context()))
 }
 
 // TestAWebClientReachesTelegramThroughTheProxy is the whole chain end to end: a
@@ -483,6 +376,39 @@ func TestAWebClientReachesTelegramThroughTheProxy(t *testing.T) {
 		"the proxy did not see the real client address; the PROXY header was lost")
 	require.NotContains(t, c.clientIPs.seen(), "127.0.0.1",
 		"the proxy saw the relay's own address, so the PROXY header was dropped")
+}
+
+// TestAWebStreamOutlastsTheInitialWindow pushes four times the relay's initial
+// window each way through one stream. A client that never returns credit
+// stalls the download at 4 MiB; one that ignores the relay's grants has its
+// upload cut with ErrCreditExhausted. Either is a client that cannot carry a
+// bulk transfer, which is what the load benchmarks need it to do.
+func TestAWebStreamOutlastsTheInitialWindow(t *testing.T) {
+	t.Parallel()
+
+	const size = 16 << 20
+
+	c := newChain(t)
+	conn, _ := c.openStream(t, 3)
+
+	sent := make([]byte, size)
+	_, err := rand.Read(sent)
+	require.NoError(t, err)
+
+	wrote := make(chan error, 1)
+
+	go func() {
+		// A copy: the obfuscated2 writer encrypts in place.
+		_, err := conn.Write(append([]byte(nil), sent...))
+		wrote <- err
+	}()
+
+	echoed := make([]byte, size)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(20*time.Second)))
+	_, err = io.ReadFull(conn, echoed)
+	require.NoError(t, err, "the download must not stall at the initial window")
+	require.NoError(t, <-wrote, "the upload must not be cut for spending credit it was not given")
+	require.True(t, bytes.Equal(sent, echoed), "every byte must come back, in order")
 }
 
 // TestTheRelayProxyChainDoesNotLeakUnderChurn opens and tears down many full
@@ -547,7 +473,7 @@ func TestTheRelayProxyChainDoesNotLeakUnderChurn(t *testing.T) {
 func (c *chain) oneRound(t *testing.T, streamID uint32) {
 	t.Helper()
 
-	conn, sessionToken := c.openStream(t, streamID)
+	conn, session := c.openStream(t, streamID)
 
 	_, err := conn.Write([]byte("ping"))
 	require.NoError(t, err)
@@ -559,7 +485,7 @@ func (c *chain) oneRound(t *testing.T, streamID uint32) {
 	require.Equal(t, "ping", string(echoed))
 
 	require.NoError(t, conn.Close())
-	c.deleteSession(t, sessionToken)
+	c.deleteSession(t, session)
 }
 
 // A speed limit set on the proxy is felt by a WEB client. The relay knows
