@@ -1,11 +1,16 @@
 # Benchmarks
 
-Two kinds live in this repository:
+Three kinds live in this repository:
 
-- **Door benchmarks** (`mtglib/door_bench_test.go`, and
+- **Door benchmarks** (Tier A: `mtglib/door_bench_test.go`,
+  `internal/webrelay/chain_bench_test.go` for the WEB door, and
   `mtglib/internal/middleproxy/stream_bench_test.go` for the ad-tag leg): whole
   streams through `ServeConn` on real loopback sockets, per door. These are the
   yardstick a performance change is judged by.
+- **mtgbench** (Tier B: `tools/mtgbench`): the real `mtg-proxy` binary, and its
+  WEB relay, as separate processes under load from real clients, with CPU and
+  memory read from `/proc`. It also checks that a capped user gets the cap and
+  that the proxy counts every byte. It is not part of the release binary.
 - **Micro-benchmarks** in this directory and in `mtglib/internal/relay/`,
   inherited from mtg-multi; `ANALYSIS.md` discusses them.
 
@@ -75,6 +80,54 @@ benchstat results/2026-10-02-tierA-baseline.txt <new file>
 
 `-test.run '^$'` matters: a test binary run away from its source tree cannot
 find golden files, so the tests themselves would fail there.
+
+The WEB door's Tier A benchmarks are a package of their own:
+
+```bash
+# here
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -o webrelay.test ./internal/webrelay
+
+# on the box
+GOMAXPROCS=2 ./webrelay.test -test.run '^$' -test.bench BenchmarkDoor -test.benchmem -test.count 6 -test.benchtime 1s > webrelay-p2.txt
+```
+
+Its figures include the test client's own WebSocket work, in the same process.
+
+## mtgbench on the bench box
+
+mtgbench starts the binary with a config of its own: Telegram is mtgbench's
+SOCKS5 server, which answers for Telegram's data centres and then *is* the data
+centre; domain fronting goes to a local listener of its own; nothing leaves the
+machine. It uses loopback ports base to base+32 (`-base-port`, 47000 by
+default), checks they are free before it starts anything, and stops every
+process it started however the run ends (on Linux its children die with it
+even if it is killed).
+
+```bash
+# here
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o mtg-proxy .
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o mtgbench ./tools/mtgbench
+scp mtg-proxy mtgbench <box>:/root/mtg-bench/
+
+# on the box: the binary on core 0, mtgbench on core 1, so figures are per core
+cd /root/mtg-bench && chmod +x mtg-proxy mtgbench && ulimit -n 65536
+taskset -c 1 ./mtgbench -bin ./mtg-proxy -pin 0 -dir /root/mtg-bench/work -out tierB \
+    -scenarios bulk,handshake,latency,idle,contention,limiter,slow-reader
+taskset -c 1 ./mtgbench -bin ./mtg-proxy -pin 0 -dir /root/mtg-bench/work -out tierB-2 \
+    -scenarios caps,accounting
+```
+
+Every scenario runs three times, each a 2 s warm-up then 5 s measured, and
+each table cell is the median with the range. The whole matrix took 25
+minutes on the box, so it runs in the two parts above: about 18 minutes (3 of
+them idle, while the WEB handshake cell's TIME_WAIT clears) and 7. Wait for
+`ss -Htan state time-wait | wc -l` to drop under 200 between them. `-warmup`,
+`-measure`, `-runs`, `-scenarios`, `-doors` and `-shaping` narrow a run;
+`-smoke` moves 1 MiB each way through every door once and stops.
+
+The report is Markdown on stdout; `-out` writes `tierB.md` and `tierB.json`.
+A row that failed says why, the rest of the run goes on, and mtgbench exits
+non-zero naming every failed row. Off Linux, CPU and memory read n/a.
 
 ## Limits
 

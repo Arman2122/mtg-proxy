@@ -1,0 +1,349 @@
+# Tier A, new rows -- the WEB door, conns=64, and latency against no proxy
+#
+# Code: perf-measure at a34c2cc, test binaries cross-compiled (linux/amd64,
+#       CGO_ENABLED=0).
+# Box: the same Linux 6.8 VM as the 2026-10-02 baselines, 2 vCPU Intel Xeon
+#      (Skylake), loopback only, another project's database running alongside.
+# Run: -test.run ^$ -test.benchmem -test.count 6 -test.benchtime 1s, the
+#      baselines' settings, GOMAXPROCS=2 (names end in -2) then GOMAXPROCS=1:
+#   webrelay.test -test.bench BenchmarkDoor
+#   mtglib.test   -test.bench 'BenchmarkDoor$/.*/.*/conns=64'
+#   mtglib.test   -test.bench '^BenchmarkDoorRoundTrip$'
+# The WEB rows include the test client's own WebSocket work, in-process.
+# BenchmarkDoorRoundTrip/direct is the same 100-byte round trip with no proxy.
+# Compare the other doors' rows with 2026-10-02-tierA-after.txt.
+
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/internal/webrelay
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoor/web/download/conns=1-2         	     295	   4095069 ns/op	 256.06 MB/s	 4258842 B/op	     194 allocs/op
+BenchmarkDoor/web/download/conns=1-2         	     279	   4694754 ns/op	 223.35 MB/s	 4253680 B/op	     181 allocs/op
+BenchmarkDoor/web/download/conns=1-2         	     296	   4155417 ns/op	 252.34 MB/s	 4263797 B/op	     189 allocs/op
+BenchmarkDoor/web/download/conns=1-2         	     264	   4381497 ns/op	 239.32 MB/s	 4253616 B/op	     183 allocs/op
+BenchmarkDoor/web/download/conns=1-2         	     271	   4629678 ns/op	 226.49 MB/s	 4256397 B/op	     186 allocs/op
+BenchmarkDoor/web/download/conns=1-2         	     253	   4406824 ns/op	 237.94 MB/s	 4273663 B/op	     189 allocs/op
+BenchmarkDoor/web/download/conns=16-2        	      20	  54211328 ns/op	 309.48 MB/s	68111666 B/op	    1965 allocs/op
+BenchmarkDoor/web/download/conns=16-2        	      22	  52168658 ns/op	 321.60 MB/s	67859853 B/op	    1974 allocs/op
+BenchmarkDoor/web/download/conns=16-2        	      18	  57684098 ns/op	 290.85 MB/s	67487959 B/op	    1960 allocs/op
+BenchmarkDoor/web/download/conns=16-2        	      24	  50614137 ns/op	 331.47 MB/s	67518863 B/op	    1975 allocs/op
+BenchmarkDoor/web/download/conns=16-2        	      22	  51635318 ns/op	 324.92 MB/s	67717120 B/op	    1973 allocs/op
+BenchmarkDoor/web/download/conns=16-2        	      22	  50711228 ns/op	 330.84 MB/s	67755054 B/op	    1953 allocs/op
+BenchmarkDoor/web/download/conns=64-2        	       5	 202741579 ns/op	 331.01 MB/s	272081052 B/op	    7795 allocs/op
+BenchmarkDoor/web/download/conns=64-2        	       6	 196828829 ns/op	 340.95 MB/s	270442729 B/op	    7754 allocs/op
+BenchmarkDoor/web/download/conns=64-2        	       6	 178759096 ns/op	 375.42 MB/s	270979205 B/op	    7764 allocs/op
+BenchmarkDoor/web/download/conns=64-2        	       6	 189163039 ns/op	 354.77 MB/s	270393554 B/op	    7747 allocs/op
+BenchmarkDoor/web/download/conns=64-2        	       6	 188385848 ns/op	 356.23 MB/s	271321549 B/op	    7759 allocs/op
+BenchmarkDoor/web/download/conns=64-2        	       6	 186763294 ns/op	 359.33 MB/s	270985441 B/op	    7772 allocs/op
+BenchmarkDoor/web/upload/conns=1-2           	     172	   6636004 ns/op	 158.01 MB/s	 4596360 B/op	     372 allocs/op
+BenchmarkDoor/web/upload/conns=1-2           	     204	   6362143 ns/op	 164.81 MB/s	 4596209 B/op	     376 allocs/op
+BenchmarkDoor/web/upload/conns=1-2           	     198	   6197304 ns/op	 169.20 MB/s	 4596238 B/op	     371 allocs/op
+BenchmarkDoor/web/upload/conns=1-2           	     193	   6241865 ns/op	 167.99 MB/s	 4596248 B/op	     372 allocs/op
+BenchmarkDoor/web/upload/conns=1-2           	     198	   6274485 ns/op	 167.12 MB/s	 4596220 B/op	     372 allocs/op
+BenchmarkDoor/web/upload/conns=1-2           	     184	   6432670 ns/op	 163.01 MB/s	 4596305 B/op	     372 allocs/op
+BenchmarkDoor/web/upload/conns=16-2          	      18	  64607031 ns/op	 259.68 MB/s	73535676 B/op	    5540 allocs/op
+BenchmarkDoor/web/upload/conns=16-2          	      18	  65812742 ns/op	 254.92 MB/s	73535212 B/op	    5567 allocs/op
+BenchmarkDoor/web/upload/conns=16-2          	      18	  65453415 ns/op	 256.32 MB/s	73536012 B/op	    5519 allocs/op
+BenchmarkDoor/web/upload/conns=16-2          	      15	  67062323 ns/op	 250.17 MB/s	73537067 B/op	    5533 allocs/op
+BenchmarkDoor/web/upload/conns=16-2          	      16	  71657320 ns/op	 234.13 MB/s	73539918 B/op	    5527 allocs/op
+BenchmarkDoor/web/upload/conns=16-2          	      15	  68419589 ns/op	 245.21 MB/s	73537374 B/op	    5573 allocs/op
+BenchmarkDoor/web/upload/conns=64-2          	       4	 285992664 ns/op	 234.65 MB/s	294153950 B/op	   24185 allocs/op
+BenchmarkDoor/web/upload/conns=64-2          	       3	 337709097 ns/op	 198.72 MB/s	294169501 B/op	   23768 allocs/op
+BenchmarkDoor/web/upload/conns=64-2          	       4	 260779732 ns/op	 257.34 MB/s	294157550 B/op	   23391 allocs/op
+BenchmarkDoor/web/upload/conns=64-2          	       4	 262601581 ns/op	 255.55 MB/s	294160724 B/op	   23418 allocs/op
+BenchmarkDoor/web/upload/conns=64-2          	       5	 236097067 ns/op	 284.24 MB/s	294147451 B/op	   23217 allocs/op
+BenchmarkDoor/web/upload/conns=64-2          	       5	 245419123 ns/op	 273.45 MB/s	294146649 B/op	   23026 allocs/op
+BenchmarkDoorRoundTrip/web-2                 	    7134	    159504 ns/op	       135.7 p50-µs	       472.6 p99-µs	      1046 p999-µs	    1304 B/op	      28 allocs/op
+BenchmarkDoorRoundTrip/web-2                 	    8056	    156932 ns/op	       129.2 p50-µs	       443.4 p99-µs	       920.7 p999-µs	    1304 B/op	      28 allocs/op
+BenchmarkDoorRoundTrip/web-2                 	    7184	    163911 ns/op	       140.1 p50-µs	       458.8 p99-µs	       725.9 p999-µs	    1304 B/op	      28 allocs/op
+BenchmarkDoorRoundTrip/web-2                 	    8995	    165898 ns/op	       136.9 p50-µs	       474.4 p99-µs	       749.7 p999-µs	    1304 B/op	      28 allocs/op
+BenchmarkDoorRoundTrip/web-2                 	    8556	    152381 ns/op	       126.0 p50-µs	       419.6 p99-µs	       697.9 p999-µs	    1304 B/op	      28 allocs/op
+BenchmarkDoorRoundTrip/web-2                 	    6932	    152572 ns/op	       126.3 p50-µs	       433.8 p99-µs	       669.8 p999-µs	    1304 B/op	      28 allocs/op
+BenchmarkDoorHandshake/web-2                 	     638	   2135070 ns/op	  629252 B/op	     824 allocs/op
+BenchmarkDoorHandshake/web-2                 	     542	   2013477 ns/op	  624672 B/op	     822 allocs/op
+BenchmarkDoorHandshake/web-2                 	     622	   1913039 ns/op	  625158 B/op	     822 allocs/op
+BenchmarkDoorHandshake/web-2                 	     552	   2056731 ns/op	  624928 B/op	     822 allocs/op
+BenchmarkDoorHandshake/web-2                 	     594	   1982935 ns/op	  624375 B/op	     822 allocs/op
+BenchmarkDoorHandshake/web-2                 	     625	   1838656 ns/op	  625096 B/op	     822 allocs/op
+BenchmarkDoorIdle/web-2                      	534248547	         2.287 ns/op	         7.003 goroutines/conn	    230162 heap-B/conn	     36798 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web-2                      	530509520	         2.293 ns/op	         7.003 goroutines/conn	    219955 heap-B/conn	     37978 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web-2                      	523599802	         2.284 ns/op	         7.003 goroutines/conn	    218595 heap-B/conn	     36930 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web-2                      	540552612	         2.299 ns/op	         7.003 goroutines/conn	    218522 heap-B/conn	     38633 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web-2                      	516388225	         2.304 ns/op	         7.003 goroutines/conn	    217555 heap-B/conn	     37290 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web-2                      	526957419	         2.264 ns/op	         7.003 goroutines/conn	    218341 heap-B/conn	     36700 stack-B/conn	       0 B/op	       0 allocs/op
+PASS
+
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/internal/webrelay
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoor/web/download/conns=1         	     246	   4377810 ns/op	 239.52 MB/s	 4223134 B/op	     128 allocs/op
+BenchmarkDoor/web/download/conns=1         	     242	   4538786 ns/op	 231.03 MB/s	 4218823 B/op	     127 allocs/op
+BenchmarkDoor/web/download/conns=1         	     249	   4856090 ns/op	 215.93 MB/s	 4218967 B/op	     128 allocs/op
+BenchmarkDoor/web/download/conns=1         	     261	   4771066 ns/op	 219.78 MB/s	 4218505 B/op	     128 allocs/op
+BenchmarkDoor/web/download/conns=1         	     279	   4275818 ns/op	 245.23 MB/s	 4218192 B/op	     128 allocs/op
+BenchmarkDoor/web/download/conns=1         	     264	   4670682 ns/op	 224.50 MB/s	 4218516 B/op	     128 allocs/op
+BenchmarkDoor/web/download/conns=16        	      13	  88066678 ns/op	 190.51 MB/s	67620302 B/op	    1959 allocs/op
+BenchmarkDoor/web/download/conns=16        	      12	  91481492 ns/op	 183.39 MB/s	67801378 B/op	    1953 allocs/op
+BenchmarkDoor/web/download/conns=16        	      12	  89124195 ns/op	 188.25 MB/s	67629660 B/op	    1950 allocs/op
+BenchmarkDoor/web/download/conns=16        	      13	  91333453 ns/op	 183.69 MB/s	67609659 B/op	    1947 allocs/op
+BenchmarkDoor/web/download/conns=16        	      13	  89858625 ns/op	 186.71 MB/s	67775318 B/op	    1951 allocs/op
+BenchmarkDoor/web/download/conns=16        	      13	  85935428 ns/op	 195.23 MB/s	67605822 B/op	    1944 allocs/op
+BenchmarkDoor/web/download/conns=64        	       4	 325634111 ns/op	 206.09 MB/s	270745292 B/op	    7755 allocs/op
+BenchmarkDoor/web/download/conns=64        	       4	 310951462 ns/op	 215.82 MB/s	270813956 B/op	    7750 allocs/op
+BenchmarkDoor/web/download/conns=64        	       3	 334326672 ns/op	 200.73 MB/s	270546704 B/op	    7736 allocs/op
+BenchmarkDoor/web/download/conns=64        	       4	 330996200 ns/op	 202.75 MB/s	270784470 B/op	    7707 allocs/op
+BenchmarkDoor/web/download/conns=64        	       3	 338110894 ns/op	 198.48 MB/s	270543816 B/op	    7746 allocs/op
+BenchmarkDoor/web/download/conns=64        	       4	 317758958 ns/op	 211.19 MB/s	270778104 B/op	    7714 allocs/op
+BenchmarkDoor/web/upload/conns=1           	     139	   8410209 ns/op	 124.68 MB/s	 4596357 B/op	     345 allocs/op
+BenchmarkDoor/web/upload/conns=1           	     140	   8405694 ns/op	 124.75 MB/s	 4596350 B/op	     345 allocs/op
+BenchmarkDoor/web/upload/conns=1           	     166	   7183387 ns/op	 145.97 MB/s	 4596183 B/op	     345 allocs/op
+BenchmarkDoor/web/upload/conns=1           	     156	   7587366 ns/op	 138.20 MB/s	 4596241 B/op	     345 allocs/op
+BenchmarkDoor/web/upload/conns=1           	     176	   6773005 ns/op	 154.82 MB/s	 4596132 B/op	     345 allocs/op
+BenchmarkDoor/web/upload/conns=1           	     162	   7289780 ns/op	 143.84 MB/s	 4596205 B/op	     345 allocs/op
+BenchmarkDoor/web/upload/conns=16          	       9	 119191133 ns/op	 140.76 MB/s	73542715 B/op	    5521 allocs/op
+BenchmarkDoor/web/upload/conns=16          	       9	 112243881 ns/op	 149.47 MB/s	73542187 B/op	    5500 allocs/op
+BenchmarkDoor/web/upload/conns=16          	       9	 113452473 ns/op	 147.88 MB/s	73542064 B/op	    5505 allocs/op
+BenchmarkDoor/web/upload/conns=16          	       9	 112468453 ns/op	 149.17 MB/s	73542010 B/op	    5511 allocs/op
+BenchmarkDoor/web/upload/conns=16          	       9	 111525163 ns/op	 150.43 MB/s	73541962 B/op	    5513 allocs/op
+BenchmarkDoor/web/upload/conns=16          	       9	 116617770 ns/op	 143.87 MB/s	73542368 B/op	    5505 allocs/op
+BenchmarkDoor/web/upload/conns=64          	       3	 470157899 ns/op	 142.74 MB/s	294173029 B/op	   23277 allocs/op
+BenchmarkDoor/web/upload/conns=64          	       3	 450914730 ns/op	 148.83 MB/s	294168637 B/op	   23533 allocs/op
+BenchmarkDoor/web/upload/conns=64          	       3	 461718645 ns/op	 145.35 MB/s	294173136 B/op	   23459 allocs/op
+BenchmarkDoor/web/upload/conns=64          	       3	 467315826 ns/op	 143.60 MB/s	294174445 B/op	   23449 allocs/op
+BenchmarkDoor/web/upload/conns=64          	       3	 450424565 ns/op	 148.99 MB/s	294168133 B/op	   23317 allocs/op
+BenchmarkDoor/web/upload/conns=64          	       3	 439250474 ns/op	 152.78 MB/s	294167856 B/op	   23279 allocs/op
+BenchmarkDoorRoundTrip/web                 	    9768	    128430 ns/op	       108.4 p50-µs	       385.0 p99-µs	      1174 p999-µs	    1304 B/op	      29 allocs/op
+BenchmarkDoorRoundTrip/web                 	   10000	    124668 ns/op	       108.7 p50-µs	       318.5 p99-µs	       615.5 p999-µs	    1304 B/op	      29 allocs/op
+BenchmarkDoorRoundTrip/web                 	   10000	    134719 ns/op	       114.2 p50-µs	       394.6 p99-µs	       569.2 p999-µs	    1304 B/op	      29 allocs/op
+BenchmarkDoorRoundTrip/web                 	    7838	    135067 ns/op	       114.4 p50-µs	       452.2 p99-µs	       652.6 p999-µs	    1304 B/op	      29 allocs/op
+BenchmarkDoorRoundTrip/web                 	    8870	    130398 ns/op	       113.9 p50-µs	       321.5 p99-µs	       699.1 p999-µs	    1304 B/op	      29 allocs/op
+BenchmarkDoorRoundTrip/web                 	    8659	    129723 ns/op	       111.7 p50-µs	       358.8 p99-µs	       601.6 p999-µs	    1304 B/op	      29 allocs/op
+BenchmarkDoorHandshake/web                 	     747	   1599695 ns/op	  619587 B/op	     821 allocs/op
+BenchmarkDoorHandshake/web                 	     741	   1648232 ns/op	  619377 B/op	     820 allocs/op
+BenchmarkDoorHandshake/web                 	     741	   1640038 ns/op	  619375 B/op	     820 allocs/op
+BenchmarkDoorHandshake/web                 	     764	   1624573 ns/op	  619374 B/op	     820 allocs/op
+BenchmarkDoorHandshake/web                 	     753	   1628162 ns/op	  619372 B/op	     820 allocs/op
+BenchmarkDoorHandshake/web                 	     795	   1628760 ns/op	  619480 B/op	     820 allocs/op
+BenchmarkDoorIdle/web                      	515836118	         2.330 ns/op	         7.003 goroutines/conn	    231440 heap-B/conn	     36012 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web                      	522675621	         2.294 ns/op	         7.003 goroutines/conn	    217260 heap-B/conn	     39158 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web                      	518720874	         2.348 ns/op	         7.003 goroutines/conn	    216441 heap-B/conn	     38896 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web                      	519274852	         2.283 ns/op	         7.003 goroutines/conn	    216564 heap-B/conn	     39059 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web                      	487858681	         2.316 ns/op	         7.003 goroutines/conn	    216261 heap-B/conn	     38502 stack-B/conn	       0 B/op	       0 allocs/op
+BenchmarkDoorIdle/web                      	512416261	         2.319 ns/op	         7.003 goroutines/conn	    217227 heap-B/conn	     38502 stack-B/conn	       0 B/op	       0 allocs/op
+PASS
+
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoor/ee-record/download/conns=64-2         	       2	 902540226 ns/op	  74.36 MB/s	66010716 B/op	    5070 allocs/op
+BenchmarkDoor/ee-record/download/conns=64-2         	       2	 834241260 ns/op	  80.44 MB/s	65360160 B/op	    4935 allocs/op
+BenchmarkDoor/ee-record/download/conns=64-2         	       1	1073397516 ns/op	  62.52 MB/s	104003272 B/op	    5297 allocs/op
+BenchmarkDoor/ee-record/download/conns=64-2         	       1	1166678236 ns/op	  57.52 MB/s	106814872 B/op	    5262 allocs/op
+BenchmarkDoor/ee-record/download/conns=64-2         	       1	1169810448 ns/op	  57.37 MB/s	104099384 B/op	    5287 allocs/op
+BenchmarkDoor/ee-record/download/conns=64-2         	       2	 975156150 ns/op	  68.82 MB/s	66243328 B/op	    4917 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64-2           	      12	 102854588 ns/op	 652.46 MB/s	  122460 B/op	    4501 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64-2           	      12	 104454175 ns/op	 642.47 MB/s	  122333 B/op	    4501 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64-2           	      10	 106280882 ns/op	 631.43 MB/s	  130915 B/op	    4504 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64-2           	      13	 110043227 ns/op	 609.84 MB/s	  119043 B/op	    4500 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64-2           	      12	 118402410 ns/op	 566.79 MB/s	  125072 B/op	    4501 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64-2           	      10	 109046161 ns/op	 615.42 MB/s	  130915 B/op	    4504 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64-2          	      13	  88112847 ns/op	 761.62 MB/s	10144246 B/op	    4600 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64-2          	      13	  86325836 ns/op	 777.39 MB/s	 9150284 B/op	    4585 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64-2          	      12	  91810943 ns/op	 730.95 MB/s	10887474 B/op	    4609 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64-2          	      12	  86712886 ns/op	 773.92 MB/s	10380600 B/op	    4587 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64-2          	      12	  90995611 ns/op	 737.50 MB/s	10674623 B/op	    4615 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64-2          	      12	  95977528 ns/op	 699.21 MB/s	10006722 B/op	    4600 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64-2            	      12	 101478983 ns/op	 661.31 MB/s	  123703 B/op	    4501 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64-2            	      10	 100725740 ns/op	 666.25 MB/s	  130915 B/op	    4504 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64-2            	      13	 100342265 ns/op	 668.80 MB/s	  119032 B/op	    4499 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64-2            	      13	  99296428 ns/op	 675.84 MB/s	  119032 B/op	    4499 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64-2            	      10	 112415551 ns/op	 596.97 MB/s	  130915 B/op	    4504 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64-2            	      12	  99587623 ns/op	 673.87 MB/s	  125170 B/op	    4503 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64-2        	      12	  99109559 ns/op	 677.12 MB/s	10326022 B/op	    4595 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64-2        	      12	  96522233 ns/op	 695.27 MB/s	 9921082 B/op	    4587 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64-2        	      12	  97623069 ns/op	 687.43 MB/s	11503734 B/op	    4604 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64-2        	      12	  98449880 ns/op	 681.66 MB/s	11376606 B/op	    4594 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64-2        	      12	  99821978 ns/op	 672.29 MB/s	10061900 B/op	    4595 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64-2        	      12	  96156603 ns/op	 697.91 MB/s	11055972 B/op	    4597 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64-2          	      13	  99165603 ns/op	 676.74 MB/s	  119032 B/op	    4499 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64-2          	      10	 102164076 ns/op	 656.87 MB/s	  132556 B/op	    4504 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64-2          	      13	 101374286 ns/op	 661.99 MB/s	  119032 B/op	    4499 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64-2          	      13	 105101892 ns/op	 638.51 MB/s	  120204 B/op	    4499 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64-2          	      13	 104750603 ns/op	 640.65 MB/s	  119032 B/op	    4499 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64-2          	      13	 103236243 ns/op	 650.05 MB/s	  119033 B/op	    4499 allocs/op
+BenchmarkDoor/dd/download/conns=64-2                	      14	  82295650 ns/op	 815.46 MB/s	  120417 B/op	    4537 allocs/op
+BenchmarkDoor/dd/download/conns=64-2                	      13	  83157452 ns/op	 807.01 MB/s	  122142 B/op	    4535 allocs/op
+BenchmarkDoor/dd/download/conns=64-2                	      13	  84840719 ns/op	 791.00 MB/s	  120943 B/op	    4539 allocs/op
+BenchmarkDoor/dd/download/conns=64-2                	      14	  82066906 ns/op	 817.73 MB/s	  121204 B/op	    4532 allocs/op
+BenchmarkDoor/dd/download/conns=64-2                	      14	  87403139 ns/op	 767.81 MB/s	  121272 B/op	    4543 allocs/op
+BenchmarkDoor/dd/download/conns=64-2                	      14	  84691868 ns/op	 792.39 MB/s	  118032 B/op	    4538 allocs/op
+BenchmarkDoor/dd/upload/conns=64-2                  	      13	  92306709 ns/op	 727.02 MB/s	  121945 B/op	    4501 allocs/op
+BenchmarkDoor/dd/upload/conns=64-2                  	      13	  85289214 ns/op	 786.84 MB/s	  120319 B/op	    4500 allocs/op
+BenchmarkDoor/dd/upload/conns=64-2                  	      12	  89429778 ns/op	 750.41 MB/s	  123725 B/op	    4501 allocs/op
+BenchmarkDoor/dd/upload/conns=64-2                  	      13	  89591865 ns/op	 749.05 MB/s	  121580 B/op	    4500 allocs/op
+BenchmarkDoor/dd/upload/conns=64-2                  	      12	  94536403 ns/op	 709.87 MB/s	  123725 B/op	    4501 allocs/op
+BenchmarkDoor/dd/upload/conns=64-2                  	      13	  87456431 ns/op	 767.34 MB/s	  121581 B/op	    4500 allocs/op
+BenchmarkDoor/plain/download/conns=64-2             	      14	  79256707 ns/op	 846.73 MB/s	  118057 B/op	    4540 allocs/op
+BenchmarkDoor/plain/download/conns=64-2             	      14	  82534463 ns/op	 813.10 MB/s	  118239 B/op	    4551 allocs/op
+BenchmarkDoor/plain/download/conns=64-2             	      12	  83875714 ns/op	 800.10 MB/s	  124919 B/op	    4559 allocs/op
+BenchmarkDoor/plain/download/conns=64-2             	      14	  84501728 ns/op	 794.17 MB/s	  119115 B/op	    4549 allocs/op
+BenchmarkDoor/plain/download/conns=64-2             	      14	  85197768 ns/op	 787.68 MB/s	  119305 B/op	    4545 allocs/op
+BenchmarkDoor/plain/download/conns=64-2             	      14	  87695580 ns/op	 765.25 MB/s	  118310 B/op	    4536 allocs/op
+BenchmarkDoor/plain/upload/conns=64-2               	      12	  88273776 ns/op	 760.24 MB/s	  125156 B/op	    4504 allocs/op
+BenchmarkDoor/plain/upload/conns=64-2               	      12	  94424957 ns/op	 710.71 MB/s	  123728 B/op	    4501 allocs/op
+BenchmarkDoor/plain/upload/conns=64-2               	      13	  91112606 ns/op	 736.55 MB/s	  120316 B/op	    4500 allocs/op
+BenchmarkDoor/plain/upload/conns=64-2               	      13	  90169853 ns/op	 744.25 MB/s	  122235 B/op	    4500 allocs/op
+BenchmarkDoor/plain/upload/conns=64-2               	      12	  92469422 ns/op	 725.74 MB/s	  127636 B/op	    4505 allocs/op
+BenchmarkDoor/plain/upload/conns=64-2               	      14	  93089623 ns/op	 720.91 MB/s	  117396 B/op	    4499 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorRoundTrip/ee-record-2         	     122	  10115233 ns/op	      1417 p50-µs	    120736 p99-µs	    160832 p999-µs	      42 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2         	     199	   5056867 ns/op	      1309 p50-µs	    113967 p99-µs	    133957 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2         	     280	   4932387 ns/op	      1324 p50-µs	     82912 p99-µs	    193206 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2         	     135	   7840226 ns/op	      1397 p50-µs	     89629 p99-µs	    246854 p999-µs	      40 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2         	     183	   6281524 ns/op	      1374 p50-µs	     73640 p99-µs	    110762 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record-2         	     126	  10039076 ns/op	      1390 p50-µs	    181977 p99-µs	    208001 p999-µs	      82 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst-2          	   13242	     90885 ns/op	        76.83 p50-µs	       270.0 p99-µs	       405.4 p999-µs	      47 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst-2          	   12543	     96575 ns/op	        82.46 p50-µs	       270.1 p99-µs	       526.5 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst-2          	   12684	     87954 ns/op	        70.71 p50-µs	       289.9 p99-µs	       757.2 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst-2          	   13342	     90247 ns/op	        75.31 p50-µs	       250.1 p99-µs	       476.6 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst-2          	   13302	     93590 ns/op	        81.51 p50-µs	       242.0 p99-µs	       356.7 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst-2          	   12016	     97422 ns/op	        82.37 p50-µs	       270.1 p99-µs	       428.1 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2        	   12319	     97612 ns/op	        83.70 p50-µs	       260.4 p99-µs	       389.6 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2        	   11815	     97215 ns/op	        82.81 p50-µs	       257.7 p99-µs	       379.3 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2        	   12111	     98544 ns/op	        87.21 p50-µs	       250.0 p99-µs	       331.1 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2        	   13522	     93155 ns/op	        77.49 p50-µs	       257.0 p99-µs	       437.2 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2        	   12292	     99345 ns/op	        85.60 p50-µs	       270.6 p99-µs	       419.3 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced-2        	   10000	    104591 ns/op	        92.09 p50-µs	       266.2 p99-µs	       377.6 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/dd-2                	   20841	     58851 ns/op	        45.74 p50-µs	       163.1 p99-µs	       254.1 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                	   20114	     56851 ns/op	        45.49 p50-µs	       167.4 p99-µs	       264.3 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                	   19686	     59251 ns/op	        47.51 p50-µs	       180.9 p99-µs	       265.8 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                	   19964	     59681 ns/op	        46.23 p50-µs	       177.0 p99-µs	       324.6 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                	   21813	     55153 ns/op	        45.25 p50-µs	       151.2 p99-µs	       248.4 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd-2                	   20107	     58693 ns/op	        45.73 p50-µs	       159.2 p99-µs	       258.9 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2             	   20672	     58534 ns/op	        45.74 p50-µs	       175.6 p99-µs	       279.2 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2             	   18844	     59489 ns/op	        46.79 p50-µs	       182.0 p99-µs	       327.4 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2             	   19808	     58767 ns/op	        50.78 p50-µs	       151.2 p99-µs	       248.5 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2             	   21084	     58789 ns/op	        45.56 p50-µs	       179.9 p99-µs	       302.0 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2             	   20704	     60167 ns/op	        46.87 p50-µs	       165.8 p99-µs	       298.9 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain-2             	   21290	     55488 ns/op	        45.48 p50-µs	       154.9 p99-µs	       263.1 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/direct-2            	   44154	     27526 ns/op	        20.53 p50-µs	        81.16 p99-µs	       147.1 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct-2            	   49974	     25207 ns/op	        20.25 p50-µs	        75.35 p99-µs	       124.7 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct-2            	   50704	     27430 ns/op	        20.45 p50-µs	        85.93 p99-µs	       159.7 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct-2            	   46578	     26029 ns/op	        20.32 p50-µs	        83.62 p99-µs	       179.0 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct-2            	   51703	     25937 ns/op	        20.37 p50-µs	        82.25 p99-µs	       145.5 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct-2            	   45024	     26347 ns/op	        20.37 p50-µs	        80.75 p99-µs	       140.0 p999-µs	       0 B/op	       0 allocs/op
+PASS
+
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoor/ee-record/download/conns=64         	       1	1345686329 ns/op	  49.87 MB/s	105798280 B/op	    5528 allocs/op
+BenchmarkDoor/ee-record/download/conns=64         	       1	1063743161 ns/op	  63.09 MB/s	104059992 B/op	    5396 allocs/op
+BenchmarkDoor/ee-record/download/conns=64         	       1	1066269988 ns/op	  62.94 MB/s	103559832 B/op	    5367 allocs/op
+BenchmarkDoor/ee-record/download/conns=64         	       1	1148725367 ns/op	  58.42 MB/s	104084456 B/op	    5395 allocs/op
+BenchmarkDoor/ee-record/download/conns=64         	       1	1470122117 ns/op	  45.65 MB/s	105706440 B/op	    5384 allocs/op
+BenchmarkDoor/ee-record/download/conns=64         	       1	1115059769 ns/op	  60.18 MB/s	102978504 B/op	    5391 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64           	       6	 187983154 ns/op	 356.99 MB/s	  168981 B/op	    4517 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64           	       6	 182187802 ns/op	 368.35 MB/s	  166236 B/op	    4517 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64           	       6	 176935942 ns/op	 379.28 MB/s	  166236 B/op	    4517 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64           	       6	 179479082 ns/op	 373.91 MB/s	  166236 B/op	    4517 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64           	       7	 176998519 ns/op	 379.15 MB/s	  153835 B/op	    4512 allocs/op
+BenchmarkDoor/ee-record/upload/conns=64           	       7	 193147169 ns/op	 347.45 MB/s	  153835 B/op	    4512 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64          	       6	 183433973 ns/op	 365.85 MB/s	21277112 B/op	    4686 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64          	       6	 186507584 ns/op	 359.82 MB/s	20748550 B/op	    4684 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64          	       6	 170689429 ns/op	 393.16 MB/s	19803449 B/op	    4681 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64          	       6	 181724065 ns/op	 369.29 MB/s	19903269 B/op	    4682 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64          	       5	 223935612 ns/op	 299.68 MB/s	24210185 B/op	    4701 allocs/op
+BenchmarkDoor/ee-burst/download/conns=64          	       6	 166689756 ns/op	 402.60 MB/s	19004537 B/op	    4668 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64            	       6	 184372226 ns/op	 363.99 MB/s	  166236 B/op	    4517 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64            	       6	 183451377 ns/op	 365.81 MB/s	  166244 B/op	    4517 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64            	       6	 179732196 ns/op	 373.38 MB/s	  166236 B/op	    4517 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64            	       6	 185195142 ns/op	 362.37 MB/s	  166236 B/op	    4517 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64            	       7	 180449533 ns/op	 371.90 MB/s	  153835 B/op	    4512 allocs/op
+BenchmarkDoor/ee-burst/upload/conns=64            	       7	 184965536 ns/op	 362.82 MB/s	  153835 B/op	    4512 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64        	       6	 193828767 ns/op	 346.23 MB/s	20084426 B/op	    4669 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64        	       6	 194656550 ns/op	 344.76 MB/s	19801954 B/op	    4678 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64        	       6	 185696707 ns/op	 361.39 MB/s	18082813 B/op	    4663 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64        	       6	 190385199 ns/op	 352.49 MB/s	19097192 B/op	    4661 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64        	       6	 187155796 ns/op	 358.57 MB/s	19904082 B/op	    4661 allocs/op
+BenchmarkDoor/ee-unpaced/download/conns=64        	       6	 181335005 ns/op	 370.08 MB/s	19097226 B/op	    4663 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64          	       7	 186174497 ns/op	 360.46 MB/s	  153835 B/op	    4512 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64          	       7	 179417859 ns/op	 374.04 MB/s	  153835 B/op	    4512 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64          	       6	 201166175 ns/op	 333.60 MB/s	  166236 B/op	    4517 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64          	       7	 183775797 ns/op	 365.17 MB/s	  153835 B/op	    4512 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64          	       7	 182317732 ns/op	 368.09 MB/s	  153835 B/op	    4512 allocs/op
+BenchmarkDoor/ee-unpaced/upload/conns=64          	       6	 183159194 ns/op	 366.40 MB/s	  166236 B/op	    4517 allocs/op
+BenchmarkDoor/dd/download/conns=64                	       7	 151387532 ns/op	 443.29 MB/s	  155635 B/op	    4550 allocs/op
+BenchmarkDoor/dd/download/conns=64                	       7	 157528878 ns/op	 426.01 MB/s	  156234 B/op	    4588 allocs/op
+BenchmarkDoor/dd/download/conns=64                	       7	 154335200 ns/op	 434.83 MB/s	  156262 B/op	    4589 allocs/op
+BenchmarkDoor/dd/download/conns=64                	       7	 151659421 ns/op	 442.50 MB/s	  156012 B/op	    4574 allocs/op
+BenchmarkDoor/dd/download/conns=64                	       7	 155300560 ns/op	 432.12 MB/s	  156106 B/op	    4580 allocs/op
+BenchmarkDoor/dd/download/conns=64                	       7	 153914367 ns/op	 436.01 MB/s	  156195 B/op	    4585 allocs/op
+BenchmarkDoor/dd/upload/conns=64                  	       7	 166987071 ns/op	 401.88 MB/s	  155029 B/op	    4512 allocs/op
+BenchmarkDoor/dd/upload/conns=64                  	       7	 158800159 ns/op	 422.60 MB/s	  155029 B/op	    4512 allocs/op
+BenchmarkDoor/dd/upload/conns=64                  	       7	 167256128 ns/op	 401.23 MB/s	  155029 B/op	    4512 allocs/op
+BenchmarkDoor/dd/upload/conns=64                  	       7	 157525168 ns/op	 426.02 MB/s	  155029 B/op	    4512 allocs/op
+BenchmarkDoor/dd/upload/conns=64                  	       7	 161826287 ns/op	 414.70 MB/s	  155029 B/op	    4512 allocs/op
+BenchmarkDoor/dd/upload/conns=64                  	       7	 156560748 ns/op	 428.64 MB/s	  155029 B/op	    4512 allocs/op
+BenchmarkDoor/plain/download/conns=64             	       7	 151260899 ns/op	 443.66 MB/s	  155742 B/op	    4557 allocs/op
+BenchmarkDoor/plain/download/conns=64             	       7	 157608642 ns/op	 425.79 MB/s	  155576 B/op	    4547 allocs/op
+BenchmarkDoor/plain/download/conns=64             	       7	 150245230 ns/op	 446.66 MB/s	  155966 B/op	    4571 allocs/op
+BenchmarkDoor/plain/download/conns=64             	       7	 157847217 ns/op	 425.15 MB/s	  156165 B/op	    4583 allocs/op
+BenchmarkDoor/plain/download/conns=64             	       7	 161025498 ns/op	 416.76 MB/s	  156006 B/op	    4573 allocs/op
+BenchmarkDoor/plain/download/conns=64             	       7	 150220000 ns/op	 446.74 MB/s	  155763 B/op	    4558 allocs/op
+BenchmarkDoor/plain/upload/conns=64               	       7	 158875771 ns/op	 422.40 MB/s	  155049 B/op	    4513 allocs/op
+BenchmarkDoor/plain/upload/conns=64               	       7	 165122772 ns/op	 406.42 MB/s	  155029 B/op	    4512 allocs/op
+BenchmarkDoor/plain/upload/conns=64               	       7	 159051191 ns/op	 421.93 MB/s	  155369 B/op	    4514 allocs/op
+BenchmarkDoor/plain/upload/conns=64               	       7	 162611926 ns/op	 412.69 MB/s	  155029 B/op	    4512 allocs/op
+BenchmarkDoor/plain/upload/conns=64               	       7	 158687571 ns/op	 422.90 MB/s	  155049 B/op	    4513 allocs/op
+BenchmarkDoor/plain/upload/conns=64               	       7	 150281354 ns/op	 446.55 MB/s	  155027 B/op	    4512 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorRoundTrip/ee-record         	     362	   6137024 ns/op	      1276 p50-µs	    116512 p99-µs	    126510 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record         	     242	   6477465 ns/op	      1306 p50-µs	     71696 p99-µs	     90559 p999-µs	      38 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record         	     243	   6348263 ns/op	      1249 p50-µs	     76437 p99-µs	    121595 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record         	     206	   5888904 ns/op	      1326 p50-µs	     69501 p99-µs	    100639 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record         	     120	   9255624 ns/op	      1257 p50-µs	     45569 p99-µs	    578134 p999-µs	      38 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-record         	     132	   8657323 ns/op	      1383 p50-µs	    105555 p99-µs	    130632 p999-µs	      38 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst          	   20300	     59725 ns/op	        47.17 p50-µs	       181.0 p99-µs	       284.1 p999-µs	      40 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst          	   20907	     59008 ns/op	        47.06 p50-µs	       178.0 p99-µs	       282.0 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst          	   19138	     59287 ns/op	        47.11 p50-µs	       160.1 p99-µs	       263.7 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst          	   19483	     61111 ns/op	        48.13 p50-µs	       173.2 p99-µs	       272.1 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst          	   20917	     57139 ns/op	        47.09 p50-µs	       170.7 p99-µs	       278.9 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-burst          	   19310	     61799 ns/op	        47.76 p50-µs	       185.5 p99-µs	       276.1 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced        	   19110	     61746 ns/op	        48.19 p50-µs	       178.2 p99-µs	       271.9 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced        	   20978	     58043 ns/op	        47.78 p50-µs	       171.5 p99-µs	       282.5 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced        	   20053	     61473 ns/op	        48.27 p50-µs	       175.4 p99-µs	       292.5 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced        	   19585	     58296 ns/op	        47.58 p50-µs	       169.0 p99-µs	       253.6 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced        	   21368	     59557 ns/op	        47.77 p50-µs	       162.6 p99-µs	       302.0 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/ee-unpaced        	   19789	     61598 ns/op	        48.16 p50-µs	       178.2 p99-µs	       323.1 p999-µs	      37 B/op	       3 allocs/op
+BenchmarkDoorRoundTrip/dd                	   21127	     57686 ns/op	        46.58 p50-µs	       154.8 p99-µs	       239.7 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                	   20880	     57591 ns/op	        45.38 p50-µs	       185.2 p99-µs	       287.3 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                	   21267	     55999 ns/op	        45.35 p50-µs	       178.3 p99-µs	       258.4 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                	   23140	     54067 ns/op	        45.00 p50-µs	       146.5 p99-µs	       233.2 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                	   19537	     59908 ns/op	        50.10 p50-µs	       173.9 p99-µs	       258.1 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/dd                	   21291	     56809 ns/op	        45.31 p50-µs	       164.6 p99-µs	       253.8 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain             	   21319	     56808 ns/op	        45.29 p50-µs	       181.1 p99-µs	       280.8 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain             	   20619	     58354 ns/op	        45.78 p50-µs	       166.6 p99-µs	       283.5 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain             	   21082	     57423 ns/op	        45.37 p50-µs	       172.8 p99-µs	       274.6 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain             	   19566	     61048 ns/op	        49.75 p50-µs	       183.4 p99-µs	       275.3 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain             	   20863	     58774 ns/op	        47.96 p50-µs	       162.1 p99-µs	       247.0 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/plain             	   21518	     58620 ns/op	        48.42 p50-µs	       143.5 p99-µs	       244.7 p999-µs	      32 B/op	       2 allocs/op
+BenchmarkDoorRoundTrip/direct            	   48062	     27447 ns/op	        20.56 p50-µs	        84.71 p99-µs	       658.6 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct            	   45595	     25592 ns/op	        20.58 p50-µs	        69.00 p99-µs	       123.4 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct            	   45573	     25826 ns/op	        20.45 p50-µs	        72.42 p99-µs	       138.4 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct            	   44703	     26522 ns/op	        20.46 p50-µs	        82.49 p99-µs	       135.0 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct            	   48579	     26313 ns/op	        20.61 p50-µs	        77.92 p99-µs	       141.4 p999-µs	       0 B/op	       0 allocs/op
+BenchmarkDoorRoundTrip/direct            	   48135	     24522 ns/op	        20.37 p50-µs	        71.20 p99-µs	       124.0 p999-µs	       0 B/op	       0 allocs/op
+PASS
+

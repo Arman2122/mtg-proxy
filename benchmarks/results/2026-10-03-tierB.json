@@ -1,0 +1,1914 @@
+{
+  "commit": "a34c2cc",
+  "parts": [
+    {
+      "started": "2026-10-03T09:24:50.184649143Z",
+      "binary": "/root/mtg-bench/mtg-proxy",
+      "pin": 0,
+      "options": {
+        "warmup": 2000000000,
+        "measure": 5000000000,
+        "runs": 3
+      },
+      "limits": [
+        "Loopback on one machine: these are the binary's own costs, not the network's.",
+        "CPU and RSS are every process of the binary: the proxy, and the WEB relay beside it.",
+        "Handshake times include the proxy's SOCKS5 round trip to mtgbench's data centre.",
+        "ee unpaced and the ad-tag leg are measured in Tier A only.",
+        "The binary is pinned to core 0; run mtgbench on another, so the figures are per core."
+      ],
+      "tables": [
+        {
+          "scenario": "bulk",
+          "about": "Every connection moves 1 MiB chunks, two commands in flight, each checked to the byte. CPU is every process of the binary (the proxy, and the relay), per GB moved.",
+          "metrics": [
+            {
+              "key": "mbps",
+              "title": "MB/s"
+            },
+            {
+              "key": "cpu-s/gb",
+              "title": "CPU-s per GB"
+            },
+            {
+              "key": "load",
+              "title": "binary cores busy"
+            },
+            {
+              "key": "bench-load",
+              "title": "mtgbench cores busy"
+            }
+          ],
+          "rows": [
+            {
+              "label": "ee-record, 1 conn, download",
+              "samples": [
+                {
+                  "bench-load": 0.017997543443305248,
+                  "cpu-s/gb": 17.259021452316453,
+                  "load": 0.03199563278809823,
+                  "mbps": 1.8538497606307724,
+                  "total-mib": 15
+                },
+                {
+                  "bench-load": 0.021994804409297245,
+                  "cpu-s/gb": 15.7184550049298,
+                  "load": 0.03799102579787704,
+                  "mbps": 2.416969465889737,
+                  "total-mib": 18
+                },
+                {
+                  "bench-load": 0.023995767962387546,
+                  "cpu-s/gb": 15.033764582438437,
+                  "load": 0.035993651943581305,
+                  "mbps": 2.3941875467191354,
+                  "total-mib": 16
+                }
+              ]
+            },
+            {
+              "label": "ee-record, 1 conn, upload",
+              "samples": [
+                {
+                  "bench-load": 0.367954377336754,
+                  "cpu-s/gb": 2.679307537052329,
+                  "load": 0.40394991425013205,
+                  "mbps": 150.76653525729347,
+                  "total-mib": 1083
+                },
+                {
+                  "bench-load": 0.3459321871900908,
+                  "cpu-s/gb": 2.5840576537354973,
+                  "load": 0.36192905133760944,
+                  "mbps": 140.06229729991014,
+                  "total-mib": 983
+                },
+                {
+                  "bench-load": 0.4098983378340469,
+                  "cpu-s/gb": 2.758978537555729,
+                  "load": 0.43789139505198194,
+                  "mbps": 158.71504221266053,
+                  "total-mib": 1090
+                }
+              ]
+            },
+            {
+              "label": "ee-record, 64 conns, download",
+              "samples": [
+                {
+                  "bench-load": 0.5279533359996721,
+                  "cpu-s/gb": 3.959999026940984,
+                  "load": 0.5899478565147852,
+                  "mbps": 148.97676804999307,
+                  "total-mib": 1074
+                },
+                {
+                  "bench-load": 0.5039161121777567,
+                  "cpu-s/gb": 3.972342703796042,
+                  "load": 0.5679054597558846,
+                  "mbps": 142.96487038069097,
+                  "total-mib": 1063
+                },
+                {
+                  "bench-load": 0.499984289693643,
+                  "cpu-s/gb": 3.9292511556323992,
+                  "load": 0.5799817760446263,
+                  "mbps": 147.60618577747297,
+                  "total-mib": 1066
+                }
+              ]
+            },
+            {
+              "label": "ee-record, 64 conns, upload",
+              "samples": [
+                {
+                  "bench-load": 0.8999456587612762,
+                  "cpu-s/gb": 1.7937098708108201,
+                  "load": 0.9659416737371028,
+                  "mbps": 538.5161164890413,
+                  "total-mib": 3686
+                },
+                {
+                  "bench-load": 0.9477091365039559,
+                  "cpu-s/gb": 1.6811233869185254,
+                  "load": 0.9717017728711441,
+                  "mbps": 578.007408874526,
+                  "total-mib": 3935
+                },
+                {
+                  "bench-load": 0.9358199441251425,
+                  "cpu-s/gb": 1.6524400078941155,
+                  "load": 0.9618149425730635,
+                  "mbps": 582.0574047942649,
+                  "total-mib": 3890
+                }
+              ]
+            },
+            {
+              "label": "dd, 1 conn, download",
+              "samples": [
+                {
+                  "bench-load": 0.8009754532345514,
+                  "cpu-s/gb": 2.184869439854087,
+                  "load": 0.9148298194050489,
+                  "mbps": 418.7114354375996,
+                  "total-mib": 2888
+                },
+                {
+                  "bench-load": 0.8576865239808128,
+                  "cpu-s/gb": 2.015542242359045,
+                  "load": 0.923662410440875,
+                  "mbps": 458.2699340301574,
+                  "total-mib": 3066
+                },
+                {
+                  "bench-load": 0.8677645798083202,
+                  "cpu-s/gb": 2.0749399352771967,
+                  "load": 0.9357461367518299,
+                  "mbps": 450.97504792437337,
+                  "total-mib": 2968
+                }
+              ]
+            },
+            {
+              "label": "dd, 1 conn, upload",
+              "samples": [
+                {
+                  "bench-load": 0.8637927911394017,
+                  "cpu-s/gb": 2.082838888061972,
+                  "load": 0.9397745644340674,
+                  "mbps": 451.1988756405942,
+                  "total-mib": 2986
+                },
+                {
+                  "bench-load": 0.8757155374688148,
+                  "cpu-s/gb": 2.0695441717551994,
+                  "load": 0.9336967031916372,
+                  "mbps": 451.1605579308609,
+                  "total-mib": 2974
+                },
+                {
+                  "bench-load": 0.8659661001982684,
+                  "cpu-s/gb": 2.062597940134444,
+                  "load": 0.9299635949011414,
+                  "mbps": 450.87002988111425,
+                  "total-mib": 2900
+                }
+              ]
+            },
+            {
+              "label": "dd, 64 conns, download",
+              "samples": [
+                {
+                  "bench-load": 0.9277196642694662,
+                  "cpu-s/gb": 1.7007999675236565,
+                  "load": 0.9817033516299731,
+                  "mbps": 577.2009468340483,
+                  "total-mib": 3921
+                },
+                {
+                  "bench-load": 0.9499649994895587,
+                  "cpu-s/gb": 1.6230997579418145,
+                  "load": 0.9819638205249986,
+                  "mbps": 604.9928944417971,
+                  "total-mib": 4095
+                },
+                {
+                  "bench-load": 0.9398654302556667,
+                  "cpu-s/gb": 1.60668444319247,
+                  "load": 0.9878585586091495,
+                  "mbps": 614.8429225133231,
+                  "total-mib": 4190
+                }
+              ]
+            },
+            {
+              "label": "dd, 64 conns, upload",
+              "samples": [
+                {
+                  "bench-load": 0.9039645797750798,
+                  "cpu-s/gb": 1.6811120249059073,
+                  "load": 0.9659621505118637,
+                  "mbps": 574.5971334456008,
+                  "total-mib": 3818
+                },
+                {
+                  "bench-load": 0.9258409757023305,
+                  "cpu-s/gb": 1.6518218983353237,
+                  "load": 0.9798317021471769,
+                  "mbps": 593.1824146021031,
+                  "total-mib": 3911
+                },
+                {
+                  "bench-load": 0.9398193139100216,
+                  "cpu-s/gb": 1.6059453391765013,
+                  "load": 0.9738127784557035,
+                  "mbps": 606.3797781281002,
+                  "total-mib": 4086
+                }
+              ]
+            },
+            {
+              "label": "plain, 1 conn, download",
+              "samples": [
+                {
+                  "bench-load": 0.8517651610199274,
+                  "cpu-s/gb": 2.013730933372742,
+                  "load": 0.9277442129418917,
+                  "mbps": 460.70912333259867,
+                  "total-mib": 3068
+                },
+                {
+                  "bench-load": 0.8539045478171496,
+                  "cpu-s/gb": 2.0689582469521053,
+                  "load": 0.9318958297020885,
+                  "mbps": 450.4179004457509,
+                  "total-mib": 3039
+                },
+                {
+                  "bench-load": 0.8177395162731995,
+                  "cpu-s/gb": 2.1310085379183428,
+                  "load": 0.8877172254897313,
+                  "mbps": 416.57140724405076,
+                  "total-mib": 2850
+                }
+              ]
+            },
+            {
+              "label": "plain, 1 conn, upload",
+              "samples": [
+                {
+                  "bench-load": 0.8538976333854755,
+                  "cpu-s/gb": 2.0275306182888984,
+                  "load": 0.9378875645381426,
+                  "mbps": 462.57627681581323,
+                  "total-mib": 3093
+                },
+                {
+                  "bench-load": 0.8439751871294982,
+                  "cpu-s/gb": 2.0222808641365346,
+                  "load": 0.9219728939969192,
+                  "mbps": 455.90744112123105,
+                  "total-mib": 3052
+                },
+                {
+                  "bench-load": 0.8519653331898045,
+                  "cpu-s/gb": 2.0167149535012836,
+                  "load": 0.9219624849776983,
+                  "mbps": 457.16053395500916,
+                  "total-mib": 3066
+                }
+              ]
+            },
+            {
+              "label": "plain, 64 conns, download",
+              "samples": [
+                {
+                  "bench-load": 0.9215803891505879,
+                  "cpu-s/gb": 1.6017369397879773,
+                  "load": 0.96156218477534,
+                  "mbps": 600.3246606166318,
+                  "total-mib": 4079
+                },
+                {
+                  "bench-load": 0.9238995118848108,
+                  "cpu-s/gb": 1.6501321564646119,
+                  "load": 0.9698945092297235,
+                  "mbps": 587.7677769201896,
+                  "total-mib": 4041
+                },
+                {
+                  "bench-load": 0.925954479522213,
+                  "cpu-s/gb": 1.6413783457641835,
+                  "load": 0.979951824980314,
+                  "mbps": 597.0298240556315,
+                  "total-mib": 4091
+                }
+              ]
+            },
+            {
+              "label": "plain, 64 conns, upload",
+              "samples": [
+                {
+                  "bench-load": 0.9495885081646375,
+                  "cpu-s/gb": 1.617665990627666,
+                  "load": 0.9935694495954205,
+                  "mbps": 614.199380682973,
+                  "total-mib": 4142
+                },
+                {
+                  "bench-load": 0.9516711871364594,
+                  "cpu-s/gb": 1.601465455778348,
+                  "load": 0.9776622069532106,
+                  "mbps": 610.4797349363024,
+                  "total-mib": 4072
+                },
+                {
+                  "bench-load": 0.9377480964798345,
+                  "cpu-s/gb": 1.6944321127821083,
+                  "load": 0.9897341316791469,
+                  "mbps": 584.1096401638013,
+                  "total-mib": 3834
+                }
+              ]
+            },
+            {
+              "label": "web, 1 conn, download",
+              "samples": [
+                {
+                  "bench-load": 0.4998439751027348,
+                  "cpu-s/gb": 5.636666994896643,
+                  "load": 0.9137147864877979,
+                  "mbps": 162.10196332603326,
+                  "total-mib": 1057
+                },
+                {
+                  "bench-load": 0.5038030305474034,
+                  "cpu-s/gb": 5.580103788565881,
+                  "load": 0.9156420158361469,
+                  "mbps": 164.09049912519143,
+                  "total-mib": 1096
+                },
+                {
+                  "bench-load": 0.5139309688950429,
+                  "cpu-s/gb": 5.517152105769646,
+                  "load": 0.9138772481907971,
+                  "mbps": 165.6429314745729,
+                  "total-mib": 1081
+                }
+              ]
+            },
+            {
+              "label": "web, 1 conn, upload",
+              "samples": [
+                {
+                  "bench-load": 0.55573122503886,
+                  "cpu-s/gb": 7.17483948324326,
+                  "load": 0.9655330276754258,
+                  "mbps": 134.5720736931349,
+                  "total-mib": 892
+                },
+                {
+                  "bench-load": 0.5759743841152399,
+                  "cpu-s/gb": 7.005119036045914,
+                  "load": 0.9739566842504255,
+                  "mbps": 139.03499415766981,
+                  "total-mib": 932
+                },
+                {
+                  "bench-load": 0.549738996348635,
+                  "cpu-s/gb": 7.0615579153745145,
+                  "load": 0.9695396844694096,
+                  "mbps": 137.29826988439976,
+                  "total-mib": 917
+                }
+              ]
+            },
+            {
+              "label": "web, 64 conns, download",
+              "samples": [
+                {
+                  "bench-load": 0.671822383866885,
+                  "cpu-s/gb": 3.486248349140588,
+                  "load": 0.9737425623308633,
+                  "mbps": 279.30958004495153,
+                  "total-mib": 1823
+                },
+                {
+                  "bench-load": 0.6456758044998016,
+                  "cpu-s/gb": 3.606081008911114,
+                  "load": 0.9675142086003199,
+                  "mbps": 268.30074150011086,
+                  "total-mib": 1838
+                },
+                {
+                  "bench-load": 0.6338692451985559,
+                  "cpu-s/gb": 3.649147839699699,
+                  "load": 0.9817974744242505,
+                  "mbps": 269.0484237835226,
+                  "total-mib": 1903
+                }
+              ]
+            },
+            {
+              "label": "web, 64 conns, upload",
+              "samples": [
+                {
+                  "bench-load": 0.5639337310193991,
+                  "cpu-s/gb": 5.281559554985223,
+                  "load": 0.9878839117857465,
+                  "mbps": 187.04397848799994,
+                  "total-mib": 1268
+                },
+                {
+                  "bench-load": 0.5659111002329856,
+                  "cpu-s/gb": 5.37189409697477,
+                  "load": 0.9878448180745455,
+                  "mbps": 183.89134265153498,
+                  "total-mib": 1292
+                },
+                {
+                  "bench-load": 0.5757473672369875,
+                  "cpu-s/gb": 5.367793151233335,
+                  "load": 0.9935640330443705,
+                  "mbps": 185.09730256950823,
+                  "total-mib": 1292
+                }
+              ]
+            },
+            {
+              "label": "ee-burst, 1 conn, download",
+              "samples": [
+                {
+                  "bench-load": 0.8318938092543785,
+                  "cpu-s/gb": 1.896595082689274,
+                  "load": 0.893885896001707,
+                  "mbps": 471.3108792490504,
+                  "total-mib": 3131
+                },
+                {
+                  "bench-load": 0.833466567894381,
+                  "cpu-s/gb": 2.204755301986648,
+                  "load": 0.9034217954155009,
+                  "mbps": 409.7605727952897,
+                  "total-mib": 2739
+                },
+                {
+                  "bench-load": 0.8279608127803206,
+                  "cpu-s/gb": 2.134245878440045,
+                  "load": 0.8999574051960036,
+                  "mbps": 421.6746600226761,
+                  "total-mib": 2729
+                }
+              ]
+            },
+            {
+              "label": "ee-burst, 1 conn, upload",
+              "samples": [
+                {
+                  "bench-load": 0.887845961211698,
+                  "cpu-s/gb": 2.342798031360962,
+                  "load": 0.9338379817249175,
+                  "mbps": 398.5994393133576,
+                  "total-mib": 2578
+                },
+                {
+                  "bench-load": 0.883802389386437,
+                  "cpu-s/gb": 2.5016138681602786,
+                  "load": 0.9477880827356775,
+                  "mbps": 378.870654180013,
+                  "total-mib": 2497
+                },
+                {
+                  "bench-load": 0.8836851219593318,
+                  "cpu-s/gb": 2.3653929445283755,
+                  "load": 0.9436637501466253,
+                  "mbps": 398.94587169100475,
+                  "total-mib": 2603
+                }
+              ]
+            },
+            {
+              "label": "ee-burst, 64 conns, download",
+              "samples": [
+                {
+                  "bench-load": 0.9337545913653043,
+                  "cpu-s/gb": 1.9089295268305784,
+                  "load": 0.9657461833606859,
+                  "mbps": 505.9098147872055,
+                  "total-mib": 3417
+                },
+                {
+                  "bench-load": 0.9159124015883614,
+                  "cpu-s/gb": 1.8964254922770016,
+                  "load": 0.9439097239076594,
+                  "mbps": 497.730982710175,
+                  "total-mib": 3367
+                },
+                {
+                  "bench-load": 0.9094635314726124,
+                  "cpu-s/gb": 1.848338429004995,
+                  "load": 0.9514387713867435,
+                  "mbps": 514.753551869246,
+                  "total-mib": 3518
+                }
+              ]
+            },
+            {
+              "label": "ee-burst, 64 conns, upload",
+              "samples": [
+                {
+                  "bench-load": 0.9519659763552395,
+                  "cpu-s/gb": 1.7409504238776636,
+                  "load": 0.9499660478334625,
+                  "mbps": 545.6594483130535,
+                  "total-mib": 3641
+                },
+                {
+                  "bench-load": 0.9637811707865956,
+                  "cpu-s/gb": 1.77163344163161,
+                  "load": 0.9657807167840677,
+                  "mbps": 545.1357454026263,
+                  "total-mib": 3681
+                },
+                {
+                  "bench-load": 0.9516082354506918,
+                  "cpu-s/gb": 1.7876804930324974,
+                  "load": 0.9735991820682497,
+                  "mbps": 544.6158784317792,
+                  "total-mib": 3676
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "scenario": "handshake",
+          "about": "Whole connections back to back, 8 at a time: dial, a one-byte echo, close. Connect-to-first-byte includes the proxy's SOCKS5 round trip to the data centre. Fronted is hellos the anti-replay cache took for replays (by the client; the cover listener's own count beside it).",
+          "metrics": [
+            {
+              "key": "conn/s",
+              "title": "connections/s"
+            },
+            {
+              "key": "p50-ms",
+              "title": "first byte p50 ms"
+            },
+            {
+              "key": "p99-ms",
+              "title": "p99 ms"
+            },
+            {
+              "key": "fronted",
+              "title": "fronted",
+              "count": true
+            },
+            {
+              "key": "cover",
+              "title": "at the cover",
+              "count": true
+            }
+          ],
+          "rows": [
+            {
+              "label": "ee-record",
+              "samples": [
+                {
+                  "conn/s": 831.4918210793501,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 3.282951,
+                  "p99-ms": 112.74502
+                },
+                {
+                  "conn/s": 874.3434063047106,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 3.265106,
+                  "p99-ms": 108.784337
+                },
+                {
+                  "conn/s": 880.7958959677537,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 3.629283,
+                  "p99-ms": 87.97282100000001
+                }
+              ]
+            },
+            {
+              "label": "dd",
+              "samples": [
+                {
+                  "conn/s": 2886.702957074405,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 2.363913,
+                  "p99-ms": 8.426961
+                },
+                {
+                  "conn/s": 3088.6979266347143,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 2.174491,
+                  "p99-ms": 8.691017
+                },
+                {
+                  "conn/s": 3071.3084003998874,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 2.243525,
+                  "p99-ms": 7.827387
+                }
+              ]
+            },
+            {
+              "label": "plain",
+              "samples": [
+                {
+                  "conn/s": 3182.759442290508,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 2.180178,
+                  "p99-ms": 7.208018
+                },
+                {
+                  "conn/s": 3115.48367615434,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 2.2209399999999997,
+                  "p99-ms": 7.382542
+                },
+                {
+                  "conn/s": 3168.645947184282,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 2.179139,
+                  "p99-ms": 7.545121
+                }
+              ]
+            },
+            {
+              "label": "web",
+              "samples": [
+                {
+                  "conn/s": 631.3342542404982,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 10.057227000000001,
+                  "p99-ms": 26.39992
+                },
+                {
+                  "conn/s": 578.9231103750229,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 10.803002000000001,
+                  "p99-ms": 32.752162
+                },
+                {
+                  "conn/s": 550.3918068723559,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 11.35691,
+                  "p99-ms": 31.965293
+                }
+              ]
+            },
+            {
+              "label": "ee-burst",
+              "samples": [
+                {
+                  "conn/s": 783.091193936757,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 4.538679,
+                  "p99-ms": 96.546823
+                },
+                {
+                  "conn/s": 791.3376611455225,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 4.532307,
+                  "p99-ms": 102.588923
+                },
+                {
+                  "conn/s": 782.9716521015838,
+                  "cover": 0,
+                  "failed": 0,
+                  "fronted": 0,
+                  "p50-ms": 4.597865,
+                  "p99-ms": 94.469759
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "scenario": "latency",
+          "about": "One connection, 100 bytes to the data centre and 100 back, over and over. Direct is the same with no proxy and no SOCKS5: a door's added latency is its figure minus that one. Samples is how many round trips the percentiles rest on.",
+          "metrics": [
+            {
+              "key": "p50-us",
+              "title": "p50 \u00b5s"
+            },
+            {
+              "key": "p99-us",
+              "title": "p99 \u00b5s"
+            },
+            {
+              "key": "p999-us",
+              "title": "p99.9 \u00b5s"
+            },
+            {
+              "key": "n",
+              "title": "samples",
+              "count": true
+            }
+          ],
+          "rows": [
+            {
+              "label": "direct",
+              "samples": [
+                {
+                  "n": 190026,
+                  "p50-us": 23.629,
+                  "p99-us": 51.033,
+                  "p999-us": 103.268
+                },
+                {
+                  "n": 181193,
+                  "p50-us": 23.67,
+                  "p99-us": 56.607,
+                  "p999-us": 201.267
+                },
+                {
+                  "n": 189069,
+                  "p50-us": 23.564,
+                  "p99-us": 48.672,
+                  "p999-us": 100.584
+                }
+              ]
+            },
+            {
+              "label": "ee-record",
+              "samples": [
+                {
+                  "n": 807,
+                  "p50-us": 1319.222,
+                  "p99-us": 88284.457,
+                  "p999-us": 400749.104
+                },
+                {
+                  "n": 830,
+                  "p50-us": 1359.082,
+                  "p99-us": 67728.966,
+                  "p999-us": 318274.958
+                },
+                {
+                  "n": 602,
+                  "p50-us": 1400.965,
+                  "p99-us": 100806.919,
+                  "p999-us": 421834.753
+                }
+              ]
+            },
+            {
+              "label": "dd",
+              "samples": [
+                {
+                  "n": 34832,
+                  "p50-us": 124.895,
+                  "p99-us": 385.1,
+                  "p999-us": 1106.523
+                },
+                {
+                  "n": 33788,
+                  "p50-us": 128.089,
+                  "p99-us": 389.818,
+                  "p999-us": 1878.41
+                },
+                {
+                  "n": 33188,
+                  "p50-us": 128.347,
+                  "p99-us": 471.197,
+                  "p999-us": 1221.411
+                }
+              ]
+            },
+            {
+              "label": "plain",
+              "samples": [
+                {
+                  "n": 33537,
+                  "p50-us": 123.642,
+                  "p99-us": 452.636,
+                  "p999-us": 1949.508
+                },
+                {
+                  "n": 33506,
+                  "p50-us": 123.982,
+                  "p99-us": 477.498,
+                  "p999-us": 1843.595
+                },
+                {
+                  "n": 34243,
+                  "p50-us": 123.817,
+                  "p99-us": 429.782,
+                  "p999-us": 1923.701
+                }
+              ]
+            },
+            {
+              "label": "web",
+              "samples": [
+                {
+                  "n": 13243,
+                  "p50-us": 259.859,
+                  "p99-us": 2169.275,
+                  "p999-us": 3770.897
+                },
+                {
+                  "n": 16757,
+                  "p50-us": 256.505,
+                  "p99-us": 904.842,
+                  "p999-us": 2209.095
+                },
+                {
+                  "n": 15960,
+                  "p50-us": 272.422,
+                  "p99-us": 911.463,
+                  "p999-us": 2228.743
+                }
+              ]
+            },
+            {
+              "label": "ee-burst",
+              "samples": [
+                {
+                  "n": 27956,
+                  "p50-us": 148.682,
+                  "p99-us": 641.362,
+                  "p999-us": 2094.585
+                },
+                {
+                  "n": 32553,
+                  "p50-us": 127.829,
+                  "p99-us": 442.719,
+                  "p999-us": 2067.227
+                },
+                {
+                  "n": 30125,
+                  "p50-us": 141.685,
+                  "p99-us": 491.88,
+                  "p999-us": 1694.388
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "scenario": "idle",
+          "about": "Connections opened and left open on a fresh process, each first proven with a one-byte echo. RSS is every process of the binary; per connection is the growth over the process before it, divided by the count. WEB is one session per connection.",
+          "metrics": [
+            {
+              "key": "kib/conn",
+              "title": "RSS KiB per conn"
+            },
+            {
+              "key": "open-s",
+              "title": "seconds to open"
+            },
+            {
+              "key": "bench-kib/conn",
+              "title": "mtgbench's own heap KiB per conn"
+            }
+          ],
+          "rows": [
+            {
+              "label": "ee-record, 1000 conns",
+              "samples": [
+                {
+                  "bench-kib/conn": 7.5607265625,
+                  "kib/conn": 72.508,
+                  "open-s": 1.361290535
+                },
+                {
+                  "bench-kib/conn": 7.1472265625,
+                  "kib/conn": 73.236,
+                  "open-s": 0.86559495
+                },
+                {
+                  "bench-kib/conn": 7.1599296875,
+                  "kib/conn": 71.208,
+                  "open-s": 0.919929055
+                }
+              ]
+            },
+            {
+              "label": "ee-record, 5000 conns",
+              "samples": [
+                {
+                  "bench-kib/conn": 7.5201890625,
+                  "kib/conn": 72.0288,
+                  "open-s": 4.231454557
+                },
+                {
+                  "bench-kib/conn": 7.1442453125,
+                  "kib/conn": 70.8456,
+                  "open-s": 4.3289213
+                },
+                {
+                  "bench-kib/conn": 7.1324953125,
+                  "kib/conn": 71.9928,
+                  "open-s": 4.21895226
+                }
+              ]
+            },
+            {
+              "label": "dd, 1000 conns",
+              "samples": [
+                {
+                  "bench-kib/conn": 2.8712578125,
+                  "kib/conn": 34.732,
+                  "open-s": 0.401246286
+                },
+                {
+                  "bench-kib/conn": 2.8747890625,
+                  "kib/conn": 33.624,
+                  "open-s": 0.405630789
+                },
+                {
+                  "bench-kib/conn": 2.8562109375,
+                  "kib/conn": 34.14,
+                  "open-s": 0.394813585
+                }
+              ]
+            },
+            {
+              "label": "dd, 5000 conns",
+              "samples": [
+                {
+                  "bench-kib/conn": 2.8372203125,
+                  "kib/conn": 32.588,
+                  "open-s": 1.943465999
+                },
+                {
+                  "bench-kib/conn": 2.8274703125,
+                  "kib/conn": 32.5768,
+                  "open-s": 1.7391501329999999
+                },
+                {
+                  "bench-kib/conn": 2.8503609375,
+                  "kib/conn": 32,
+                  "open-s": 1.906301988
+                }
+              ]
+            },
+            {
+              "label": "plain, 1000 conns",
+              "samples": [
+                {
+                  "bench-kib/conn": 2.8735859375,
+                  "kib/conn": 33.9,
+                  "open-s": 0.386411268
+                },
+                {
+                  "bench-kib/conn": 2.8702421875,
+                  "kib/conn": 33.84,
+                  "open-s": 0.38538014
+                },
+                {
+                  "bench-kib/conn": 2.8474296875,
+                  "kib/conn": 34.02,
+                  "open-s": 0.375725735
+                }
+              ]
+            },
+            {
+              "label": "web, 1000 conns",
+              "samples": [
+                {
+                  "bench-kib/conn": 8.35959375,
+                  "kib/conn": 167.588,
+                  "open-s": 1.5706971159999998
+                },
+                {
+                  "bench-kib/conn": 10.1117578125,
+                  "kib/conn": 170.688,
+                  "open-s": 1.510472018
+                },
+                {
+                  "bench-kib/conn": 8.6216484375,
+                  "kib/conn": 168.324,
+                  "open-s": 1.489896152
+                }
+              ]
+            },
+            {
+              "label": "ee-burst, 1000 conns",
+              "samples": [
+                {
+                  "bench-kib/conn": 7.1989375,
+                  "kib/conn": 64.32,
+                  "open-s": 0.974059091
+                },
+                {
+                  "bench-kib/conn": 7.2263828125,
+                  "kib/conn": 66.64,
+                  "open-s": 1.370219321
+                },
+                {
+                  "bench-kib/conn": 7.303328125,
+                  "kib/conn": 64.292,
+                  "open-s": 1.055468092
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "scenario": "contention",
+          "about": "dd, 64 downloads: one user's 64 connections against 64 users of one each.",
+          "metrics": [
+            {
+              "key": "mbps",
+              "title": "MB/s"
+            },
+            {
+              "key": "cpu-s/gb",
+              "title": "CPU-s per GB"
+            },
+            {
+              "key": "load",
+              "title": "binary cores busy"
+            },
+            {
+              "key": "bench-load",
+              "title": "mtgbench cores busy"
+            }
+          ],
+          "rows": [
+            {
+              "label": "dd, 1 user \u00d7 64 conns",
+              "samples": [
+                {
+                  "bench-load": 0.9556416284643423,
+                  "cpu-s/gb": 1.6582697481868907,
+                  "load": 0.979632631689401,
+                  "mbps": 590.7558964761349,
+                  "total-mib": 3986
+                },
+                {
+                  "bench-load": 0.9276175212187131,
+                  "cpu-s/gb": 1.6965727875198033,
+                  "load": 0.9815952649103038,
+                  "mbps": 578.5753915959507,
+                  "total-mib": 3934
+                },
+                {
+                  "bench-load": 0.9397813826040443,
+                  "cpu-s/gb": 1.624117628939683,
+                  "load": 0.9737734751663215,
+                  "mbps": 599.5707809674208,
+                  "total-mib": 4122
+                }
+              ]
+            },
+            {
+              "label": "dd, 64 users \u00d7 1 conn",
+              "samples": [
+                {
+                  "bench-load": 0.9017060162465091,
+                  "cpu-s/gb": 1.6500623963719852,
+                  "load": 0.9616864607861899,
+                  "mbps": 582.8182394197111,
+                  "total-mib": 4000
+                },
+                {
+                  "bench-load": 0.9359646546051708,
+                  "cpu-s/gb": 1.6730717613823103,
+                  "load": 0.9739632196425596,
+                  "mbps": 582.1407318702579,
+                  "total-mib": 3978
+                },
+                {
+                  "bench-load": 0.9319082851278342,
+                  "cpu-s/gb": 1.6682449428514519,
+                  "load": 0.9739041520541916,
+                  "mbps": 583.7896624398234,
+                  "total-mib": 3968
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "scenario": "limiter",
+          "about": "dd, 64 downloads: no cap, against a cap of 10 GB/s that never binds. The difference is the limiter's own cost.",
+          "metrics": [
+            {
+              "key": "mbps",
+              "title": "MB/s"
+            },
+            {
+              "key": "cpu-s/gb",
+              "title": "CPU-s per GB"
+            },
+            {
+              "key": "load",
+              "title": "binary cores busy"
+            },
+            {
+              "key": "bench-load",
+              "title": "mtgbench cores busy"
+            }
+          ],
+          "rows": [
+            {
+              "label": "dd, no cap",
+              "samples": [
+                {
+                  "bench-load": 0.9258477337855139,
+                  "cpu-s/gb": 1.6183501041147264,
+                  "load": 0.9698404986738159,
+                  "mbps": 599.2773110144424,
+                  "total-mib": 4144
+                },
+                {
+                  "bench-load": 0.929955230839248,
+                  "cpu-s/gb": 1.6360967619889184,
+                  "load": 0.9719532090061774,
+                  "mbps": 594.0682920395393,
+                  "total-mib": 4081
+                },
+                {
+                  "bench-load": 0.923907740420858,
+                  "cpu-s/gb": 1.6037865584501854,
+                  "load": 0.9699031474115104,
+                  "mbps": 604.758246850986,
+                  "total-mib": 4116
+                }
+              ]
+            },
+            {
+              "label": "dd, cap far above",
+              "samples": [
+                {
+                  "bench-load": 0.9259016777601163,
+                  "cpu-s/gb": 1.629443538513838,
+                  "load": 0.977896156424841,
+                  "mbps": 600.1411729287337,
+                  "total-mib": 4122
+                },
+                {
+                  "bench-load": 0.9156453868401615,
+                  "cpu-s/gb": 1.7423579979085226,
+                  "load": 0.9796206103748555,
+                  "mbps": 562.2384214672097,
+                  "total-mib": 3890
+                },
+                {
+                  "bench-load": 0.897897053768255,
+                  "cpu-s/gb": 1.6460006245362242,
+                  "load": 0.9518908632376232,
+                  "mbps": 578.3052867952753,
+                  "total-mib": 4009
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "scenario": "slow-reader",
+          "about": "64 ee connections on a fresh process whose clients read 100 KiB/s while the data centre sends as fast as it can, for 20 s, once. RSS per connection should stay near the doppelganger's bound (about 512 KiB of queue) and not grow with time.",
+          "metrics": [
+            {
+              "key": "kib@5s",
+              "title": "KiB per conn at 5 s"
+            },
+            {
+              "key": "kib@end",
+              "title": "at 20 s"
+            },
+            {
+              "key": "kib-peak",
+              "title": "peak"
+            },
+            {
+              "key": "growth",
+              "title": "growth 5\u219220 s"
+            }
+          ],
+          "rows": [
+            {
+              "label": "ee-record, 64 conns",
+              "samples": [
+                {
+                  "growth": 4.125,
+                  "kib-peak": 1261.75,
+                  "kib@5s": 1257.625,
+                  "kib@end": 1261.75
+                }
+              ]
+            },
+            {
+              "label": "ee-burst, 64 conns",
+              "samples": [
+                {
+                  "growth": 174.375,
+                  "kib-peak": 1169.875,
+                  "kib@5s": 995.5,
+                  "kib@end": 1169.875
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "started": "2026-10-03T09:42:45.472663142Z",
+      "binary": "/root/mtg-bench/mtg-proxy",
+      "pin": 0,
+      "options": {
+        "warmup": 2000000000,
+        "measure": 5000000000,
+        "runs": 3
+      },
+      "limits": [
+        "Loopback on one machine: these are the binary's own costs, not the network's.",
+        "CPU and RSS are every process of the binary: the proxy, and the WEB relay beside it.",
+        "Handshake times include the proxy's SOCKS5 round trip to mtgbench's data centre.",
+        "ee unpaced and the ad-tag leg are measured in Tier A only.",
+        "The binary is pinned to core 0; run mtgbench on another, so the figures are per core."
+      ],
+      "tables": [
+        {
+          "scenario": "caps",
+          "about": "One user, 8 connections, against a cap of 1 or 10 MiB/s. speed-up is measured uploading, speed and speed-down downloading. Delivered bytes are sampled every second; the first (burst) second is dropped, and on ee the second after it too, which the doppelganger's queue (after the limiter) carries part of the burst into. Achieved over target: the mean, and the lowest and highest single second. Fairness is Jain's index across the user's connections (1 is equal shares).",
+          "metrics": [
+            {
+              "key": "mean",
+              "title": "achieved/target mean"
+            },
+            {
+              "key": "min",
+              "title": "lowest second"
+            },
+            {
+              "key": "max",
+              "title": "highest second"
+            },
+            {
+              "key": "jain",
+              "title": "fairness"
+            }
+          ],
+          "rows": [
+            {
+              "label": "ee-record, speed 1 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9993697047866611,
+                  "max": 1.0116310119628906,
+                  "mean": 0.9991250991821289,
+                  "min": 0.9864654541015625
+                },
+                {
+                  "jain": 0.999801447638433,
+                  "max": 1.0094614028930664,
+                  "mean": 1.0017385482788086,
+                  "min": 0.9956722259521484
+                },
+                {
+                  "jain": 0.9998500096763556,
+                  "max": 1.004281997680664,
+                  "mean": 1.0003965377807618,
+                  "min": 0.993596076965332
+                }
+              ]
+            },
+            {
+              "label": "ee-record, speed 10 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9931192196332413,
+                  "max": 1.0280305862426757,
+                  "mean": 0.9962572479248046,
+                  "min": 0.9688549041748047
+                },
+                {
+                  "jain": 0.9943382649677505,
+                  "max": 1.026550579071045,
+                  "mean": 0.9975118255615234,
+                  "min": 0.9608902931213379
+                },
+                {
+                  "jain": 0.9960598206488057,
+                  "max": 1.0156469345092773,
+                  "mean": 0.9987469482421875,
+                  "min": 0.9796422004699707
+                }
+              ]
+            },
+            {
+              "label": "ee-record, speed-up 1 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9965066828675577,
+                  "max": 1.0625,
+                  "mean": 1.0125000000000002,
+                  "min": 1
+                },
+                {
+                  "jain": 0.9978273464658169,
+                  "max": 1.125,
+                  "mean": 1.0375,
+                  "min": 1
+                },
+                {
+                  "jain": 0.9975062344139651,
+                  "max": 1.1875,
+                  "mean": 0.9999999999999999,
+                  "min": 0.8125
+                }
+              ]
+            },
+            {
+              "label": "ee-record, speed-up 10 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9997134284604687,
+                  "max": 1.0125,
+                  "mean": 0.99875,
+                  "min": 0.9875
+                },
+                {
+                  "jain": 0.9996546440950419,
+                  "max": 1,
+                  "mean": 0.9975,
+                  "min": 0.99375
+                },
+                {
+                  "jain": 0.9974767732547293,
+                  "max": 1.0125,
+                  "mean": 1.00125,
+                  "min": 0.9875
+                }
+              ]
+            },
+            {
+              "label": "ee-record, speed-down 1 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.999749808799859,
+                  "max": 1.0091800689697266,
+                  "mean": 1.0021636962890625,
+                  "min": 0.9923248291015625
+                },
+                {
+                  "jain": 0.9999185079415784,
+                  "max": 1.0150384902954102,
+                  "mean": 1.0025054931640625,
+                  "min": 0.985468864440918
+                },
+                {
+                  "jain": 0.9998094517596191,
+                  "max": 1.006352424621582,
+                  "mean": 0.9994501113891603,
+                  "min": 0.9954280853271484
+                }
+              ]
+            },
+            {
+              "label": "ee-record, speed-down 10 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9959496898588959,
+                  "max": 1.0218053817749024,
+                  "mean": 0.9974969482421875,
+                  "min": 0.9750514984130859
+                },
+                {
+                  "jain": 0.9962146405559076,
+                  "max": 1.015641212463379,
+                  "mean": 0.9981438827514648,
+                  "min": 0.9795945167541504
+                },
+                {
+                  "jain": 0.9941360777678602,
+                  "max": 1.0358922004699707,
+                  "mean": 1.0003063011169433,
+                  "min": 0.9765582084655762
+                }
+              ]
+            },
+            {
+              "label": "dd, speed 1 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9996470921827968,
+                  "max": 1.0107126235961914,
+                  "mean": 1.0021986007690429,
+                  "min": 0.9955892562866211
+                },
+                {
+                  "jain": 0.9997340430632821,
+                  "max": 1.0139732360839844,
+                  "mean": 1.0005512237548828,
+                  "min": 0.9912357330322266
+                },
+                {
+                  "jain": 0.9998536120611881,
+                  "max": 1.0068597793579102,
+                  "mean": 1.000509262084961,
+                  "min": 0.9931135177612305
+                }
+              ]
+            },
+            {
+              "label": "dd, speed 10 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9999985379011123,
+                  "max": 1.0012568473815917,
+                  "mean": 1.000632038116455,
+                  "min": 0.99969482421875
+                },
+                {
+                  "jain": 0.9999930716847768,
+                  "max": 1.001558208465576,
+                  "mean": 1.0003131675720214,
+                  "min": 0.9999961853027344
+                },
+                {
+                  "jain": 0.9999977561999605,
+                  "max": 1.0015658378601073,
+                  "mean": 1.0003116416931153,
+                  "min": 0.9999923706054688
+                }
+              ]
+            },
+            {
+              "label": "dd, speed-up 1 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9988796414852753,
+                  "max": 1,
+                  "mean": 0.9875,
+                  "min": 0.9375
+                },
+                {
+                  "jain": 0.9989342265529841,
+                  "max": 1.125,
+                  "mean": 1.0125,
+                  "min": 0.75
+                },
+                {
+                  "jain": 0.9982185273159145,
+                  "max": 1.125,
+                  "mean": 1.0250000000000001,
+                  "min": 0.875
+                }
+              ]
+            },
+            {
+              "label": "dd, speed-up 10 MiB/s",
+              "samples": [
+                {
+                  "jain": 1,
+                  "max": 1,
+                  "mean": 1,
+                  "min": 1
+                },
+                {
+                  "jain": 0.9983912623403649,
+                  "max": 1.0125,
+                  "mean": 1.0037500000000001,
+                  "min": 0.9875
+                },
+                {
+                  "jain": 0.9986399205067693,
+                  "max": 1.0125,
+                  "mean": 1.0025,
+                  "min": 0.9875
+                }
+              ]
+            },
+            {
+              "label": "dd, speed-down 1 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9995654899389317,
+                  "max": 1.006058692932129,
+                  "mean": 1.001552200317383,
+                  "min": 0.9888229370117188
+                },
+                {
+                  "jain": 0.9998267862877365,
+                  "max": 1.0136432647705078,
+                  "mean": 1.0023479461669922,
+                  "min": 0.9953851699829102
+                },
+                {
+                  "jain": 0.9999295660843425,
+                  "max": 1.0078792572021484,
+                  "mean": 1.000362777709961,
+                  "min": 0.9951076507568359
+                }
+              ]
+            },
+            {
+              "label": "dd, speed-down 10 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9999988295898414,
+                  "max": 1.0012568473815917,
+                  "mean": 1.0003196334838866,
+                  "min": 0.99969482421875
+                },
+                {
+                  "jain": 0.9999993143872915,
+                  "max": 1.0015658378601073,
+                  "mean": 1.0003139305114745,
+                  "min": 1
+                },
+                {
+                  "jain": 0.999997271665046,
+                  "max": 1.0015658378601073,
+                  "mean": 1.0006255722045898,
+                  "min": 0.9984379768371582
+                }
+              ]
+            },
+            {
+              "label": "web, speed 1 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9999320704914215,
+                  "max": 1.015315055847168,
+                  "mean": 1.0028188705444336,
+                  "min": 0.99969482421875
+                },
+                {
+                  "jain": 0.9998965783311029,
+                  "max": 1.015122413635254,
+                  "mean": 1.0009468078613282,
+                  "min": 0.985590934753418
+                },
+                {
+                  "jain": 0.9999287007115701,
+                  "max": 1.0062828063964844,
+                  "mean": 1.0002876281738282,
+                  "min": 0.9958400726318359
+                }
+              ]
+            },
+            {
+              "label": "web, speed 10 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9999977553144395,
+                  "max": 1.0012568473815917,
+                  "mean": 1.0000072288513182,
+                  "min": 0.99969482421875
+                },
+                {
+                  "jain": 0.9985253946711063,
+                  "max": 1.0015238761901855,
+                  "mean": 1.0005843734741209,
+                  "min": 0.9999580383300781
+                },
+                {
+                  "jain": 0.998575971791551,
+                  "max": 1.0015238761901855,
+                  "mean": 0.9999595642089844,
+                  "min": 0.9983998298645019
+                }
+              ]
+            },
+            {
+              "label": "web, speed-up 1 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9978273464658169,
+                  "max": 1.0625,
+                  "mean": 1.0375,
+                  "min": 1
+                },
+                {
+                  "jain": 0.9989342265529841,
+                  "max": 1.0625,
+                  "mean": 1.0125,
+                  "min": 0.875
+                },
+                {
+                  "jain": 1,
+                  "max": 1.0625,
+                  "mean": 1,
+                  "min": 0.875
+                }
+              ]
+            },
+            {
+              "label": "web, speed-up 10 MiB/s",
+              "samples": [
+                {
+                  "jain": 1,
+                  "max": 1,
+                  "mean": 1,
+                  "min": 1
+                },
+                {
+                  "jain": 0.9972773505333664,
+                  "max": 1.025,
+                  "mean": 1.0025,
+                  "min": 0.99375
+                },
+                {
+                  "jain": 0.9988681794970794,
+                  "max": 1.0125,
+                  "mean": 1.00125,
+                  "min": 0.9875
+                }
+              ]
+            },
+            {
+              "label": "web, speed-down 1 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9997548940688338,
+                  "max": 1.0118131637573242,
+                  "mean": 1.002446746826172,
+                  "min": 0.9959487915039062
+                },
+                {
+                  "jain": 0.9999128734964066,
+                  "max": 1.0090770721435547,
+                  "mean": 1.0013185501098634,
+                  "min": 0.9935979843139648
+                },
+                {
+                  "jain": 0.9999295660843425,
+                  "max": 1.0034008026123047,
+                  "mean": 1.0003627777099608,
+                  "min": 0.9958400726318359
+                }
+              ]
+            },
+            {
+              "label": "web, speed-down 10 MiB/s",
+              "samples": [
+                {
+                  "jain": 0.9999988295898414,
+                  "max": 1.0012568473815917,
+                  "mean": 1.0003196334838866,
+                  "min": 0.99969482421875
+                },
+                {
+                  "jain": 0.9975732196392046,
+                  "max": 1.0014857292175292,
+                  "mean": 1.0005439376831053,
+                  "min": 0.9999008178710938
+                },
+                {
+                  "jain": 0.9974126511121189,
+                  "max": 1.001466655731201,
+                  "mean": 1.0002315330505371,
+                  "min": 0.9999198913574219
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "scenario": "accounting",
+          "about": "Clean: one connection uploads 8 MiB and downloads 16 MiB; the proxy's /stats bytes_in and bytes_out, and for WEB the relay's bytes.up and bytes.down (less the client's 64-byte obfuscated2 frame), minus what the client moved. Every difference must be 0. Abrupt: the client asks for 64 MiB, reads 4 MiB and resets; the proxy may have counted bytes still in buffers, so counted \u2265 received and counted \u2264 what the data centre sent is the bound, and the gap is reported.",
+          "metrics": [
+            {
+              "key": "in-diff",
+              "title": "bytes_in \u2212 written",
+              "count": true
+            },
+            {
+              "key": "out-diff",
+              "title": "bytes_out \u2212 read",
+              "count": true
+            },
+            {
+              "key": "up-diff",
+              "title": "relay up \u2212 written",
+              "count": true
+            },
+            {
+              "key": "down-diff",
+              "title": "relay down \u2212 read",
+              "count": true
+            },
+            {
+              "key": "gap-kib",
+              "title": "abrupt: counted \u2212 received KiB"
+            }
+          ],
+          "rows": [
+            {
+              "label": "ee-record, clean",
+              "samples": [
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                },
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                },
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                }
+              ]
+            },
+            {
+              "label": "ee-record, abrupt",
+              "samples": [
+                {
+                  "gap-kib": 286.740234375
+                },
+                {
+                  "gap-kib": 270.7451171875
+                },
+                {
+                  "gap-kib": 286.701171875
+                }
+              ]
+            },
+            {
+              "label": "dd, clean",
+              "samples": [
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                },
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                },
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                }
+              ]
+            },
+            {
+              "label": "dd, abrupt",
+              "samples": [
+                {
+                  "gap-kib": 1297.177734375
+                },
+                {
+                  "gap-kib": 878.5986328125
+                },
+                {
+                  "gap-kib": 4.9609375
+                }
+              ]
+            },
+            {
+              "label": "plain, clean",
+              "samples": [
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                },
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                },
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                }
+              ]
+            },
+            {
+              "label": "plain, abrupt",
+              "samples": [
+                {
+                  "gap-kib": 531.5283203125
+                },
+                {
+                  "gap-kib": 90.783203125
+                },
+                {
+                  "gap-kib": 542.623046875
+                }
+              ]
+            },
+            {
+              "label": "web, clean",
+              "samples": [
+                {
+                  "down-diff": 0,
+                  "in-diff": 0,
+                  "out-diff": 0,
+                  "up-diff": 0
+                },
+                {
+                  "down-diff": 0,
+                  "in-diff": 0,
+                  "out-diff": 0,
+                  "up-diff": 0
+                },
+                {
+                  "down-diff": 0,
+                  "in-diff": 0,
+                  "out-diff": 0,
+                  "up-diff": 0
+                }
+              ]
+            },
+            {
+              "label": "web, abrupt",
+              "samples": [
+                {
+                  "gap-kib": 4541.36328125
+                },
+                {
+                  "gap-kib": 8828.25
+                },
+                {
+                  "gap-kib": 5133.2216796875
+                }
+              ]
+            },
+            {
+              "label": "ee-burst, clean",
+              "samples": [
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                },
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                },
+                {
+                  "in-diff": 0,
+                  "out-diff": 0
+                }
+              ]
+            },
+            {
+              "label": "ee-burst, abrupt",
+              "samples": [
+                {
+                  "gap-kib": 1726.30078125
+                },
+                {
+                  "gap-kib": 510.671875
+                },
+                {
+                  "gap-kib": 1035.345703125
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
