@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -37,10 +38,13 @@ const (
 )
 
 var (
-	errNoBootstrap    = errors.New("the bridge page carried no bootstrap token")
-	errSessionRefused = errors.New("the relay refused the session")
-	errStreamClosed   = errors.New("the WEB stream is closed")
-	errNotHTTP        = errors.New("only a plain-HTTP relay origin is supported")
+	errNoBootstrap     = errors.New("the bridge page carried no bootstrap token")
+	errSessionRefused  = errors.New("the relay refused the session")
+	errStreamClosed    = errors.New("the WEB stream is closed")
+	errStreamInUse     = errors.New("the stream id is already open")
+	errNotHTTP         = errors.New("only a plain-HTTP relay origin is supported")
+	errCarrierClosed   = errors.New("the relay closed the carrier")
+	errDownlinkOverrun = errors.New("the relay sent past the credit this stream granted")
 )
 
 // WebOptions shapes how a WEB client presents itself to the relay.
@@ -55,6 +59,10 @@ type WebOptions struct {
 
 	// DialTimeout bounds every HTTP step and the upgrade. Default 5s.
 	DialTimeout time.Duration
+
+	// ResetOnClose makes closing the carrier send a reset, so a run that opens
+	// thousands of sessions leaves no TIME_WAIT behind.
+	ResetOnClose bool
 }
 
 // WebSession is one WEB proxy session: a bootstrap spent on a session, and the
@@ -103,7 +111,19 @@ func OpenWebSession(ctx context.Context, baseURL, capability string, o WebOption
 	conn, reader, err := dialWebSocket(ctx, strings.TrimPrefix(baseURL, "http://"), webCarrierPath,
 		webSubprotocol+token, o.Origin, o.ForwardedFor, o.DialTimeout)
 	if err != nil {
+		// The session exists; without a carrier it would hold a slot against
+		// the relay's session limit for its reconnect grace. Give it back.
+		deleteSession(context.WithoutCancel(ctx), client, baseURL, token) //nolint: errcheck
+
 		return nil, err
+	}
+
+	if o.ResetOnClose {
+		if err := ResetOnClose(conn); err != nil {
+			conn.Close() //nolint: errcheck
+
+			return nil, err
+		}
 	}
 
 	s := &WebSession{
@@ -197,7 +217,7 @@ func setForwardedFor(request *http.Request, forwardedFor string) {
 // OpenStream opens stream id on the carrier. Its credit starts at the relay's
 // initial window in both directions.
 func (s *WebSession) OpenStream(id uint32) (*WebStream, error) {
-	stream := &WebStream{session: s, id: id, credit: webInitialWindow}
+	stream := &WebStream{session: s, id: id, credit: webInitialWindow, window: webInitialWindow}
 	stream.cond = sync.NewCond(&stream.mu)
 
 	s.mu.Lock()
@@ -208,10 +228,18 @@ func (s *WebSession) OpenStream(id uint32) (*WebStream, error) {
 		return nil, err
 	}
 
+	if _, open := s.streams[id]; open {
+		s.mu.Unlock()
+
+		return nil, fmt.Errorf("stream %d: %w", id, errStreamInUse)
+	}
+
 	s.streams[id] = stream
 	s.mu.Unlock()
 
 	if err := s.writeFrames(frame.NewOpen(id)); err != nil {
+		s.forget(id)
+
 		return nil, err
 	}
 
@@ -224,14 +252,22 @@ func (s *WebSession) OpenStream(id uint32) (*WebStream, error) {
 // relay's DELETE alone does not end a carrier the client keeps open.)
 func (s *WebSession) Delete(ctx context.Context) error {
 	defer s.Close() //nolint: errcheck
-	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, s.baseURL+webSessionPath, nil)
+	return deleteSession(ctx, s.client, s.baseURL, s.token)
+}
+
+// Token is the session's bearer, for a test that drives the session API
+// itself.
+func (s *WebSession) Token() string { return s.token }
+
+func deleteSession(ctx context.Context, client *http.Client, baseURL, token string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, baseURL+webSessionPath, nil)
 	if err != nil {
 		return fmt.Errorf("cannot build the delete request: %w", err)
 	}
 
-	request.Header.Set("Authorization", "Bearer "+s.token)
+	request.Header.Set("Authorization", "Bearer "+token)
 
-	response, err := s.client.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("cannot delete the session: %w", err)
 	}
@@ -296,6 +332,12 @@ func (s *WebSession) readLoop() {
 	for {
 		opcode, payload, err := readServerFrame(s.r, buf)
 		if err != nil {
+			// A carrier that ends without a close frame ended mid-stream as far
+			// as every stream on it is concerned: never the io.EOF of a clean end.
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+
 			s.fail(err)
 
 			return
@@ -310,8 +352,14 @@ func (s *WebSession) readLoop() {
 			}
 		case opClose:
 			// The closing handshake: echo the close, then let go of the socket.
+			// Whatever the code, the streams on the carrier did not end cleanly.
+			code := 0
+			if len(payload) >= 2 {
+				code = int(binary.BigEndian.Uint16(payload))
+			}
+
 			s.writeControl(opClose, append([]byte(nil), payload...)) //nolint: errcheck
-			s.fail(io.EOF)
+			s.fail(fmt.Errorf("%w (code %d)", errCarrierClosed, code))
 
 			return
 		case opBinary:
@@ -387,7 +435,8 @@ type WebStream struct {
 	cond     *sync.Cond
 	queue    [][]byte
 	consumed int
-	credit   int
+	credit   int // uplink: what the relay has granted and this side not spent
+	window   int // downlink: what this side has granted and the relay not spent
 	eof      bool
 	closed   bool
 	err      error
@@ -430,6 +479,7 @@ func (st *WebStream) Read(p []byte) (int, error) {
 	grant := 0
 	if st.consumed >= webGrantEvery {
 		grant, st.consumed = st.consumed, 0
+		st.window += grant
 	}
 	st.mu.Unlock()
 
@@ -447,6 +497,12 @@ func (st *WebStream) Write(p []byte) (int, error) {
 
 	for written < len(p) {
 		st.mu.Lock()
+
+		if st.eof && st.err == nil && !st.closed {
+			st.mu.Unlock()
+
+			return written, io.ErrClosedPipe
+		}
 
 		for st.credit == 0 {
 			if err := st.blockedLocked(st.writeDeadline); err != nil {
@@ -502,6 +558,18 @@ func (st *WebStream) blockedLocked(deadline time.Time) error {
 
 func (st *WebStream) deliver(payload []byte) {
 	st.mu.Lock()
+
+	if len(payload) > st.window {
+		window := st.window
+		st.mu.Unlock()
+
+		st.session.fail(fmt.Errorf("%w: stream %d got %d bytes with %d of credit",
+			errDownlinkOverrun, st.id, len(payload), window))
+
+		return
+	}
+
+	st.window -= len(payload)
 	st.queue = append(st.queue, payload)
 	st.mu.Unlock()
 	st.cond.Broadcast()

@@ -411,6 +411,47 @@ func TestAWebStreamOutlastsTheInitialWindow(t *testing.T) {
 	require.True(t, bytes.Equal(sent, echoed), "every byte must come back, in order")
 }
 
+// A DELETEd session ends: its carrier and the streams on it stop, even if the
+// client keeps the socket open. Today they do not -- store.remove cancels the
+// session's context, but nothing watching it closes the WebSocket, so a client
+// that holds the socket keeps its streams while the session is already gone
+// from the table and from MaxSessions. Found while building the measurement
+// tooling; it is the WEB relay project's to fix, and this test is its pin.
+func TestADeletedSessionStopsServing(t *testing.T) {
+	t.Parallel()
+	t.Skip("known relay defect: a DELETEd session's carrier keeps serving (WEB relay project)")
+
+	c := newChain(t)
+	conn, session := c.openStream(t, 7)
+
+	_, err := conn.Write([]byte("before"))
+	require.NoError(t, err)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = io.ReadFull(conn, make([]byte, len("before")))
+	require.NoError(t, err)
+
+	// The DELETE alone, without the client closing anything.
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodDelete, c.server.URL+sessionPath, nil)
+	require.NoError(t, err)
+	request.Header.Set("Authorization", "Bearer "+session.Token())
+
+	response, err := c.server.Client().Do(request)
+	require.NoError(t, err)
+	response.Body.Close() //nolint: errcheck
+	require.Equal(t, http.StatusNoContent, response.StatusCode)
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = conn.Write([]byte("after"))
+
+	if err == nil {
+		_, err = io.ReadFull(conn, make([]byte, len("after")))
+	}
+
+	require.Error(t, err, "the stream of a deleted session must end")
+	require.Eventually(t, func() bool { return c.counters.streamsActive.Load() == 0 },
+		5*time.Second, 20*time.Millisecond, "no stream may outlive its deleted session")
+}
+
 // TestTheRelayProxyChainDoesNotLeakUnderChurn opens and tears down many full
 // sessions against one standing relay and proxy, and asserts the relay is left
 // holding nothing: no live stream, no live session, and no goroutine drift

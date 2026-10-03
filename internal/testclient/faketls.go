@@ -22,6 +22,10 @@ const (
 // is the HMAC-SHA256 of the whole message under key (computed with the random
 // zeroed) XORed with a little-endian timestamp. It is the inverse of the
 // proxy's FakeTLS reader.
+//
+// It refuses an empty SNI or one over 255 bytes -- a guard: a host name that
+// long is no cover anyone uses -- and a session ID over 32 bytes, which TLS
+// cannot carry.
 func ClientHello(key [16]byte, sni string, sessionID []byte) ([]byte, error) {
 	if sni == "" || len(sni) > 255 {
 		return nil, fmt.Errorf("an SNI of %d bytes cannot be sent", len(sni))

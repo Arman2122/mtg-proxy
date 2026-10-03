@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/stretchr/testify/assert"
@@ -58,6 +59,56 @@ func TestRecordConnRoundTrip(t *testing.T) {
 	_, err = io.ReadFull(conn, read)
 	require.NoError(t, err)
 	assert.Equal(t, answer, read, "a record with no application data is skipped")
+}
+
+// failAfter takes n writes, then fails every one.
+type failAfter struct {
+	essentials.Conn
+
+	n int
+}
+
+func (f *failAfter) Write(p []byte) (int, error) {
+	if f.n == 0 {
+		return 0, io.ErrClosedPipe
+	}
+
+	f.n--
+
+	return len(p), nil
+}
+
+// A Write that fails partway reports what went out before the failure, as the
+// io.Writer contract asks -- accounting after a dropped connection reads it.
+func TestRecordConnCountsWhatWentOutBeforeAnError(t *testing.T) {
+	t.Parallel()
+
+	conn := NewRecordConn(&failAfter{n: 1})
+
+	n, err := conn.Write(make([]byte, 200<<10))
+	require.ErrorIs(t, err, io.ErrClosedPipe)
+	assert.Equal(t, recordsPerWrite*MaxRecordPayload, n, "one whole batch went out")
+}
+
+// A TLS alert ends the stream with an error, rather than being skipped like a
+// record that carries no data.
+func TestRecordConnRefusesAnAlert(t *testing.T) {
+	t.Parallel()
+
+	near, far := net.Pipe()
+	t.Cleanup(func() {
+		near.Close() //nolint: errcheck
+		far.Close()  //nolint: errcheck
+	})
+
+	go far.Write([]byte{TypeAlert, 3, 3, 0, 2, 2, 40}) //nolint: errcheck
+
+	// A reader that skipped the alert would wait for ever; the deadline turns
+	// that into a failure.
+	require.NoError(t, near.SetReadDeadline(time.Now().Add(5*time.Second)))
+
+	_, err := NewRecordConn(essentials.WrapNetConn(near)).Read(make([]byte, 16))
+	require.ErrorIs(t, err, errAlert)
 }
 
 func TestReadServerFlightNeedsThreeRecords(t *testing.T) {

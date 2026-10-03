@@ -14,6 +14,7 @@ import (
 const (
 	RecordHeaderSize     = 5
 	TypeChangeCipherSpec = 0x14
+	TypeAlert            = 0x15
 	TypeHandshake        = 0x16
 	TypeApplicationData  = 0x17
 
@@ -22,7 +23,23 @@ const (
 	MaxRecordPayload = 16384 - RecordHeaderSize
 )
 
-var errNotTLS = errors.New("not a TLS record layer")
+var (
+	errNotTLS = errors.New("not a TLS record layer")
+	errAlert  = errors.New("the server sent a TLS alert")
+)
+
+// batchPayload is the payload a batch of records carries, headers aside.
+func batchPayload(batch []byte) int {
+	payload := 0
+
+	for len(batch) >= RecordHeaderSize {
+		n := int(binary.BigEndian.Uint16(batch[3:]))
+		payload += n
+		batch = batch[min(len(batch), RecordHeaderSize+n):]
+	}
+
+	return payload
+}
 
 // Record is one TLS record as it arrived. Raw is the whole record, header
 // included, because the ServerHello digest is computed over the records' bytes.
@@ -117,6 +134,10 @@ func (c *recordConn) Read(p []byte) (int, error) {
 			return 0, fmt.Errorf("record of type %#x declares %d bytes: %w", header[0], length, errNotTLS)
 		}
 
+		if header[0] == TypeAlert {
+			return 0, fmt.Errorf("record of type %#x: %w", header[0], errAlert)
+		}
+
 		if header[0] != TypeApplicationData {
 			if _, err := c.r.Discard(length); err != nil {
 				return 0, err //nolint: wrapcheck
@@ -154,7 +175,8 @@ func (c *recordConn) Write(p []byte) (int, error) {
 		}
 
 		if _, err := c.Conn.Write(batch); err != nil {
-			return 0, err //nolint: wrapcheck
+			// What earlier batches carried is out; this batch may be in part.
+			return written - batchPayload(batch), err //nolint: wrapcheck
 		}
 	}
 

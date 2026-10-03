@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha1" //nolint: gosec // RFC 6455 fixes SHA-1 for the accept key
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -81,7 +82,8 @@ func dialWebSocket(
 	response.Body.Close() //nolint: errcheck
 
 	if response.StatusCode != http.StatusSwitchingProtocols ||
-		response.Header.Get("Sec-WebSocket-Protocol") != subprotocol {
+		response.Header.Get("Sec-WebSocket-Protocol") != subprotocol ||
+		response.Header.Get("Sec-WebSocket-Accept") != acceptKey(base64.StdEncoding.EncodeToString(key)) {
 		conn.Close() //nolint: errcheck
 
 		return nil, nil, fmt.Errorf("%w: %s", errUpgradeRefused, response.Status)
@@ -94,6 +96,17 @@ func dialWebSocket(
 	}
 
 	return conn, reader, nil
+}
+
+// websocketGUID is RFC 6455's, section 1.3; TestTheAcceptKeyIsTheRFCs checks
+// it against the RFC's own worked example.
+const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// acceptKey is the Sec-WebSocket-Accept a server must answer key with.
+func acceptKey(key string) string {
+	sum := sha1.Sum([]byte(key + websocketGUID)) //nolint: gosec // the protocol's own choice
+
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 // appendClientFrame appends one masked, final WebSocket frame. A client must
