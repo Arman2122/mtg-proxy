@@ -1,0 +1,68 @@
+package main
+
+import (
+	"os"
+	"testing"
+
+	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func benchSetup(t *testing.T) Setup {
+	t.Helper()
+
+	return Setup{
+		Dir:      t.TempDir(),
+		Users:    []User{NewUser("alice"), NewUser("bob")},
+		Doors:    AllDoors,
+		Shaping:  "burst",
+		Caps:     map[string]Caps{"bob": {Speed: "10MB", Up: "1MB", Down: "2MB"}},
+		BasePort: 47000,
+	}
+}
+
+// What mtgbench writes is a config the real binary accepts in full: the proxy's
+// validation and the relay's both.
+func TestGeneratedConfigValidates(t *testing.T) {
+	t.Parallel()
+
+	path, err := WriteConfig(benchSetup(t))
+	require.NoError(t, err)
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	conf, err := config.Parse(raw)
+	require.NoError(t, err)
+	require.NoError(t, conf.Validate())
+	require.NoError(t, conf.ValidateWeb())
+
+	limits := conf.GetSecretLimits()
+	assert.Equal(t, int64(10<<20), limits["bob"].SpeedBytesPerSecond)
+	assert.Equal(t, int64(1<<20), limits["bob"].SpeedUpBytesPerSecond)
+	assert.Equal(t, int64(2<<20), limits["bob"].SpeedDownBytesPerSecond)
+}
+
+// Nothing in the generated config may reach the internet: every outbound dial
+// the binary makes on its own is either through mtgbench's SOCKS5 or to its
+// local cover listener.
+func TestGeneratedConfigStaysOnLoopback(t *testing.T) {
+	t.Parallel()
+
+	path, err := WriteConfig(benchSetup(t))
+	require.NoError(t, err)
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	conf, err := config.Parse(raw)
+	require.NoError(t, err)
+
+	text := string(raw)
+	assert.Contains(t, text, `proxies = ["socks5://127.0.0.1:47010"]`)
+	assert.Contains(t, text, "scout-covers = false")
+	assert.Contains(t, text, `public-ipv4 = "127.0.0.1"`)
+	assert.Equal(t, "127.0.0.1", conf.DomainFronting.Host.Get(""), "fronting goes to mtgbench's cover listener")
+	assert.NotContains(t, text, "auto-update = true")
+}
