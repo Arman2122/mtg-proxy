@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -115,14 +116,14 @@ func (suite *PageTestSuite) TestNonceIsPerResponseAndAuthorisesTheScript() {
 	suite.Require().Len(secondMatch, 2)
 	suite.NotEqual(firstMatch[1], secondMatch[1])
 
-	suite.Contains(string(first.HTML), `<script nonce="`+firstMatch[1]+`">`)
-	suite.Contains(string(second.HTML), `<script nonce="`+secondMatch[1]+`">`)
+	suite.Contains(string(first.HTML()), `<script nonce="`+firstMatch[1]+`">`)
+	suite.Contains(string(second.HTML()), `<script nonce="`+secondMatch[1]+`">`)
 }
 
 // One inline script and nothing else. A second element that loads or executes
 // anything would need its own nonce and would be a second thing to review.
 func (suite *PageTestSuite) TestExactlyOneScriptAndNoExternalReferences() {
-	html := string(suite.render().HTML)
+	html := string(suite.render().HTML())
 
 	suite.Equal(1, strings.Count(html, "<script"))
 	suite.Equal(1, strings.Count(html, "</script>"))
@@ -135,7 +136,7 @@ func (suite *PageTestSuite) TestExactlyOneScriptAndNoExternalReferences() {
 }
 
 func (suite *PageTestSuite) TestBootParametersReachTheScript() {
-	html := string(suite.render().HTML)
+	html := string(suite.render().HTML())
 
 	suite.Contains(html, `var TPROXY_BOOT={`)
 	suite.Contains(html, `"host":"`+testHost+`"`)
@@ -215,6 +216,35 @@ func TestPage(t *testing.T) {
 // level is what keeps it parseable in the oldest WebView a supported client
 // embeds, and a stray arrow function or template literal is a silent blank page
 // on exactly one platform.
+// Rendering a page does not copy the script into it: the script is one part
+// of the document, shared by every render, and a page per new session costs
+// only its few hundred bytes of nonce, token and headers.
+func TestRenderDoesNotCopyTheScript(t *testing.T) { //nolint: paralleltest // reads the allocator's totals
+	bridge, err := page.New(testHost)
+	require.NoError(t, err)
+
+	const renders = 100
+
+	docs := make([]page.Document, 0, renders)
+
+	var before, after runtime.MemStats
+
+	runtime.ReadMemStats(&before)
+
+	for range renders {
+		doc, err := bridge.Render(testToken)
+		require.NoError(t, err)
+
+		docs = append(docs, doc)
+	}
+
+	runtime.ReadMemStats(&after)
+
+	perRender := (after.TotalAlloc - before.TotalAlloc) / renders
+	require.Len(t, docs, renders)
+	require.Less(t, perRender, uint64(4<<10), "a render allocates %d bytes", perRender)
+}
+
 func TestScriptStaysES5(t *testing.T) {
 	t.Parallel()
 
@@ -224,7 +254,7 @@ func TestScriptStaysES5(t *testing.T) {
 	doc, err := bridge.Render(testToken)
 	require.NoError(t, err)
 
-	html := string(doc.HTML)
+	html := string(doc.HTML())
 	script := html[strings.Index(html, "<script"):]
 
 	for _, banned := range []struct {

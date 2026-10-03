@@ -65,7 +65,7 @@ func TestBridgeInABrowser(t *testing.T) {
 	}
 
 	fixture, err := json.Marshal(map[string]any{
-		"html":       string(doc.HTML),
+		"html":       string(doc.HTML()),
 		"headers":    headers,
 		"capability": testToken,
 	})

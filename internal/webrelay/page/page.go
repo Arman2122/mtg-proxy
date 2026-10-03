@@ -129,11 +129,16 @@ func New(host string) (*Bridge, error) {
 	return bridge, nil
 }
 
-// Document is one rendered bridge response.
+// Document is one rendered bridge response. Its page is kept in parts, so the
+// script every page embeds is shared by all of them instead of copied into
+// each: a render costs its nonce, token and headers, a few hundred bytes.
 type Document struct {
-	HTML   []byte
 	Header http.Header
+	parts  [][]byte
 }
+
+// HTML is the whole page in one piece.
+func (d Document) HTML() []byte { return bytes.Join(d.parts, nil) }
 
 // WriteTo writes the document's headers and body to w. It sets a status of 200
 // itself, so the caller must not have written one.
@@ -146,12 +151,26 @@ func (d Document) WriteTo(w http.ResponseWriter) error {
 
 	w.WriteHeader(http.StatusOK)
 
-	if _, err := w.Write(d.HTML); err != nil {
-		return fmt.Errorf("cannot write bridge document: %w", err)
+	for _, part := range d.parts {
+		if _, err := w.Write(part); err != nil {
+			return fmt.Errorf("cannot write bridge document: %w", err)
+		}
 	}
 
 	return nil
 }
+
+// The page's fixed parts, made once: the head up to the script's nonce, the
+// text between the nonce and the boot parameters, the script itself, and the
+// close. Every render shares them.
+var (
+	pageHead = []byte(`<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+		`<meta name="viewport" content="width=device-width,initial-scale=1">` +
+		`</head><body><script nonce="`)
+	pageBoot   = []byte(`">var TPROXY_BOOT=`)
+	pageScript = []byte(";\n" + script)
+	pageTail   = []byte(`</script></body></html>`)
+)
 
 // Render builds the document embedding one bootstrap token. Each call draws a
 // fresh CSP nonce, so two responses never share the value that authorises their
@@ -179,17 +198,7 @@ func (b *Bridge) Render(token string) (Document, error) {
 		return Document{}, fmt.Errorf("cannot encode bridge parameters: %w", err)
 	}
 
-	body := &bytes.Buffer{}
-	body.Grow(len(script) + len(boot) + 256)
-	body.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8">`)
-	body.WriteString(`<meta name="viewport" content="width=device-width,initial-scale=1">`)
-	body.WriteString(`</head><body><script nonce="`)
-	body.WriteString(nonce)
-	body.WriteString(`">var TPROXY_BOOT=`)
-	body.Write(boot)
-	body.WriteString(";\n")
-	body.WriteString(script)
-	body.WriteString(`</script></body></html>`)
+	parts := [][]byte{pageHead, []byte(nonce), pageBoot, boot, pageScript, pageTail}
 
 	header := make(http.Header, len(b.header)+1)
 
@@ -199,7 +208,7 @@ func (b *Bridge) Render(token string) (Document, error) {
 
 	header.Set("Content-Security-Policy", fmt.Sprintf(b.csp, nonce))
 
-	return Document{HTML: body.Bytes(), Header: header}, nil
+	return Document{Header: header, parts: parts}, nil
 }
 
 func newNonce() (string, error) {

@@ -509,7 +509,6 @@ func TestAWebStreamOutlastsTheInitialWindow(t *testing.T) {
 // tooling; it is the WEB relay project's to fix, and this test is its pin.
 func TestADeletedSessionStopsServing(t *testing.T) {
 	t.Parallel()
-	t.Skip("known relay defect: a DELETEd session's carrier keeps serving (WEB relay project)")
 
 	c := newChain(t)
 	conn, session := c.openStream(t, 7)

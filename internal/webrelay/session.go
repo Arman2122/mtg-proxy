@@ -162,6 +162,17 @@ func (s *session) Serve(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	defer s.cancel()
 
+	// A session ended from outside -- DELETEd, which cancels the context it was
+	// served with, or its process stopping -- has a read loop blocked on the
+	// carrier. Closing the carrier is what unblocks it; shutdown then ends
+	// every stream. Before this, a client that kept its socket open kept a
+	// deleted session serving. It watches ctx, not s.ctx: an end from inside
+	// closes the carrier itself, with the code that says why.
+	stop := context.AfterFunc(ctx, func() {
+		s.conn.Close(ws.CloseNormal, "") //nolint: errcheck // ending regardless
+	})
+	defer stop()
+
 	s.wg.Add(1)
 
 	go func() {
@@ -228,6 +239,7 @@ func (s *session) writeLoop() {
 			// The relay built a batch its own client would reject. That is a
 			// fault on this side, not the peer's.
 			s.logError("cannot encode a downlink batch", err)
+			s.conn.Close(ws.CloseInternalError, "") //nolint: errcheck // ending regardless
 			s.cancel()
 
 			return
@@ -577,22 +589,31 @@ func (s *session) logError(message string, err error) {
 // fixed-size ring: the oldest id is forgotten when the newest arrives, which is
 // the trade the specification names -- bounded memory in exchange for a window
 // beyond which the two cases are indistinguishable again.
+//
+// It grows to its size rather than starting there: most sessions close a few
+// streams, and an idle one closes none, so a ring and a map preallocated to
+// MaxTombstones were 88 KB a session for nothing.
 type tombstones struct {
 	ring  []uint32
 	index int
+	size  int
 	set   map[uint32]struct{}
 }
 
 func newTombstones(size int) *tombstones {
-	return &tombstones{ring: make([]uint32, 0, size), set: make(map[uint32]struct{}, size)}
+	return &tombstones{size: size}
 }
 
 func (t *tombstones) add(id uint32) {
+	if t.set == nil {
+		t.set = make(map[uint32]struct{})
+	}
+
 	if _, ok := t.set[id]; ok {
 		return
 	}
 
-	if len(t.ring) < cap(t.ring) {
+	if len(t.ring) < t.size {
 		t.ring = append(t.ring, id)
 	} else {
 		delete(t.set, t.ring[t.index])
