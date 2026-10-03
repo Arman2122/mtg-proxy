@@ -1,7 +1,9 @@
 package main
 
 import (
+	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -9,7 +11,8 @@ import (
 
 // The speed limiter starts a user with one second of burst, so the first
 // second of a capped transfer runs above the cap by design. Accuracy is the
-// seconds after it.
+// seconds after it. On ee the doppelganger's queue sits after the limiter and
+// carries part of the burst into the next second, so ee skips two.
 func TestCapAccuracyIgnoresTheBurstSecond(t *testing.T) {
 	t.Parallel()
 
@@ -17,11 +20,15 @@ func TestCapAccuracyIgnoresTheBurstSecond(t *testing.T) {
 
 	perSecond := []float64{2 * target, target, 0.9 * target, 1.1 * target, target}
 
-	a := capAccuracy(perSecond, target)
+	a := capAccuracy(perSecond, target, 1)
 
 	assert.InDelta(t, 1.0, a.mean, 1e-9, "the burst second would have made it 1.2")
-	assert.InDelta(t, 0.9, a.p10, 1e-9)
-	assert.InDelta(t, 1.1, a.p90, 1e-9)
+	assert.InDelta(t, 0.9, a.lowest, 1e-9)
+	assert.InDelta(t, 1.1, a.highest, 1e-9)
+
+	queued := []float64{2 * target, 1.4 * target, target, target}
+	assert.InDelta(t, 1.0, capAccuracy(queued, target, 2).mean, 1e-9, "the queued burst is skipped too")
+	assert.True(t, math.IsNaN(capAccuracy(queued[:2], target, 2).mean), "nothing measured is not a 0")
 }
 
 // Jain's fairness index: (Σx)² / (n·Σx²). One for equal shares, 1/n when one
@@ -71,4 +78,15 @@ func TestCleanAccountingMatchesExactly(t *testing.T) {
 	short := accountingDiff(client, traffic{written: 1000, read: 1999}, nil)
 	assert.InDelta(t, -1, short.sample["out-diff"], 0)
 	require.ErrorIs(t, short.err, errMiscounted)
+}
+
+// A bulk row says whose core was busy: the binary's, or mtgbench's own. A
+// row where mtgbench ran out of core first measured mtgbench.
+func TestBulkSaysWhoseCoreWasBusy(t *testing.T) {
+	t.Parallel()
+
+	s := bulkWindow{bytes: 1e9, elapsed: 2 * time.Second, cpu: 1.0, self: 1.8}.sample()
+
+	assert.InDelta(t, 0.5, s["load"], 1e-9, "the binary's cores busy")
+	assert.InDelta(t, 0.9, s["bench-load"], 1e-9, "mtgbench's")
 }

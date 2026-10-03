@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -79,6 +80,57 @@ func TestDataCentreCommands(t *testing.T) {
 	assert.Eventually(t, func() bool { return dc.BytesSent() == 3<<20+100 }, 5*time.Second, time.Millisecond,
 		"payload sent, commands and acks aside: %d", dc.BytesSent())
 	assert.Equal(t, int64(5<<20+100), dc.BytesReceived())
+}
+
+// An upload is checked byte by byte, as a download is: a byte that arrives
+// changed -- a buffer reused too early, a cipher out of step -- is never
+// acknowledged, however right the count.
+func TestTheDataCentreRefusesACorruptUpload(t *testing.T) {
+	t.Parallel()
+
+	conn, err := dialAsProxy(t, startTestDC(t), "149.154.167.51:443")
+	require.NoError(t, err)
+
+	corrupt := make([]byte, 1<<20)
+	corrupt[777] = 1
+
+	_, err = conn.Write(command(cmdUpload, int64(len(corrupt))))
+	require.NoError(t, err)
+	_, err = conn.Write(corrupt)
+	require.NoError(t, err)
+
+	require.Error(t, readAck(conn, int64(len(corrupt))), "a corrupt upload was acknowledged")
+}
+
+// An idle connection costs mtgbench almost nothing on the data centre's side:
+// the idle scenario holds 5,000 of them on a host that runs other people's
+// services, and a chunk-sized buffer each would be gigabytes.
+func TestAnIdleDataCentreConnectionHoldsLittle(t *testing.T) { //nolint: paralleltest // reads the heap
+	const conns = 64
+
+	dc := startTestDC(t)
+
+	var before, after runtime.MemStats
+
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	held := make([]essentials.Conn, 0, conns)
+
+	for range conns {
+		conn, err := dialAsProxy(t, dc, "149.154.167.51:443")
+		require.NoError(t, err)
+		require.NoError(t, Echo(conn, []byte{1}), "each is proven, as the idle scenario proves them")
+
+		held = append(held, conn)
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+
+	perConn := (int64(after.HeapAlloc) - int64(before.HeapAlloc)) / conns //nolint: gosec // heap sizes
+	assert.Less(t, perConn, int64(16<<10), "an idle connection holds %d bytes", perConn)
+	runtime.KeepAlive(held)
 }
 
 // The direct data centre is the same, with no SOCKS in front: the baseline the

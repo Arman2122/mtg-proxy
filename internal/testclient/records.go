@@ -111,15 +111,20 @@ type recordConn struct {
 }
 
 // NewRecordConn wraps c, whose ServerHello flight has been read, in the client
-// side of the FakeTLS record layer.
+// side of the FakeTLS record layer, reading through a 64 KiB buffer.
 func NewRecordConn(c essentials.Conn) essentials.Conn {
-	return &recordConn{
-		Conn:   c,
-		r:      bufio.NewReaderSize(c, 64<<10),
-		inbuf:  make([]byte, MaxRecordPayload),
-		outbuf: make([]byte, 0, recordsPerWrite*(RecordHeaderSize+MaxRecordPayload)),
-	}
+	return NewRecordConnSize(c, 64<<10)
 }
+
+// NewRecordConnSize is NewRecordConn with a read buffer of readBuffer bytes. A
+// run that holds thousands of idle connections makes it small. The record
+// buffers grow to what the connection carries, so an idle one holds little.
+func NewRecordConnSize(c essentials.Conn, readBuffer int) essentials.Conn {
+	return &recordConn{Conn: c, r: bufio.NewReaderSize(c, readBuffer)}
+}
+
+// maxBatch is the most one Write sends in a single call.
+const maxBatch = recordsPerWrite * (RecordHeaderSize + MaxRecordPayload)
 
 func (c *recordConn) Read(p []byte) (int, error) {
 	for len(c.pending) == 0 {
@@ -146,6 +151,10 @@ func (c *recordConn) Read(p []byte) (int, error) {
 			continue
 		}
 
+		if cap(c.inbuf) < length {
+			c.inbuf = make([]byte, min(MaxRecordPayload, max(length, 2*cap(c.inbuf))))
+		}
+
 		if _, err := io.ReadFull(c.r, c.inbuf[:length]); err != nil {
 			return 0, err //nolint: wrapcheck
 		}
@@ -163,6 +172,10 @@ func (c *recordConn) Write(p []byte) (int, error) {
 	written := 0
 
 	for written < len(p) {
+		if need := min(maxBatch, len(p)-written+recordsPerWrite*RecordHeaderSize); cap(c.outbuf) < need {
+			c.outbuf = make([]byte, 0, need)
+		}
+
 		batch := c.outbuf[:0]
 
 		for len(batch)+RecordHeaderSize < cap(batch) && written < len(p) {

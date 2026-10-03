@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,26 +15,39 @@ import (
 const bulkChunk = 1 << 20
 
 // bulkWindow is what a bulk run moved: in the measured stretch, and in all,
-// with the binary's CPU time over the measured stretch (NaN when it cannot be
-// read).
+// with the binary's CPU time and mtgbench's own over the measured stretch
+// (NaN when they cannot be read).
 type bulkWindow struct {
 	bytes   int64
 	elapsed time.Duration
 	total   int64
 	cpu     float64
+	self    float64
 }
 
 func (w bulkWindow) rate() float64 { return float64(w.bytes) / w.elapsed.Seconds() }
 
 func (w bulkWindow) sample() Sample {
 	return Sample{
-		"mbps":      w.rate() / 1e6,
-		"cpu-s/gb":  w.cpu / (float64(w.bytes) / 1e9),
-		"total-mib": float64(w.total) / (1 << 20),
+		"mbps":       w.rate() / 1e6,
+		"cpu-s/gb":   w.cpu / (float64(w.bytes) / 1e9),
+		"load":       w.cpu / w.elapsed.Seconds(),
+		"bench-load": w.self / w.elapsed.Seconds(),
+		"total-mib":  float64(w.total) / (1 << 20),
 	}
 }
 
-var bulkMetrics = []Metric{{Key: "mbps", Title: "MB/s"}, {Key: "cpu-s/gb", Title: "CPU-s per GB"}}
+// bulkMetrics show, beside the rate, whose cores were busy: a row where
+// mtgbench's own core ran out before the binary's measured mtgbench.
+var bulkMetrics = []Metric{
+	{Key: "mbps", Title: "MB/s"},
+	{Key: "cpu-s/gb", Title: "CPU-s per GB"},
+	{Key: "load", Title: "binary cores busy"},
+	{Key: "bench-load", Title: "mtgbench cores busy"},
+}
+
+// selfCPU is mtgbench's own CPU seconds so far.
+func selfCPU() (float64, error) { return cpuSeconds(os.Getpid()) }
 
 // runBulk moves data through every connection at once, for the warm-up and
 // then the measured stretch, and reports the measured stretch. Every chunk is
@@ -58,7 +72,7 @@ func runBulk(ctx context.Context, conns []io.ReadWriter, download bool, o Option
 		})
 	}
 
-	readCPU := func() float64 {
+	read := func(cpu func() (float64, error)) float64 {
 		if cpu == nil {
 			return math.NaN()
 		}
@@ -84,11 +98,11 @@ func runBulk(ctx context.Context, conns []io.ReadWriter, download bool, o Option
 
 	err := wait(o.Warmup)
 	if err == nil {
-		bytes0, cpu0, t0 := moved.Load(), readCPU(), time.Now()
+		bytes0, cpu0, self0, t0 := moved.Load(), read(cpu), read(selfCPU), time.Now()
 
 		err = wait(o.Measure)
 
-		w.bytes, w.cpu, w.elapsed = moved.Load()-bytes0, readCPU()-cpu0, time.Since(t0)
+		w.bytes, w.cpu, w.self, w.elapsed = moved.Load()-bytes0, read(cpu)-cpu0, read(selfCPU)-self0, time.Since(t0)
 	}
 
 	close(stop)

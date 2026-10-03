@@ -204,6 +204,24 @@ func (r Report) markdown(w io.Writer) error {
 	return p.err
 }
 
+// prepareOut makes dir and proves it writable, before a run that would
+// otherwise lose its report at the end.
+func prepareOut(dir string) error {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("cannot make %s: %w", dir, err)
+	}
+
+	probe, err := os.CreateTemp(dir, ".mtgbench-probe-*")
+	if err != nil {
+		return fmt.Errorf("cannot write into %s: %w", dir, err)
+	}
+
+	probe.Close()           //nolint: errcheck
+	os.Remove(probe.Name()) //nolint: errcheck
+
+	return nil
+}
+
 // write saves r as tierB.md and tierB.json in dir.
 func (r Report) write(dir string) error {
 	var md strings.Builder

@@ -39,15 +39,32 @@ func (c *Client) Close() error { return c.close() }
 // Dial opens one connection through door as user u, up to the point where the
 // proxy has dialled the data centre.
 func Dial(ctx context.Context, s Setup, door Door, u User, clientIP string) (*Client, error) {
+	return dial(ctx, s, door, u, clientIP, bulkReadBuffer)
+}
+
+// DialIdle is Dial for a connection that will be held open and idle: its read
+// buffers are small, so thousands of them cost mtgbench little on a host it
+// shares.
+func DialIdle(ctx context.Context, s Setup, door Door, u User, clientIP string) (*Client, error) {
+	return dial(ctx, s, door, u, clientIP, idleReadBuffer)
+}
+
+// The client read buffers: large for transfers, small for idle connections.
+const (
+	bulkReadBuffer = 256 << 10
+	idleReadBuffer = 4 << 10
+)
+
+func dial(ctx context.Context, s Setup, door Door, u User, clientIP string, readBuffer int) (*Client, error) {
 	switch door {
 	case DoorEE:
-		return dialEE(ctx, s, u)
+		return dialEE(ctx, s, u, readBuffer)
 	case DoorDD:
 		return dialObfuscated(ctx, s, u, obfuscation.TagPaddedIntermediate)
 	case DoorPlain:
 		return dialObfuscated(ctx, s, u, obfuscation.TagIntermediate)
 	case DoorWeb:
-		return dialWeb(ctx, s, u, clientIP)
+		return dialWeb(ctx, s, u, clientIP, readBuffer)
 	}
 
 	return nil, fmt.Errorf("no such door: %q", door)
@@ -68,7 +85,7 @@ func dialTCP(ctx context.Context, addr string) (net.Conn, error) {
 	return conn, nil
 }
 
-func dialEE(ctx context.Context, s Setup, u User) (*Client, error) {
+func dialEE(ctx context.Context, s Setup, u User, readBuffer int) (*Client, error) {
 	conn, err := dialTCP(ctx, s.EEAddr())
 	if err != nil {
 		return nil, err
@@ -114,7 +131,7 @@ func dialEE(ctx context.Context, s Setup, u User) (*Client, error) {
 	}
 
 	obfuscated, err := obfuscation.Obfuscator{Secret: u.Key[:]}.SendHandshake(
-		testclient.NewRecordConn(essentials.WrapNetConn(conn)), telegramDC, obfuscation.TagPaddedIntermediate)
+		testclient.NewRecordConnSize(essentials.WrapNetConn(conn), min(readBuffer, 64<<10)), telegramDC, obfuscation.TagPaddedIntermediate)
 	if err != nil {
 		return fail(fmt.Errorf("cannot send the obfuscated2 handshake: %w", err))
 	}
@@ -157,14 +174,14 @@ func DialDirect(ctx context.Context, s Setup) (*Client, error) {
 	return &Client{Conn: obfuscated, close: conn.Close}, nil
 }
 
-func dialWeb(ctx context.Context, s Setup, u User, clientIP string) (*Client, error) {
+func dialWeb(ctx context.Context, s Setup, u User, clientIP string, readBuffer int) (*Client, error) {
 	capability, err := u.Capability()
 	if err != nil {
 		return nil, err
 	}
 
 	session, err := testclient.OpenWebSession(ctx, "http://"+s.RelayAddr(), capability,
-		testclient.WebOptions{Origin: webHost, ForwardedFor: clientIP, ResetOnClose: true})
+		testclient.WebOptions{Origin: webHost, ForwardedFor: clientIP, ResetOnClose: true, ReadBufferSize: readBuffer})
 	if err != nil {
 		return nil, err //nolint: wrapcheck
 	}

@@ -437,6 +437,49 @@ func TestAWrongAcceptKeyIsRefused(t *testing.T) {
 	require.ErrorIs(t, err, errUpgradeRefused)
 }
 
+// A Write with credit to spare can still block, in the carrier's own socket,
+// when the relay stops reading. The stream's deadline reaches that socket too:
+// a load run is bounded however the relay misbehaves.
+func TestAWriteToAStalledCarrierHonoursItsDeadline(t *testing.T) {
+	t.Parallel()
+
+	relay := make(chan *ws.Conn, 1)
+	done := make(chan struct{})
+
+	t.Cleanup(func() { close(done) })
+
+	conn, reader := relayStandIn(t, ws.Options{MaxMessage: 2 << 20}, func(c *ws.Conn) {
+		relay <- c
+		<-done // and never read
+	})
+
+	stream, err := sessionOver(conn, reader).OpenStream(1)
+	require.NoError(t, err)
+	require.NoError(t, (<-relay).Write(relayFrames(t, frame.NewWindow(1, 1<<30))))
+	require.NoError(t, stream.SetWriteDeadline(time.Now().Add(time.Second)))
+
+	wrote := make(chan error, 1)
+
+	go func() {
+		chunk := make([]byte, 1<<20)
+
+		for {
+			if _, err := stream.Write(chunk); err != nil {
+				wrote <- err
+
+				return
+			}
+		}
+	}()
+
+	select {
+	case err := <-wrote:
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	case <-time.After(10 * time.Second):
+		t.Fatal("a Write blocked in the carrier's socket ignored its deadline")
+	}
+}
+
 // bareUpgrader answers a WebSocket upgrade by hand and then holds the socket
 // without reading it, so a heap measurement counts the client's side alone.
 func bareUpgrader(t *testing.T) string {

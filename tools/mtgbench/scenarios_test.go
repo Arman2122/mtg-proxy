@@ -247,6 +247,25 @@ func TestTheReportWritesUnreadableFiguresAsNull(t *testing.T) {
 	assert.Contains(t, string(raw), `"mbps": 100`)
 }
 
+// -out names a directory that may not exist yet. It is made, and proven
+// writable, before anything starts: a run must not finish only to lose its
+// report.
+func TestTheReportDirectoryIsReadyBeforeTheRun(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "results", "tierB")
+
+	require.NoError(t, prepareOut(dir))
+	require.NoError(t, Report{}.write(dir))
+
+	_, err := os.Stat(filepath.Join(dir, "tierB.json"))
+	require.NoError(t, err)
+
+	blocked := filepath.Join(t.TempDir(), "a-file")
+	require.NoError(t, os.WriteFile(blocked, nil, 0o600))
+	require.Error(t, prepareOut(filepath.Join(blocked, "below")), "a path that cannot be a directory is refused up front")
+}
+
 // The tables show the median of the runs with their spread, and a failed row
 // says why instead of showing numbers.
 func TestTablesShowTheMedianAndSpread(t *testing.T) {

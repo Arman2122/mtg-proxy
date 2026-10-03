@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -26,7 +27,7 @@ func openIdle(ctx context.Context, st *Stack, door Door, u User, n int) ([]*Clie
 	for range idleWorkers {
 		wg.Go(func() {
 			for i := range next {
-				c, err := Dial(ctx, st.Setup, door, u, clientIP(i))
+				c, err := DialIdle(ctx, st.Setup, door, u, clientIP(i))
 				if err == nil {
 					err = c.SetDeadline(time.Now().Add(10 * time.Minute))
 				}
@@ -78,6 +79,16 @@ func openIdle(ctx context.Context, st *Stack, door Door, u User, n int) ([]*Clie
 	return clients, nil
 }
 
+// liveHeap is mtgbench's own live heap, after a collection.
+func liveHeap() int64 {
+	var m runtime.MemStats
+
+	runtime.GC()
+	runtime.ReadMemStats(&m)
+
+	return int64(m.HeapAlloc) //nolint: gosec // a heap size
+}
+
 // rssDelta is (after - before) per connection, in KiB, or NaN when the
 // readings are not available here.
 func rssDelta(before, after int64, errBefore, errAfter error, n int) float64 {
@@ -94,7 +105,11 @@ func idleScenario() scenario {
 		about: "Connections opened and left open on a fresh process, each first proven with a one-byte echo. " +
 			"RSS is every process of the binary; per connection is the growth over the process before it, divided by the count. " +
 			"WEB is one session per connection.",
-		metrics: []Metric{{Key: "kib/conn", Title: "RSS KiB per conn"}, {Key: "open-s", Title: "seconds to open"}},
+		metrics: []Metric{
+			{Key: "kib/conn", Title: "RSS KiB per conn"},
+			{Key: "open-s", Title: "seconds to open"},
+			{Key: "bench-kib/conn", Title: "mtgbench's own heap KiB per conn"},
+		},
 		run: func(ctx context.Context, b *Bench) []Row {
 			var rows []Row
 
@@ -126,6 +141,7 @@ func (b *Bench) idle(ctx context.Context, door Door, n int) (Sample, error) {
 	defer st.Close() //nolint: errcheck
 
 	before, errBefore := st.Runner.RSSBytes()
+	selfBefore := liveHeap()
 	started := time.Now()
 
 	clients, err := openIdle(ctx, st, door, b.user(alice), n)
@@ -137,7 +153,14 @@ func (b *Bench) idle(ctx context.Context, door Door, n int) (Sample, error) {
 	opened := time.Since(started)
 	after, errAfter := st.Runner.RSSBytes()
 
-	return Sample{"kib/conn": rssDelta(before, after, errBefore, errAfter, n), "open-s": opened.Seconds()}, nil
+	// mtgbench's own side of the same connections, the clients and the data
+	// centre's ends: what the run costs the host beside the binary.
+	self := float64(liveHeap()-selfBefore) / float64(n) / 1024
+
+	return Sample{
+		"kib/conn": rssDelta(before, after, errBefore, errAfter, n), "open-s": opened.Seconds(),
+		"bench-kib/conn": self,
+	}, nil
 }
 
 const (

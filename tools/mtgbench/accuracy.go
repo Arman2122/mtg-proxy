@@ -8,7 +8,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,30 +19,32 @@ var (
 	errMiscounted   = errors.New("a clean transfer was not counted exactly")
 )
 
-// accuracy is achieved over target across the measured seconds.
-type accuracy struct{ mean, p10, p90 float64 }
+// accuracy is achieved over target across the measured seconds: their mean,
+// and the lowest and highest single second. With a handful of seconds those
+// are what the spread is; percentiles of five samples would only be them
+// under another name.
+type accuracy struct{ mean, lowest, highest float64 }
 
-// capAccuracy is achieved over target for every second but the first: the
-// speed limiter starts a user with one second of burst, so the first second
-// runs above the cap by design.
-func capAccuracy(perSecond []float64, target float64) accuracy {
-	if len(perSecond) < 2 {
+// capAccuracy is achieved over target for every second after the first skip:
+// the speed limiter starts a user with one second of burst, so the first
+// second runs above the cap by design, and on ee the doppelganger's queue,
+// which sits after the limiter, carries part of it into the second after.
+func capAccuracy(perSecond []float64, target float64, skip int) accuracy {
+	if len(perSecond) <= skip {
 		return accuracy{math.NaN(), math.NaN(), math.NaN()}
 	}
 
-	ratios := make([]float64, 0, len(perSecond)-1)
-	sum := 0.0
+	measured := perSecond[skip:]
+	a := accuracy{lowest: math.Inf(1), highest: math.Inf(-1)}
 
-	for _, v := range perSecond[1:] {
-		ratios = append(ratios, v/target)
-		sum += v / target
+	for _, v := range measured {
+		r := v / target
+		a.mean += r / float64(len(measured))
+		a.lowest = math.Min(a.lowest, r)
+		a.highest = math.Max(a.highest, r)
 	}
 
-	slices.Sort(ratios)
-
-	at := func(q float64) float64 { return ratios[min(len(ratios)-1, int(q*float64(len(ratios))))] }
-
-	return accuracy{mean: sum / float64(len(ratios)), p10: at(0.10), p90: at(0.90)}
+	return a
 }
 
 // jain is Jain's fairness index, (Σx)² / (n·Σx²): 1 when every share is
@@ -448,12 +449,14 @@ func capsScenario() scenario {
 	return scenario{
 		name: "caps",
 		about: "One user, 8 connections, against a cap of 1 or 10 MiB/s. speed-up is measured uploading, " +
-			"speed and speed-down downloading. Delivered bytes are sampled every second and the first (burst) second is dropped. " +
-			"Achieved over target per second, and Jain's fairness index across the user's connections (1 is equal shares).",
+			"speed and speed-down downloading. Delivered bytes are sampled every second; the first (burst) second is dropped, " +
+			"and on ee the second after it too, which the doppelganger's queue (after the limiter) carries part of the burst into. " +
+			"Achieved over target: the mean, and the lowest and highest single second. " +
+			"Fairness is Jain's index across the user's connections (1 is equal shares).",
 		metrics: []Metric{
 			{Key: "mean", Title: "achieved/target mean"},
-			{Key: "p10", Title: "p10"},
-			{Key: "p90", Title: "p90"},
+			{Key: "min", Title: "lowest second"},
+			{Key: "max", Title: "highest second"},
 			{Key: "jain", Title: "fairness"},
 		},
 		run: func(ctx context.Context, b *Bench) []Row {
@@ -485,7 +488,12 @@ func capsScenario() scenario {
 }
 
 func (b *Bench) capped(ctx context.Context, door Door, kind string, mib int) (Sample, error) {
-	seconds := 1 + max(3, int(b.Opts.Measure/time.Second))
+	skip := 1
+	if door == DoorEE {
+		skip = 2
+	}
+
+	seconds := skip + max(3, int(b.Opts.Measure/time.Second))
 	download := kind != "speed-up"
 
 	clients, err := b.dialMany(ctx, b.Stack, door, []User{b.user(capUser(kind, mib))}, capConns,
@@ -529,7 +537,7 @@ func (b *Bench) capped(ctx context.Context, door Door, kind string, mib int) (Sa
 			now := moved[i].Load()
 			total += float64(now - last[i])
 
-			if second > 0 {
+			if second >= skip {
 				perConn[i] += float64(now - last[i])
 			}
 
@@ -550,7 +558,7 @@ func (b *Bench) capped(ctx context.Context, door Door, kind string, mib int) (Sa
 		return nil, err //nolint: wrapcheck
 	}
 
-	a := capAccuracy(perSecond, float64(mib<<20))
+	a := capAccuracy(perSecond, float64(mib<<20), skip)
 
-	return Sample{"mean": a.mean, "p10": a.p10, "p90": a.p90, "jain": jain(perConn)}, nil
+	return Sample{"mean": a.mean, "min": a.lowest, "max": a.highest, "jain": jain(perConn)}, nil
 }

@@ -243,7 +243,10 @@ func (dc *DataCentre) serve(raw essentials.Conn) {
 
 	dc.served.Add(1)
 
-	buf := make([]byte, dcChunk)
+	// Sized to what the commands need, up to dcChunk: an idle connection, whose
+	// only command was a one-byte echo, holds one byte, not a chunk -- a run
+	// of 5,000 of them shares a host with other people's services.
+	var buf []byte
 
 	for {
 		var command [commandSize]byte
@@ -253,7 +256,11 @@ func (dc *DataCentre) serve(raw essentials.Conn) {
 
 		n := int64(binary.BigEndian.Uint64(command[1:])) //nolint: gosec // our own client's counts
 
-		if err := dc.run(conn, command[0], n, buf); err != nil {
+		if need := int(min(n, dcChunk)); cap(buf) < need {
+			buf = make([]byte, need)
+		}
+
+		if err := dc.run(conn, command[0], n, buf[:cap(buf)]); err != nil {
 			return
 		}
 	}
@@ -278,19 +285,28 @@ func (dc *DataCentre) run(conn essentials.Conn, op byte, n int64, buf []byte) er
 
 		return nil
 	case cmdUpload:
-		// Wrapped so CopyBuffer uses buf: io.Discard's own ReadFrom would read
-		// 8 KiB at a time.
-		got, err := io.CopyBuffer(struct{ io.Writer }{io.Discard}, io.LimitReader(conn, n), buf)
-		dc.received.Add(got)
+		// Every byte is checked, as the client checks a download: what is
+		// acknowledged arrived as it was sent, not just in the right number.
+		var got int64
 
-		if err != nil || got != n {
-			return fmt.Errorf("upload ended at %d of %d: %w", got, n, err)
+		for got < n {
+			m, err := conn.Read(buf[:min(int64(len(buf)), n-got)])
+			if m > 0 && !bytes.Equal(buf[:m], zeros[:m]) {
+				return fmt.Errorf("upload, at byte %d: %w", got, errCorrupt)
+			}
+
+			got += int64(m)
+			dc.received.Add(int64(m))
+
+			if err != nil && got < n {
+				return fmt.Errorf("upload ended at %d of %d: %w", got, n, err)
+			}
 		}
 
 		var ack [8]byte
 		binary.BigEndian.PutUint64(ack[:], uint64(got)) //nolint: gosec // non-negative
 
-		_, err = conn.Write(ack[:])
+		_, err := conn.Write(ack[:])
 
 		return err //nolint: wrapcheck
 	case cmdEcho:

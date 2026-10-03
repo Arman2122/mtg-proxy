@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -59,6 +60,50 @@ func TestRecordConnRoundTrip(t *testing.T) {
 	_, err = io.ReadFull(conn, read)
 	require.NoError(t, err)
 	assert.Equal(t, answer, read, "a record with no application data is skipped")
+}
+
+// A record layer made for an idle connection costs little once it has carried
+// a byte each way: its buffers grow to what the connection used, not to the
+// most a bulk transfer could use.
+func TestASmallRecordConnHoldsLittle(t *testing.T) { //nolint: paralleltest // reads the heap
+	const conns = 64
+
+	var before, after runtime.MemStats
+
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	held := make([]essentials.Conn, 0, conns)
+
+	for range conns {
+		near, far := net.Pipe()
+		t.Cleanup(func() {
+			near.Close() //nolint: errcheck
+			far.Close()  //nolint: errcheck
+		})
+
+		conn := NewRecordConnSize(essentials.WrapNetConn(near), 4<<10)
+
+		go func() {
+			ReadRecord(far)                         //nolint: errcheck
+			far.Write(ApplicationRecord([]byte{1})) //nolint: errcheck
+		}()
+
+		_, err := conn.Write([]byte{1})
+		require.NoError(t, err)
+
+		_, err = io.ReadFull(conn, make([]byte, 1))
+		require.NoError(t, err)
+
+		held = append(held, conn)
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+
+	perConn := (int64(after.HeapAlloc) - int64(before.HeapAlloc)) / conns //nolint: gosec // heap sizes
+	assert.Less(t, perConn, int64(8<<10), "an idle record layer holds %d bytes", perConn)
+	runtime.KeepAlive(held)
 }
 
 // failAfter takes n writes, then fails every one.

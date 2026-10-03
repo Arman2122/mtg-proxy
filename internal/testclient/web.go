@@ -246,7 +246,7 @@ func (s *WebSession) OpenStream(id uint32) (*WebStream, error) {
 	s.streams[id] = stream
 	s.mu.Unlock()
 
-	if err := s.writeFrames(frame.NewOpen(id)); err != nil {
+	if err := s.writeFrames(time.Time{}, frame.NewOpen(id)); err != nil {
 		s.forget(id)
 
 		return nil, err
@@ -297,7 +297,11 @@ func (s *WebSession) Close() error {
 	return s.conn.Close() //nolint: wrapcheck
 }
 
-func (s *WebSession) writeFrames(frames ...frame.Frame) error {
+// writeFrames sends frames in one carrier message. The caller's deadline
+// bounds the socket write too: a relay that stops reading would otherwise
+// hold the write, and the stream, forever. A write cut off part-way leaves the
+// carrier mid-message, so it fails the session.
+func (s *WebSession) writeFrames(deadline time.Time, frames ...frame.Frame) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -308,6 +312,10 @@ func (s *WebSession) writeFrames(frames ...frame.Frame) error {
 
 	s.batch = batch
 	s.wire = appendClientFrame(s.wire[:0], opBinary, batch)
+
+	if err := s.conn.SetWriteDeadline(deadline); err != nil {
+		return fmt.Errorf("cannot bound the carrier write: %w", err)
+	}
 
 	if _, err := s.conn.Write(s.wire); err != nil {
 		s.fail(err)
@@ -323,6 +331,12 @@ func (s *WebSession) writeControl(opcode byte, payload []byte) error {
 	defer s.writeMu.Unlock()
 
 	s.wire = appendClientFrame(s.wire[:0], opcode, payload)
+
+	// A stream's write may have left its deadline on the socket; a pong is
+	// the session's own and has none.
+	if err := s.conn.SetWriteDeadline(time.Time{}); err != nil {
+		return err //nolint: wrapcheck
+	}
 
 	_, err := s.conn.Write(s.wire)
 
@@ -496,10 +510,12 @@ func (st *WebStream) Read(p []byte) (int, error) {
 		grant, st.consumed = st.consumed, 0
 		st.window += grant
 	}
+
+	deadline := st.readDeadline
 	st.mu.Unlock()
 
 	if grant > 0 {
-		if err := st.session.writeFrames(frame.NewWindow(st.id, uint32(grant))); err != nil { //nolint: gosec // < webInitialWindow
+		if err := st.session.writeFrames(deadline, frame.NewWindow(st.id, uint32(grant))); err != nil { //nolint: gosec // < webInitialWindow
 			return n, err
 		}
 	}
@@ -543,10 +559,11 @@ func (st *WebStream) Write(p []byte) (int, error) {
 
 		n := min(len(p)-written, webDataChunk, st.credit)
 		st.credit -= n
+		deadline := st.writeDeadline
 		st.mu.Unlock()
 
 		// EncodeBatch copies the payload into the batch, so p is not retained.
-		if err := st.session.writeFrames(frame.NewData(st.id, p[written:written+n])); err != nil {
+		if err := st.session.writeFrames(deadline, frame.NewData(st.id, p[written:written+n])); err != nil {
 			return written, err
 		}
 
@@ -624,12 +641,13 @@ func (st *WebStream) Close() error {
 	}
 
 	st.closed = true
+	deadline := st.writeDeadline
 	st.mu.Unlock()
 	st.cond.Broadcast()
 
 	st.session.forget(st.id)
 
-	return st.session.writeFrames(frame.NewClose(st.id))
+	return st.session.writeFrames(deadline, frame.NewClose(st.id))
 }
 
 // CloseRead and CloseWrite exist so a stream satisfies essentials.Conn. The

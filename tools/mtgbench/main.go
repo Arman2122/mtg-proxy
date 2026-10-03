@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -111,6 +112,12 @@ func run() error {
 		return nil
 	}
 
+	if *out != "" {
+		if err := prepareOut(*out); err != nil {
+			return err
+		}
+	}
+
 	report := Report{Started: time.Now(), Binary: binary, Pin: *pin, Options: opts, Limits: limits(*pin)}
 
 	for _, shaping := range shapingList {
@@ -138,17 +145,19 @@ func run() error {
 		return fmt.Errorf("cannot print the report: %w", err)
 	}
 
+	// Every way the run fell short is reported: a report that could not be
+	// written does not hide the rows that failed.
+	errs := []error{ctx.Err()}
+
 	if *out != "" {
-		if err := report.write(*out); err != nil {
-			return err
-		}
+		errs = append(errs, report.write(*out))
 	}
 
 	if failed := failures(report.Tables); len(failed) > 0 {
-		return fmt.Errorf("%d row(s) failed: %s", len(failed), strings.Join(failed, "; ")) //nolint: err113
+		errs = append(errs, fmt.Errorf("%d row(s) failed: %s", len(failed), strings.Join(failed, "; "))) //nolint: err113
 	}
 
-	return ctx.Err() //nolint: wrapcheck
+	return errors.Join(errs...)
 }
 
 // standingSetup is the configuration of one shaping's stack. The record stack
