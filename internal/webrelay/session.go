@@ -108,7 +108,7 @@ func (o SessionOptions) withDefaults() SessionOptions {
 // pathological orderings that break them.
 type carrier interface {
 	Read() ([]byte, error)
-	Write(payload []byte) error
+	WriteBuffers(bufs [][]byte) error
 	Close(code uint16, reason string) error
 }
 
@@ -205,14 +205,25 @@ func (s *session) readLoop() error {
 	}
 }
 
+// writeLoop sends every batch as one vectored write -- headers and the DATA
+// payloads, which are the pumps' own read buffers, never copied -- and then
+// hands those buffers back to their pools. A batch that is not written is not
+// released: the garbage collector has it, the pool is only an optimization.
 func (s *session) writeLoop() {
+	var (
+		vecs    [][]byte
+		scratch []byte
+	)
+
 	for {
 		batch := s.out.Take()
 		if batch == nil {
 			return
 		}
 
-		payload, err := s.limits.EncodeBatch(nil, batch, frame.RelayToClient)
+		var err error
+
+		vecs, scratch, err = s.limits.BatchVectors(vecs[:0], scratch, batch, frame.RelayToClient)
 		if err != nil {
 			// The relay built a batch its own client would reject. That is a
 			// fault on this side, not the peer's.
@@ -222,10 +233,23 @@ func (s *session) writeLoop() {
 			return
 		}
 
-		if err := s.conn.Write(payload); err != nil {
+		if err := s.conn.WriteBuffers(vecs); err != nil {
+			// A message half on the wire cannot be continued, and a carrier
+			// that cannot be written is finished: close it, so the read loop
+			// ends too rather than serving a session that can no longer answer.
+			s.conn.Close(ws.CloseInternalError, "") //nolint: errcheck // already failing
 			s.cancel()
 
 			return
+		}
+
+		// The vectors alias the payloads; drop them before the buffers go back.
+		clear(vecs)
+
+		for i := range batch {
+			if batch[i].Type == frame.TypeData {
+				releaseReadBuffer(batch[i].Payload)
+			}
 		}
 	}
 }

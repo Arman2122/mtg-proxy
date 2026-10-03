@@ -313,31 +313,37 @@ func (s *stream) pump() {
 		chunk = frame.MaxRelayDataChunk
 	}
 
-	buf := make([]byte, chunk)
+	// Each read takes a buffer from the pools and the DATA frame carries it to
+	// the write loop, which releases it once written: no copy, and a stream
+	// waiting on an idle backend holds a small buffer, not a large one.
+	large := false
 
 	for {
-		allowed := s.spend(len(buf))
+		buf := getReadBuffer(large)
+
+		allowed := s.spend(min(len(buf), chunk))
 		if allowed == 0 {
+			releaseReadBuffer(buf)
+
 			return
 		}
 
 		n, err := s.conn.Read(buf[:allowed])
+		large = nextReadLarge(large, n)
 
 		if n > 0 {
 			// Refund what the read did not use: credit is spent on bytes that
 			// exist, not on the size of the buffer offered.
 			s.refund(allowed - n)
 
-			payload := make([]byte, n)
-			copy(payload, buf[:n])
-
-			if pushErr := s.session.out.PushData(frame.NewData(s.id, payload)); pushErr != nil {
+			if pushErr := s.session.out.PushData(frame.NewData(s.id, buf[:n])); pushErr != nil {
 				return
 			}
 
 			s.session.counters.addBytesDown(n)
 		} else {
 			s.refund(allowed)
+			releaseReadBuffer(buf)
 		}
 
 		if err != nil {

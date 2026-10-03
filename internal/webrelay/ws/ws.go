@@ -278,6 +278,10 @@ type Conn struct {
 	closeMu sync.Mutex
 	closed  bool
 
+	// header and vecs are WriteBuffers' own scratch, reused under writeMu.
+	header [10]byte
+	vecs   [][]byte
+
 	// pinged is set when a ping went out for the current silence period and
 	// cleared by any traffic. It is touched only by the reader.
 	pinged bool
@@ -417,20 +421,55 @@ func (c *Conn) handleControl(header frameHeader) error {
 	}
 }
 
-func (c *Conn) writeFrame(opcode byte, payload []byte) error {
-	header := make([]byte, 2, 10)
-	header[0] = 0x80 | opcode
+// WriteBuffers sends one whole binary message whose payload is bufs, joined,
+// in a single vectored write: on a TCP socket, one writev of the header and
+// every slice, with nothing copied. The bytes on the wire are exactly those
+// Write would send for the joined payload.
+func (c *Conn) WriteBuffers(bufs [][]byte) error {
+	total := 0
+	for _, b := range bufs {
+		total += len(b)
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	c.vecs = append(append(c.vecs[:0], appendHeader(c.header[:0], opBinary, total)), bufs...)
+
+	// WriteTo consumes the vectors it is given; c.vecs keeps its backing
+	// array for the next message, and is cleared so a buffer the caller
+	// releases is not held here.
+	defer clear(c.vecs)
+
+	if err := c.conn.SetWriteDeadline(time.Now().Add(c.opts.WriteTimeout)); err != nil {
+		return fmt.Errorf("cannot set a write deadline: %w", err)
+	}
+
+	vectors := net.Buffers(c.vecs)
+	if _, err := vectors.WriteTo(c.conn); err != nil {
+		return fmt.Errorf("cannot write a websocket message: %w", err)
+	}
+
+	return nil
+}
+
+// appendHeader appends the header of a final, unmasked server frame carrying n
+// payload bytes, in the minimal length form.
+func appendHeader(dst []byte, opcode byte, n int) []byte {
+	dst = append(dst, 0x80|opcode)
 
 	switch {
-	case len(payload) <= maxControlPayload:
-		header[1] = byte(len(payload)) //nolint:gosec // bounded by the case: at most 125
-	case len(payload) <= 0xFFFF:
-		header[1] = 126                                                      //nolint:gosec // header was made with len 2, cap 10
-		header = binary.BigEndian.AppendUint16(header, uint16(len(payload))) //nolint:gosec // bounded by the case
+	case n <= maxControlPayload:
+		return append(dst, byte(n)) //nolint:gosec // bounded by the case: at most 125
+	case n <= 0xFFFF:
+		return binary.BigEndian.AppendUint16(append(dst, 126), uint16(n)) //nolint:gosec // bounded by the case
 	default:
-		header[1] = 127                                                      //nolint:gosec // ditto
-		header = binary.BigEndian.AppendUint64(header, uint64(len(payload))) //nolint:gosec // a length is never negative
+		return binary.BigEndian.AppendUint64(append(dst, 127), uint64(n)) //nolint:gosec // a length is never negative
 	}
+}
+
+func (c *Conn) writeFrame(opcode byte, payload []byte) error {
+	header := appendHeader(make([]byte, 0, 10), opcode, len(payload))
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()

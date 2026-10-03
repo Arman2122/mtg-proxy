@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +29,9 @@ type testCarrier struct {
 	mu        sync.Mutex
 	closeCode uint16
 	closed    bool
+
+	// failWrites makes every write fail, as a socket whose peer has gone.
+	failWrites atomic.Bool
 }
 
 func newTestCarrier() *testCarrier {
@@ -42,23 +46,33 @@ func newSyncCarrier() *testCarrier {
 	return &testCarrier{in: make(chan []byte, 64), out: make(chan []byte), done: make(chan struct{})}
 }
 
+// Read returns the next message, or ErrClosed once the carrier is closed, as
+// a socket's read fails when the socket is closed under it.
 func (c *testCarrier) Read() ([]byte, error) {
-	message, ok := <-c.in
-	if !ok {
+	select {
+	case message, ok := <-c.in:
+		if !ok {
+			return nil, ws.ErrClosed
+		}
+
+		return message, nil
+	case <-c.done:
 		return nil, ws.ErrClosed
 	}
-
-	return message, nil
 }
 
-func (c *testCarrier) Write(payload []byte) error {
+// WriteBuffers delivers the vectors as one message, as the WebSocket carrier
+// sends them as one.
+func (c *testCarrier) WriteBuffers(bufs [][]byte) error {
 	c.mu.Lock()
 	closed := c.closed
 	c.mu.Unlock()
 
-	if closed {
+	if closed || c.failWrites.Load() {
 		return net.ErrClosed
 	}
+
+	payload := bytes.Join(bufs, nil)
 
 	// A real socket fails a blocked write when it is closed, and the session
 	// joins its write loop before returning, so a carrier that could block for
