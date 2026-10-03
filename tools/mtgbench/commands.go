@@ -2,11 +2,11 @@ package main
 
 import (
 	"bytes"
-	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 )
 
 var (
@@ -36,22 +36,7 @@ func Download(conn io.ReadWriter, n int64) error {
 		return fmt.Errorf("cannot ask for a download: %w", err)
 	}
 
-	buf := make([]byte, clientChunk)
-
-	for got := int64(0); got < n; {
-		m, err := conn.Read(buf[:min(int64(len(buf)), n-got)])
-		if m > 0 && !bytes.Equal(buf[:m], zeros[:m]) {
-			return fmt.Errorf("download, at byte %d: %w", got, errCorrupt)
-		}
-
-		got += int64(m)
-
-		if err != nil && got < n {
-			return fmt.Errorf("download ended at %d of %d bytes: %w", got, n, cmp.Or(err, io.ErrUnexpectedEOF))
-		}
-	}
-
-	return nil
+	return readZeros(conn, n, make([]byte, clientChunk), nil)
 }
 
 // Upload sends n bytes and waits for the data centre to acknowledge all of them.
@@ -60,8 +45,43 @@ func Upload(conn io.ReadWriter, n int64) error {
 		return fmt.Errorf("cannot announce an upload: %w", err)
 	}
 
-	buf := make([]byte, clientChunk)
+	if err := writeZeros(conn, n, make([]byte, clientChunk), nil); err != nil {
+		return err
+	}
 
+	return readAck(conn, n)
+}
+
+// readZeros reads exactly n bytes into buf, a piece at a time, checking every
+// one is zero. moved, when given, counts them as they arrive.
+func readZeros(conn io.Reader, n int64, buf []byte, moved *atomic.Int64) error {
+	for got := int64(0); got < n; {
+		m, err := conn.Read(buf[:min(int64(len(buf)), n-got)])
+		if m > 0 && !bytes.Equal(buf[:m], zeros[:m]) {
+			return fmt.Errorf("download, at byte %d: %w", got, errCorrupt)
+		}
+
+		got += int64(m)
+
+		if moved != nil {
+			moved.Add(int64(m))
+		}
+
+		if err != nil && got < n {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+
+			return fmt.Errorf("download ended at %d of %d bytes: %w", got, n, err)
+		}
+	}
+
+	return nil
+}
+
+// writeZeros writes n zero bytes from buf, a piece at a time. moved, when
+// given, counts them as they go.
+func writeZeros(conn io.Writer, n int64, buf []byte, moved *atomic.Int64) error {
 	for left := n; left > 0; {
 		chunk := min(left, int64(len(buf)))
 		copy(buf, zeros[:chunk])
@@ -70,9 +90,17 @@ func Upload(conn io.ReadWriter, n int64) error {
 			return fmt.Errorf("upload stopped with %d of %d bytes left: %w", left, n, err)
 		}
 
+		if moved != nil {
+			moved.Add(chunk)
+		}
+
 		left -= chunk
 	}
 
+	return nil
+}
+
+func readAck(conn io.Reader, n int64) error {
 	var ack [8]byte
 	if _, err := io.ReadFull(conn, ack[:]); err != nil {
 		return fmt.Errorf("no acknowledgement for the upload: %w", err)
@@ -80,6 +108,85 @@ func Upload(conn io.ReadWriter, n int64) error {
 
 	if got := int64(binary.BigEndian.Uint64(ack[:])); got != n { //nolint: gosec // our own data centre's count
 		return fmt.Errorf("%w: %d of %d", errShortAck, got, n)
+	}
+
+	return nil
+}
+
+// pumpDepth is how many chunk commands a bulk transfer keeps in flight: with
+// one, the pipe drains for a round trip at the end of every chunk.
+const pumpDepth = 2
+
+// pump moves chunk after chunk through conn, pumpDepth commands ahead, until
+// stop closes; then it finishes the chunks in flight. Every chunk is checked:
+// a download must arrive whole and zero, an upload must be acknowledged in
+// full. moved counts payload bytes as they pass, for the rate.
+func pump(conn io.ReadWriter, download bool, chunk int64, stop <-chan struct{}, moved *atomic.Int64) error {
+	buf := make([]byte, clientChunk)
+
+	stopped := func() bool {
+		select {
+		case <-stop:
+			return true
+		default:
+			return false
+		}
+	}
+
+	if download {
+		inFlight := 0
+
+		for ; inFlight < pumpDepth; inFlight++ {
+			if _, err := conn.Write(command(cmdDownload, chunk)); err != nil {
+				return fmt.Errorf("cannot ask for a download: %w", err)
+			}
+		}
+
+		for inFlight > 0 {
+			if err := readZeros(conn, chunk, buf, moved); err != nil {
+				return err
+			}
+
+			inFlight--
+
+			if !stopped() {
+				if _, err := conn.Write(command(cmdDownload, chunk)); err != nil {
+					return fmt.Errorf("cannot ask for a download: %w", err)
+				}
+
+				inFlight++
+			}
+		}
+
+		return nil
+	}
+
+	// Acks are 8 bytes, so the data centre's never fill a socket buffer while
+	// this side is still writing: one goroutine can both send and collect.
+	inFlight := 0
+
+	for !stopped() {
+		if _, err := conn.Write(command(cmdUpload, chunk)); err != nil {
+			return fmt.Errorf("cannot announce an upload: %w", err)
+		}
+
+		if err := writeZeros(conn, chunk, buf, moved); err != nil {
+			return err
+		}
+
+		if inFlight++; inFlight == pumpDepth {
+			if err := readAck(conn, chunk); err != nil {
+				return err
+			}
+
+			inFlight--
+		}
+	}
+
+	for ; inFlight > 0; inFlight-- {
+		if err := readAck(conn, chunk); err != nil {
+			return err
+		}
 	}
 
 	return nil

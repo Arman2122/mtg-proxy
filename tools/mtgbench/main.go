@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -31,18 +32,40 @@ func main() {
 
 func run() error {
 	var (
-		bin      = flag.String("bin", "./mtg-proxy", "the mtg-proxy binary under test")
-		smoke    = flag.Bool("smoke", false, "move 1 MiB each way through every door once, and stop")
-		pin      = flag.Int("pin", noPin, "CPU core to pin the binary to with taskset (Linux); -1 leaves it unpinned")
-		basePort = flag.Int("base-port", 47000, "first of the loopback ports the run uses (base..base+12)")
-		shaping  = flag.String("shaping", "record", `the ee door's shaping: "record" or "burst"`)
-		dir      = flag.String("dir", "", "where configs and logs go; a fresh temporary directory if empty")
+		bin       = flag.String("bin", "./mtg-proxy", "the mtg-proxy binary under test")
+		smoke     = flag.Bool("smoke", false, "move 1 MiB each way through every door once, and stop")
+		pin       = flag.Int("pin", noPin, "CPU core to pin the binary to with taskset (Linux); -1 leaves it unpinned")
+		basePort  = flag.Int("base-port", 47000, fmt.Sprintf("first of the loopback ports the run uses (base..base+%d)", portSpan))
+		shapings  = flag.String("shaping", "record,burst", `the ee door's shapings, each its own process: "record", "burst" or both`)
+		dir       = flag.String("dir", "", "where configs and logs go; a fresh temporary directory if empty")
+		scenarios = flag.String("scenarios", "all", "the scenarios to run, comma-separated: bulk, handshake, latency, idle, contention, limiter, slow-reader")
+		warmup    = flag.Duration("warmup", 2*time.Second, "each run's warm-up, whose figures are dropped")
+		measure   = flag.Duration("measure", 5*time.Second, "each run's measured stretch")
+		runs      = flag.Int("runs", 3, "runs per cell; the report gives their median and range")
+		out       = flag.String("out", "", "a directory to write tierB.md and tierB.json into; the Markdown also goes to stdout")
 	)
 
 	flag.Parse()
 
-	if *basePort < 1024 || *basePort > 65535-12 {
-		return fmt.Errorf("-base-port %d: the run needs %d..%d", *basePort, *basePort, *basePort+12)
+	if *basePort < 1024 || *basePort > 65535-portSpan {
+		return fmt.Errorf("-base-port %d: the run needs %d..%d", *basePort, *basePort, *basePort+portSpan)
+	}
+
+	shapingList := strings.Split(*shapings, ",")
+	for _, s := range shapingList {
+		if s != shapingRecord && s != shapingBurst {
+			return fmt.Errorf("-shaping %q: want record, burst or both", s)
+		}
+	}
+
+	selected, err := selectScenarios(*scenarios)
+	if err != nil {
+		return err
+	}
+
+	opts := Options{Warmup: *warmup, Measure: *measure, Runs: *runs}
+	if opts.Runs < 1 || opts.Measure <= 0 || opts.Warmup < 0 {
+		return fmt.Errorf("-runs %d, -measure %s, -warmup %s: want at least one run of some length", opts.Runs, opts.Measure, opts.Warmup)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -50,8 +73,6 @@ func run() error {
 
 	workDir := *dir
 	if workDir == "" {
-		var err error
-
 		if workDir, err = os.MkdirTemp("", "mtgbench-"); err != nil {
 			return fmt.Errorf("cannot make a work directory: %w", err)
 		}
@@ -64,25 +85,138 @@ func run() error {
 		return fmt.Errorf("cannot resolve %s: %w", *bin, err)
 	}
 
+	if *smoke {
+		for _, shaping := range shapingList {
+			setup, err := standingSetup(workDir, shaping, *basePort, false)
+			if err != nil {
+				return err
+			}
+
+			if err := runSmoke(ctx, setup, binary, *pin); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	report := Report{Started: time.Now(), Binary: binary, Pin: *pin, Options: opts, Limits: limits(*pin)}
+
+	for _, shaping := range shapingList {
+		setup, err := standingSetup(workDir, shaping, *basePort, true)
+		if err != nil {
+			return err
+		}
+
+		stack, err := StartStack(ctx, setup, binary, *pin)
+		if err != nil {
+			return err
+		}
+
+		bench := &Bench{Stack: stack, Opts: opts, Log: os.Stderr, Fresh: freshStacks(setup, binary, *pin)}
+		report.Tables = runScenarios(ctx, bench, selected, report.Tables)
+
+		stack.Close() //nolint: errcheck
+	}
+
+	if err := report.markdown(os.Stdout); err != nil {
+		return fmt.Errorf("cannot print the report: %w", err)
+	}
+
+	if *out != "" {
+		if err := report.write(*out); err != nil {
+			return err
+		}
+	}
+
+	if failed := failures(report.Tables); len(failed) > 0 {
+		return fmt.Errorf("%d row(s) failed: %s", len(failed), strings.Join(failed, "; ")) //nolint: err113
+	}
+
+	return ctx.Err() //nolint: wrapcheck
+}
+
+// standingSetup is the configuration of one shaping's stack. The record stack
+// serves every door and, for the scenarios, the capped user and the crowd; the
+// burst stack serves ee alone, the one door shaping changes.
+func standingSetup(workDir, shaping string, basePort int, scenarios bool) (Setup, error) {
 	token, err := NewAPIToken()
 	if err != nil {
-		return err
+		return Setup{}, err
+	}
+
+	dir := filepath.Join(workDir, shaping)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return Setup{}, fmt.Errorf("cannot make %s: %w", dir, err)
 	}
 
 	setup := Setup{
-		Dir:      workDir,
-		Users:    []User{NewUser("alice")},
+		Dir:      dir,
+		Users:    []User{NewUser(alice)},
 		Doors:    AllDoors,
-		Shaping:  *shaping,
-		BasePort: *basePort,
+		Shaping:  shaping,
+		BasePort: basePort,
 		APIToken: token,
 	}
 
-	if *smoke {
-		return runSmoke(ctx, setup, binary, *pin)
+	if shaping == shapingBurst {
+		setup.Doors = []Door{DoorEE}
 	}
 
-	return fmt.Errorf("nothing to do: pass -smoke")
+	if scenarios && shaping == shapingRecord {
+		setup.Users = append(setup.Users, NewUser(capped))
+		setup.Caps = map[string]Caps{capped: {Speed: "10GB"}}
+
+		for i := range crowdSize {
+			setup.Users = append(setup.Users, NewUser(crowdName(i)))
+		}
+	}
+
+	return setup, nil
+}
+
+// freshStacks starts stacks like setup's on the ports beside it, one at a time:
+// each is closed before the next starts.
+func freshStacks(setup Setup, bin string, core int) func(context.Context) (*Stack, error) {
+	return func(ctx context.Context) (*Stack, error) {
+		token, err := NewAPIToken()
+		if err != nil {
+			return nil, err
+		}
+
+		fresh := setup
+		fresh.BasePort += freshOffset
+		fresh.Dir = setup.Dir + "-fresh"
+		fresh.APIToken = token
+
+		if err := os.MkdirAll(fresh.Dir, 0o750); err != nil {
+			return nil, fmt.Errorf("cannot make %s: %w", fresh.Dir, err)
+		}
+
+		return StartStack(ctx, fresh, bin, core)
+	}
+}
+
+// limits are stated with every result.
+func limits(pin int) []string {
+	l := []string{
+		"Loopback on one machine: these are the binary's own costs, not the network's.",
+		"CPU and RSS are every process of the binary: the proxy, and the WEB relay beside it.",
+		"Handshake times include the proxy's SOCKS5 round trip to mtgbench's data centre.",
+		"ee unpaced and the ad-tag leg are measured in Tier A only.",
+	}
+
+	if pin == noPin {
+		l = append(l, "Not pinned: the figures are per machine, not per core.")
+	} else {
+		l = append(l, fmt.Sprintf("The binary is pinned to core %d; run mtgbench on another, so the figures are per core.", pin))
+	}
+
+	if runtime.GOOS != "linux" {
+		l = append(l, "CPU and memory read n/a: they come from Linux /proc.")
+	}
+
+	return l
 }
 
 // runSmoke moves 1 MiB each way and one echo through every door, byte-exact,

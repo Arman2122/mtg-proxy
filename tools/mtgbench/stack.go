@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync/atomic"
 	"time"
+
+	"github.com/Arman2122/mtg-proxy/internal/testclient"
 )
 
 // Stack is one standing run: mtgbench's data centres and cover listener, and
@@ -138,7 +140,17 @@ func (st *Stack) serveCover() {
 		}
 
 		st.fronted.Add(1)
-		c.Close() //nolint: errcheck
+
+		// A cover site that takes the hello and hangs up without a word: the
+		// client sees nothing come back, which is how it tells fronting from
+		// a failure. A reset, not a close, so a high handshake rate leaves no
+		// TIME_WAIT behind.
+		go func() {
+			testclient.ResetOnClose(c)                     //nolint: errcheck
+			c.SetReadDeadline(time.Now().Add(time.Second)) //nolint: errcheck
+			c.Read(make([]byte, 4096))                     //nolint: errcheck
+			c.Close()                                      //nolint: errcheck
+		}()
 	}
 }
 

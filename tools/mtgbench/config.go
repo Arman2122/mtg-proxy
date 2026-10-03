@@ -29,6 +29,19 @@ const (
 // AllDoors is every door, in report order.
 var AllDoors = []Door{DoorEE, DoorDD, DoorPlain, DoorWeb}
 
+// The ee door's shapings. Shaping is process-wide, so each is its own stack.
+const (
+	shapingRecord = "record"
+	shapingBurst  = "burst"
+)
+
+// A run's ports: the standing stack takes base to base+12, a fresh one
+// base+freshOffset to base+portSpan.
+const (
+	freshOffset = 20
+	portSpan    = 32
+)
+
 // The hosts mtgbench names. The cover host is what ee clients put in SNI; its
 // fronting goes to mtgbench's own cover listener, never to the internet.
 const (

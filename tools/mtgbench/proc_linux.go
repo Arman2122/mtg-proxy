@@ -65,6 +65,23 @@ func cpuSeconds(pid int) (float64, error) {
 	return (utime + stime) / clockTicks, nil
 }
 
+// timeWaits counts the sockets in TIME_WAIT that have a port in [lo, hi] at
+// either end: every connection of a run touches one of its listeners.
+func timeWaits(lo, hi int) (int, error) {
+	n := 0
+
+	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return 0, fmt.Errorf("cannot read %s: %w", path, err)
+		}
+
+		n += countTimeWaits(string(b), lo, hi)
+	}
+
+	return n, nil
+}
+
 // rssBytes reads VmRSS from /proc/<pid>/status.
 func rssBytes(pid int) (int64, error) {
 	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/status")

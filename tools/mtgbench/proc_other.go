@@ -26,4 +26,5 @@ func kill(cmd *exec.Cmd) error {
 }
 
 func cpuSeconds(int) (float64, error) { return 0, errNoProc }
+func timeWaits(int, int) (int, error) { return 0, errNoProc }
 func rssBytes(int) (int64, error)     { return 0, errNoProc }

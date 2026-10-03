@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
+	"github.com/Arman2122/mtg-proxy/internal/testclient"
 	"github.com/Arman2122/mtg-proxy/mtglib/obfuscation"
 )
 
@@ -141,6 +142,13 @@ func (dc *DataCentre) acceptLoop() {
 
 			// Both handshakes are bounded; what follows them is the run's.
 			if c.SetDeadline(time.Now().Add(10*time.Second)) != nil {
+				return
+			}
+
+			// The proxy closes its side first when its client goes. A reset in
+			// answer, rather than a close, means neither side keeps a TIME_WAIT,
+			// which thousands of handshakes a second would otherwise pile up.
+			if testclient.ResetOnClose(c) != nil {
 				return
 			}
 
