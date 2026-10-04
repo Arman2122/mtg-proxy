@@ -232,10 +232,11 @@ func (f *frameConn) appendFrame(dst []byte, parts ...[]byte) []byte {
 	paddingLength := (aes.BlockSize - messageLength%aes.BlockSize) % aes.BlockSize
 	start := len(dst)
 
-	// G115: messageLength is 12 plus a message this process assembled;
-	// readPacket rejects anything above frameMaxMessageLength (16 MiB) on the
-	// way in, and nothing here builds a larger one. The sequence number is a
-	// signed 32-bit wire field written as its two's complement.
+	// G115: messageLength is 12 plus a message this process assembled, at
+	// most frameMaxMessageLength (16 MiB), the most readPacket accepts: the
+	// largest message is a client packet, and middleConn.Write refuses any
+	// over maxClientPacket, the size that fills such a frame. The sequence
+	// number is a signed 32-bit wire field written as its two's complement.
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(messageLength)) //nolint: gosec
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(f.writeSeqNo))  //nolint: gosec
 

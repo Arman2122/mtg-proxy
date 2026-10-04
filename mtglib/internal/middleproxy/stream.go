@@ -3,6 +3,8 @@ package middleproxy
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -10,7 +12,24 @@ import (
 	"github.com/Arman2122/mtg-proxy/essentials"
 )
 
-const quickAckLength uint32 = 0x80000000
+const (
+	quickAckLength uint32 = 0x80000000
+
+	// reqHeaderLength is the size of the RPC_PROXY_REQ prefix header builds:
+	// tag, flags, conn_id, two IP:port pairs, the extra block with its 16-byte
+	// ad_tag, aligned to 4.
+	reqHeaderLength = 84
+
+	// maxClientPacket is the longest packet a client may declare: the one
+	// whose RPC_PROXY_REQ frame is exactly frameMaxMessageLength, the most
+	// the frame reader accepts. Telegram's transport documentation sets no
+	// maximum; TDLib's writer stays under 1<<24 bytes plus 15 of padding, so
+	// this refuses at most its last ~100 bytes, which no client fills (file
+	// parts are 512 KiB).
+	maxClientPacket = frameMaxMessageLength - 4 - 4 - reqHeaderLength - 4
+)
+
+var errPacketTooLarge = errors.New("client packet too large")
 
 type proxyResponseType uint8
 
@@ -89,6 +108,14 @@ func (m *middleConn) Write(p []byte) (int, error) {
 		if length >= quickAckLength {
 			quickAck = true
 			length -= quickAckLength
+		}
+
+		// Judged on the header, before the body is waited for: a client that
+		// could declare any length could make this buffer everything it sent.
+		if length > maxClientPacket {
+			m.inbuf = m.inbuf[:0]
+
+			return 0, fmt.Errorf("%w: %d bytes declared, at most %d", errPacketTooLarge, length, maxClientPacket)
 		}
 
 		if uint64(len(rest)) < uint64(length)+4 {
@@ -237,7 +264,7 @@ func (m *middleConn) buildProxyReq(packet []byte, quickAck bool) []byte {
 // and kept; the flags word is rewritten for each packet.
 func (m *middleConn) header(packet []byte, quickAck bool) []byte {
 	if m.reqHeader == nil {
-		h := make([]byte, 0, 84)
+		h := make([]byte, 0, reqHeaderLength)
 		h = append(h, tagProxyRequest...)
 		h = append(h, 0, 0, 0, 0) // flags, per packet
 		h = append(h, m.connID[:]...)
