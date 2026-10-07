@@ -1100,6 +1100,132 @@ func TestFairShareTickBaselinesBeforeItDecides(t *testing.T) {
 	assert.Equal(t, fairHoldTicks, fairStateOf(table, first, fairDownBucket).hold)
 }
 
+// A baseline tick keeps the counts it took. Here the first second is busy and
+// the second nearly idle for one address: measured from the baseline, that
+// address moved 10,000 in the second second and the other gets the rest;
+// measured from nothing, its first second would count too and it would look
+// like it wanted half the total.
+func TestFairShareABaselineTickKeepsItsCounts(t *testing.T) {
+	t.Parallel()
+
+	table, clock := newTestClientTable(t)
+	secret := fairSecret{name: "alice", totals: fairTotals{Down: fairTestTotal}}
+	init := entryInit{FairTotals: secret.totals}
+
+	slowing := table.acquire("alice", "203.0.113.1", true, init)
+	busy := table.acquire("alice", "203.0.113.2", true, init)
+
+	start := clock.read()
+
+	for _, e := range []*clientEntry{slowing, busy} {
+		e.bytesOut.Add(fairTestTotal / 2)
+		fairBlockTick(e, fairDownBucket, start)
+	}
+
+	clock.advance(fairTestTick)
+	table.tick(clock.read(), secret)
+	require.Zero(t, fairLevelOf(table, "alice", fairDownBucket), "the first tick is the baseline")
+
+	start = clock.read()
+	slowing.bytesOut.Add(10_000)
+	busy.bytesOut.Add(fairTestTotal / 2)
+	fairBlockTick(busy, fairDownBucket, start)
+
+	clock.advance(fairTestTick)
+	table.tick(clock.read(), secret)
+
+	assert.EqualValues(t, fairTestTotal-10_000, fairLevelOf(table, "alice", fairDownBucket),
+		"the slowing address asks for the 10,000 it moved since the baseline")
+	assert.False(t, fairStateOf(table, slowing, fairDownBucket).throttled)
+}
+
+// A tick that comes late -- the ticker held up, or the tick after one a reload
+// discarded -- measures over its own length: the same bytes over two seconds
+// are half the rate, and the same blocked time half the duty.
+func TestFairShareMeasuresALongTickOverItsLength(t *testing.T) {
+	t.Parallel()
+
+	table, clock := newTestClientTable(t)
+	secret := fairSecret{name: "alice", totals: fairTotals{Down: fairTestTotal}}
+	init := entryInit{FairTotals: secret.totals}
+
+	quiet := table.acquire("alice", "203.0.113.1", true, init)
+	busy := table.acquire("alice", "203.0.113.2", true, init)
+
+	table.tick(clock.read(), secret)
+
+	// Two seconds: the quiet address moves 400,000 and waits 400 ms -- a duty
+	// of a fifth, which over one second would have been two fifths, and
+	// throttled. The busy one waits throughout.
+	start := clock.read()
+	quiet.bytesOut.Add(400_000)
+	quiet.blockedDown.enter(start)
+	quiet.blockedDown.leave(start.Add(400 * time.Millisecond))
+	busy.bytesOut.Add(fairTestTotal)
+	busy.blockedDown.enter(start)
+	busy.blockedDown.leave(start.Add(2 * fairTestTick))
+
+	clock.advance(2 * fairTestTick)
+	table.tick(clock.read(), secret)
+
+	assert.False(t, fairStateOf(table, quiet, fairDownBucket).throttled, "a duty of a fifth")
+	assert.EqualValues(t, fairTestTotal-200_000, fairLevelOf(table, "alice", fairDownBucket),
+		"400,000 over two seconds is 200,000 a second, and the busy one gets the rest")
+}
+
+// The half-level release compares an address's rate with the level it ran at,
+// not with the total: three addresses at a third each, one of which has a tick
+// of little waiting while it still moves its third. A third is at least half
+// of a third, so its throttle holds; it is below half the total, which would
+// have released it.
+func TestFairShareTheHalfLevelRuleUsesTheLevelItRanAt(t *testing.T) {
+	t.Parallel()
+
+	table, clock := newTestClientTable(t)
+	secret := fairSecret{name: "alice", totals: fairTotals{Down: fairTestTotal}}
+	init := entryInit{FairTotals: secret.totals}
+
+	entries := []*clientEntry{
+		table.acquire("alice", "203.0.113.1", true, init),
+		table.acquire("alice", "203.0.113.2", true, init),
+		table.acquire("alice", "203.0.113.3", true, init),
+	}
+
+	table.tick(clock.read(), secret)
+
+	third := int64(fairTestTotal / 3)
+
+	second := func(steady bool) {
+		start := clock.read()
+
+		for i, e := range entries {
+			e.bytesOut.Add(third)
+
+			if i == 0 && steady {
+				e.blockedDown.enter(start)
+				e.blockedDown.leave(start.Add(100 * time.Millisecond))
+
+				continue
+			}
+
+			fairBlockTick(e, fairDownBucket, start)
+		}
+
+		clock.advance(fairTestTick)
+		table.tick(clock.read(), secret)
+	}
+
+	second(false)
+	require.EqualValues(t, third, fairLevelOf(table, "alice", fairDownBucket))
+	require.Equal(t, fairHoldTicks, fairStateOf(table, entries[0], fairDownBucket).hold)
+
+	second(true)
+
+	state := fairStateOf(table, entries[0], fairDownBucket)
+	assert.True(t, state.throttled, "moving the level it ran at, it is still held")
+	assert.Equal(t, fairHoldTicks-1, state.hold)
+}
+
 // A reload that moves a secret's fair limiters while a tick is computing makes
 // that tick's work stale: it was measured against limiters and states the
 // reload has replaced, so the tick publishes nothing -- no level, no state, no
