@@ -116,18 +116,25 @@ names of up to 16 secrets that recently matched from it, most recent first.
   rotation drops the older generation. A valid-secret holder who controls many
   addresses can therefore keep new hints out, never evict existing ones.
 - **Privacy.** The cache holds address → secret name (the panel's names are
-  emails) in process memory for 30 to 60 minutes after the last use, regardless of
-  `track-client-ips`. Never logged, exported or persisted; gone on restart.
-  `hints = false` turns it off.
+  emails) in process memory for 30 to 60 minutes after the last use. Never logged,
+  exported or persisted; gone on restart. It **follows `track-client-ips`** by
+  default (on exactly when the operator has already chosen to keep client addresses
+  past a connection — the panel always does), so a standalone deployment keeps the
+  documented promise that no address outlives its connection. `hints = true|false`
+  overrides it either way.
 - **What it cannot do.** It never makes a wrong secret verify: every hinted
   candidate passes through the same `Verify`. A prober never matches, so it can
   neither read nor plant a hint.
 
 ## 3. The budget
 
-**Units and calibration.** Cost is in SHA-256 blocks. At start the proxy measures
-`ns/block` on this machine (the minimum of three short runs of about 4 ms, clamped
-to 10 ns to 2 µs); tests inject the constant. `GOMAXPROCS` is read once at start.
+**Units and calibration.** Cost is in SHA-256 blocks. The first proxy a process
+builds measures `ns/block` on this machine (the minimum of three short runs of
+about 4 ms, clamped to 10 ns to 2 µs) and every later one reuses it (a
+package-level `sync.Once`: the test suite builds hundreds of proxies); tests inject
+the constant. `GOMAXPROCS` is read once at start. The calibrated value is logged at
+start and reported as `ns_per_block` in `/stats`, so an operator can see what the
+budget believes a block costs.
 
 **Two buckets** over the *unhinted scan* (hinted verification is exempt):
 
@@ -135,7 +142,7 @@ to 10 ns to 2 µs); tests inject the constant. `GOMAXPROCS` is read once at star
 |---|---|---|
 | Key | the hint key; unkeyed addresses skip this bucket | one |
 | Refill | `per-ip-ms` (default 50) ms of scan CPU per second; **0 disables this bucket** | `cpu-percent` (default 25) % of `GOMAXPROCS` cores |
-| Burst | 4 s of refill, but never below 4 scans at the current candidate count | 1 s of refill, same floor |
+| Burst | 4 s of refill, but never below `4 × candidates × 12` blocks | 1 s of refill, same floor |
 
 Both refill rates are `real CPU time ÷ ns/block`: 50 ms/s at 325 ns/block is about
 154,000 blocks/s; 25% of 2 cores is about 1,540,000 blocks/s.
@@ -150,9 +157,17 @@ refused and neither bucket changes; otherwise both are charged and the handshake
 waits the delay (cancelled by the connection's context) and scans. Both buckets are
 reserved under one lock, so there is no partial reservation to roll back.
 
+The burst floor depends only on the candidate count (the 12 is the cost floor), never
+on the hello's own size, so a flood of large hellos cannot raise its own cap. The
+per-address map never resets buckets by rotating when it fills: once it holds its
+maximum (32,768 addresses) a new address simply has no per-address entry and uses the
+process-wide bucket only; the 30-minute rotation is by timer.
+
 **Settlement.** The reservation is single-use. It is **refunded in full only when
 the whole handshake succeeds** (verified, replay check passed, `attribute` and
-`admit` accepted). A replay of a captured valid hello, a disabled, expired or
+`admit` accepted). `admit` runs immediately after the door returns, before the
+client's next flight (`proxy_serve.go:69-75`), so no client round trip is spent
+holding a reservation. A replay of a captured valid hello, a disabled, expired or
 over-quota user, a throttled or `ip-limit`-refused user, and a scan that matched
 nothing all keep their charge. Refunds go to the bucket object and are capped at
 its burst.
@@ -161,11 +176,15 @@ its burst.
 connection with the host the SNI named, through the same call a no-match uses.
 No scan, no close.
 
-**Modes.** `enforce` (default) refuses. `observe` computes every decision, counts
-it, and scans anyway without reserving; it additionally counts hellos that were
-over budget **and then matched a secret** (`over_budget_matched`): the legitimate
-traffic `enforce` would have fronted, which is what a canary needs to see. `off`
-disables the budget and the scan cap; the hint cache is governed by `hints`.
+**Modes.** `enforce` (default) refuses. `observe` runs the **identical shadow
+accounting** — a granted scan deducts from the buckets, a would-refuse leaves them
+unchanged, a successful handshake refunds — and differs only in that it never waits
+and never refuses: it counts the decision and scans anyway. It additionally counts
+hellos that were over budget **and then matched a secret** (`over_budget_matched`):
+the legitimate traffic `enforce` would have fronted, which is what a canary needs to
+see. (Without the shadow deduction the buckets would never drain and observe would
+report nothing.) `off` disables the budget and the scan cap; the hint cache is
+governed by `hints`.
 
 **What an attacker can and cannot do, stated plainly.** To lock new users out, an
 attacker must keep the process-wide bucket empty, which costs them about
@@ -205,7 +224,8 @@ and with the SNI gate before this change; this adds one more such dependence and
 
 - **Config**: a new optional `[defense.handshake-budget]` table: `mode`
   (`"enforce"` default, `"observe"`, `"off"`), `per-ip-ms` (default 50, 0–1000),
-  `cpu-percent` (default 25, 1–100), `hints` (default true). Restart-only: a
+  `cpu-percent` (default 25, 1–100), `hints` (default: the value of
+  `track-client-ips`). Restart-only: a
   reload re-reads secrets, not this table. The panel never writes `[defense]`. An
   older binary logs the table as unknown keys on `run` and refuses it only under
   `run --check` (`internal/cli/run_proxy.go:336`, `internal/cli/run.go:37`).
@@ -214,11 +234,13 @@ and with the SNI gate before this change; this adds one more such dependence and
 - **`/stats`**: a new top-level object `faketls_handshake`, omitted until the door
   has counted something (the pattern `obfuscated` follows), with `hinted`,
   `scanned`, `unmatched`, `denied_ip`, `denied_global`, `oversized`,
-  `over_budget_matched` and the flag `enforced`. Nothing is added under `users`
+  `over_budget_matched`, the flag `enforced` and `ns_per_block` (the calibrated
+  block cost). Nothing is added under `users`
   (the panel bills every `users` key as a client). `features` gains
   `handshake-budget`.
-- **Counter outcomes (each handshake past the SNI gate increments exactly one of
-  these):** matched by a hint → `hinted`; matched by the scan → `scanned`; scanned,
+- **Counter outcomes (in `enforce` mode each handshake past the SNI gate
+  increments exactly one of these; in `observe` a would-refuse counter moves
+  together with `scanned` or `unmatched`, tested as pairs):** matched by a hint → `hinted`; matched by the scan → `scanned`; scanned,
   no match → `unmatched`; refused by a bucket → `denied_ip` (checked first) or
   `denied_global`; above the scan cap → `oversized`. `over_budget_matched` is an
   extra counter, only in observe mode, on a match that the budget would have
@@ -259,8 +281,12 @@ the default harness peers are loopback and therefore unkeyed.
   addresses; the 150 ms queue admits a small herd and refuses past it; a charge is
   refunded exactly once and only on whole success (replay, denied user and
   `admit`-refused keep it); burst floors scale with the candidate count;
-  size-uniform cost; oversized refused; unkeyed peers use only the process-wide
-  bucket; `per-ip-ms = 0` disables only the per-address bucket; tokens never go
+  size-uniform cost; oversized refused; **observe mode's shadow accounting drains the
+  buckets like enforce (a flood in observe mode, then a legitimate hello during it,
+  moves `over_budget_matched`)**; a full per-address map gives a new address no
+  entry (process-wide bucket only) and never resets an existing one; the burst floor
+  is `4 × candidates × 12` whatever the hello size; unkeyed peers use only the
+  process-wide bucket; `per-ip-ms = 0` disables only the per-address bucket; tokens never go
   below the debt floor or above burst; no overflow after a long idle.
 - *End to end*: a refused hello and a no-match hello deliver identical bytes to
   the cover site (bytes only; timing is stated, not proven); the shared-address
@@ -338,7 +364,11 @@ Audit these; each was a judgement call, not an instruction.
 6. A match refunds only after the whole handshake succeeds.
 7. Precomputed pads are conditional on a measured 10% gain.
 8. The new `/stats` object is `faketls_handshake`; the feature string is
-   `handshake-budget`; `hints = false` is the privacy switch.
+   `handshake-budget`; `hints` defaults to the value of `track-client-ips` (the
+   privacy switch), so only deployments that already keep addresses keep hints.
+9. The first deployment to the live server runs `mode = "observe"`, and `enforce` is
+   enabled only once `over_budget_matched` stays near zero (release-notes item, not
+   code).
 
 ## Review
 
