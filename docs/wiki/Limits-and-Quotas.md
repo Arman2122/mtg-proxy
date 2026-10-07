@@ -12,6 +12,7 @@ mtg-proxy has two independent governors and they answer different questions.
 - [Resetting a quota](#resetting-a-quota)
 - [Speed limits](#speed-limits)
 - [Address limits](#address-limits)
+- [Per-address controls](#per-address-controls)
 - [Connection throttling: `[throttle]`](#connection-throttling-throttle)
 - [Worked example: a small paid deployment](#worked-example-a-small-paid-deployment)
 - [Limits that live elsewhere](#limits-that-live-elsewhere)
@@ -79,7 +80,9 @@ curl -X POST http://127.0.0.1:9090/reload
 
 A disabled, expired or over-quota user is not told anything. On the FakeTLS listener the connection is routed to the fronting domain, exactly as a wrong secret would be, so a prober cannot tell a revoked customer from a wrong guess. On an obfuscated `[[listener]]` it takes the same exit as every other refusal on that socket — close or drain, per that listener's `on-unknown-secret` — so the deny reason is not readable by timing one connection against another. See [[Security]] for why every refusal on that door has to look alike.
 
-The operator's view is the log. The proxy writes `connection denied by per-user limit` with `secret_name` and a `deny_reason` of `disabled`, `expired`, `quota_exceeded` or `ip_limit`.
+The operator's view is the log. The proxy writes `connection denied by per-user limit` with `secret_name` and a `deny_reason` of `disabled`, `expired`, `quota_exceeded`, `ip_limit`, `client_conns` or `banned`. The line is at info level, which `debug = true` shows.
+
+An address an operator has banned from the secret is turned away the same way as a disabled user: routed to the fronting domain on the FakeTLS listener, and the usual exit on an obfuscated one. A connection over the [per-address connection cap](#per-address-controls) is refused like an address-limit refusal, below.
 
 A user at their [address limit](#address-limits) is the one refusal that is not routed to the cover site. It happens at admission, after the secret has matched, so only someone holding the valid secret can ever see it and there is nothing for a prober to learn; the connection is simply closed, on the FakeTLS door after the TLS answer and on an obfuscated listener through that socket's usual exit.
 
@@ -226,6 +229,40 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9090/secrets/alic
 Alice on her VPN from two places is then refused a third place through the proxy, and admitted from either of the two. The report is pushed, never pulled: no network call sits in the handshake, and each report expires after its `ttl` (default two minutes, at most an hour), so a panel that dies takes its claims with it and the limit degrades to what this proxy can see rather than refusing everyone. The panel refreshes the report as a heartbeat, well inside the ttl. To enforce in the other direction — refusing the VPN because the user is already on the proxy twice — the panel reads this proxy's `connected_ips` and `connected_ips_last_seen`, which need `track-client-ips`. The routes are on [[Multi-User-and-API]].
 
 **Watching it.** `ip_limit` is the configured limit and `active_ips` how many places the user counts as being in right now, on both `/stats` and `/secrets`; `ip_limit_refused` on `/stats` counts the connections turned away. A limit nobody ever hits is doing nothing; a user hitting it constantly is either sharing a secret or roaming between networks, and the two look different in `active_ips`. The addresses themselves — `connected_ips`, `external_ips` — appear only with `track-client-ips`, for the reasons on [[Security]]; the counts always do. Prometheus and statsd get an `ip_limited` counter, and with it a `throttled` counter for the connection throttle below. Nothing about addresses is written to disk or to the log.
+
+## Per-address controls
+
+```toml
+[secret-limits.shared]
+speed = "50mbit"
+ip-limit = 30
+client-conns = 16
+client-speed = "10mbit"
+client-fair = true
+```
+
+Every limit above is per user. When one secret is shared by many people, one of
+them can take the whole `speed`, and nothing says who. Three optional keys act
+on each address inside the secret, where an address is an IPv4 address or an
+IPv6 /64, the unit `ip-limit` counts:
+
+- **`client-conns`** caps how many live connections one address may hold to the
+  secret. The next one is refused after the handshake, as an `ip-limit` refusal
+  is, and counted in `client_conns_refused`. Lowering it never drops anyone.
+- **`client-speed`** is a ceiling on one address, both directions together, in
+  the same spelling and with the same floor as `speed`. Each address has its own.
+- **`client-fair`** divides the secret's `speed`, `speed-up` and `speed-down`
+  among its addresses: an address that wants less than an even split keeps what
+  it wants, and the others share the rest. It needs at least one of those three.
+
+All three are off by default and live on reload. Two things limit what they can
+do. One address may be many people, behind a mobile carrier's NAT. And
+loopback and private addresses do not stand for one place: they share one entry
+per secret that is never capped and has no ceiling, so behind a carrier that
+forwards no client address the keys do nothing. The full reference — what an
+address is, PROXY-protocol listeners, how fair share settles, what is kept — is
+under *Per-address controls* on [[Configuration]]. Per-address usage and
+temporary bans are on [[Multi-User-and-API]].
 
 ## Connection throttling: `[throttle]`
 
