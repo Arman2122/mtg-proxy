@@ -188,4 +188,29 @@ func TestAFailedCarrierWriteEndsTheSession(t *testing.T) {
 	require.Error(t, h.fatal(), "the session must end when its carrier cannot be written")
 }
 
+// A backend that sends the poison byte, one at a time, has it relayed. Each
+// read lands in a buffer back from the pool, poisoned whole when it was last
+// released, and leaves it all poison again; the write loop's one release of it
+// used to panic as a second. The first byte only puts a buffer through the
+// pool, so the reads after it land in recycled ones even with no other test
+// running.
+func TestABackendSendingThePoisonByteIsRelayed(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, SessionOptions{})
+	h.send(frame.NewOpen(1))
+
+	backend := h.backend.accept(t)
+
+	_, err := backend.Write([]byte{0})
+	require.NoError(t, err)
+	require.Equal(t, []byte{0}, h.nextOfType(frame.TypeData).Payload)
+
+	for range 64 {
+		_, err := backend.Write([]byte{poison})
+		require.NoError(t, err)
+		require.Equal(t, []byte{poison}, h.nextOfType(frame.TypeData).Payload)
+	}
+}
+
 var _ essentials.Conn = (*testclient.WebStream)(nil)
