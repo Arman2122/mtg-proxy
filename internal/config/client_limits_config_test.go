@@ -100,6 +100,7 @@ var secretLimitSamples = map[string]string{
 	"speedDown":   `speed-down = "1mbit"`,
 	"ipLimit":     `ip-limit = 2`,
 	"clientConns": `client-conns = 3`,
+	"clientSpeed": `client-speed = "1mbit"`,
 }
 
 // Every engine-level limit can be written in the config file: each field of
@@ -183,4 +184,74 @@ func TestClientConnsLeavesConfigStringAloneUntilUsed(t *testing.T) {
 
 	assert.Contains(t, limitKeys(t, used), "clientConns", "a table that uses it shows it")
 	assert.Contains(t, used.String(), `"clientConns":6`)
+
+	speed, err := config.Parse([]byte(clientLimitsConfig(t, `client-speed = "500kbit"`)))
+	require.NoError(t, err)
+
+	assert.Contains(t, limitKeys(t, speed), "clientSpeed", "a table that uses client-speed shows it")
+	assert.NotContains(t, limitKeys(t, speed), "clientConns", "and only what it uses")
+	assert.Contains(t, speed.String(), `"clientSpeed":"62500B/s"`,
+		"in a form the key accepts back, as speed renders")
+}
+
+// client-speed is a key of [secret-limits.<name>] this binary reads: a speed
+// spelled as speed is, through the same parser the API uses, so it has the same
+// floor and the same units. It reaches the engine as the per-address ceiling,
+// it is a limit on its own, and a value it refuses is refused by its own name
+// -- an operator told "speed is below the minimum" about a client-speed line
+// would look at the wrong one.
+func TestSecretLimitClientSpeed(t *testing.T) {
+	t.Parallel()
+
+	t.Run("reaches the engine in bytes per second and is no unknown key", func(t *testing.T) {
+		t.Parallel()
+
+		conf, err := config.Parse([]byte(clientLimitsConfig(t, "speed = \"20mbit\"\nclient-speed = \"5mbit\"")))
+		require.NoError(t, err)
+		require.NoError(t, conf.Validate())
+
+		assert.Empty(t, conf.UnknownKeys, "run --check accepts it")
+
+		alice := conf.GetSecretLimits()["alice"]
+		assert.EqualValues(t, 625_000, alice.ClientSpeedBytesPerSecond)
+		assert.EqualValues(t, 2_500_000, alice.SpeedBytesPerSecond, "and it is not the secret's own speed")
+	})
+
+	t.Run("alone it is still a limit", func(t *testing.T) {
+		t.Parallel()
+
+		conf, err := config.Parse([]byte(clientLimitsConfig(t, `client-speed = "1MB/s"`)))
+		require.NoError(t, err)
+
+		limits := conf.GetSecretLimits()
+		require.Contains(t, limits, "alice")
+		assert.EqualValues(t, 1<<20, limits["alice"].ClientSpeedBytesPerSecond)
+	})
+
+	t.Run("the floor is speed's", func(t *testing.T) {
+		t.Parallel()
+
+		conf, err := config.Parse([]byte(clientLimitsConfig(t, `client-speed = "64kbit"`)))
+		require.NoError(t, err, "exactly the floor is accepted")
+		assert.EqualValues(t, mtglib.MinSpeedBytesPerSecond, conf.GetSecretLimits()["alice"].ClientSpeedBytesPerSecond)
+	})
+
+	for name, value := range map[string]string{
+		"below the floor": `"32kbit"`,
+		"not a speed":     `"fast"`,
+		"negative":        `"-1mbit"`,
+		"zero":            `"0"`,
+		"not a string":    `1000000`,
+	} {
+		t.Run("is refused at parse time by its own name: "+name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := config.Parse([]byte(clientLimitsConfig(t, "client-speed = "+value)))
+			require.Error(t, err)
+
+			if name != "not a string" {
+				assert.Contains(t, err.Error(), "client-speed")
+			}
+		})
+	}
 }

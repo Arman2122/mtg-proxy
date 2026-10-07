@@ -29,7 +29,8 @@ type tomlConfig struct {
 		Disabled   bool   `toml:"disabled" json:"disabled,omitempty"`
 		IPLimit    int    `toml:"ip-limit" json:"ipLimit,omitempty"`
 
-		ClientConns int `toml:"client-conns" json:"clientConns,omitempty"`
+		ClientConns int    `toml:"client-conns" json:"clientConns,omitempty"`
+		ClientSpeed string `toml:"client-speed" json:"clientSpeed,omitempty"`
 	} `toml:"secret-limits" json:"secretLimits,omitempty"`
 	UsageStateFile string `toml:"usage-state-file" json:"usageStateFile,omitempty"`
 	APIToken       string `toml:"api-token" json:"apiToken,omitempty"`

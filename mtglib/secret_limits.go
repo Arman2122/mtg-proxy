@@ -98,6 +98,20 @@ type SecretLimits struct {
 	// never capped. Distinct from IPLimit, which counts places: a Telegram
 	// client opens several connections, so this is set to a few times that.
 	ClientConns int
+
+	// ClientSpeedBytesPerSecond is how fast one address may move bytes on this
+	// secret, upload and download combined across all of its connections,
+	// client-speed: the per-address ceiling. 0 means unlimited.
+	//
+	// It is the address's own bucket, beside the user's SpeedBytesPerSecond,
+	// which still holds the secret as a whole: an address is held to whichever
+	// is reached first, and two addresses are each held to it, not to it
+	// between them. An address is the unit IPLimit counts (an IPv4 address, an
+	// IPv6 /64). Every peer that does not stand for one place, and every
+	// address the per-address table has no room for, shares the secret's one
+	// rest entry, which has no ceiling: it stands for many clients at once, and
+	// one address's ceiling would hold all of them together.
+	ClientSpeedBytesPerSecond int64
 }
 
 // IsZero reports whether the limits impose no restriction at all, i.e. the
@@ -107,7 +121,7 @@ func (l SecretLimits) IsZero() bool {
 	return l.QuotaBytes == 0 && l.QuotaReset == QuotaResetNone &&
 		l.ExpiresAt.IsZero() && !l.Disabled && l.SpeedBytesPerSecond == 0 &&
 		l.SpeedUpBytesPerSecond == 0 && l.SpeedDownBytesPerSecond == 0 &&
-		l.IPLimit == 0 && l.ClientConns == 0
+		l.IPLimit == 0 && l.ClientConns == 0 && l.ClientSpeedBytesPerSecond == 0
 }
 
 // hasClientControl reports whether the limits carry a per-address control --

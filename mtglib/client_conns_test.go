@@ -779,6 +779,9 @@ var limitFieldSamples = map[string]string{
 	"speed":       `"1mbit"`,
 	"speed_up":    `"1mbit"`,
 	"speed_down":  `"1mbit"`,
+
+	// The per-address ceiling, spelled as speed is.
+	"client_speed": `"1mbit"`,
 }
 
 // Every SecretLimits field can be set through the secrets API: each API field,

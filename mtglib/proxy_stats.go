@@ -509,9 +509,11 @@ const (
 	// FeatureClientLimits means the per-address controls inside one secret are
 	// honoured: [secret-limits.<name>] and the secrets API accept client-conns
 	// (client_conns on the API), a cap on the live connections one address may
-	// hold to the secret, and /stats reads it back as client_conns and counts
-	// its refusals in client_conns_refused. The API is strict, so a client
-	// must see this before it sends the field.
+	// hold to the secret, and client-speed (client_speed), a ceiling on how
+	// fast one address may move bytes. /stats reads them back as client_conns
+	// and client_speed_limit and counts the cap's refusals in
+	// client_conns_refused. The API is strict, so a client must see this before
+	// it sends either field.
 	FeatureClientLimits = "client-limits"
 
 	// FeatureFakeTLS means the proxy speaks the FakeTLS (obfuscated) handshake.
@@ -773,6 +775,11 @@ type UserStatsJSON struct {
 	// when zero, and neither is gated.
 	ClientConns        int   `json:"client_conns,omitempty"`
 	ClientConnsRefused int64 `json:"client_conns_refused,omitempty"`
+
+	// ClientSpeedLimit is the per-address ceiling in bytes per second, read
+	// back as SpeedLimit is, and absent for unlimited. Time an address spent
+	// held to it is in ThrottledMillis.
+	ClientSpeedLimit int64 `json:"client_speed_limit,omitempty"`
 
 	// ConnectedIPs lists the distinct client addresses holding a live
 	// connection right now, sorted. LastIP is the address of the most recent
