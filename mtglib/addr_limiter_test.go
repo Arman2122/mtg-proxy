@@ -700,11 +700,12 @@ func TestAnAddrLimiterWithNoBurstReturnsInsteadOfSpinning(t *testing.T) {
 func TestTheZeroAddrClockIsTheRealClock(t *testing.T) {
 	t.Parallel()
 
-	// 64 KiB at 256 KiB/s: 250 ms to refill, so a slow runner has room before
-	// the bucket would be full again between the two waits.
+	// 64 KiB at 64 KiB/s: a second to refill, so a slow runner has room before
+	// the bucket would be full again between the two waits, and a stall of some
+	// hundreds of milliseconds still reads as a sleep cut short.
 	const (
-		slowRate = 256 << 10
-		refill   = 250 * time.Millisecond
+		slowRate = 64 << 10
+		refill   = time.Second
 	)
 
 	var l addrLimiter

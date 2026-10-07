@@ -291,3 +291,72 @@ func TestAPIPutSecretAdTagKeepsConnections(t *testing.T) {
 		assert.Error(t, stream.Err(), "re-keying must drop the old connection")
 	})
 }
+
+// Forgetting a name takes everything filed under it out of the config: the
+// secret, its advertising override and its limits, and nothing of another
+// name's. A config with no overrides and no limits has nil maps, and forgetting
+// a name from it is no different.
+func TestForgettingASecretLeavesNothingFiledUnderIt(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("alice.example.com")
+	bob := GenerateSecret("bob.example.com")
+
+	t.Run("every map", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := SecretConfig{
+			Secrets:      map[string]Secret{"alice": alice, "bob": bob},
+			SecretAdTags: map[string][AdTagLength]byte{"alice": {1}, "bob": {2}},
+			Limits:       map[string]SecretLimits{"alice": {IPLimit: 1}, "bob": {IPLimit: 2}},
+		}
+
+		cfg.forget("bob")
+
+		assert.Equal(t, map[string]Secret{"alice": alice}, cfg.Secrets)
+		assert.Equal(t, map[string][AdTagLength]byte{"alice": {1}}, cfg.SecretAdTags)
+		assert.Equal(t, map[string]SecretLimits{"alice": {IPLimit: 1}}, cfg.Limits,
+			"the limits go with the secret, and alice's stay")
+	})
+
+	t.Run("nil maps", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := SecretConfig{Secrets: map[string]Secret{"alice": alice, "bob": bob}}
+
+		require.NotPanics(t, func() { cfg.forget("bob") })
+		assert.Equal(t, map[string]Secret{"alice": alice}, cfg.Secrets)
+		assert.Nil(t, cfg.SecretAdTags)
+		assert.Nil(t, cfg.Limits)
+	})
+}
+
+// A deleted secret leaves no limits behind: the proxy's config holds none for
+// the name, and the name added back starts with none, as a new name does. A set
+// is built from the names in Secrets alone, so this would hold even with limits
+// left in the config DeleteSecret swaps in; the test above is the one that sees
+// those.
+func TestDeletingASecretLeavesNoLimitsBehind(t *testing.T) {
+	t.Parallel()
+
+	alice := GenerateSecret("alice.example.com")
+	bob := GenerateSecret("bob.example.com")
+
+	p := newAPITestProxy(map[string]Secret{"alice": alice, "bob": bob})
+
+	require.NoError(t, p.PutSecret("bob", bob, nil, &SecretLimits{IPLimit: 2, SpeedBytesPerSecond: 1 << 20}))
+	require.Contains(t, p.secrets.Load().toConfig().Limits, "bob", "the control: bob has limits")
+
+	require.NoError(t, p.DeleteSecret("bob"))
+
+	_, held := p.secrets.Load().limitsOf("bob")
+	assert.False(t, held, "bob is gone")
+	assert.NotContains(t, p.secrets.Load().toConfig().Limits, "bob", "and so are his limits")
+
+	require.NoError(t, p.PutSecret("bob", bob, nil, nil))
+
+	lim, held := p.secrets.Load().limitsOf("bob")
+	require.True(t, held, "bob is back")
+	assert.True(t, lim.IsZero(), "with no limits from before")
+	assert.NotContains(t, p.secrets.Load().toConfig().Limits, "bob")
+}

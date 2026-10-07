@@ -341,10 +341,18 @@ func TestWaitDeadlineRefusalIsStillReturned(t *testing.T) {
 
 	s.set(MinSpeedBytesPerSecond)
 
-	// Empty the bucket, so that the next burst's worth is a second away.
+	// Empty the bucket, and charge it two seconds more, so that the next burst's
+	// worth is three seconds away: further than the deadline below by a second,
+	// and the deadline itself long enough that a slow runner does not pass it
+	// before the check. The burst is a second of the rate whatever the rate, so
+	// only a debt puts the bucket further away than that.
 	require.NoError(t, s.wait(t.Context(), MinSpeedBytesPerSecond))
 
-	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	for range 2 {
+		require.True(t, s.limiter.Load().ReserveN(time.Now(), MinSpeedBytesPerSecond).OK())
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 
 	requests := installWaitSeam(t, nil)

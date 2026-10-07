@@ -245,9 +245,10 @@ func (p *Proxy) PutSecret(name string, s Secret, adTag *[AdTagLength]byte, limit
 	return p.swapSecretConfigLocked(cfg)
 }
 
-// DeleteSecret removes a single secret and its advertising override. It returns
-// ErrSecretNotFound for an unknown name and ErrLastSecret if the removal would
-// empty the set. The removed secret's live connections are closed.
+// DeleteSecret removes a single secret, its advertising override and its
+// limits. It returns ErrSecretNotFound for an unknown name and ErrLastSecret if
+// the removal would empty the set. The removed secret's live connections are
+// closed.
 func (p *Proxy) DeleteSecret(name string) error {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
@@ -262,10 +263,21 @@ func (p *Proxy) DeleteSecret(name string) error {
 		return ErrLastSecret
 	}
 
-	delete(cfg.Secrets, name)
-	delete(cfg.SecretAdTags, name)
+	cfg.forget(name)
 
 	return p.swapSecretConfigLocked(cfg)
+}
+
+// forget removes everything cfg files under name: the secret, its advertising
+// override and its limits. A set is built from the names in Secrets alone, so
+// an override or limits left behind would never be read; they go all the same,
+// so that the config handed to the swap says what the set will hold. Deleting
+// from a nil map does nothing, so a config with no overrides or no limits needs
+// no check.
+func (c *SecretConfig) forget(name string) {
+	delete(c.Secrets, name)
+	delete(c.SecretAdTags, name)
+	delete(c.Limits, name)
 }
 
 // GlobalAdTag returns the currently active global advertising tag, or nil when
