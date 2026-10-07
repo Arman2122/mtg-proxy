@@ -10,6 +10,7 @@ Sections on this page:
 - Threat model
 - Replay protection
 - Domain fronting
+- The ee handshake budget
 - The obfuscated2 door
 - The WEB relay
 - IP blocklists and allowlists
@@ -34,8 +35,8 @@ proxy should refuse to relay to.
 Explicitly **not** in scope:
 
 - **Denial of service by volume.** Someone with more bandwidth than your server
-  wins. The per-IP handshake budget and the concurrency limit bound specific
-  cheap attacks, not a flood.
+  wins. The per-IP handshake budget, the ee handshake budget and the concurrency
+  limit bound specific cheap attacks, not a flood.
 - **An adversary who already has your server.** Everything below assumes the
   host is yours. This matters for the client-address section: a proxy that
   records who connected is a proxy whose seizure records who connected.
@@ -125,13 +126,24 @@ website.
 `doDomainFrontingForHost` rewinds the connection — the bytes already read are
 put back — dials the fronting target, and relays the two sockets together. The
 prober's ClientHello reaches an actual HTTPS server, gets an actual certificate,
-and gets actual content. There is no signal to measure, because the answer is
-not synthesised.
+and gets actual content. Nothing in the answer is synthesised, so there is no
+response of this proxy's own for a prober to fingerprint.
 
-Four things take this exit:
+What a prober can still measure is *when* the first byte comes back, and that
+includes whatever work the proxy did first. A hello that fails the hostname check
+is fronted before any secret is tried; one that matches nothing is fronted after
+every hosted secret was; a larger hello takes longer to try; and a hello refused
+by the [ee handshake budget](#the-ee-handshake-budget) is fronted without being
+tried at all. The bytes sent to the cover site are the same in every case. The
+delay is not, and this page does not claim it is hidden.
+
+Five things take this exit:
 
 - an unreadable or non-matching ClientHello (wrong secret, wrong SNI, or a
   timestamp outside `tolerate-time-skewness`, default `3s`);
+- an `ee` hello the handshake budget will not try against every secret — over
+  its CPU budget, or too large to scan (see below) — which gets the same bytes a
+  wrong secret gets;
 - a replayed session ID;
 - a user who is disabled, expired, or over quota (see
   [[Limits-and-Quotas]]) — the outcome is deliberately identical to a wrong
@@ -211,6 +223,83 @@ an x25519 key share. Every Telegram ClientHello this project has on record
 offers x25519 only, so the answer matches the question. Whether current app
 versions now offer a post-quantum group — which a modern cover site would pick
 instead — has not been checked against a capture from current apps.
+
+## The ee handshake budget
+
+A hello is cheap to send and not cheap to answer. The proxy does not know which
+secret a client holds, so it tries each hosted `ee` secret with one HMAC over the
+whole hello until one verifies, and a hello that matches nothing pays for all of
+them: microseconds per secret for an ordinary hello, about a hundred times that
+for one padded to 64 KiB. The hostname check comes first, but the cover hostname
+is public — it is in every link. With thousands of secrets and nothing to bound
+it, one connection per probe is a cheap way to burn a core.
+
+`[defense.handshake-budget]` (see [[Configuration]]) is that bound, and it is on
+by default. It does five things, all inside the ee door:
+
+- charges every scan that no hint shortcut in **real CPU** — the cost of a
+  SHA-256 block is measured at start, so "25% of the cores" means 25% of this
+  machine — against two buckets: one per client address (50 ms of scan CPU a
+  second) and one for the whole process (25% of the cores);
+- never scans a hello larger than 128 SHA-256 blocks (about 8 KiB; real clients
+  send 0.5 to 2 KiB): it is fronted;
+- lets a scan wait at most 150 ms for budget, and fronts the hello to the cover
+  site, with the same bytes a no-match gets, when it would have to wait longer —
+  it never closes the connection;
+- remembers, per client address, which secrets matched, and tries those first, so
+  a returning client costs one HMAC;
+- refunds the charge only when the whole handshake succeeds, so a replay, a
+  disabled user, an `ip-limit`-refused user and a hello that matched nothing all
+  keep it.
+
+**What it defends.** CPU, and only CPU: the work an unauthenticated peer can make
+the process do per connection. The process-wide bucket is the real bound. It does
+not care how many addresses the work comes from, and addresses are cheap for an
+attacker — a PROXY-protocol listener takes the client address from a header any
+peer can send, and one IPv6 /48 holds 65,536 /64s — so the per-address bucket is
+only there to stop a single source from spending all of it.
+
+**What it cannot do.**
+
+- **It is not a defence against volume.** Bandwidth, and the number of
+  connections an attacker opens, are as they were; `concurrency` and the
+  operating system are what bound those.
+- **It does not prevent lock-out; it prices it.** To keep new users out, an
+  attacker has to keep the process-wide bucket empty, which costs them about
+  `cpu-percent` of this proxy's real CPU in scan work. Before this budget the same
+  effort could starve everything, relays included. While it lasts, a client with
+  **no hint** is fronted within 150 ms and retries; hinted clients,
+  streams already established and the data path are unaffected. A legitimate user
+  behind an address whose bucket a flooder has drained is treated the same way
+  unless a hint exists. Behind a carrier that hides client addresses, the
+  per-address bucket is off by construction and only the process-wide one
+  applies. This is the accepted degradation, and `mode = "observe"` exists so you
+  can see whether it ever touches a real client before you enforce.
+- **It does not change what an accepted client gets.** Every byte the proxy sends
+  for an accepted hello is as it was, and a hint only reorders the secrets tried:
+  each goes through the same verification, so a hint can never make a wrong secret
+  match. A prober never matches, so it can neither read a hint nor plant one.
+
+**Timing.** A refused hello and a no-match hello send the cover site the same
+bytes, and that is all that is the same. A no-match is fronted after its scan; a
+refusal is decided before any hashing and fronted straight away (a scan that is
+granted but has to wait for budget waits at most 150 ms, and then runs). Scan
+time already varied with the hello's size and with the hostname check before the
+budget existed; this adds one more dependence of the same kind. What a prober
+can read from it is that a budget exists and is spent — not whether any secret is
+valid.
+
+**Hints are an address kept in memory.** The cache holds a client address and the
+name of a secret it matched for 30 to 60 minutes after the address last completed
+a handshake, and is never logged, exported or written to disk. That is why
+`hints` follows `track-client-ips` by default: a deployment that did not choose to
+keep addresses past a connection does not get a cache of them. See
+[[Configuration]] and *Client addresses* below.
+
+**Restart only, and observable.** The table is read once at start; a reload
+re-reads the secrets, not this. `GET /stats` carries the door's counters as
+`faketls_handshake`, including `over_budget_matched`, the number to watch while
+running `observe`. See [[Monitoring]].
 
 ## The obfuscated2 door
 
@@ -612,6 +701,13 @@ a proxy which does not know something cannot be made to disclose it.
 
 - **Nothing is written to disk in any form.** `usage-state-file` persists quota
   counters only, so no address survives a restart.
+- **It also turns the FakeTLS hint cache on.** `[defense.handshake-budget] hints`
+  follows this setting. With tracking on, the proxy keeps each client address and
+  the name of a secret it matched in memory for 30 to 60 minutes after the
+  address last completed a handshake, so a returning client skips a scan over
+  every hosted secret. It is never logged, exported or written to disk, and
+  `hints = false` keeps it off while tracking stays on. See *The ee handshake
+  budget* above.
 - **The fields are absent, not empty, when tracking is off.** `/stats` looks
   exactly as it did before the feature existed, and an absent field is
   indistinguishable from an idle secret.

@@ -631,6 +631,54 @@ drs = false
 # connections being blocked.
 # shaping = "record"
 
+# The ee handshake budget. A client proves it holds a secret with one HMAC, and
+# the proxy does not know which secret that is, so it tries the hosted ee
+# secrets in turn: a hello that matches nothing costs one HMAC per hosted
+# secret, and a hello can be made up to 64 KiB long. This table bounds that work
+# in real CPU, so that thousands of secrets are not a cheap way to burn a core.
+#
+# It is ON by default, with the values below: a config without this table gets
+# them, so uncomment it only to change something. It is read once at start. A
+# POST /reload re-reads the secrets, not this table.
+#
+# A scan that would go over budget waits up to 150 ms for it and is then
+# fronted to the cover site with the same bytes a wrong secret gets -- never
+# closed. A hello larger than 128 SHA-256 blocks (about 8 KiB; a real client
+# sends 0.5 to 2 KiB) is never scanned at all and is fronted the same way. A
+# client whose address matched a secret recently is tried against that secret
+# first and skips the scan. A legitimate client with no such hint can therefore
+# be fronted while a flood keeps the budget spent; it retries. That is the
+# accepted cost, and "observe" below is how to see whether it ever touches your
+# users. See the Security and Configuration pages of the wiki.
+#
+# [defense.handshake-budget]
+# # "enforce" (the default) acts on the budget as described above.
+# # "observe" keeps the same accounting but never waits and never refuses: it
+# # counts what "enforce" would have refused, and how many of those hellos then
+# # matched a real secret (over_budget_matched on GET /stats). Run it first, and
+# # switch to "enforce" once that number stays near zero.
+# # "off" has no budget and no limit on hello size.
+# mode = "enforce"
+#
+# # Scan CPU one client address (an IPv4 address, or an IPv6 /64) may spend per
+# # second, in milliseconds; 0 to 1000. Burst: four seconds' worth. 0 turns the
+# # per-address bucket off and leaves only the process-wide one below. Loopback
+# # and private addresses have no bucket of their own either way.
+# per-ip-ms = 50
+#
+# # The share of the cores (GOMAXPROCS, read at start) the whole process may
+# # spend scanning; 1 to 100. Burst: one second's worth. This is the bound that
+# # holds against many addresses and against forged ones.
+# cpu-percent = 25
+#
+# # Remember which secrets a client address matched, and try them first. The
+# # cache holds address -> secret name in memory for 30 to 60 minutes after the
+# # last successful handshake; it is never logged, exported or written to disk.
+# # Left out, this follows track-client-ips: on exactly when you have already
+# # chosen to keep client addresses beyond their connection. true or false
+# # overrides that either way.
+# # hints = true
+
 # Some countries do active probing on Telegram connections. This technique
 # allows to protect from such effort.
 #

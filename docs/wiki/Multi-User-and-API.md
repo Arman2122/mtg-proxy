@@ -164,6 +164,7 @@ Top level:
 | `features` | Capability names — see below. Always an array, never `null`. |
 | `throttle` | Present only when `[throttle] max-connections` is set. |
 | `listeners`, `obfuscated` | Present only when at least one `[[listener]]` is configured. |
+| `faketls_handshake` | Present only once the FakeTLS door has counted something. What the door decided about each `ee` hello, and whether the handshake budget is enforcing; see [[Monitoring]]. A top-level object: nothing about it is under `users`. |
 | `users` | Keyed by secret name. |
 
 Timestamps are RFC3339 in the server's own zone, not forced to UTC, and carry
@@ -211,7 +212,7 @@ Cross-reference: [[Limits-and-Quotas]] for what the quota fields mean,
 `features` is a sorted list of capability names the **binary** supports:
 
 ```text
-client-ip-activity  client-ips  faketls  ip-limits  kick  listeners  quota-ceiling  quota-reset  secret-modes  secret-read  secrets-api  speed-directions  speed-limits  web-relay  web-relay-watch
+client-ip-activity  client-ips  faketls  handshake-budget  ip-limits  kick  listeners  quota-ceiling  quota-reset  secret-modes  secret-read  secrets-api  speed-directions  speed-limits  web-relay  web-relay-watch
 ```
 
 | Name | Means |
@@ -219,6 +220,7 @@ client-ip-activity  client-ips  faketls  ip-limits  kick  listeners  quota-ceili
 | `client-ip-activity` | `connected_ips_last_seen` accompanies `connected_ips` wherever it appears: when each address last moved a byte, gated exactly as the addresses are. |
 | `client-ips` | The binary understands `track-client-ips`, and `connected_ips`/`last_ip` may appear when it is on. |
 | `faketls` | The FakeTLS handshake is served. |
+| `handshake-budget` | The FakeTLS door bounds the CPU it spends scanning hellos no hint matched, `[defense.handshake-budget]` is honoured, and `/stats` reports the door's counters as the top-level `faketls_handshake` object once it has counted something. |
 | `ip-limits` | `ip_limit` is accepted on `[secret-limits.<name>]` and the secrets API, `/stats` reports `ip_limit`, `active_ips` and `ip_limit_refused`, and `/secrets/{name}/external-ips` is served. |
 | `kick` | `POST /secrets/{name}/kick` closes a user's live streams from the named places. |
 | `listeners` | The `[[listener]]` table is honoured and `/stats` reports each socket. |

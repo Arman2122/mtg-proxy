@@ -294,6 +294,17 @@ curl http://127.0.0.1:9090/stats
     "draining": 0,
     "rate_limited": 0
   },
+  "faketls_handshake": {
+    "hinted": 3120,
+    "scanned": 842,
+    "unmatched": 29,
+    "denied_ip": 0,
+    "denied_global": 0,
+    "oversized": 0,
+    "over_budget_matched": 0,
+    "enforced": true,
+    "ns_per_block": 33.8
+  },
   "users": {
     "alice": {
       "connections": 8,
@@ -328,6 +339,15 @@ because the middle proxy could not be reached or refused it — the first is by
 design, the second is an outage, apart from a few in the seconds after a restart
 while the middle-proxy config loads — see
 [Sponsored channel](#sponsored-channel-ad-tag).
+
+`faketls_handshake` appears once the FakeTLS door has counted something, and it is
+a top-level object, never under `users`. `hinted` and `scanned` are hellos matched
+to a secret (by an address's earlier match, or by the scan), `unmatched` matched
+none, and `denied_ip`, `denied_global` and `oversized` were turned away by the
+handshake budget, whose `[defense.handshake-budget]` table is on by default.
+`enforced` says whether a refusal is acted on, `over_budget_matched` is the
+number to watch while running it in `observe` mode, and `ns_per_block` is what
+the budget believes one SHA-256 block costs on this machine.
 
 `features` is a sorted list of capability names this build supports, meant to be
 read before a capability is used — it is how a panel can tell an older binary
