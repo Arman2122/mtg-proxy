@@ -361,6 +361,13 @@ func (t *clientTable) release(entry *clientEntry) {
 // still to reach. Each entry is judged under the hold that removes it, so one
 // that a stream picked up meanwhile is kept.
 //
+// An entry no stream holds whose stamp is more than lastSeenStepBack ahead of
+// now is forgotten too. The wall clock was stepped back under it: the stamp
+// says nothing about how long the address has been gone, and an idle entry is
+// never stamped again to bring it back, so it would otherwise be kept for the
+// step plus ten minutes. A held entry is kept whatever its stamp, and a stamp a
+// little ahead is only skew between two reads of the clock.
+//
 // It takes the table's lock and nothing else: it never takes liveMu.
 func (t *clientTable) sweep(now time.Time, maxPerHold int) int {
 	if t == nil {
@@ -369,6 +376,7 @@ func (t *clientTable) sweep(now time.Time, maxPerHold int) int {
 
 	maxPerHold = max(maxPerHold, 1)
 	cutoff := now.Add(-clientIdleRetention).Unix()
+	future := now.Add(lastSeenStepBack).Unix()
 	dropped := 0
 
 	t.mu.Lock()
@@ -382,7 +390,7 @@ func (t *clientTable) sweep(now time.Time, maxPerHold int) int {
 			walked++
 
 			entry := t.all[cursor]
-			if entry.refs == 0 && entry.lastSeen.Load() <= cutoff {
+			if seen := entry.lastSeen.Load(); entry.refs == 0 && (seen <= cutoff || seen > future) {
 				t.forgetLocked(entry)
 
 				dropped++

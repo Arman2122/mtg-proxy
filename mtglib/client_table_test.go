@@ -498,6 +498,39 @@ func TestClientTableReleaseRestartsTheIdleClock(t *testing.T) {
 	assert.Zero(t, table.clients("alice"))
 }
 
+// A wall clock stepped back leaves the entries stamped before the step in the
+// future, and one that no stream holds is never stamped again to bring it back:
+// measured from its stamp, it would be kept for the step plus ten minutes. A
+// stamp more than a minute ahead of the sweep says nothing about idleness -- the
+// clock moved under it -- so an idle entry carrying one is forgotten. An entry a
+// stream holds is kept whatever its stamp, and so is one a little ahead, which
+// is only skew between the clock reads.
+func TestClientTableSweepDropsIdleEntriesStampedInTheFuture(t *testing.T) {
+	t.Parallel()
+
+	table, clock := newTestClientTable(t)
+
+	ahead := table.acquire("alice", "203.0.113.1", true, entryInit{})
+	held := table.acquire("alice", "203.0.113.2", true, entryInit{})
+	skewed := table.acquire("alice", "203.0.113.3", true, entryInit{})
+
+	// The clock runs ahead while the addresses come and go.
+	clock.advance(30 * time.Second)
+	table.release(skewed)
+
+	clock.advance(10*time.Minute - 30*time.Second)
+	table.release(ahead)
+	held.seen(clock.read())
+
+	// And then it is put right.
+	clock.advance(-10 * time.Minute)
+
+	assert.Equal(t, 1, table.sweep(clock.read(), clientSweepChunk), "only the idle entry stamped ten minutes ahead")
+	assert.ElementsMatch(t, []*clientEntry{held, skewed}, table.snapshot("alice"),
+		"a held entry stays whatever its stamp, and a stamp thirty seconds ahead is skew")
+	requireClientTableConsistent(t, table)
+}
+
 // A secret removed while the sweep is between two holds -- a DeleteSecret
 // during the sweep of a big table -- shrinks all under the walk. The walk must
 // go on within the shorter table and leave every index consistent: a read past
