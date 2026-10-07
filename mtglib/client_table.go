@@ -82,7 +82,8 @@ type fairTotals struct {
 // divides. The zero value makes no limiter at all, which is unlimited. It is
 // read from the secret set that is current when the entry is made, so that a
 // reload cannot leave a new entry on a stale limit; once the entry exists only
-// applyLimits and the fair-share ticker change its limiters.
+// applyLimits and fair share change its limiters -- fair share by its tick, and
+// when the address comes back to the entry (acquire's returnLocked).
 type entryInit struct {
 	CeilingRate int64
 	FairTotals  fairTotals
@@ -145,6 +146,10 @@ type clientEntry struct {
 	// limiter or at the user's bucket it divides. Never the ceiling's waits. See
 	// blocked_tracker.go.
 	blockedSpeed, blockedUp, blockedDown blockedTracker
+
+	// fair is what fair share remembers of the address from one tick to the
+	// next. Guarded by the table's lock. See fair_share.go.
+	fair fairEntryState
 }
 
 // lastSeenStepBack is how far back a stamp has to go before seen takes it for
@@ -191,6 +196,10 @@ type secretClients struct {
 	// overflow counts the connections of new addresses that found the table
 	// full and joined the rest entry.
 	overflow int64
+
+	// fair is the secret's fair share: the totals its fair limiters are made
+	// for, and what the ticks have measured. See fair_share.go.
+	fair fairSecretState
 }
 
 // clientTable is the per-address table. Every field is guarded by mu, which is
@@ -217,6 +226,11 @@ type clientTable struct {
 	// with the lock released, and is told how many entries that hold looked
 	// at. Only tests set it.
 	afterHold func(walked int)
+
+	// beforeFairPublish, when set, runs in a fair-share tick after it has
+	// decided and before it takes the lock again to publish, with the lock
+	// released. Only tests set it.
+	beforeFairPublish func()
 }
 
 // newClientTable makes an empty table on the given clock.
@@ -242,9 +256,11 @@ func clientKeyed(ip net.IP) bool {
 // connection; an unkeyed one is not, since no cap turned it away.
 //
 // An entry that already exists is returned as it is: its bucket, bytes and
-// limiters are what its address left, whatever init says now. A new one has its
-// limiters made from init before it is published -- a rest entry without the
-// ceiling -- so nobody ever sees it without them.
+// limiters are what its address left, whatever init says now -- except that an
+// address coming back to an entry no stream held runs at its secret's fair
+// level as it is now, not the one it left at. A new one has its limiters made
+// from init before it is published -- a rest entry without the ceiling, fair
+// limiters at the secret's level -- so nobody ever sees it without them.
 func (t *clientTable) acquire(name string, key addressKey, keyed bool, init entryInit) *clientEntry {
 	if t == nil {
 		return nil
@@ -257,7 +273,7 @@ func (t *clientTable) acquire(name string, key addressKey, keyed bool, init entr
 
 	sc := t.secrets[name]
 	if sc == nil {
-		sc = &secretClients{entries: make(map[addressKey]*clientEntry)}
+		sc = &secretClients{entries: make(map[addressKey]*clientEntry), fair: fairSecretState{totals: init.FairTotals}}
 		t.secrets[name] = sc
 	}
 
@@ -266,8 +282,9 @@ func (t *clientTable) acquire(name string, key addressKey, keyed bool, init entr
 
 		switch {
 		case entry != nil:
+			t.returnLocked(sc, entry, init)
 		case len(sc.entries) < maxClientsPerSecret && t.keyed < maxClients:
-			entry = t.makeLocked(name, key, false, init, now)
+			entry = t.makeLocked(sc, name, key, false, init, now)
 			sc.entries[key] = entry
 			t.keyed++
 		default:
@@ -282,7 +299,9 @@ func (t *clientTable) acquire(name string, key addressKey, keyed bool, init entr
 	}
 
 	if sc.rest == nil {
-		sc.rest = t.makeLocked(name, "", true, init, now)
+		sc.rest = t.makeLocked(sc, name, "", true, init, now)
+	} else {
+		t.returnLocked(sc, sc.rest, init)
 	}
 
 	t.holdLocked(sc.rest, now)
@@ -290,9 +309,14 @@ func (t *clientTable) acquire(name string, key addressKey, keyed bool, init entr
 	return sc.rest
 }
 
-// makeLocked builds an entry with its limiters already made and appends it to
-// all. The caller publishes it. Caller holds mu.
-func (t *clientTable) makeLocked(name string, key addressKey, rest bool, init entryInit, now time.Time) *clientEntry {
+// makeLocked builds an entry of sc with its limiters already made and appends
+// it to all. Its fair limiters start at the secret's level, or at the total
+// when the table knows none -- the secret's first tick is still to come, or
+// nobody took part in the last, which leaves the level at the total. The caller
+// publishes it. Caller holds mu.
+func (t *clientTable) makeLocked(
+	sc *secretClients, name string, key addressKey, rest bool, init entryInit, now time.Time,
+) *clientEntry {
 	entry := &clientEntry{key: key, name: name, rest: rest, firstSeen: now, clock: t.clock}
 
 	// The clock first: a limiter must run on the table's clock from the first
@@ -305,16 +329,9 @@ func (t *clientTable) makeLocked(name string, key addressKey, rest bool, init en
 		entry.ceiling.install(init.CeilingRate, ceilingBurst(init.CeilingRate))
 	}
 
-	for _, fair := range []struct {
-		limiter *addrLimiter
-		total   int64
-	}{
-		{&entry.fairSpeed, init.FairTotals.Speed},
-		{&entry.fairUp, init.FairTotals.Up},
-		{&entry.fairDown, init.FairTotals.Down},
-	} {
-		if fair.total > 0 {
-			fair.limiter.install(fair.total, fairBurst(fair.total))
+	for b := range fairBucketCount {
+		if total := init.FairTotals.of(b); total > 0 {
+			entry.fairLimiter(b).install(sc.fair.rate(b, total), fairBurst(total))
 		}
 	}
 
@@ -322,6 +339,25 @@ func (t *clientTable) makeLocked(name string, key addressKey, rest bool, init en
 	t.all = append(t.all, entry)
 
 	return entry
+}
+
+// returnLocked moves an existing entry of sc that no stream holds -- an
+// address coming back within the retention window -- to the secret's fair
+// level as it is now. The tick sets only the entries a stream holds, so an
+// address that left at another level would otherwise come back at that one.
+// Only a limiter that is there is moved, and init's totals say which buckets
+// are divided. An entry a stream still holds is at the level already. Caller
+// holds mu.
+func (t *clientTable) returnLocked(sc *secretClients, entry *clientEntry, init entryInit) {
+	if entry.refs > 0 {
+		return
+	}
+
+	for b := range fairBucketCount {
+		if total := init.FairTotals.of(b); total > 0 {
+			t.setRate(entry, b, sc.fair.rate(b, total))
+		}
+	}
 }
 
 // holdLocked counts one more stream on entry. Caller holds mu.
