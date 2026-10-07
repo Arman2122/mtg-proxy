@@ -578,3 +578,29 @@ lock order and the stale-ceiling race (limiters initialised before publication; 
 backfills live streams), counting the cap from the ledger, the panel's case in the benchmarks,
 banning unkeyed addresses (`force`), `GET /bans` privacy and the retention exception, and the
 refusal plumbing (`DenyReason`, no new event, charge a miss on the obfuscated door).
+
+## Revision 4 (as built)
+
+Corrections found while building and reviewing the branch; where this section and the text above disagree, this
+section is what the code does.
+
+1. **Overflow and `ip-limit` (§3).** The line "with `ip-limit` set no live address is ever routed to the rest entry
+   because of a cap" is too strong. The ledger bounds the *live* addresses of a secret to its `ip-limit`, but the two
+   table caps (4,096 per secret, 32,768 in all) also count *idle* entries, which stay ten minutes after their last
+   stream. A secret that saw 4,096 distinct addresses within ten minutes, or a proxy at 32,768 entries, sends new
+   addresses to the rest entry whatever `ip-limit` says. `clients_overflow` counts those connections.
+2. **Ban TTL (§5, "Decided by the agent" 8).** The API takes a Go duration (`"1h"`, `"90m"`); the maximum is `720h`
+   (30 days) and `"30d"` is a 400. The default is `1h`.
+3. **A reload that changes a secret's total (§3).** Entries run at the new total and the secret's next tick only takes
+   a baseline (the limiters changed under it), so the share is recomputed on the tick after: up to about two seconds,
+   not one tick.
+4. **`client-speed = "0"`** is refused by the config and the API (400). Leave the key out for no ceiling.
+5. **The start warning** (per-address controls on a PROXY-protocol listener) covers the three config keys only. Bans
+   are API-driven and cannot be known at start. A reload or API change that adds the keys behind such a listener does
+   not warn, and `mtg doctor` has no check for it.
+6. **The longest sleep.** "About 8 s" (a 64 KiB piece at the 8,000 B/s floor) is the ceiling's worst case. A fair
+   share has no floor of its own, so a wait at a small level can be longer; the participant rule (§3, "moved a byte or
+   was blocked") exists for that case.
+7. **Library entry points** (`SecretLimits{ClientFair: true}` with no speed) are not refused by the library; only the
+   config and the HTTP API refuse it. The engine treats it as off (nothing is divided), but the secret's addresses
+   still get entries and the read-backs show `client_fair: true`.
