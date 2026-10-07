@@ -2,6 +2,7 @@ package mtglib
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
 	"math"
@@ -24,10 +25,11 @@ import (
 // many addresses and forged behind a PROXY-protocol listener.
 //
 // Costs are in SHA-256 blocks (see fake.Parsed.Blocks) and rates in blocks a
-// second, converted from real CPU time by the cost of a block measured once on
-// this machine: a block costs 25 times more on a CPU without SHA extensions than
-// on one with them, so a budget in fixed units would be wrong by an order of
-// magnitude on one or the other.
+// second, converted from real CPU time by what a block of the door's own work
+// costs, measured once on this machine by timing the verification of a real
+// client's hello (see measureBlockNanos): about 340 ns a block on a CPU without
+// SHA extensions and about 35 ns on one with them, so a budget in fixed units
+// would be wrong by an order of magnitude on one or the other.
 
 const (
 	// defaultBudgetPerIPMillis is how much scan CPU one address may spend a
@@ -331,10 +333,12 @@ func (b *scanBudget) reserve(ip net.IP, blocks, candidates int) (*scanReservatio
 		key, keyed = hintKey(ip)
 	}
 
-	now := b.now()
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Read under the lock, so reservations commit in the order they read the
+	// clock; the commit below is monotone as well, for a clock that is not.
+	now := b.now()
 
 	var (
 		address *bucketState
@@ -369,9 +373,15 @@ func (b *scanBudget) reserve(ip net.IP, blocks, candidates int) (*scanReservatio
 		b.current[key] = address
 	}
 
+	// tokens is the level as of the later of now and the bucket's own time
+	// (available refills nothing for a now behind it), and a bucket's time
+	// never goes back: moving it back would refill that stretch a second time.
 	for _, c := range charges[:n] {
 		c.bucket.tokens = c.after
-		c.bucket.last = now
+
+		if now.After(c.bucket.last) {
+			c.bucket.last = now
+		}
 	}
 
 	res := &scanReservation{budget: b, charges: charges, n: n}
@@ -475,12 +485,14 @@ func (r *scanReservation) settle(success bool) {
 	}
 }
 
-// Calibration: what one SHA-256 block costs on this machine.
+// Calibration: what one block of the door's own work costs on this machine.
 
 const (
-	// minBlockNanos and maxBlockNanos bound a measurement: about 13 ns a block
-	// is a CPU with SHA extensions, about 325 ns one without, and a reading
-	// outside these bounds is a disturbed run, not a machine.
+	// minBlockNanos and maxBlockNanos bound a measurement. One verification of
+	// a 517-byte hello -- the call the calibration times -- costs about 35 ns a
+	// block on a CPU with SHA extensions and about 340 ns on one without (the
+	// bench box: 4.1 us a candidate at 12 blocks). A reading outside these
+	// bounds is a disturbed run, not a machine.
 	minBlockNanos = 10.0
 	maxBlockNanos = 2000.0
 
@@ -489,8 +501,15 @@ const (
 	calibrationRuns = 3
 	calibrationRun  = 4 * time.Millisecond
 
-	// calibrationBuffer is hashed over and over in a run.
-	calibrationBuffer = 64 << 10
+	// calibrationHelloSize is the hello one timed call verifies: a real
+	// client's, as one record.
+	calibrationHelloSize = 517
+
+	// calibrationCallBlocks is what the door charges one candidate for that
+	// hello, counted the way fake.Parsed.Blocks counts: the key's inner pad
+	// block, the record and SHA-256's 9 bytes of padding, and the outer hash's
+	// two. It is minCostBlocks, the cost floor.
+	calibrationCallBlocks = 3 + (calibrationHelloSize+9+sha256.BlockSize-1)/sha256.BlockSize
 )
 
 // calibration is a measurement taken once and shared. runs counts how many were
@@ -518,22 +537,28 @@ func (c *calibration) value() (ns float64, first bool) {
 // it, so a test binary that builds hundreds measures once.
 var processCalibration = &calibration{measure: measureBlockNanos}
 
-// blockNanos is what a SHA-256 block costs on this machine in ns, measured the
-// first time anything asks.
+// blockNanos is what a block of the door's work costs on this machine in ns,
+// measured the first time anything asks.
 func blockNanos() float64 {
 	ns, _ := processCalibration.value()
 
 	return ns
 }
 
-// measureBlockNanos times SHA-256 here: the fastest of three runs of about
-// 4 ms, clamped to 10 ns to 2 us a block.
+// measureBlockNanos times the door's own work here: the fastest of three runs
+// of about 4 ms, clamped to 10 ns to 2 us a block.
+//
+// What is timed is the plain HMAC, the slower of the door's two ways to verify
+// a candidate. Where the door verifies with precomputed key pads, a block
+// really costs less than the budget believes, so the budget errs strict, never
+// loose. The same holds for a hello larger than 517 bytes (more blocks for the
+// same per-call overhead) and a smaller one (charged the cost floor of 12).
 func measureBlockNanos() float64 {
-	return measureBlockNanosWith(hashFor)
+	return measureBlockNanosWith(hmacFor)
 }
 
 // measureBlockNanosWith is measureBlockNanos with the timed run supplied: each
-// call hashes for about the given time and reports the blocks it hashed and the
+// call works for about the given time and reports the blocks it did and the
 // time it took.
 func measureBlockNanosWith(run func(time.Duration) (blocks int, elapsed time.Duration)) float64 {
 	best := math.Inf(1)
@@ -566,23 +591,25 @@ func clampBlockNanos(ns float64) float64 {
 	return ns
 }
 
-// hashFor hashes a 64 KiB buffer over and over for at least d, and reports how
-// many SHA-256 blocks that was -- padding included, as fake.Parsed.Blocks counts
-// them -- and how long it took. Each digest is written back into the buffer, so
-// no hash can be skipped as unused.
-func hashFor(d time.Duration) (int, time.Duration) {
-	buf := make([]byte, calibrationBuffer)
-	perSum := (calibrationBuffer + 9 + sha256.BlockSize - 1) / sha256.BlockSize
+// hmacFor verifies a 517-byte hello the way the door's plain path does -- a
+// fresh HMAC-SHA256 under a 16-byte key, over the whole record -- over and over
+// for at least d (at least once), and reports the blocks the budget charges for
+// that, calibrationCallBlocks a call, and how long it took. Each digest is
+// written back into the hello, so no call can be skipped as unused.
+func hmacFor(d time.Duration) (int, time.Duration) {
+	key := make([]byte, SecretKeyLength)
+	hello := make([]byte, calibrationHelloSize)
 
 	var blocks int
 
 	started := time.Now()
 
 	for {
-		sum := sha256.Sum256(buf)
-		copy(buf, sum[:])
+		mac := hmac.New(sha256.New, key)
+		mac.Write(hello)
+		copy(hello, mac.Sum(nil))
 
-		blocks += perSum
+		blocks += calibrationCallBlocks
 
 		if elapsed := time.Since(started); elapsed >= d {
 			return blocks, elapsed

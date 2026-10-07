@@ -1094,6 +1094,55 @@ func TestCalibrationRunsOncePerProcess(t *testing.T) {
 	})
 }
 
+// The calibration has to time what the budget charges for, or every rate is off
+// by a factor that depends on the CPU: one timed call is one verification of a
+// real client's 517-byte hello, which is exactly what the door charges 12
+// blocks for (the cost floor).
+func TestCalibrationTimesWhatTheBudgetCharges(t *testing.T) {
+	t.Parallel()
+
+	hello := fakeTLSClientHelloPadded(t, keyFilledFrom(5), govCoverHost, make([]byte, 32), calibrationHelloSize)
+	require.Len(t, hello, calibrationHelloSize)
+
+	assert.Equal(t, parsedHello(t, hello, govCoverHost).Blocks(), calibrationCallBlocks,
+		"a timed call is charged what the door charges that hello")
+	assert.Equal(t, 12, calibrationCallBlocks)
+	assert.Equal(t, minCostBlocks, calibrationCallBlocks, "a real client's hello is the cost floor")
+
+	// A run of no length still makes one call, and counts it at that cost.
+	blocks, _ := hmacFor(0)
+	assert.Equal(t, calibrationCallBlocks, blocks)
+}
+
+// The virtual schedule rests on one invariant: no interval of time is refilled
+// twice. A reservation whose clock reading is older than the bucket's last
+// charge -- a caller that read the clock and then waited for the lock while
+// another went first -- must not move the bucket's time back.
+func TestAReservationReadAtAnOlderTimeRefillsNothingTwice(t *testing.T) {
+	t.Parallel()
+
+	// 1e6 blocks a second for the process.
+	b, clock := testBudget(scanBudgetConfig{NsPerBlock: nsPerBlockForTests, CPUPercent: 25, Procs: 4})
+
+	// Well below the burst, so a refill is not hidden by the cap: 900,000 of
+	// 1e6 spent, 100,000 left.
+	_, _, v := b.reserve(nil, 100, 9000)
+	require.Equal(t, budgetGranted, v)
+	require.InDelta(t, 100000, b.globalAvailable(10), 1e-6)
+
+	// A millisecond earlier than that charge: no refill, 120 more spent.
+	clock.advance(-time.Millisecond)
+
+	_, _, v = b.reserve(nil, 12, 10)
+	require.Equal(t, budgetGranted, v)
+
+	// Ten milliseconds after the first charge: 10,000 of refill since then, and
+	// not 11,000 -- the millisecond before it was never the bucket's to refill.
+	clock.advance(11 * time.Millisecond)
+
+	assert.InDelta(t, 100000-120+10000, b.globalAvailable(10), 1e-6, "the overlap is refilled once")
+}
+
 func TestCalibrationIsClamped(t *testing.T) {
 	t.Parallel()
 
