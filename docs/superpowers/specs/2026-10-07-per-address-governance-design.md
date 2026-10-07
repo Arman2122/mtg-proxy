@@ -195,7 +195,9 @@ creation (`clamp(T/20, 64 KiB, 4 MiB)` for fair limiters from the secret's confi
 the summed delay. **Every call on the limiter uses the injected clock** (`ReserveN(now)`,
 `SetLimitAt(now)`, `CancelAt(now)` when the context ends during a sleep): `SetLimit` alone is
 shorthand for `time.Now`, and mixing clocks corrupts the token state. This is the
-fake-clock seam for tests. (The *throttle signal* is the duty of §3 below, measured around
+fake-clock seam for tests. (A tick's re-rate may land on a limiter that a concurrent reload has
+just replaced: harmless — the re-rate is lost and the new object runs at `install`'s rate
+for at most one tick.) (The *throttle signal* is the duty of §3 below, measured around
 the waits, not a per-wait delay: `time.Since` around `WaitN` adds a few hundred
 nanoseconds to every wait that never slept, which is irrelevant against a duty threshold
 of 25% of a second and fatal to any "delay > 0" rule.)
@@ -214,9 +216,11 @@ of 25% of a second and fatal to any "delay > 0" rule.)
 - A wait on any per-address limiter also adds to the **user's** `throttled_ms` through a
   per-user atomic on `secretStats` added at wait time (entries are swept, so summing entries
   would make the counter go backwards), and to the entry's own throttled time.
-- The time spent in the waits that feed the fair-share duty (the fair limiters and the
-  secret-level buckets, **not** the ceiling) is accumulated per direction on the entry, for
-  the ticker to read and reset.
+- The waits that feed the fair-share duty (the fair limiters and the secret-level buckets,
+  **not** the ceiling) are tracked per direction on the entry by the blocked-interval
+  tracker of §3 (enter/leave around each such wait), which the ticker reads and resets.
+  `speedLimiter.wait` returns no waited time, so `countingConn` brackets the secret-level
+  wait itself.
 
 **Static ceiling.** `client-speed` (bytes/s, `ParseSpeed` rules, floor 8,000) is the combined
 `ceiling` limiter. Setting or lowering it re-rates live entries; removing it sets the limiter
@@ -231,10 +235,16 @@ say so). Each configured secret bucket is divided separately: `speed` → `fairS
   that moved a byte in the last 10 s, **plus its rest entry** if it has live streams.
 - Every second a ticker (under the proxy context) takes the participants of each fair secret
   (pointers copied under `tableMu`) and, per configured direction with total `T`:
-  1. each participant has a **duty**: the wall time its streams spent waiting in that
-     direction last second — at its own fair limiter **or at the secret-level bucket**, never
-     at its ceiling — summed over its streams and divided by the tick. It is **throttled**
-     when the duty is at least 25%. Counting the secret-level wait is essential: an address
+  1. each participant has a **duty**: the fraction of the last second during which **at
+     least one of its streams was blocked** waiting in that direction — at its own fair
+     limiter **or at the secret-level bucket**, never at its ceiling. It is a *union*, not a
+     sum over streams (so fifty chatty streams each blocked 1% of the time do not add up to
+     a false throttle) and it is tracked *incrementally* by a blocked-interval tracker (the
+     count of blocked streams, the time it last rose from zero, and the time accumulated),
+     so a wait that outlasts a tick — a 16 KiB write held for seconds at a small `L` — is
+     credited while it lasts, not when it ends (otherwise the ticks during a long sleep
+     would see no duty and a near-zero rate and could trigger the `L/2` release). It is
+     **throttled** when the duty is at least 25%. Counting the secret-level wait is essential: an address
      starved there (the shared bucket splits tokens per connection, not per address) is never
      delayed at its own limiter, which sits at or above what it receives, so without it a
      4-connection address and a 1-connection address would lock into a 4:1 split that every
