@@ -26,8 +26,8 @@ standalone on the 2 vCPU Skylake bench box (no SHA-NI): 3.9 µs per secret, so
   blocks. 12 blocks for a 517-byte hello; 1,028 for the largest accepted
   (65,540 bytes). The part that precomputing the key pads can remove is 2 of 12
   blocks (17%), plus seven allocations. (From the source; measured below.)
-- **Real cost per block varies 25× across CPUs.** About 325 ns on the bench box
-  (no SHA-NI); about 13 ns with SHA-NI (a review measured a 64 KiB HMAC at
+- **Real cost per block varies 25× across CPUs.** About 340 ns on the bench box
+  (no SHA-NI; 4.1 µs per 12-block candidate); about 13 ns with SHA-NI (a review measured a 64 KiB HMAC at
   13.4 µs). Any budget in fixed "nominal" units is therefore off by an order of
   magnitude on one of them.
 - **The FakeTLS door has no budget.** The dd door has `obfuscatedLimiter` (per-IP
@@ -118,8 +118,9 @@ names of up to 16 secrets that recently matched from it, most recent first.
 - **Privacy (budget).** Separately from hints, the per-address budget bucket
   (§3) holds an address (IPv4, or IPv6 /64) as the key to a token count and the time
   it was last charged — no secret name — in process memory for 30 to 60 minutes
-  after the last hello from that address that reached the budget (scanned or
-  refused), whatever `hints` and `track-client-ips` say; it is never logged,
+  after the last hello from that address that reached the budget (an address gets
+  a bucket on its first granted scan; a refused hello only refreshes a bucket it
+  already has), whatever `hints` and `track-client-ips` say; it is never logged,
   exported or persisted. The older dd limiter also keeps anonymous per-address
   buckets in memory (10 to 20 minutes). `per-ip-ms = 0` or `mode = "off"` keeps
   none, at the price of per-source isolation. What `track-client-ips` governs
@@ -160,8 +161,8 @@ budget believes a block costs.
 | Refill | `per-ip-ms` (default 50) ms of scan CPU per second; **0 disables this bucket** | `cpu-percent` (default 25) % of `GOMAXPROCS` cores |
 | Burst | 4 s of refill, but never below `4 × candidates × 12` blocks | 1 s of refill, same floor |
 
-Both refill rates are `real CPU time ÷ ns/block`: 50 ms/s at 325 ns/block is about
-154,000 blocks/s; 25% of 2 cores is about 1,540,000 blocks/s.
+Both refill rates are `real CPU time ÷ ns/block`: 50 ms/s at 340 ns/block is about
+147,000 blocks/s; 25% of 2 cores is about 1,470,000 blocks/s.
 
 **Admission** of an unhinted scan: `cost = candidates × clamp(Blocks, 12, 128)`.
 The floor of 12 makes admission size-uniform (a 100-byte hello cannot slip in where
@@ -202,12 +203,21 @@ see. (Without the shadow deduction the buckets would never drain and observe wou
 report nothing.) `off` disables the budget and the scan cap; the hint cache is
 governed by `hints`.
 
-**What an attacker can and cannot do, stated plainly.** To lock new users out, an
-attacker must keep the process-wide bucket empty, which costs them about
-`cpu-percent` of this proxy's real CPU in scan work (before this change the same
-effort could starve everything, relays included). While it lasts, a client **with
-no hint** is fronted after at most 150 ms and retries; hinted clients, established
-streams and the data path are unaffected. Behind a carrier that hides client
+**What an attacker can and cannot do, stated plainly.** The budget bounds the
+proxy's CPU; it does not make an attack expensive, and the two must not be confused.
+To keep the process-wide bucket empty an attacker needs a hello *rate* of
+`(cpu-percent/100 × GOMAXPROCS × 1e9 / ns_per_block) / (candidates × 12)` unmatched
+517-byte hellos per second: on the bench box (2 cores, about 340 ns per block) with
+2,000 hosted secrets that is about 60 a second, roughly 30 KB/s from a few
+connections (a refused hello costs nothing and a granted one waits at most 150 ms).
+Before this change the same proxy needed about four times that rate (about 240 a
+second) to saturate its CPU. So `enforce` deliberately makes locking out *unhinted*
+clients cheaper to cause than CPU exhaustion was, and in exchange keeps the relays,
+the data path and every hinted client up while the attack lasts. While it lasts, a
+client **with no hint** is fronted at once (a scan the budget can pay for within
+150 ms waits and runs) and retries; hinted clients, established streams and the data
+path are unaffected. That is why hints matter (`track-client-ips`, which the panel
+always sets) and why the first deployment runs `observe`. Behind a carrier that hides client
 addresses, the per-address layer is off by construction and only the process-wide
 bucket applies. A legitimate user behind an address whose bucket a flooder has
 drained is treated the same way unless a hint exists. This is the accepted
@@ -216,7 +226,8 @@ it ever touches real users before enforcing.
 
 **Timing.** A refused hello and a no-match hello send the cover site the same
 bytes; the time before the first fronted byte differs (a no-match is fronted after
-its scan, a refusal after at most 150 ms). Scan time already varied with hello size
+its scan, a refusal at once; a granted scan may wait up to 150 ms and then runs).
+Scan time already varied with hello size
 and with the SNI gate before this change; this adds one more such dependence and
 `Security.md` says so.
 
@@ -382,6 +393,9 @@ Audit these; each was a judgement call, not an instruction.
 8. The new `/stats` object is `faketls_handshake`; the feature string is
    `handshake-budget`; `hints` defaults to the value of `track-client-ips` (the
    privacy switch), so only deployments that already keep addresses keep hints.
+9. The first deployment to the live server runs `mode = "observe"`, and `enforce` is
+   enabled only once `over_budget_matched` stays near zero (release-notes item, not
+   code).
 10. The per-address budget bucket keeps an address (no secret name) in memory for
     30 to 60 minutes even when `track-client-ips` is off, so the repo's "no address
     outlives its connection" promise is scoped to what `track-client-ips` governs
@@ -389,9 +403,12 @@ Audit these; each was a judgement call, not an instruction.
     Task 7 review; `per-ip-ms = 0` keeps none). Alternative not taken: make the
     per-address layer follow `track-client-ips` — it would leave one source able to
     lock out everyone on a standalone deployment.
-9. The first deployment to the live server runs `mode = "observe"`, and `enforce` is
-   enabled only once `over_budget_matched` stays near zero (release-notes item, not
-   code).
+11. `enforce` makes locking out *unhinted* clients cheaper to cause (about 60
+    hellos a second at 2,000 secrets on the 2-core bench box) than CPU exhaustion
+    was (about 240 a second), in exchange for relays and hinted clients staying up
+    (stated in §3 after the final review). `enforce` stays the default — the
+    alternative, `observe` as the default, would leave a fresh install with no CPU
+    bound at all.
 
 ## Review
 
