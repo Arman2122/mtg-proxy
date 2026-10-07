@@ -57,6 +57,12 @@ type secretStats struct {
 	// it constantly is either sharing a secret or roaming between networks.
 	ipLimitRefused atomic.Int64
 
+	// clientConnsRefused counts connections turned away for arriving from an
+	// address already at the per-address connection cap. Kept apart from
+	// ipLimitRefused: that one says how many places a user is at, this one how
+	// many sockets one place opens, and the two are tuned differently.
+	clientConnsRefused atomic.Int64
+
 	// lastIP is the client address of the most recently admitted connection,
 	// stored as a string. It is written only when the proxy is configured to
 	// track addresses, so a deployment that does not ask for them never holds
@@ -196,6 +202,12 @@ func (s *ProxyStats) SetDirectionalSpeedLimits(name string, upBytesPerSecond, do
 // OnIPLimitRefused counts one connection refused by the user's address limit.
 func (s *ProxyStats) OnIPLimitRefused(name string) {
 	s.getOrCreate(name).ipLimitRefused.Add(1)
+}
+
+// OnClientConnsRefused counts one connection refused by the per-address
+// connection cap.
+func (s *ProxyStats) OnClientConnsRefused(name string) {
+	s.getOrCreate(name).clientConnsRefused.Add(1)
 }
 
 // SetQuotaCeiling installs the quota the data path holds a user to, or

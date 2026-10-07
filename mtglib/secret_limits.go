@@ -113,6 +113,14 @@ const (
 	// DenyIPLimit means the connection came from an address the user is not
 	// already counted at, while they are at their address limit.
 	DenyIPLimit
+
+	// DenyClientConns means the connection came from an address that already
+	// holds the per-address connection cap of live connections to this secret.
+	DenyClientConns
+
+	// DenyBanned means the connection came from an address an operator banned
+	// from this secret.
+	DenyBanned
 )
 
 // String returns a short machine-friendly reason label for logs.
@@ -126,6 +134,10 @@ func (d DenyReason) String() string {
 		return "quota_exceeded"
 	case DenyIPLimit:
 		return "ip_limit"
+	case DenyClientConns:
+		return "client_conns"
+	case DenyBanned:
+		return "banned"
 	default:
 		return "allowed"
 	}

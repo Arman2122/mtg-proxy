@@ -239,6 +239,17 @@ func (p *Proxy) dropLedgerIfIdleLocked(name string, now time.Time) {
 	}
 }
 
+// releaseAddressLocked gives back one connection the ledger counted for key and
+// forgets the ledger if that leaves it counting nothing. It is what undoes an
+// admit, whether the stream later ended or a step after the admit refused it.
+// Caller holds liveMu.
+func (p *Proxy) releaseAddressLocked(name string, key addressKey, now time.Time) {
+	if ledger := p.addresses[name]; ledger != nil {
+		ledger.release(key)
+		p.dropLedgerIfIdleLocked(name, now)
+	}
+}
+
 // ParseExternalAddresses validates one report as the API receives it: at
 // most MaxExternalAddresses distinct addresses, each a literal IP with no
 // zone, and a ttl within (0, MaxExternalAddressTTL], with an empty ttl

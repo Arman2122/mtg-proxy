@@ -212,7 +212,7 @@ func (p *Proxy) completeFakeTLS(
 	// Enforce per-user governance limits before we speak TLS back. A denied
 	// user (disabled, expired, or over quota) is routed to the cover site just
 	// like a wrong secret, so the outcome is indistinguishable to a prober.
-	if !p.attribute(ctx, set, idx) {
+	if reason := p.attribute(ctx, set, idx); reason != DenyNone {
 		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
 
 		return false
@@ -387,7 +387,7 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 		return p.denyObfuscated(ctx, policy)
 	}
 
-	if !p.attribute(ctx, set, res.Index) {
+	if reason := p.attribute(ctx, set, res.Index); reason != DenyNone {
 		return p.denyObfuscated(ctx, policy)
 	}
 
