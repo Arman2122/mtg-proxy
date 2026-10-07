@@ -171,11 +171,13 @@ func TestCountingConnCountsAQuotaCutReadOnTheEntry(t *testing.T) {
 }
 
 // lastSeen is stamped from the table's clock, which is the clock the sweep
-// measures idleness by. It is stamped to the second and only ever forward: a
-// store happens only when the second has moved on past the stamp. One reading
-// of that clock serves the stream's own activity stamp too, so production reads
-// the time once per call, as it did before there were entries. The fake clock
-// starts in 2001, so a stamp taken from time.Now instead shows at once.
+// measures idleness by. It is stamped to the second and forward: a store
+// happens only when the second has moved on past the stamp, and a stream whose
+// reading is a little older than a sibling's never takes the stamp back. One
+// reading of that clock serves the stream's own activity stamp too, so
+// production reads the time once per call, as it did before there were entries.
+// The fake clock starts in 2001, so a stamp taken from time.Now instead shows at
+// once.
 func TestCountingConnStampsLastSeenOnTheTablesClock(t *testing.T) {
 	t.Parallel()
 
@@ -197,15 +199,51 @@ func TestCountingConnStampsLastSeenOnTheTablesClock(t *testing.T) {
 	readChunk(t, conn)
 	assert.Equal(t, start+1, entry.lastSeen.Load(), "within the same second there is nothing to store")
 
-	// A sibling stream of the address read the clock later and stored first. The
-	// stamp only moves forward, so this stream's earlier second never replaces it.
-	entry.lastSeen.Store(start + 60)
+	// A sibling stream of the address read the clock later and stored first.
+	// This stream's slightly earlier second never replaces it.
+	entry.lastSeen.Store(start + 2)
 	writeChunk(t, conn)
-	assert.Equal(t, start+60, entry.lastSeen.Load(), "an earlier second never replaces a later one")
+	assert.Equal(t, start+2, entry.lastSeen.Load(), "an earlier second never replaces a later one")
 
 	clock.advance(time.Minute)
 	readChunk(t, conn)
 	assert.Equal(t, start+61, entry.lastSeen.Load(), "a later second does")
+}
+
+// The stamp holds against the small regressions of streams racing each other,
+// but not against the clock itself. A wall clock stepped back -- a resumed
+// machine's bad time put right -- would otherwise leave every entry stamped in
+// between in the future, and the sweep would keep those addresses for the step
+// plus ten minutes, filling a secret's entries with addresses long gone. A step
+// back of a minute or more is the clock's, and the stamp follows it.
+func TestLastSeenFollowsTheClockBackAfterAStep(t *testing.T) {
+	t.Parallel()
+
+	table, entry, clock := fakeClientEntry(t)
+	start := clock.read().Unix()
+
+	entry.seen(clock.read().Add(-time.Second))
+	assert.Equal(t, start, entry.lastSeen.Load(), "a second back is two streams racing: the stamp stays")
+
+	entry.seen(clock.read().Add(-59 * time.Second))
+	assert.Equal(t, start, entry.lastSeen.Load(), "and so is anything short of a minute")
+
+	entry.seen(clock.read().Add(-time.Minute))
+	assert.Equal(t, start-60, entry.lastSeen.Load(), "a minute back is a step of the clock")
+
+	clock.advance(-5 * time.Minute)
+
+	conn, _, held := clientStream(t.Context(), NewProxyStats(), entry)
+	writeChunk(t, conn)
+	assert.Equal(t, start-300, entry.lastSeen.Load(), "the data path follows a step back of five minutes")
+
+	// So the sweep forgets the address ten minutes after it left, by the clock
+	// as it now is, and not ten minutes after a time that has not come yet.
+	held.Store(nil)
+	table.release(entry)
+	clock.advance(clientIdleRetention)
+
+	assert.Equal(t, 1, table.sweep(clock.read(), clientSweepChunk), "the entry is forgotten on time")
 }
 
 // An entry with no limiter installed does not cut a transfer: an unlimited user
@@ -490,92 +528,6 @@ func TestThrottledMillisKeepsAddressWaitsAcrossTheSweep(t *testing.T) {
 
 	assert.Equal(t, before, statsFor(t, p).Users["alice"].ThrottledMillis,
 		"the user's throttled time outlives the entry it was spent through")
-}
-
-// The blocked-interval tracker is a union over the address's streams: two
-// streams blocked at once are one address blocked. Fifty chatty streams each
-// blocked a little must not add up to an address blocked all the time.
-func TestBlockedTrackerIsAUnionOverStreams(t *testing.T) {
-	t.Parallel()
-
-	var b blockedTracker
-
-	t0 := fakeAddrClockBase
-
-	b.enter(t0)                      // one stream blocks
-	b.enter(t0.Add(time.Second))     // a second one, while the first still is
-	b.leave(t0.Add(2 * time.Second)) // the first is let go
-	b.leave(t0.Add(3 * time.Second)) // and then the second
-
-	assert.Equal(t, 3*time.Second, b.snapshot(t0.Add(4*time.Second)),
-		"three seconds with a stream blocked, not four seconds of blocked streams")
-}
-
-// A wait that outlasts a window is credited in every window it spans, while it
-// lasts: a snapshot counts the interval still open up to its own instant, and
-// the next window starts there.
-func TestBlockedTrackerCreditsAWaitWhileItLasts(t *testing.T) {
-	t.Parallel()
-
-	var b blockedTracker
-
-	t0 := fakeAddrClockBase
-
-	b.enter(t0)
-
-	assert.Equal(t, time.Second, b.snapshot(t0.Add(time.Second)), "an open wait is credited up to the snapshot")
-	assert.Equal(t, 1500*time.Millisecond, b.snapshot(t0.Add(2500*time.Millisecond)),
-		"and the next window has what came after, not the whole wait again")
-
-	b.leave(t0.Add(3 * time.Second))
-
-	assert.Equal(t, 500*time.Millisecond, b.snapshot(t0.Add(5*time.Second)), "the wait ended half a second in")
-	assert.Zero(t, b.snapshot(t0.Add(6*time.Second)), "and nothing is blocked any more")
-}
-
-// A snapshot takes what it reports: the window starts again empty.
-func TestBlockedTrackerResetsItsWindow(t *testing.T) {
-	t.Parallel()
-
-	var b blockedTracker
-
-	t0 := fakeAddrClockBase
-
-	b.enter(t0)
-	b.leave(t0.Add(time.Second))
-
-	assert.Equal(t, time.Second, b.snapshot(t0.Add(2*time.Second)))
-	assert.Zero(t, b.snapshot(t0.Add(3*time.Second)), "the second snapshot of the same wait finds nothing")
-
-	b.enter(t0.Add(4 * time.Second))
-	b.leave(t0.Add(4500 * time.Millisecond))
-
-	assert.Equal(t, 500*time.Millisecond, b.snapshot(t0.Add(5*time.Second)), "and a new wait counts afresh")
-}
-
-// The tracker's edges: a leave with nothing blocked changes nothing, and a
-// snapshot taken at an instant before the open interval began -- two goroutines
-// read the clock moments apart and reach the lock in the other order -- credits
-// none of it and leaves it whole for the next.
-func TestBlockedTrackerEdges(t *testing.T) {
-	t.Parallel()
-
-	var b blockedTracker
-
-	t0 := fakeAddrClockBase
-
-	b.leave(t0)
-	b.enter(t0.Add(time.Second))
-	b.leave(t0.Add(2 * time.Second))
-
-	assert.Equal(t, time.Second, b.snapshot(t0.Add(3*time.Second)),
-		"an unmatched leave neither opens nor closes an interval")
-
-	b.enter(t0.Add(5 * time.Second))
-	assert.Zero(t, b.snapshot(t0.Add(4*time.Second)), "a snapshot before the interval began credits none of it")
-
-	b.leave(t0.Add(6 * time.Second))
-	assert.Equal(t, time.Second, b.snapshot(t0.Add(7*time.Second)), "and the interval is whole for the next")
 }
 
 // The duty fair share reads is the time an address spent waiting at its own

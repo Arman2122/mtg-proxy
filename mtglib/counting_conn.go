@@ -16,13 +16,17 @@ var errQuotaExhausted = errors.New("quota exhausted")
 // countingConn wraps the client side of a stream and is where a user's bytes
 // become that user's: it counts them, charges them to the quota, holds them to
 // the user's speed limit, and ends the stream at the quota's ceiling. The
-// *secretStats pointer is resolved once at construction so the data path never
-// takes a lock; the speed bucket and the ceiling are fields of the same
-// struct, so both cost one atomic load when there is no limit.
+// *secretStats pointer is resolved once at construction so the data path takes
+// no lock to find the user's state; the speed bucket and the ceiling are fields
+// of the same struct, so both cost one atomic load when there is no limit.
 //
 // A stream whose address has an entry in the per-address table is also where
 // that address's bytes become the address's: they are counted on the entry,
-// and the address's own limiters are paid before the user's.
+// and the address's own limiters are paid before the user's. The entry's
+// counters are atomics too. The one lock an entry adds is a fair share's: a
+// stream of an address with one brackets every wait at it, and at the user's
+// bucket it divides, with that share's blocked tracker -- two lock pairs per
+// chunk, contended across the address's streams.
 type countingConn struct {
 	essentials.Conn
 
@@ -417,6 +421,9 @@ func (c *countingConn) Write(p []byte) (int, error) {
 // once per call, not once per piece. Each piece is cut to the address's
 // limiters as well and paid for at them first; an entry with no limiter
 // installed neither cuts nor waits, so an unlimited user still writes once.
+// Whether the address paces the write is read once per call too, so a reload
+// that installs an address limiter during a write reaches the stream at its
+// next call: at most one relay buffer later.
 func (c *countingConn) writeAddress(entry *clientEntry, p []byte) (int, error) {
 	paced := entry.pacesDownload()
 

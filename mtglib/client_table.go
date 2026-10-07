@@ -142,102 +142,43 @@ type clientEntry struct {
 
 	// The blocked trackers measure fair share's duty, one per fair limiter:
 	// the time at least one of the address's streams was waiting at that fair
-	// limiter or at the user's bucket it divides. Never the ceiling's waits.
+	// limiter or at the user's bucket it divides. Never the ceiling's waits. See
+	// blocked_tracker.go.
 	blockedSpeed, blockedUp, blockedDown blockedTracker
 }
 
-// seen stamps lastSeen with now, to the second. It only ever moves the stamp
-// forward, and writes only when the second has moved on past it, as markActive
-// does: the streams of one address stamp it from many goroutines, and one that
-// read the clock a moment before another must not take the stamp back when it
-// stores after it. A stamp that is current costs one load.
+// lastSeenStepBack is how far back a stamp has to go before seen takes it for
+// the clock's own step rather than a race between streams. Streams that read
+// the clock moments apart disagree by a second; a wall clock put right after a
+// machine resumed with a bad time can be minutes or hours out.
+const lastSeenStepBack = time.Minute
+
+// seen stamps lastSeen with now, to the second, writing only when the second
+// has moved on past the stamp, as markActive does. The streams of one address
+// stamp it from many goroutines, and one that read the clock a moment before
+// another must not take the stamp back when it stores after it, so an earlier
+// second is ignored -- unless it is lastSeenStepBack or more earlier, which is
+// the wall clock stepped back: a stamp left in the future would keep the sweep
+// from forgetting the address until that future came, plus ten minutes.
+//
+// A stamp that is current costs one load. That it costs no store is not
+// something a value can show -- a store of the same second leaves the same
+// number -- and only the benchmarks that put many streams on one entry, the
+// CountingConnParallel entry rows and the addr=shared/tracked door rows, would
+// see a store on every call.
 func (e *clientEntry) seen(now time.Time) {
 	second := now.Unix()
 
 	for {
 		last := e.lastSeen.Load()
-		if second <= last || e.lastSeen.CompareAndSwap(last, second) {
+		if second == last || (second < last && last-second < int64(lastSeenStepBack/time.Second)) {
+			return
+		}
+
+		if e.lastSeen.CompareAndSwap(last, second) {
 			return
 		}
 	}
-}
-
-// blockedTracker is the time at least one of an address's streams spent
-// blocked at one bucket: a union over the streams, not a sum. Fifty streams each
-// blocked a hundredth of the time are an address blocked a hundredth of the
-// time, or a little more, not one blocked half of it.
-//
-// It is kept incrementally, so a wait is credited while it lasts and not only
-// when it ends: a chunk held for seconds at a small fair share must show in the
-// ticks it spans, or those ticks would see an address with no duty and next to
-// no rate, and release it as one that had paused. A stream enters before a wait
-// and leaves after it, and a snapshot counts an interval still open up to its
-// own instant.
-//
-// It is touched only around a wait that can block, never on the unthrottled
-// path, so a small mutex of its own is enough. It is a leaf in the lock order:
-// nothing is taken while it is held. The zero value is ready, with nothing
-// blocked.
-type blockedTracker struct {
-	mu sync.Mutex
-
-	// blocked is how many streams are waiting now, and since is when that last
-	// rose from zero -- or the last snapshot, if one was taken while they were.
-	blocked int
-	since   time.Time
-
-	// total is the blocked time closed in the current window.
-	total time.Duration
-}
-
-// enter counts one more stream blocked from now.
-func (b *blockedTracker) enter(now time.Time) {
-	b.mu.Lock()
-
-	if b.blocked == 0 {
-		b.since = now
-	}
-
-	b.blocked++
-
-	b.mu.Unlock()
-}
-
-// leave counts one stream let go at now. The last one to leave closes the
-// interval. A leave with nothing blocked changes nothing.
-func (b *blockedTracker) leave(now time.Time) {
-	b.mu.Lock()
-
-	if b.blocked > 0 {
-		b.blocked--
-
-		if b.blocked == 0 && now.After(b.since) {
-			b.total += now.Sub(b.since)
-		}
-	}
-
-	b.mu.Unlock()
-}
-
-// snapshot is the blocked time since the last snapshot, up to now: the
-// intervals that closed in the window, and the one still open if streams are
-// blocked now. It starts the next window at now, with an open interval carried
-// into it from there. An instant before the open interval began -- two clocks
-// read moments apart -- credits none of it.
-func (b *blockedTracker) snapshot(now time.Time) time.Duration {
-	b.mu.Lock()
-
-	total := b.total
-	b.total = 0
-
-	if b.blocked > 0 && now.After(b.since) {
-		total += now.Sub(b.since)
-		b.since = now
-	}
-
-	b.mu.Unlock()
-
-	return total
 }
 
 // secretClients is one secret's part of the table. It lives until the secret
