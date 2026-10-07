@@ -72,8 +72,9 @@ An address is what the existing per-address features count: an IPv4 address, or 
 
 1. **A bounded per-address table with its own lifetime**, keyed by (secret, address): it
    survives reconnects (a bucket must not reset on every new connection) and is dropped after
-   the address has been idle ten minutes with no live connection. It holds bytes, times and
-   limiters — **not** connection counts.
+   the address has been idle ten minutes with no live stream. It holds bytes, times and
+   limiters and a reference count of the streams using it — **not** the connection counts the
+   cap uses (those come from the ledger).
 2. **The connection cap counts from the ledger**, which already refcounts live connections per
    (secret, address) for every address, whether or not a table entry exists. So the cap
    cannot fail open when the table is full and cannot undercount streams that were open when
@@ -90,7 +91,8 @@ An address is what the existing per-address features count: an IPv4 address, or 
    burst chosen once when the limiter is created and are re-rated with `SetLimit` only;
    changing the burst means replacing the limiter object (an in-flight wait keeps the old one).
    Independently, `speedLimiter.wait` is hardened to re-chunk and retry when `WaitN` fails
-   because the burst shrank under it (the context being done is still an error), which fixes
+   because the burst shrank under it — detected as `ctx.Err() == nil && piece > Burst()`,
+   never by matching an error string (there are two different messages for it) — which fixes
    the latent reload bug for the secret-level buckets too.
 6. **A real fair share, with a static ceiling kept separate.** `client-fair` divides a secret's
    speed limit among its active addresses by a *water level* (below), work-conserving;
@@ -139,7 +141,10 @@ type clientEntry struct {
   and the secret's speed fields) **and backfills live streams that have no entry** (a control
   a reload enabled must reach connections that were already open, which live for hours):
   under `liveMu`, for each live stream of the secret whose address is keyed, acquire an entry
-  and store the pointer. Removing a control sets the matching limiters to unlimited.
+  and store the pointer, **and for each unkeyed one join the rest entry** (otherwise streams
+  that were open before the control was enabled would stay ungoverned, which is the
+  fail-open the rest entry exists to close). Removing a control sets the matching limiters
+  to unlimited.
 - **Secret removed** (`DeleteSecret`/reload drops the name): its entries, its rest entry and
   its bans are dropped with it. A re-key of the same name keeps them.
 - **Retention, stated exactly:** an entry holds an address (IPv4, or IPv6 /64) **and the
@@ -154,10 +159,17 @@ type clientEntry struct {
 ## 2. The connection cap
 
 `client-conns` (int ≥ 0, 0 = unlimited) in `[secret-limits.<name>]`, `client_conns` on the API.
-Checked in `tryRegisterConn` next to the ip-limit check, under `liveMu`, **against the
-ledger's live count** (`local[key]`): a new connection from a keyed address that already has
-`client-conns` live connections is refused. `tryRegisterConn` now returns a `DenyReason`
-instead of a bool; `admit` maps it: ip-limit refusals keep `ip_limit_refused` and
+Checked in `tryRegisterConn` under `liveMu`, **against the ledger's live count**
+(`local[key]`): a new connection from a keyed address that already has `client-conns` live
+connections is refused. The ledger is populated for every stream that has an address,
+whatever `ip-limit` or tracking say (`ledger.admit` always increments unless it refuses), so the
+cap cannot undercount. **Order inside `tryRegisterConn`, with rollback stated** because
+`ledger.admit` increments `local[key]` itself: (1) the ban re-check; (2) the `client-conns`
+check, reading `local[key]` *before* the admission (reading after would be off by one); (3)
+`ledger.admit` (the ip-limit check); (4) entry acquisition. A refusal at any step leaves the
+ledger exactly as it was (a test asserts the ledger is empty after refused attempts).
+`tryRegisterConn` and `attribute` now return a `DenyReason` instead of a bool (on both doors);
+`admit` maps it: ip-limit refusals keep `ip_limit_refused` and
 `EventIPLimited`; `DenyClientConns` increments `client_conns_refused` and emits **no event**
 (a new event type touches the observer interface and both metric backends; the counter is in
 `/stats`); `DenyBanned` (§5) likewise. Refused like ip-limit: closed after the handshake.
@@ -173,9 +185,13 @@ creation (`clamp(T/20, 64 KiB, 4 MiB)` for fair limiters from the secret's confi
 `T`; `clamp(rate/20, 64 KiB, 4 MiB)` for the ceiling), `SetLimit` for re-rating, a nil limiter
 = unlimited (one atomic load). Its wait is built on `ReserveN` plus a sleep with an
 **injectable clock**, so the reservation's delay is known: it records
-`delayed` (waits whose delay was at least 1 ms) and the summed delay. This is both the
-fake-clock seam for tests and the **throttle signal**: `time.Since` around `WaitN` cannot be
-used (it adds a few hundred nanoseconds to every wait that never slept).
+the summed delay. **Every call on the limiter uses the injected clock** (`ReserveN(now)`,
+`SetLimitAt(now)`, `CancelAt(now)` when the context ends during a sleep): `SetLimit` alone is
+shorthand for `time.Now`, and mixing clocks corrupts the token state. This is the
+fake-clock seam for tests. (The *throttle signal* is the duty of §3 below, measured around
+the waits, not a per-wait delay: `time.Since` around `WaitN` adds a few hundred
+nanoseconds to every wait that never slept, which is irrelevant against a duty threshold
+of 25% of a second and fatal to any "delay > 0" rule.)
 
 `countingConn` gains a nil-safe per-address step. For a stream with an entry:
 
@@ -191,6 +207,9 @@ used (it adds a few hundred nanoseconds to every wait that never slept).
 - A wait on any per-address limiter also adds to the **user's** `throttled_ms` through a
   per-user atomic on `secretStats` added at wait time (entries are swept, so summing entries
   would make the counter go backwards), and to the entry's own throttled time.
+- The time spent in the waits that feed the fair-share duty (the fair limiters and the
+  secret-level buckets, **not** the ceiling) is accumulated per direction on the entry, for
+  the ticker to read and reset.
 
 **Static ceiling.** `client-speed` (bytes/s, `ParseSpeed` rules, floor 8,000) is the combined
 `ceiling` limiter. Setting or lowering it re-rates live entries; removing it sets the limiter
@@ -205,22 +224,47 @@ say so). Each configured secret bucket is divided separately: `speed` → `fairS
   that moved a byte in the last 10 s, **plus its rest entry** if it has live streams.
 - Every second a ticker (under the proxy context) takes the participants of each fair secret
   (pointers copied under `tableMu`) and, per configured direction with total `T`:
-  1. each participant is **throttled** if its fair limiter recorded a delayed wait (≥ 1 ms)
-     in the last second, and stays throttled for 3 more ticks (hysteresis); only the fair
-     limiter's own delays count — waits at the ceiling or the secret-level bucket do not, so
-     an address held by its ceiling reports its true demand;
+  1. each participant has a **duty**: the wall time its streams spent waiting in that
+     direction last second — at its own fair limiter **or at the secret-level bucket**, never
+     at its ceiling — summed over its streams and divided by the tick. It is **throttled**
+     when the duty is at least 25%. Counting the secret-level wait is essential: an address
+     starved there (the shared bucket splits tokens per connection, not per address) is never
+     delayed at its own limiter, which sits at or above what it receives, so without it a
+     4-connection address and a 1-connection address would lock into a 4:1 split that every
+     pause or arrival returns to (found by the second review, with a worked scenario).
+     A *duty* — unlike a "delay of at least 1 ms" — does not depend on the rate: the relay
+     writes at most 16 KiB per operation, so at 16 MB/s per connection every reservation delay
+     is already under a millisecond. The measurement is a clock read around the waits
+     (`countingConn` accumulates it on the entry); its noise (hundreds of nanoseconds a wait)
+     is irrelevant against a 25%-of-a-second threshold. Waits at the ceiling are excluded, so
+     an address held by its ceiling reports its true demand. A throttled participant stays
+     throttled for 3 more ticks unless its observed rate falls below `L/2` (a downloader that
+     pauses releases the others at once);
   2. a non-throttled participant has demand `d` = the rate it actually moved last second; a
      throttled one has demand = +∞;
   3. the **water level** `L` solves `Σ min(d_i, L) = T`: sort the finite demands ascending;
      `remaining = T`, `k = n`; for each finite demand `d`: if `d ≤ remaining/k` then
      `remaining −= d`, `k −= 1`, else stop; `L = remaining/k` (and `L = T` when `k = 0`);
-  4. **every participant's fair limiter is set to `L`** (clamped to at least `8,000 B/s` and
-     never zero: a zero would read as "unlimited"); the sum of the rates may exceed `T`,
-     because the secret-level bucket already enforces `T`. A quiet address can therefore grow
-     to `L` at once, nothing is reserved for it, and no capacity is wasted (the reviewed
-     alternative of a per-address demand floor wasted up to half of `T`).
-- A new participant starts at the current `L` (or `T` if it is alone). Limiters are re-rated
-  only through `(*clientTable).setRate(entry, direction, bytesPerSecond)` (the hook D uses).
+  4. **the fair limiter of every entry of the secret that has a live stream is set to `L`** —
+     participants and idle-but-connected entries alike, so an address that wakes after ten
+     quiet seconds does not run at a stale, possibly tiny, rate for a tick. `L` is
+     `floor(·)` and **at least 1 byte/s: never zero**, because a zero would read as
+     "unlimited" (`T ≥ 8,000` and there are at most 4,097 participants, so `floor(T/n) ≥ 1`
+     already; there is deliberately no larger clamp, because lifting `L` above `T/n` would put
+     the sum of the rates above `T` and hand the split back to the secret-level bucket's
+     per-connection sharing). The sum of the rates may exceed `T` when quiet addresses are
+     below `L`, because the secret-level bucket already enforces `T`; a quiet address can
+     grow to `L` at once, nothing is reserved for it, and no capacity is wasted (the first
+     reviewed alternative, a per-address demand floor, wasted up to half of `T`).
+- A new entry starts at the current `L` (or `T` if it is alone). Limiters are re-rated only
+  through `(*clientTable).setRate(entry, direction, bytesPerSecond)` (the hook D uses), which
+  **never creates a limiter** — only `applyLimits` creates and removes them.
+- **The "rest" pseudo-address participates as one participant and carries no static
+  ceiling.** It stands for every unkeyed client and every address past a cap; giving it one
+  address's `client-speed` would let a holder of an IPv6 /56 fill the 4,096 entries and cap
+  every later legitimate address of the secret together. It still holds one fair share, so
+  that overflow is bounded, not free. **The per-secret entry cap is `min(4,096, ip-limit)`
+  when `ip-limit` is set**, which is why the docs say to pair `client-fair` with `ip-limit`.
 - Properties, all tested on the pure `waterLevel(total, demands)`, where a participant's
   allocation is `a_i = min(d_i, L)`: `Σ a_i ≤ T`, with equality when some demand exceeds `L`;
   `L ≥ T/n`; **raising one participant's demand never lowers its own allocation and never
@@ -232,7 +276,9 @@ say so). Each configured secret bucket is divided separately: `speed` → `fairS
 ## 4. Stats
 
 - **Per-user scalars** (omitempty, inside the existing user object — never new `users` keys):
-  `clients` (entries held), `clients_overflow`, `client_conns_refused`; read-back of the limits as
+  `clients` (keyed entries held, **not** counting the rest entry), `clients_overflow` (a
+  monotonic count of **connections** that were routed to the rest entry because a cap was
+  reached), `client_conns_refused`; read-back of the limits as
   `client_conns`, `client_speed_limit` (bytes/s int, as `speed_limit`), `client_fair`.
 - **A new endpoint** `GET /secrets/{name}/clients?limit=N` (default 100, max 1,000), entries by
   bytes descending, with `total`, `overflow` and the rest entry as a separate object:
@@ -254,16 +300,19 @@ say so). Each configured secret bucket is divided separately: `speed` → `fairS
 
 - `POST /secrets/{name}/bans` `{"ips":["203.0.113.9", ...], "ttl":"1h", "force": false}` → bans
   the named addresses (as `addressKey`: an IPv6 address bans its /64; the response echoes the
-  keys) for `ttl` (default 1 h, max 30 d); **an unkeyed address is refused with 400 unless
-  `force` is true**. Under `liveMu` it records the bans and snapshots the matching streams in
+  keys only when `track-client-ips` is on, as `PUT external-ips` does) for `ttl` (default 1 h,
+  max 30 d); **an unkeyed address is refused with 400 unless `force` is true**. A ban also
+  **forgets that address's hints**, so every banned attempt does not get a free hinted
+  verification. Under `liveMu` it records the bans and snapshots the matching streams in
   one critical section; the streams are closed after the lock is released (as `Kick` does), so
   no stream registers between the ban and the kick. Response `{"banned":N,"closed":M}`. 409
   `ban list full` past 4,096 bans across all secrets (a ban is an operator action: refuse it
   loudly rather than evict another).
 - `GET /secrets/{name}/bans` lists `{"address","expires_at"}` — **gated like `external_ips`**
-  (counts only when `track-client-ips` is off). `DELETE /secrets/{name}/bans/{address}` lifts
-  one and accepts either an IP or the `/64` form the listing shows. Lock order `liveMu` →
-  `banMu`.
+  (counts only when `track-client-ips` is off). `DELETE /secrets/{name}/bans/{address...}`
+  (a wildcard segment, so the `/64` form's slash needs no escaping) lifts one and accepts
+  either an IP or the `/64` form the listing shows. Lock order `liveMu` → `banMu`;
+  `GET /clients` takes `liveMu` (the ledger's counts) then `tableMu`.
 - **Enforcement** in `attribute()` right after `checkLimits`, and re-checked inside
   `tryRegisterConn` under `liveMu` (the race window). At attribution a banned address is
   turned away before the server hello exactly like a wrong secret: fronted on FakeTLS,
@@ -272,7 +321,10 @@ say so). Each configured secret bucket is divided separately: `speed` → `fairS
   after the secret matched, the budget charge is kept and no hint is written (A's rules).
   **On the obfuscated door a ban is charged to `obfsLimiter` like a miss** (`Fail`), so a
   banned client that keeps reconnecting is rate-limited instead of costing an O(N) trial
-  decryption for free.
+  decryption for free. (`obfsLimiter` is keyed by address only, so a banned address's
+  reconnect storm also drains that address's budget for its connections to *other* secrets on
+  the same public dd listener; documented, accepted.) `Fail(policy, ip)` needs the listener
+  policy, which only the obfuscated entry has, hence `attribute` returning a `DenyReason`.
 - **A ban lives in memory only**: it survives a reload (a reload rebuilds the secret set, not
   the proxy) but not a restart, and it is dropped when the secret is removed.
 
@@ -318,14 +370,23 @@ between 0.5 and 2").
 - *speedLimiter hardening*: a hook between `Burst()` and `WaitN` shrinks the burst
   deterministically; before the fix the stream errors, after it the wait completes; a done
   context is still an error.
-- *waterLevel* properties and the brute-force reference (above); extremes: one participant, all
-  ∞, all zero demand, `T` below `n × 8,000` (clamped, never zero).
-- *Tick* (synthetic): a high-demand and a low-demand address — the low one keeps its demand, the
-  high one gets the rest (work-conserving); a participant held by its **ceiling** and not
-  fair-throttled reports its true demand and the rest goes to the other (the case the
-  review found); a new arrival gets the current `L` at once and the others shrink within two
-  ticks; hysteresis keeps a throttled address at ∞ for three ticks; the rest entry
-  participates; rates never zero.
+- *waterLevel* properties and the brute-force reference (above; integer semantics — the level
+  and the allocations are floored, and the reference floors the same way, so `Σ a_i = T`
+  holds up to the floor remainder, strictly less than the number of participants); extremes:
+  one participant, all ∞, all zero demand, `T` at its 8,000 B/s minimum with 4,097
+  participants (`L = 1`, never zero, never above `T/n`).
+- *Tick* (synthetic duties and observed rates, no clocks): a high-demand and a low-demand
+  address — the low one keeps its demand, the high one gets the rest (work-conserving); a
+  participant held by its **ceiling** and not fair-throttled reports its true demand and the
+  rest goes to the other (the first review's case); **a 4-connection and a 1-connection address
+  both downloading, with the secret-level bucket splitting 4:1 and each fair limiter starting
+  at `T`, must converge to `T/2` each within a few ticks** (the second review's lock-in: it
+  fails if secret-level waits are not counted in the duty); a downloader that pauses releases
+  the other at once (the `L/2` rule); a new arrival is set to the current `L` and the others
+  shrink within two ticks; hysteresis keeps a throttled address at ∞ for three ticks; an entry
+  with a live stream but no bytes for ten seconds is still set to `L`; the rest entry
+  participates and has no ceiling; rates are never zero and never lifted above `T/n`;
+  duty is rate-independent (the same outcome at 1 MB/s and 100 MB/s).
 - *addrLimiter*: a delay of at least 1 ms is recorded as throttle and a sub-millisecond wait is
   not; fixed burst never shrinks under a waiter; replacing the limiter lets an in-flight wait
   finish on the old one.
@@ -335,8 +396,10 @@ between 0.5 and 2").
   unkeyed peers join the rest entry; IPv4-mapped and same-/64 peers share one; backfill gives a
   live stream an entry when a reload enables a control and removing a control sets the
   limiters to unlimited; entries/bans dropped when the secret is removed and kept on a
-  re-key; nil-safe on `Proxy{}`; the documented lock order (a test takes the locks in the
-  forbidden order under `-race` to prove the ticker and sweep never take `liveMu`).
+  re-key; nil-safe on `Proxy{}`; the documented lock order (Go has no lock-order checker and the
+  race detector finds data races, not inversions: the test holds `liveMu` and asserts that
+  `tick()` and a sweep chunk finish within a timeout, which also is the sabotage "take
+  `liveMu` in the ticker"); refused attempts leave the ledger empty.
 - *Connection cap* end to end through the real door: the (cap+1)th connection from an address
   is refused after the handshake **counting streams opened before the cap was enabled**, a
   different address is unaffected, a release frees a slot, lowering the cap never drops
@@ -347,8 +410,11 @@ between 0.5 and 2").
   an unkeyed peer governed as the rest entry; an unlimited secret still writes once; per-address
   waits are paid before secret-level ones (asserted at unit level with `TokensAt` on the shared
   bucket while a per-address wait is pending).
-- *Fair share* end to end (wide bands only): two active addresses both progress and their sum
-  stays within the secret's limit plus a burst; one idle address does not stall the other.
+- *Fair share* end to end (wide bands only): **a 4-connection address against a 1-connection
+  address** (a 1-against-1 test passes even without the fix, because the secret-level bucket
+  splits per connection) both progress, the sum stays within the secret's limit plus a
+  burst, and the ratio of their bytes falls well inside 0.5–2; one idle address does not stall
+  the other.
 - *Ban*: a ban refuses at attribution with the same bytes to the cover site as a wrong secret;
   a hook between `attribute` and `tryRegisterConn` proves the re-check refuses a stream that
   slipped past the first check; ban + kick is one critical section (the hook again, not a
@@ -376,11 +442,21 @@ the ledger.
 touches `countingConn`)**: `countingConn` micro-benchmarks and door bulk throughput (ee, dd,
 plain; 1 and 16 connections) with address-controlled connections in four cases: **no entry**;
 **an entry and no limiter — the panel's case, the most common production case after this piece
-ships — with a no-regression bar of 1% on bulk throughput**; a static ceiling above link
-speed; fair share on 16 addresses (the ticker's cost). The existing `tools/mtgbench` runs
+ships — with a no-regression bar of "no significant regression above 2–3% at p < 0.05" on bulk
+throughput, from interleaved runs (at least ten of each) compared with benchstat — a 1% bar
+is below the noise floor of the shared 2-vCPU box**; a static ceiling above link speed; fair share on 16 addresses (the ticker's cost). The existing `tools/mtgbench` runs
 loopback clients (unkeyed), so address-dependent cases use in-process address stamping, or
 mtgbench is extended to send PROXY v2 headers with documentation-range sources. If the
 entry-without-limiter case misses its bar, stats-only entries become an explicit opt-in.
+
+## Docs to update (part of the plan, not an afterthought)
+
+`example.config.toml` (the `[secret-limits]` block), the wiki pages Configuration,
+Limits-and-Quotas, Multi-User-and-API, Monitoring and Security (the retention exception and
+the per-address trust statement), and the README feature list. The interim advice for a leaked
+link until piece R ships is to re-key the secret; the pairing advice is `client-fair` /
+`client-conns` with `ip-limit`; the CGNAT and PROXY-listener caveats appear next to every
+control.
 
 ## Not in this piece
 
@@ -416,9 +492,12 @@ Audit these; each was a judgement call, not an instruction.
    panel-managed process gets the stats-only table (benchmarked, with a 1% bar).
 4. Table caps: 4,096 per secret, 32,768 in all, drop-new, ten minutes idle retention, 60 s
    sweep in chunks of 1,024; the cap counts from the ledger, not the table.
-5. Fair share = water level over measured demand (throttled = a ≥ 1 ms reservation delay on
-   the fair limiter, 3-tick hysteresis), 1 s tick, every participant's limiter at the level,
-   rate clamped to at least 8,000 B/s; the static ceiling is a separate bucket.
+5. Fair share = water level over measured demand; throttled = a **duty** (wait time at the fair
+   limiter or the secret-level bucket, not the ceiling, divided by the tick) of at least 25%,
+   3-tick hysteresis released when the rate falls below `L/2`; 1 s tick; the limiter of every
+   entry with a live stream set to the level; floored, at least 1 B/s and never lifted above
+   `T/n`; the static ceiling is a separate bucket; the rest entry is one participant with no
+   ceiling.
 6. Fixed-burst per-address limiters, `SetLimit` only; `speedLimiter.wait` hardened to retry.
 7. Per-address waits count into the user's `throttled_ms`.
 8. Bans are memory-only, max 4,096, TTL default 1 h / max 30 d, new routes rather than a body
@@ -428,7 +507,21 @@ Audit these; each was a judgement call, not an instruction.
 10. No per-address quota, no events, no CIDR bans in this piece.
 11. The panel cannot use these keys yet; this piece targets hand-managed configs.
 
-## Review
+## Review (revision 3)
+
+A scoped re-review of revision 2 found **one more blocker**, in the algorithm that replaced the
+first one: an address starved at the secret-level bucket (which shares tokens per connection)
+was never flagged as throttled, so a 4-connection and a 1-connection address would lock into a
+4:1 split that every pause or arrival returned to — and the planned end-to-end band (1 against 1)
+would have passed regardless. Revision 3 replaces the per-wait delay with a rate-independent
+**duty** that counts waits at the fair limiter or the secret-level bucket (never the ceiling),
+adds the release-on-pause rule, drops the 8,000 B/s clamp (it lifted `L` above `T/n`), sets the
+limiter of every connected entry to `L`, gives the rest entry no ceiling, states the
+`tryRegisterConn` order and rollback, backfills unkeyed streams into the rest entry, fixes the
+lock-order test, the benchmark bar and the clock discipline of `addrLimiter`, and settles the
+nits (ban forgets hints, `{address...}`, counter definitions, `attribute` returns a reason).
+
+### Revision 2 review
 
 Reviewed before implementation by the advisor (adopted: separate ceiling and fair buckets;
 the burst race; benchmarking the panel's case; taking the table's per-tick work off `liveMu`)
