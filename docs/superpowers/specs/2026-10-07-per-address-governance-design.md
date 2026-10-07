@@ -91,9 +91,16 @@ An address is what the existing per-address features count: an IPv4 address, or 
    burst chosen once when the limiter is created and are re-rated with `SetLimit` only;
    changing the burst means replacing the limiter object (an in-flight wait keeps the old one).
    Independently, `speedLimiter.wait` is hardened to re-chunk and retry when `WaitN` fails
-   because the burst shrank under it — detected as `ctx.Err() == nil && piece > Burst()`,
-   never by matching an error string (there are two different messages for it) — which fixes
-   the latent reload bug for the secret-level buckets too.
+   because the burst shrank under it. The rate package returns only three kinds of error from
+   `WaitN` (a burst refusal; "would exceed context deadline" when the context has a
+   deadline; the context's own error) and no stream context in this codebase carries a
+   deadline, so with a live, deadline-free context any error is a burst refusal: the rule is
+   to retry while `ctx.Err() == nil` and (the context has no deadline or `piece > Burst()`),
+   at most 16 times, never by matching an error string. (The first version tested only
+   `piece > Burst()` after the error, which a double re-rate A→B→A' inside a microsecond
+   defeats.) `chunk`, which read `Burst()` twice and could return more than it was asked for
+   when the burst was raised between the reads (a slice-bounds panic), takes one read.
+   This fixes the latent reload bugs for the secret-level buckets too.
 6. **A real fair share, with a static ceiling kept separate.** `client-fair` divides a secret's
    speed limit among its active addresses by a *water level* (below), work-conserving;
    `client-speed` is a separate per-address ceiling bucket. An address held back by its ceiling
