@@ -282,7 +282,7 @@ curl http://127.0.0.1:9090/stats
   "started_at": "2026-03-29T10:30:00Z",
   "uptime_seconds": 3600,
   "total_connections": 15,
-  "features": ["client-ips", "faketls", "listeners", "quota-reset", "secret-modes", "secrets-api"],
+  "features": ["client-ips", "faketls", "handshake-budget", "listeners", "quota-reset", "secret-modes", "secrets-api"],
   "listeners": [
     { "bind": "0.0.0.0:443", "accept": ["ee"], "public": true },
     { "bind": "127.0.0.1:2398", "accept": ["dd", "plain"], "public": false }

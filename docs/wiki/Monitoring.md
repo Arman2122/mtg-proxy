@@ -70,17 +70,6 @@ and one user with limits:
     "draining": 0,
     "rate_limited": 0
   },
-  "faketls_handshake": {
-    "hinted": 3120,
-    "scanned": 842,
-    "unmatched": 29,
-    "denied_ip": 0,
-    "denied_global": 0,
-    "oversized": 0,
-    "over_budget_matched": 0,
-    "enforced": true,
-    "ns_per_block": 33.8
-  },
   "users": {
     "alice": {
       "connections": 8,
@@ -176,7 +165,8 @@ In `enforce` mode every hello that gets past the hostname check increments
 exactly one of the first six. A replay, or a disabled or over-quota user, after a
 match counts as its match: the counter says how the secret was found, not what
 happened to the connection after. A hello that cannot be read, or whose hostname
-matches no secret, is not counted here at all. In `observe` mode `denied_ip`,
+matches no secret, is not counted here at all, and neither is one still waiting
+for budget when the proxy shuts down: nothing was decided about it. In `observe` mode `denied_ip`,
 `denied_global` and `oversized` count what `enforce` would have refused, and
 each moves together with the `scanned` or `unmatched` of the scan that went ahead
 anyway, so the first six no longer add up to the hellos. Under `off` the three

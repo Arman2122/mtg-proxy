@@ -237,7 +237,7 @@ it, one connection per probe is a cheap way to burn a core.
 `[defense.handshake-budget]` (see [[Configuration]]) is that bound, and it is on
 by default. It does five things, all inside the ee door:
 
-- charges every scan that no hint shortcut in **real CPU** — the cost of a
+- charges every scan that no hint shortcuts in **real CPU** — the cost of a
   SHA-256 block is measured at start, so "25% of the cores" means 25% of this
   machine — against two buckets: one per client address (50 ms of scan CPU a
   second) and one for the whole process (25% of the cores);
