@@ -185,9 +185,10 @@ func requireSameOutcome(t testing.TB, want, got outcome, msgAndArgs ...any) {
 
 // agreeWithReference runs one flight through the reference, the
 // ReadClientHelloMulti wrapper and the scan with each builder, and fails unless
-// all four say the same; label names the flight in a failure. The reference
-// runs again at the end: if it changed its own answer, a timestamp crossed the
-// skew bound between the runs, and stable is false (nothing was compared).
+// all four say the same (and again with an empty list of secrets, see
+// agreeOnNoSecrets); label names the flight in a failure. The reference runs
+// again at the end: if it changed its own answer, a timestamp crossed the skew
+// bound between the runs, and stable is false (nothing was compared).
 func agreeWithReference(
 	t testing.TB,
 	wire []byte,
@@ -222,7 +223,38 @@ func agreeWithReference(
 	requireSameOutcome(t, want, pads, "NewCandidate: %s", label)
 	requireSameOutcome(t, want, plain, "NewPlainCandidate: %s", label)
 
+	agreeOnNoSecrets(t, wire, hostnames, skew, label)
+
 	return want, true
+}
+
+// agreeOnNoSecrets runs the same flight against an empty list of secrets: no
+// candidate to try, so a hello that parses and passes the gate is a partial
+// result -- no hello, index -1, the matched host -- with ErrBadDigest, and one
+// that does not fails as it always did. The reference, the wrapper and both
+// scans must say the same, and the empty list is nil, as a set with no hosted
+// secret hands it over.
+func agreeOnNoSecrets(t testing.TB, wire []byte, hostnames []string, skew time.Duration, label string) {
+	t.Helper()
+
+	var want outcome
+
+	want.result, want.err = referenceMatch(connOf(wire), nil, hostnames, skew)
+
+	if want.result != nil {
+		require.ErrorIs(t, want.err, ErrBadDigest, "no secrets: %s", label)
+		require.Equal(t, -1, want.result.MatchedIndex, "no secrets: %s", label)
+		require.Nil(t, want.result.Hello, "no secrets: %s", label)
+		require.NotEmpty(t, want.result.MatchedHost, "no secrets: %s", label)
+	}
+
+	var wrapper outcome
+
+	wrapper.result, wrapper.err = ReadClientHelloMulti(connOf(wire), nil, hostnames, skew)
+
+	requireSameOutcome(t, want, wrapper, "ReadClientHelloMulti, no secrets: %s", label)
+	requireSameOutcome(t, want, scan(NewCandidate, wire, nil, hostnames, skew), "NewCandidate, no secrets: %s", label)
+	requireSameOutcome(t, want, scan(NewPlainCandidate, wire, nil, hostnames, skew), "NewPlainCandidate, no secrets: %s", label)
 }
 
 func randomBytes(rng *rand.Rand, b []byte) {
@@ -632,6 +664,41 @@ func TestPlainFallbackWhenStateCannotBeExported(t *testing.T) {
 			assert.False(t, verifyWire(t, wire, NewCandidate(decoy[:]), 3*time.Second))
 		})
 	}
+}
+
+// TestNewCandidateDoesNotAliasTheKey: a Candidate built by NewCandidate keeps
+// its own copy of the key. The export hook is made to fail so the candidate is
+// the plain fallback, the one that reads the key on every Verify; a pad
+// candidate has already hashed the key by then and could not show it. Not
+// parallel: it swaps the export hook.
+func TestNewCandidateDoesNotAliasTheKey(t *testing.T) {
+	original := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+	failExportOnCall(t, 1)
+
+	keep := slices.Clone(original[:])
+	candidate := NewCandidate(keep)
+	require.False(t, candidate.precomputed(), "the hook makes this the plain fallback")
+
+	// The caller reuses its buffer.
+	for i := range keep {
+		keep[i] ^= 0xff
+	}
+
+	var mutated [16]byte
+
+	copy(mutated[:], keep)
+
+	wireOriginal, err := testclient.ClientHelloWith(original, coverSNI, make([]byte, 32), testclient.HelloOptions{PadTo: 517})
+	require.NoError(t, err)
+
+	wireMutated, err := testclient.ClientHelloWith(mutated, coverSNI, make([]byte, 32), testclient.HelloOptions{PadTo: 517})
+	require.NoError(t, err)
+
+	assert.True(t, verifyWire(t, wireOriginal, candidate, 3*time.Second),
+		"the candidate still verifies the key it was built from")
+	assert.False(t, verifyWire(t, wireMutated, candidate, 3*time.Second),
+		"and not the key its caller's buffer holds now")
 }
 
 // TestNewCandidateFallsBackForAKeyLongerThanTheBlock: HMAC hashes a key longer

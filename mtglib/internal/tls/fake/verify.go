@@ -122,7 +122,8 @@ func ParseClientHelloFor(conn net.Conn, hostnames []string) (*Parsed, error) {
 // SHA-256's own padding (a 0x80 byte and an 8-byte length, so L+9 bytes); the
 // outer hash is the pad block and the 32-byte inner digest, padded into one
 // more. That is 12 for a 517-byte hello and 1,028 for the largest one taken,
-// 65,540 bytes. It is the price whichever path verifies.
+// 65,540 bytes. It is what the budget charges, whichever path verifies (the
+// precomputed path does 2 blocks less).
 func (p *Parsed) Blocks() int {
 	return 3 + (len(p.handshake)+9+sha256.BlockSize-1)/sha256.BlockSize
 }
@@ -133,7 +134,8 @@ func (p *Parsed) Blocks() int {
 // its last 4 bytes. It is the check ReadClientHelloMulti has always made for
 // each secret -- the first 28 bytes compared in constant time, then the clock.
 //
-// On a precomputed Candidate it allocates nothing.
+// After the first precomputed Verify on a Parsed (which makes its two scratch
+// digests), a precomputed Candidate allocates nothing.
 func (p *Parsed) Verify(c *Candidate, skew time.Duration) bool {
 	if p.Hello == nil || c == nil || len(p.handshake) < RandomOffset+RandomLen {
 		return false
@@ -162,8 +164,9 @@ func (p *Parsed) Verify(c *Candidate, skew time.Duration) bool {
 // hellos. It is read-only once built, so one Candidate may serve every
 // goroutine at once.
 type Candidate struct {
-	// key is the caller's slice, not a copy: it must not change after the
-	// Candidate is built.
+	// key is NewCandidate's own copy, or the caller's slice when the Candidate
+	// was built by NewPlainCandidate: that one must not change while the
+	// Candidate is in use.
 	key []byte
 
 	// innerState and outerState are SHA-256 states that have absorbed the
@@ -197,7 +200,10 @@ var exportDigestState = func(h hash.Hash) ([]byte, error) {
 // key is longer than the 64-byte block (which HMAC hashes first; secret keys
 // are 16 bytes), it is a plain candidate, as NewPlainCandidate makes.
 func NewCandidate(key []byte) *Candidate {
-	c := NewPlainCandidate(key)
+	// Copied: a Candidate built here is kept for as long as its secret set is
+	// (once per reload, 16 bytes), and the plain fallback reads the key on every
+	// Verify, so a caller that reuses its buffer must not reach it.
+	c := NewPlainCandidate(slices.Clone(key))
 
 	if len(key) > sha256.BlockSize {
 		return c
@@ -219,7 +225,10 @@ func NewCandidate(key []byte) *Candidate {
 }
 
 // NewPlainCandidate builds a candidate that runs crypto/hmac afresh for every
-// Verify: the reference path.
+// Verify: the reference path. It does not copy the key, so the caller must not
+// change it while the candidate is in use: ReadClientHelloMulti builds one per
+// secret per hello and keeps it on the stack, and a copy would cost an
+// allocation for each secret scanned. NewCandidate, which is kept, copies.
 func NewPlainCandidate(key []byte) *Candidate {
 	return &Candidate{key: key}
 }
