@@ -223,8 +223,8 @@ func (p *Proxy) admit(ctx *streamContext) bool {
 	// The address gate and the registration are one critical section, and
 	// both come before OnConnect: a refused connection must never have been
 	// counted, and two new addresses arriving together must not both read
-	// "one below the limit". The log line carries the reason and not the
-	// address, like every other refusal.
+	// "one below the limit". The log line adds the reason; the stream logger's
+	// own fields, client-ip among them, come with it, as on every other refusal.
 	if reason := p.tryRegisterConn(ctx); reason != DenyNone {
 		p.countAdmissionRefusal(ctx, reason)
 
@@ -259,7 +259,13 @@ func (p *Proxy) bannedFrom(name string, ip net.IP) bool {
 
 	key, ok := addressKeyOf(ip)
 
-	return ok && p.bans.banned(name, key)
+	return ok && p.bannedAt(name, key)
+}
+
+// bannedAt is bannedFrom for a place whose key the caller has already built:
+// one that asks about several secrets for the same place builds the key once.
+func (p *Proxy) bannedAt(name string, key addressKey) bool {
+	return p.bans.banned(name, key)
 }
 
 // countAdmissionRefusal is the accounting of a connection tryRegisterConn
@@ -268,7 +274,8 @@ func (p *Proxy) bannedFrom(name string, ip net.IP) bool {
 // type reaches the observer interface and every metric backend, and the counter
 // is what an operator reads. A ban is an operator's decision and not a limit
 // being felt, so it is logged and nothing more. Whatever the reason, the log
-// line names it and not the address, like every other refusal.
+// line adds it; the stream logger's own fields, client-ip among them, come with
+// it, as on every other refusal.
 //
 // A reason with no rule here is still a refusal -- admit has already said no --
 // and only goes uncounted: an unknown reason must never be let through.

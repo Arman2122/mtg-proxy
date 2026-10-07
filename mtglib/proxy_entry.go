@@ -281,9 +281,26 @@ func (p *Proxy) hintedPositions(ctx *streamContext, parsed *fake.Parsed, set *se
 
 	positions := make([]int, 0, len(names))
 
+	// The place's key is built at most once for all the hinted names, and only
+	// once a ban is held: with none held, the common case, a hinted hello pays
+	// nothing for the question, as with bannedFrom. Whether a ban is held is
+	// still asked for each name, as bannedFrom asks it, so a ban that lands
+	// during the loop is seen by the names after it.
+	var (
+		place         addressKey
+		placed, built bool
+	)
+
 	for _, name := range names {
-		if p.bannedFrom(name, ip) {
-			continue
+		if !p.bans.none() {
+			if !built {
+				place, placed = addressKeyOf(ip)
+				built = true
+			}
+
+			if placed && p.bannedAt(name, place) {
+				continue
+			}
 		}
 
 		if pos, ok := set.candByName[name]; ok && !slices.Contains(positions, pos) {

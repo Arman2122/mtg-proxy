@@ -26,6 +26,42 @@ func newTestClientTable(t *testing.T) (*clientTable, *fakeAddrClock) {
 	return newClientTable(clock.clock()), clock
 }
 
+// clients is how many addresses the named secret holds an entry for, the rest
+// entry not counted. A test's reading of one secret; /stats reads every secret
+// at once through counts.
+func (t *clientTable) clients(name string) int {
+	if t == nil {
+		return 0
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if sc := t.secrets[name]; sc != nil {
+		return len(sc.entries)
+	}
+
+	return 0
+}
+
+// overflow is how many connections of the named secret were sent to its rest
+// entry because a cap left no room for their address. It only grows while the
+// secret exists. A test's reading of one secret, as clients is.
+func (t *clientTable) overflow(name string) int64 {
+	if t == nil {
+		return 0
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if sc := t.secrets[name]; sc != nil {
+		return sc.overflow
+	}
+
+	return 0
+}
+
 // clientRefs is how many streams hold e, read under the table's lock.
 func clientRefs(table *clientTable, e *clientEntry) int {
 	table.mu.Lock()

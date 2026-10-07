@@ -573,41 +573,6 @@ func (t *clientTable) dropSecret(name string) {
 	delete(t.secrets, name)
 }
 
-// clients is how many addresses the named secret holds an entry for, the rest
-// entry not counted.
-func (t *clientTable) clients(name string) int {
-	if t == nil {
-		return 0
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if sc := t.secrets[name]; sc != nil {
-		return len(sc.entries)
-	}
-
-	return 0
-}
-
-// overflow is how many connections of the named secret were sent to its rest
-// entry because a cap left no room for their address. It only grows while the
-// secret exists.
-func (t *clientTable) overflow(name string) int64 {
-	if t == nil {
-		return 0
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if sc := t.secrets[name]; sc != nil {
-		return sc.overflow
-	}
-
-	return 0
-}
-
 // clientCounts is one secret's two numbers on /stats: the addresses it holds an
 // entry for, the rest entry not counted, and its overflow count.
 type clientCounts struct {

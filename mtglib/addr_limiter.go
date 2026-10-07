@@ -85,12 +85,6 @@ type addrLimiter struct {
 	clock addrClock
 }
 
-// newAddrLimiter makes an unlimited limiter on the given clock. The zero clock
-// is the real one.
-func newAddrLimiter(clock addrClock) *addrLimiter {
-	return &addrLimiter{clock: clock}
-}
-
 // install puts a new bucket in place, or none -- unlimited -- for a rate that
 // is not positive. It always makes a new object rather than changing the one
 // there: a wait in flight holds the old one and finishes on it, at the old

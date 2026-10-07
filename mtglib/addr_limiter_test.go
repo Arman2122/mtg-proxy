@@ -113,6 +113,13 @@ func (f *fakeAddrClock) elapsed() time.Duration {
 	return f.read().Sub(fakeAddrClockBase)
 }
 
+// newAddrLimiter makes an unlimited limiter on the given clock. The zero clock
+// is the real one. The table embeds its limiters by value and sets the clock
+// itself, so only the tests make one on its own.
+func newAddrLimiter(clock addrClock) *addrLimiter {
+	return &addrLimiter{clock: clock}
+}
+
 // installedLimiter is the rate.Limiter l holds, failing the test cleanly when
 // there is none instead of letting a nil dereference end the binary.
 func installedLimiter(t *testing.T, l *addrLimiter) *rate.Limiter {
