@@ -64,6 +64,19 @@ type streamContext struct {
 	addrKey     addressKey
 	addrCounted bool
 
+	// addrKeyed says whether the address stands for one place (clientKeyed):
+	// a keyed stream gets an entry of its own in the per-address table, any
+	// other joins its secret's rest entry. Set at admission with the two
+	// fields above, under liveMu, so a reload's backfill can read it there
+	// without resolving the address again.
+	addrKeyed bool
+
+	// addrEntry is the per-address table entry this stream is governed by, or
+	// nil when its secret needs none. Stored once admission has passed every
+	// step, or by a reload's backfill, both under liveMu, and given back by
+	// unregisterConn. Atomic because the data path reads it without a lock.
+	addrEntry atomic.Pointer[clientEntry]
+
 	// scanRes is what the FakeTLS door's scan was charged to the handshake
 	// budget, or nil when nothing was (a hinted match, the budget off, another
 	// door). ServeConn refunds it once admission has succeeded; every earlier

@@ -3,6 +3,7 @@ package mtglib
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -71,6 +72,26 @@ func (s *secretSet) effectiveAdTag(i int) *[AdTagLength]byte {
 	}
 
 	return s.globalAdTag
+}
+
+// limitsOf returns the named secret's limits, and false when the set does not
+// hold the name. Safe on a nil set, which holds nothing. names is sorted, so
+// this is a binary search and not a walk of every secret.
+func (s *secretSet) limitsOf(name string) (SecretLimits, bool) {
+	if s == nil {
+		return SecretLimits{}, false
+	}
+
+	i, found := slices.BinarySearch(s.names, name)
+	if !found {
+		return SecretLimits{}, false
+	}
+
+	if i < len(s.limits) {
+		return s.limits[i], true
+	}
+
+	return SecretLimits{}, true
 }
 
 // toConfig reconstructs a mutable SecretConfig from the immutable snapshot. It
@@ -273,10 +294,45 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	}
 
 	p.applyLimits(newSet)
+	p.dropRemovedClients(oldSet, newSet)
 	p.closeStaleConns(oldSet, newSet)
 	p.closeDeniedConns()
 
 	return nil
+}
+
+// dropRemovedClients forgets the per-address entries of every secret the swap
+// removed, rest entries included. A re-keyed secret keeps its name and so
+// keeps its entries: they are the same addresses.
+//
+// Under liveMu, so that it is one step against admission: a stream of the
+// removed secret that registers concurrently either took its entry before this
+// (and loses it here) or reads the new set after it (and takes none). The
+// removed secret's streams are closed straight after, and give back entries
+// the table no longer holds, which touches nothing.
+func (p *Proxy) dropRemovedClients(oldSet, newSet *secretSet) {
+	if p.clients == nil || oldSet == nil {
+		return
+	}
+
+	var removed []string
+
+	for _, name := range oldSet.names {
+		if _, kept := newSet.limitsOf(name); !kept {
+			removed = append(removed, name)
+		}
+	}
+
+	if len(removed) == 0 {
+		return
+	}
+
+	p.liveMu.Lock()
+	defer p.liveMu.Unlock()
+
+	for _, name := range removed {
+		p.clients.dropSecret(name)
+	}
 }
 
 // coverHosts lists the cover sites the set's ee secrets name, each once, in
@@ -322,6 +378,49 @@ func (p *Proxy) applyLimits(set *secretSet) {
 		p.stats.SetSpeedLimit(name, lim.SpeedBytesPerSecond)
 		p.stats.SetDirectionalSpeedLimits(name, lim.SpeedUpBytesPerSecond, lim.SpeedDownBytesPerSecond)
 		p.stats.SetQuotaCeiling(name, lim.QuotaBytes)
+	}
+
+	p.backfillClients(set)
+}
+
+// backfillClients gives every live stream that has no per-address entry, of
+// every secret in set that needs entries, the entry admission would have given
+// it: its address's own when it is keyed, the secret's rest entry when it is
+// not. A control a reload turned on must reach the connections already open --
+// they live for hours -- and an unkeyed stream left without the rest entry
+// would be exactly the ungoverned stream the rest entry exists to prevent.
+// A stream that already has an entry keeps it, so a reload that changes
+// nothing changes nothing here.
+//
+// Under liveMu, the same critical section admission takes its entry in, so a
+// stream is either admitted before this and backfilled by it, or admitted
+// after it from the set already swapped in.
+func (p *Proxy) backfillClients(set *secretSet) {
+	if p.clients == nil {
+		return
+	}
+
+	p.liveMu.Lock()
+	defer p.liveMu.Unlock()
+
+	for i, name := range set.names {
+		var lim SecretLimits
+
+		if i < len(set.limits) {
+			lim = set.limits[i]
+		}
+
+		if !p.clientEntriesWanted(lim) {
+			continue
+		}
+
+		for sc := range p.liveConns[name] {
+			if sc.addrEntry.Load() != nil {
+				continue
+			}
+
+			sc.addrEntry.Store(p.clients.acquire(name, sc.addrKey, sc.addrKeyed, lim.IPLimit, entryInitOf(lim)))
+		}
 	}
 }
 
@@ -454,19 +553,29 @@ const denySweepInterval = 5 * time.Second
 // on the clock rather than on an event: every sweepEvery, monthly quota
 // periods roll over and streams of users who are now denied are closed;
 // every flushEvery, the usage counters are written to usageStateFile if one
-// is configured.
+// is configured; every clientSweepInterval, the per-address table forgets the
+// addresses that have been gone long enough.
 //
 // It runs whether or not there is a usage file. The sweep is what makes an
 // expiry a deadline rather than a hint: without it, a user already connected
 // when their expiry passed stayed connected until something else swapped the
 // secret set.
 func (p *Proxy) startMaintenance(ctx context.Context, sweepEvery, flushEvery time.Duration) {
+	p.startMaintenanceEvery(ctx, sweepEvery, flushEvery, clientSweepInterval)
+}
+
+// startMaintenanceEvery is startMaintenance with the per-address sweep's
+// interval as well, so a test need not wait a minute for it.
+func (p *Proxy) startMaintenanceEvery(ctx context.Context, sweepEvery, flushEvery, clientsEvery time.Duration) {
 	go func() {
 		sweep := time.NewTicker(sweepEvery)
 		defer sweep.Stop()
 
 		flush := time.NewTicker(flushEvery)
 		defer flush.Stop()
+
+		clients := time.NewTicker(clientsEvery)
+		defer clients.Stop()
 
 		for {
 			select {
@@ -475,6 +584,8 @@ func (p *Proxy) startMaintenance(ctx context.Context, sweepEvery, flushEvery tim
 			case <-sweep.C:
 				p.rolloverAllQuotas()
 				p.closeDeniedConns()
+			case <-clients.C:
+				p.sweepClients()
 			case <-flush.C:
 				if p.usageStateFile == "" {
 					continue
@@ -486,4 +597,16 @@ func (p *Proxy) startMaintenance(ctx context.Context, sweepEvery, flushEvery tim
 			}
 		}
 	}()
+}
+
+// sweepClients is the maintenance loop's sweep of the per-address table, at
+// the table's own clock, in chunks of clientSweepChunk. It takes the table's
+// lock and never liveMu, so however many entries it walks, an admission waits
+// at most one chunk for it.
+func (p *Proxy) sweepClients() int {
+	if p.clients == nil {
+		return 0
+	}
+
+	return p.clients.sweep(p.clients.clock.read(), clientSweepChunk)
 }

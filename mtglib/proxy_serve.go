@@ -410,8 +410,13 @@ type registerStep uint8
 
 const (
 	// stepLedgerAdmitted is after the address ledger has counted the stream and
-	// before the stream is entered into the registry.
+	// before the per-address table is asked for its entry.
 	stepLedgerAdmitted registerStep = iota + 1
+
+	// stepEntryAcquired is after the per-address table has given the stream
+	// its entry, if its secret needs one, and before the stream is entered
+	// into the registry.
+	stepEntryAcquired
 )
 
 // registerStepHook runs at each registerStep, under liveMu, and a reason other
@@ -429,29 +434,38 @@ var registerStepHook = func(registerStep, *streamContext) DenyReason { return De
 // every stream.
 //
 // The steps run in a fixed order, and a refusal at any of them leaves the
-// ledger exactly as it was found. Today that is the address limit, then the
-// registration; the ban re-check and the per-address connection cap come
-// before the ledger (the cap reads the ledger's count BEFORE the admit, which
-// increments it), and the per-address table entry after it. A step that refuses
-// does so through refuse, which gives back what the steps before it took.
+// ledger, and the per-address table, exactly as it was found. Today that is
+// the address limit, then the per-address table entry, then the registration;
+// the ban re-check and the per-address connection cap come before the ledger
+// (the cap reads the ledger's count BEFORE the admit, which increments it). A
+// step that refuses does so through refuse, which gives back what the steps
+// before it took.
 //
 // A limit with no address to count against fails closed. The only way a TCP
 // listener yields no address is a PROXY header that declared a non-TCP
 // source, and admitting such a connection uncounted would make that header
 // the way around the limit.
 func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
-	key, hasKey := addressKeyOf(ctx.ClientIP())
+	ip := ctx.ClientIP()
+	key, hasKey := addressKeyOf(ip)
+	keyed := hasKey && clientKeyed(ip)
 	now := time.Now()
 
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
 
-	// counted is what the ledger holds for this stream so far. The stream itself
-	// is marked only once every step has passed, so a refusal never leaves it
-	// looking counted.
-	counted := false
+	// counted is what the ledger holds for this stream so far, and entry what
+	// the per-address table gave it. The stream itself is marked, and handed
+	// its entry, only once every step has passed, so a refusal never leaves it
+	// looking counted or governed.
+	var (
+		counted bool
+		entry   *clientEntry
+	)
 
 	refuse := func(reason DenyReason) DenyReason {
+		p.clients.release(entry)
+
 		if counted {
 			p.releaseAddressLocked(ctx.secretName, key, now)
 		} else {
@@ -478,6 +492,12 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 		return refuse(reason)
 	}
 
+	entry = p.acquireClientLocked(ctx.secretName, key, keyed)
+
+	if reason := registerStepHook(stepEntryAcquired, ctx); reason != DenyNone {
+		return refuse(reason)
+	}
+
 	conns := p.liveConns[ctx.secretName]
 	if conns == nil {
 		conns = make(map[*streamContext]struct{})
@@ -490,7 +510,43 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 		ctx.addrKey, ctx.addrCounted = key, true
 	}
 
+	ctx.addrKeyed = keyed
+
+	if entry != nil {
+		ctx.addrEntry.Store(entry)
+	}
+
 	return DenyNone
+}
+
+// clientEntriesWanted is decision 3 of the per-address design: a secret's
+// streams take entries in the per-address table only when the proxy keeps
+// client addresses (track-client-ips, which a panel always sets) or the secret
+// has a per-address control. Otherwise there is no entry, and the data path
+// reads a nil pointer. This is the one place that decides it, for admission and
+// for a reload's backfill alike.
+func (p *Proxy) clientEntriesWanted(lim SecretLimits) bool {
+	return p.trackClientIPs || lim.hasClientControl()
+}
+
+// acquireClientLocked takes the per-address entry a stream of the named secret
+// is governed by, or nil when there is no table or the secret needs none. The
+// limits are read from the secret set as it is now, under liveMu: a reload
+// swaps the set before it takes liveMu to re-rate and backfill, so an entry
+// made here is either made from the new set or reached by that reload. A
+// secret the set no longer has gets no entry; its stream is about to be
+// closed. Caller holds liveMu.
+func (p *Proxy) acquireClientLocked(name string, key addressKey, keyed bool) *clientEntry {
+	if p.clients == nil {
+		return nil
+	}
+
+	lim, ok := p.secrets.Load().limitsOf(name)
+	if !ok || !p.clientEntriesWanted(lim) {
+		return nil
+	}
+
+	return p.clients.acquire(name, key, keyed, lim.IPLimit, entryInitOf(lim))
 }
 
 // connectedIPs snapshots the distinct client addresses holding a live
@@ -513,11 +569,16 @@ func (p *Proxy) connectedIPs() map[string][]string {
 	return rv
 }
 
-// unregisterConn undoes tryRegisterConn: the stream leaves the registry and
-// its address is released from the ledger, in the same critical section.
+// unregisterConn undoes tryRegisterConn: the stream leaves the registry, its
+// address is released from the ledger and its per-address entry is given back,
+// in the same critical section. The entry stays in the table, for the address
+// to find again when it reconnects.
 func (p *Proxy) unregisterConn(ctx *streamContext) {
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
+
+	// Swapped out, so that a stream can never give its entry back twice.
+	p.clients.release(ctx.addrEntry.Swap(nil))
 
 	if ctx.addrCounted {
 		p.releaseAddressLocked(ctx.secretName, ctx.addrKey, time.Now())

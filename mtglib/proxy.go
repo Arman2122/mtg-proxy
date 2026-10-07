@@ -87,7 +87,16 @@ type Proxy struct {
 	// that the address-limit check and the registration of a stream are one
 	// critical section. Created on first use and dropped when it counts
 	// nothing, so an idle user costs no memory here.
-	addresses       map[string]*addressLedger
+	addresses map[string]*addressLedger
+
+	// clients is the per-address table: what each source address of a secret
+	// has moved and is allowed, kept past its connections (client_table.go).
+	// It has a lock of its own, taken after liveMu. nil is "off": NewProxy
+	// always builds one, and a Proxy{} literal in a test has none. An empty
+	// table costs nothing; a stream takes an entry only when its secret needs
+	// one (clientEntriesWanted).
+	clients *clientTable
+
 	network         Network
 	antiReplayCache AntiReplayCache
 	blocklist       IPBlocklist
@@ -234,6 +243,11 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	if opts.handshakeHints() {
 		proxy.hints = newMatchHints(ctx)
 	}
+
+	// The per-address table is always built: it is empty until a secret needs
+	// per-address entries, and applyLimits below must find it for a secret
+	// that already does. Its sweep runs from the maintenance loop.
+	proxy.clients = newClientTable(addrClock{})
 
 	// The scan budget is in real CPU, so it needs what a SHA-256 block costs
 	// here: measured once per process, by whichever proxy is built first, and

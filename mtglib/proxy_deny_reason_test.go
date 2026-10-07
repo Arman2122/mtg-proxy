@@ -400,10 +400,10 @@ func installRegisterStepHook(t *testing.T, hook func(registerStep, *streamContex
 	t.Cleanup(func() { registerStepHook = previous })
 }
 
-// The steps run in the stated order: the address ledger counts the stream before
-// the stream is entered into the registry, and nothing marks the stream counted
-// until every step has passed. The hook runs under liveMu, so it reads the
-// registry directly.
+// The steps run in the stated order: the address ledger counts the stream, then
+// the per-address table is asked for its entry, before the stream is entered
+// into the registry, and nothing marks the stream counted until every step has
+// passed. The hook runs under liveMu, so it reads the registry directly.
 func TestRegisterStepsRunInOrder(t *testing.T) { //nolint: paralleltest // swaps a package variable
 	probe := newDenyProbe(t)
 
@@ -433,7 +433,7 @@ func TestRegisterStepsRunInOrder(t *testing.T) { //nolint: paralleltest // swaps
 
 	require.Equal(t, DenyNone, probe.proxy.tryRegisterConn(sc))
 
-	assert.Equal(t, []registerStep{stepLedgerAdmitted}, calls)
+	assert.Equal(t, []registerStep{stepLedgerAdmitted, stepEntryAcquired}, calls)
 	assert.Equal(t, map[addressKey]int{"198.51.100.7": 1}, ledgerInHook, "the ledger has counted the stream by then")
 	assert.Zero(t, registeredNow, "and the registry has not")
 	assert.False(t, countedNow, "and the stream is not yet marked counted")

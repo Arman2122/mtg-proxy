@@ -53,6 +53,11 @@ const (
 	// client that reconnects after a stall, finds the bucket it left.
 	clientIdleRetention = 10 * time.Minute
 
+	// clientSweepInterval is how often the maintenance loop looks for idle
+	// entries. An entry is therefore forgotten between ten and eleven minutes
+	// after its address's last connection closed.
+	clientSweepInterval = time.Minute
+
 	// clientSweepChunk is the most entries the sweep looks at under one hold
 	// of the table's lock: a full table is walked in about thirty short holds
 	// rather than one long one.
@@ -75,6 +80,13 @@ type fairTotals struct {
 type entryInit struct {
 	CeilingRate int64
 	FairTotals  fairTotals
+}
+
+// entryInitOf is what a new entry of a secret with these limits starts from.
+// No per-address limit exists yet, so it is nothing, and every limiter of a new
+// entry is unlimited; client-speed and client-fair fill it in as they land.
+func entryInitOf(SecretLimits) entryInit {
+	return entryInit{}
 }
 
 // clientEntry is one address of one secret: an IPv4 address or an IPv6 /64,

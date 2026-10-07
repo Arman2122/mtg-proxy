@@ -94,6 +94,15 @@ func (l SecretLimits) IsZero() bool {
 		l.IPLimit == 0
 }
 
+// hasClientControl reports whether the limits carry a per-address control --
+// client-conns, client-speed or client-fair -- which needs the per-address
+// table to hold an entry for every address of the secret even when the proxy
+// does not track client addresses. None exists yet, so nothing does; each
+// control adds itself here as it lands.
+func (l SecretLimits) hasClientControl() bool {
+	return false
+}
+
 // DenyReason explains why a connection was refused by the per-user limits.
 type DenyReason int
 
