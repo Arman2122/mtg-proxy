@@ -15,8 +15,10 @@ import (
 // speedLimiter.wait reads the bucket's burst and then asks the bucket for that
 // many tokens, and a re-rate can lower the burst between the two. These tests
 // drive that window deterministically through beforeWaitN, the seam wait calls
-// between the two steps. They set a package variable, so none of them may run
-// in parallel, and each restores the seam when it ends.
+// between the two steps, and through afterWaitN, the one it calls after a
+// refusal and before it decides whether to ask again. They set package
+// variables, so none of them may run in parallel, and each restores the seams
+// when it ends.
 
 // waitSpinLimit is how often a test may reach the seam before it concludes that
 // wait is going round and round instead of returning. The seam then ends the
@@ -44,6 +46,31 @@ func installWaitSeam(t *testing.T, each func(call int)) *atomic.Int32 {
 	}
 
 	t.Cleanup(func() { beforeWaitN = previous })
+
+	return &calls
+}
+
+// installAfterWaitSeam is installWaitSeam for afterWaitN: each runs, with the
+// 1-based call number and the refusal, every time a WaitN failed, and the count
+// of those is returned. each may be nil.
+func installAfterWaitSeam(t *testing.T, each func(call int, err error)) *atomic.Int32 {
+	t.Helper()
+
+	var calls atomic.Int32
+
+	previous := afterWaitN
+	afterWaitN = func(err error) {
+		call := int(calls.Add(1))
+		if call > waitSpinLimit {
+			runtime.Goexit()
+		}
+
+		if each != nil {
+			each(call, err)
+		}
+	}
+
+	t.Cleanup(func() { afterWaitN = previous })
 
 	return &calls
 }
@@ -124,7 +151,7 @@ func TestWaitSurvivesABurstShrunkUnderIt(t *testing.T) {
 }
 
 // A context that is done ends the wait with an error, as it always did. Only a
-// burst that shrank is retried: treating every error as retryable would spin on
+// refusal under a live context is retried: retrying every error would spin on
 // a cancelled context forever.
 func TestWaitStillFailsWhenTheContextIsDone(t *testing.T) {
 	t.Run("a done context", func(t *testing.T) {
@@ -168,22 +195,25 @@ func TestWaitStillFailsWhenTheContextIsDone(t *testing.T) {
 	})
 }
 
-// An error that is not a shrunk burst is still the caller's: here the bucket
-// would need a second the context does not have. Retrying anything the rate
-// package refuses, rather than only the burst, would go round until the
-// deadline passed.
+// Under a context with a deadline a refusal can be the deadline's, not a burst
+// that shrank, and then it is still the caller's: here the bucket would need a
+// second the context does not have. Retrying it as if it were a burst would go
+// round until the backstop, or the deadline, ended it.
 func TestWaitReturnsAnErrorThatIsNotAShrunkBurst(t *testing.T) {
 	var s speedLimiter
 
 	s.set(MinSpeedBytesPerSecond)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	// Far longer than anything this test does before its second request, so the
+	// refusal is about the second the bucket needs and never about a deadline
+	// that a stalled runner let pass.
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer cancel()
 
 	calls := installWaitSeam(t, nil)
 
 	// Two bursts' worth. The first is in the bucket; the second is a second
-	// away, and the context ends in 100 ms.
+	// away, and the context ends in 500 ms.
 	returned, err := runWait(t, ctx, &s, 2*MinSpeedBytesPerSecond)
 
 	require.True(t, returned)
@@ -247,4 +277,234 @@ func TestWaitWithNoBurstReturnsInsteadOfSpinning(t *testing.T) {
 		require.True(t, returned, "wait spun on a bucket with no burst")
 		require.NoError(t, err)
 	})
+}
+
+// The burst can change twice under one wait: lowered inside WaitN's window, so
+// that it refuses the piece, and raised again before wait looks at the burst to
+// decide what the refusal was. A wait that decides by comparing the piece with
+// the burst it then sees finds the piece fits, takes the refusal for the
+// caller's and ends the stream. With no deadline on the context and the context
+// still live, the only thing WaitN can refuse is a burst, so there is nothing
+// to compare.
+func TestWaitSurvivesADoubleRerate(t *testing.T) {
+	const (
+		rateBytes    = 1_000_000
+		shrunkBytes  = 400_000
+		payloadBytes = 450_000
+	)
+
+	var s speedLimiter
+
+	s.set(rateBytes)
+
+	// Lowered before the request: it is refused for the burst, as it would be
+	// by a re-rate that landed inside WaitN.
+	installWaitSeam(t, func(call int) {
+		if call == 1 {
+			s.set(shrunkBytes)
+		}
+	})
+
+	// Raised again before wait decides: the piece now fits the burst it sees.
+	var refusal error
+
+	refusals := installAfterWaitSeam(t, func(call int, err error) {
+		if call == 1 {
+			refusal = err
+
+			s.set(rateBytes)
+		}
+	})
+
+	returned, err := runWait(t, t.Context(), &s, payloadBytes)
+
+	require.True(t, returned)
+	require.Error(t, refusal, "the first request must have been refused for the burst")
+	require.NoError(t, err, "a burst lowered and raised again under a wait must not end the stream")
+	assert.Equal(t, int32(1), refusals.Load(), "the piece was refused once, and asked for again")
+	assert.Equal(t, int64(rateBytes), s.bytesPerSecond())
+
+	// The retry paid for the bytes. The bucket was clamped to the lowered burst,
+	// 400,000, and 450,000 were charged against it, so what is left is only what
+	// has refilled since; a retry that charged nothing would leave 400,000.
+	tokens := s.limiter.Load().TokensAt(time.Now())
+	assert.Less(t, tokens, float64(300_000), "the retried piece must be charged to the bucket")
+}
+
+// A context with a deadline can refuse a request for a reason that is not the
+// burst: the bucket would need longer than the deadline allows. That refusal
+// is the caller's and is returned at once, from the very first request, not
+// asked for again until a backstop gives up. The context is still live when it
+// is refused; it is the reservation that does not fit in it.
+func TestWaitDeadlineRefusalIsStillReturned(t *testing.T) {
+	var s speedLimiter
+
+	s.set(MinSpeedBytesPerSecond)
+
+	// Empty the bucket, so that the next burst's worth is a second away.
+	require.NoError(t, s.wait(t.Context(), MinSpeedBytesPerSecond))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	requests := installWaitSeam(t, nil)
+	refusals := installAfterWaitSeam(t, nil)
+
+	returned, err := runWait(t, ctx, &s, MinSpeedBytesPerSecond)
+
+	require.True(t, returned)
+	require.Error(t, err)
+	require.NoError(t, ctx.Err(), "the deadline must not have passed: the refusal is about the reservation")
+	assert.Equal(t, int32(1), requests.Load(), "a refusal that is not a shrunk burst must not be asked for again")
+	assert.Equal(t, int32(1), refusals.Load())
+}
+
+// A wait that keeps being refused gives up. Here every request finds the burst
+// one byte lower than the piece it read, and the context is live and has no
+// deadline, so every refusal looks like a re-rate; nothing would end the wait
+// but the bound on how often it asks again.
+func TestWaitGivesUpAfterTheRetryBackstop(t *testing.T) {
+	var s speedLimiter
+
+	s.set(1000)
+
+	limiter := s.limiter.Load()
+
+	requests := installWaitSeam(t, func(int) {
+		limiter.SetBurst(limiter.Burst() - 1)
+	})
+	refusals := installAfterWaitSeam(t, nil)
+
+	returned, err := runWait(t, t.Context(), &s, 1000)
+
+	require.True(t, returned, "wait kept asking again for ever")
+	require.Error(t, err, "a wait refused over and over must end with the refusal")
+	assert.Equal(t, int32(maxWaitRetries+1), requests.Load(), "the first request and then every retry the backstop allows")
+	assert.Equal(t, int32(maxWaitRetries+1), refusals.Load())
+}
+
+// The time a wait is held to the cap is counted once for the whole wait, a
+// retry in the middle of it included. The retry here comes after the first
+// piece has slept for 100 ms, so a count that added the elapsed time again at
+// the retry would overshoot the wait itself, and one that began again at the
+// retry would lose the first piece's sleep.
+func TestWaitCountsTheThrottleOnceAcrossARetry(t *testing.T) {
+	var s speedLimiter
+
+	s.set(1_000_000)
+
+	limiter := s.limiter.Load()
+
+	// A rate ten times the burst: a full burst takes 100 ms, not a second.
+	limiter.SetLimit(rate.Limit(10_000_000))
+
+	// Empty the bucket, so the first piece has to sleep. Nothing was held for
+	// this, and nothing is counted for it.
+	require.NoError(t, s.wait(t.Context(), 1_000_000))
+	s.throttledNanos.Store(0)
+
+	// The second request is the one that finds the burst lowered: after the
+	// first piece's sleep, so after a good part of the whole wait.
+	installWaitSeam(t, func(call int) {
+		if call == 2 {
+			limiter.SetBurst(400_000)
+		}
+	})
+
+	started := time.Now()
+	returned, err := runWait(t, t.Context(), &s, 1_500_000)
+	elapsed := time.Since(started)
+
+	require.True(t, returned)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, elapsed, 120*time.Millisecond, "the bucket was empty: a full burst alone is 100 ms")
+
+	throttled := time.Duration(s.throttledNanos.Load())
+	assert.LessOrEqual(t, throttled, elapsed, "the time held must be counted once, not again at the retry")
+	assert.GreaterOrEqual(t, throttled, elapsed/2, "the first piece's sleep must still be in the count after the retry")
+}
+
+// A chunk is never more than it was asked for, because the callers slice a
+// buffer by it. clampChunk is the decision with the burst already read, so it
+// is tested without a bucket and without a race.
+func TestClampChunk(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		n, burst int
+		want     int
+	}{
+		{name: "fits in the burst", n: 100, burst: 1000, want: 100},
+		{name: "exactly the burst", n: 1000, burst: 1000, want: 1000},
+		{name: "more than the burst", n: 5000, burst: 1000, want: 1000},
+		{name: "a burst of one", n: 5000, burst: 1, want: 1},
+		{name: "nothing asked", n: 0, burst: 1000, want: 0},
+		{name: "no burst bounds nothing", n: 5000, burst: 0, want: 5000},
+		{name: "a negative burst bounds nothing", n: 5000, burst: -1, want: 5000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, tc.want, clampChunk(tc.n, tc.burst))
+		})
+	}
+
+	t.Run("never more than asked, never negative", func(t *testing.T) {
+		t.Parallel()
+
+		for _, n := range []int{0, 1, 2, 999, 1000, 1001, 1 << 20, maxSpeedBurst, maxSpeedBurst + 1} {
+			for _, burst := range []int{-1, 0, 1, 2, 999, 1000, 1001, 1 << 20, maxSpeedBurst} {
+				got := clampChunk(n, burst)
+
+				assert.GreaterOrEqual(t, got, 0, "n=%d burst=%d", n, burst)
+				assert.LessOrEqual(t, got, n, "n=%d burst=%d", n, burst)
+			}
+		}
+	})
+}
+
+// The same property through the bucket, while a re-rate keeps raising and
+// lowering the burst under it. chunk used to read the burst twice, once to
+// compare and once to return, and a burst raised between the two reads handed
+// back more than was asked for, which the relay then sliced its buffer by and
+// crashed the process. The window is nanoseconds wide, so this stress test is
+// a net, not a proof; TestClampChunk is the proof of the decision itself.
+func TestChunkNeverReturnsMoreThanItWasAsked(t *testing.T) {
+	const (
+		asked      = 5000
+		iterations = 1_000_000
+	)
+
+	var s speedLimiter
+
+	s.set(1000)
+
+	var stop atomic.Bool
+
+	rerated := make(chan struct{})
+
+	go func() {
+		defer close(rerated)
+
+		for !stop.Load() {
+			// Below what is asked, then far above it: the two reads of a burst
+			// that straddle the second are the ones that disagree.
+			s.set(1000)
+			s.set(1 << 20)
+		}
+	}()
+
+	defer func() {
+		stop.Store(true)
+		<-rerated
+	}()
+
+	for range iterations {
+		got := s.chunk(asked)
+
+		if got < 0 || got > asked {
+			t.Fatalf("chunk(%d) returned %d: more than it was asked for, or negative", asked, got)
+		}
+	}
 }

@@ -62,10 +62,11 @@ func (s *speedLimiter) set(bytesPerSecond int64) {
 
 // chunk bounds one read or write to what the bucket can ever grant at once.
 // Unlimited passes n through untouched, so the unthrottled path is one load
-// and one comparison.
+// and one comparison. The burst is read once: the callers slice a buffer by what
+// this returns, and a re-rate between two reads could hand back more than n.
 func (s *speedLimiter) chunk(n int) int {
-	if current := s.limiter.Load(); current != nil && n > current.Burst() {
-		return current.Burst()
+	if current := s.limiter.Load(); current != nil {
+		return clampChunk(n, current.Burst())
 	}
 
 	return n
@@ -77,6 +78,32 @@ func (s *speedLimiter) chunk(n int) int {
 // in exactly that window. A variable so it can be replaced; a test that does
 // must restore it and must not run in parallel.
 var beforeWaitN = func() {}
+
+// afterWaitN runs right after a WaitN that failed, before wait decides whether
+// to ask again. A no-op, for the same reason and under the same rules as
+// beforeWaitN: a test uses it to re-rate the bucket a second time, in the
+// window between the refusal and the decision.
+var afterWaitN = func(error) {}
+
+// maxWaitRetries is how many times one wait asks again after a refusal. A
+// re-rate that lowers the burst under a piece costs one retry, and it takes a
+// re-rate in the microseconds of every attempt to cost sixteen, so the bound
+// only ever ends a wait that cannot be explained by re-rating: a backstop
+// against a loop, not a limit anyone should meet.
+const maxWaitRetries = 16
+
+// clampChunk is chunk's decision, apart from the bucket it reads: n, or the
+// burst when n is more than the burst. The burst is a parameter, read once by
+// the caller, because two reads of a burst that a re-rate can change between
+// them can disagree and hand back more than n. A burst of nothing bounds
+// nothing; wait is what says so.
+func clampChunk(n, burst int) int {
+	if burst > 0 && n > burst {
+		return burst
+	}
+
+	return n
+}
 
 // wait charges n bytes to the bucket, blocking until they are covered. The
 // context ends the wait: the proxy shutting down must not leave a connection
@@ -99,6 +126,14 @@ func (s *speedLimiter) wait(ctx context.Context, n int) error {
 	started := time.Now()
 	defer func() { s.throttledNanos.Add(int64(time.Since(started))) }()
 
+	// WaitN refuses a request for one of three reasons: it is above the burst,
+	// the context is done, or the context has a deadline that the reservation
+	// would pass. A context with no deadline has only the first two, so while it
+	// is live every refusal is a burst, and the burst is not read again to find
+	// out: a second re-rate can have put it back.
+	_, deadlined := ctx.Deadline()
+	retries := 0
+
 	for n > 0 {
 		burst := current.Burst()
 		if burst <= 0 {
@@ -119,13 +154,18 @@ func (s *speedLimiter) wait(ctx context.Context, n int) error {
 			continue
 		}
 
-		// A burst that shrank under this piece is the one error that is not the
+		afterWaitN(err)
+
+		// A burst that shrank under this piece is the one refusal that is not the
 		// caller's: the piece is too big for the bucket as it is now, so ask again
-		// from the burst as it is now. It is told apart by the burst itself and
-		// never by the error's text -- the rate package words this refusal two
-		// ways -- and a done context is always the caller's. Each retry needs the
-		// burst to be lower than what it read, so a retry loop does not spin.
-		if ctx.Err() == nil && piece > current.Burst() {
+		// from the burst as it is now. It is told apart by the context and never
+		// by the error's text -- the rate package words this refusal two ways --
+		// and a done context is always the caller's. Under a deadline the refusal
+		// may be the deadline's, so the burst is compared as a last resort there.
+		// The retries are bounded, so that nothing makes this loop spin.
+		if ctx.Err() == nil && retries < maxWaitRetries && (!deadlined || piece > current.Burst()) {
+			retries++
+
 			continue
 		}
 
