@@ -310,24 +310,27 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	}
 
 	p.applyLimits(newSet)
-	p.dropRemovedClients(oldSet, newSet)
+	p.dropRemovedSecrets(oldSet, newSet)
 	p.closeStaleConns(oldSet, newSet)
 	p.closeDeniedConns()
 
 	return nil
 }
 
-// dropRemovedClients forgets the per-address entries of every secret the swap
-// removed, rest entries included. A re-keyed secret keeps its name and so
-// keeps its entries: they are the same addresses.
+// dropRemovedSecrets forgets what the proxy holds per address for every secret
+// the swap removed: its per-address entries, rest entries included, and its
+// bans. A re-keyed secret keeps its name and so keeps both: they are the same
+// addresses, and the same user.
 //
-// Under liveMu, so that it is one step against admission: a stream of the
-// removed secret that registers concurrently either took its entry before this
-// (and loses it here) or reads the new set after it (and takes none). The
-// removed secret's streams are closed straight after, and give back entries
-// the table no longer holds, which touches nothing.
-func (p *Proxy) dropRemovedClients(oldSet, newSet *secretSet) {
-	if p.clients == nil || oldSet == nil {
+// Under liveMu, so that it is one step against admission and against a ban: a
+// stream of the removed secret that registers concurrently either took its
+// entry before this (and loses it here) or reads the new set after it (and
+// takes none), and a ban recorded concurrently either came first (and is
+// dropped here) or found the secret gone. The removed secret's streams are
+// closed straight after, and give back entries the table no longer holds,
+// which touches nothing.
+func (p *Proxy) dropRemovedSecrets(oldSet, newSet *secretSet) {
+	if oldSet == nil {
 		return
 	}
 
@@ -348,6 +351,7 @@ func (p *Proxy) dropRemovedClients(oldSet, newSet *secretSet) {
 
 	for _, name := range removed {
 		p.clients.dropSecret(name)
+		p.bans.dropSecret(name)
 	}
 }
 

@@ -76,7 +76,8 @@ type ClientUsageJSON struct {
 //
 // The /64 form ("2001:db8::/64") is how the list spells the unit, not
 // something kick reads back: kick takes an address, and any address inside the
-// /64 -- its prefix without the "/64", say -- ends every stream of it.
+// /64 -- its prefix without the "/64", say -- ends every stream of it. The bans
+// routes take the /64 form as it is, as well as any address inside it.
 type ClientJSON struct {
 	Address string `json:"address"`
 
@@ -187,12 +188,20 @@ func (p *Proxy) clientsReport(name string, limit int) ClientsReport {
 		Clients:  make([]ClientJSON, len(rows)),
 	}
 
-	// BannedUntil is left for the ban list to fill, row by row, once there is
-	// one; nothing bans an address yet.
+	// The bans are read here, after liveMu was let go, under the ban list's
+	// own lock alone and in one hold of it; they are not the ledger's counts,
+	// and need not be of the same moment.
+	bans := p.bans.untilOf(name)
+
 	for i, row := range rows {
 		report.Clients[i] = ClientJSON{
 			Address:         string(row.entry.key),
 			ClientUsageJSON: clientUsageOf(row.entry, row.connections, row.bytesIn, row.bytesOut),
+		}
+
+		if until, banned := bans[row.entry.key]; banned {
+			until = until.UTC()
+			report.Clients[i].BannedUntil = &until
 		}
 	}
 

@@ -402,6 +402,9 @@ func (p *Proxy) buildAPIHandler(token string) http.Handler {
 	mux.HandleFunc("POST /secrets/{name}/reset-quota", p.handleResetQuota)
 	mux.HandleFunc("POST /secrets/{name}/kick", p.handleKick)
 	mux.HandleFunc("GET /secrets/{name}/clients", p.handleGetClients)
+	mux.HandleFunc("POST /secrets/{name}/bans", p.handleBan)
+	mux.HandleFunc("GET /secrets/{name}/bans", p.handleGetBans)
+	mux.HandleFunc("DELETE /secrets/{name}/bans/{address...}", p.handleUnban)
 	mux.HandleFunc("GET /secrets/{name}/external-ips", p.handleGetExternalIPs)
 	mux.HandleFunc("PUT /secrets/{name}/external-ips", p.handlePutExternalIPs)
 	mux.HandleFunc("DELETE /secrets/{name}/external-ips", p.handleDeleteExternalIPs)
@@ -969,13 +972,14 @@ func (p *Proxy) handleDeleteAdTag(w http.ResponseWriter, _ *http.Request) {
 var statusOK = map[string]string{"status": "ok"}
 
 // secretMutationStatus maps a mutation error to an HTTP status: 404 for an
-// unknown secret, 409 when a delete would empty the set, and 400 for every
-// validation failure (invalid secret, invalid/oversized adtag, empty set).
+// unknown secret, 409 when a delete would empty the set or a ban would take the
+// ban list past its bound, and 400 for every validation failure (invalid
+// secret, invalid/oversized adtag, empty set).
 func secretMutationStatus(err error) int {
 	switch {
 	case errors.Is(err, ErrSecretNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, ErrLastSecret):
+	case errors.Is(err, ErrLastSecret), errors.Is(err, ErrBanListFull):
 		return http.StatusConflict
 	default:
 		return http.StatusBadRequest

@@ -97,6 +97,11 @@ type Proxy struct {
 	// one (clientEntriesWanted).
 	clients *clientTable
 
+	// bans are the places an operator has refused a secret to, until each
+	// lapses (proxy_bans.go). Memory only. Its lock is inner to liveMu. The zero
+	// value is an empty list, so a Proxy{} literal in a test bans nobody.
+	bans banList
+
 	network         Network
 	antiReplayCache AntiReplayCache
 	blocklist       IPBlocklist

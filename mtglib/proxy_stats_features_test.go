@@ -91,6 +91,11 @@ func TestStatsFeatures(t *testing.T) {
 			doAPI(t, p, "", http.MethodPost, "/secrets/alice/kick", `{"ips":["203.0.113.9"]}`).Code)
 		assert.Equal(t, http.StatusOK,
 			doAPI(t, p, "", http.MethodGet, "/secrets/alice/clients?limit=10", "").Code)
+		assert.Equal(t, http.StatusOK,
+			doAPI(t, p, "", http.MethodPost, "/secrets/alice/bans", `{"ips":["203.0.113.9"],"ttl":"1h"}`).Code)
+		assert.Equal(t, http.StatusOK, doAPI(t, p, "", http.MethodGet, "/secrets/alice/bans", "").Code)
+		assert.Equal(t, http.StatusOK,
+			doAPI(t, p, "", http.MethodDelete, "/secrets/alice/bans/203.0.113.9", "").Code)
 
 		// client-limits adds no route; what it advertises is a field the strict
 		// decoder accepts.
