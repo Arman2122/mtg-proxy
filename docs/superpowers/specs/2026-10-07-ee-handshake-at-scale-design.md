@@ -129,8 +129,14 @@ names of up to 16 secrets that recently matched from it, most recent first.
 ## 3. The budget
 
 **Units and calibration.** Cost is in SHA-256 blocks. The first proxy a process
-builds measures `ns/block` on this machine (the minimum of three short runs of
-about 4 ms, clamped to 10 ns to 2 µs) and every later one reuses it (a
+builds measures `ns/block` on this machine **on the primitive the budget charges**:
+an HMAC-SHA-256 over a 517-byte buffer, counted as the 12 blocks `Blocks()` gives
+for such a hello (not bulk hashing, which reads 1.3 to 2.6× low because it skips
+the per-candidate overhead: about 13 ns/block bulk against about 34 ns/block for a
+real verify on a SHA-NI machine; the bench box is about 340 ns/block). The reading
+is the minimum of three short runs of about 4 ms, clamped to 10 ns to 2 µs; it is
+of the plain path, so a pad path only makes the real cost lower: conservative,
+never loose. Every later proxy reuses it (a
 package-level `sync.Once`: the test suite builds hundreds of proxies); tests inject
 the constant. `GOMAXPROCS` is read once at start. The calibrated value is logged at
 start and reported as `ns_per_block` in `/stats`, so an operator can see what the
