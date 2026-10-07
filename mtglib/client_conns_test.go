@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -311,6 +312,86 @@ func TestClientConnsHoldsWhenTheTableIsFull(t *testing.T) {
 	assert.Equal(t, map[addressKey]int{"203.0.113.50": 1}, probe.ledgerCounts())
 }
 
+// Decision 2 in the one case where the ledger and the table disagree about an
+// address: its streams were opened before a reload set the cap, and the
+// reload's backfill found the table full, so they hold the rest entry and the
+// address has no entry of its own. A cap counted from the table would read
+// nothing here; the ledger counts them.
+func TestClientConnsCountsStreamsTheTableHasNoRoomFor(t *testing.T) {
+	t.Parallel()
+
+	probe := newClientTableProbe(t, false)
+	p := probe.proxy
+
+	fillClients(t, p.clients, "alice", maxClientsPerSecret)
+
+	first := capStream(t, probe, tcpFrom("203.0.113.60", 50001), 0)
+	second := capStream(t, probe, tcpFrom("203.0.113.60", 50002), 0)
+
+	require.Equal(t, DenyNone, p.tryRegisterConn(first))
+	require.Equal(t, DenyNone, p.tryRegisterConn(second))
+	require.Nil(t, first.addrEntry.Load(), "no control and no tracking: no entry yet")
+
+	cfg := p.secrets.Load().toConfig()
+	cfg.Limits = map[string]SecretLimits{"alice": {ClientConns: 2}}
+
+	require.NoError(t, p.ReplaceSecrets(cfg))
+
+	rest := first.addrEntry.Load()
+	require.NotNil(t, rest)
+	require.True(t, rest.rest, "the backfill found the table full")
+	require.Same(t, rest, second.addrEntry.Load())
+
+	third := capStream(t, probe, tcpFrom("203.0.113.60", 50003), 2)
+
+	assert.Equal(t, DenyClientConns, p.tryRegisterConn(third),
+		"two streams opened before the cap, with no entry of their own, still count")
+	assert.Equal(t, map[addressKey]int{"203.0.113.60": 2}, probe.ledgerCounts())
+}
+
+// The full table through the real door, on every door: with the secret's part
+// of the table full before anyone dials, a new place is admitted to the rest
+// entry and is still held to the cap, the refusal is not an overflow, and once
+// every stream has ended the ledger is empty -- the refused attempts left
+// nothing in it.
+func TestClientConnsHoldsAtTheDoorWithAFullTable(t *testing.T) {
+	t.Parallel()
+
+	for _, ec := range govEntryCases() {
+		t.Run(ec.name, func(t *testing.T) {
+			t.Parallel()
+
+			secret := ec.secret(t)
+			h := ec.harness(t, map[string]Secret{"alice": secret}, map[string]SecretLimits{"alice": {ClientConns: 1}})
+			table := h.proxy.clients
+
+			fillClients(t, table, "alice", maxClientsPerSecret)
+
+			held, heldDone := dialProxyFrom(t, h, ec.policy, tcpFrom("203.0.113.70", 50001))
+			heldUp := connectThrough(t, ec, h, held, "alice", secret.Key)
+
+			rest := liveStreamAt(t, h.proxy, "alice", "203.0.113.70").addrEntry.Load()
+			require.NotNil(t, rest)
+			require.True(t, rest.rest, "a full table sends a new place to the rest entry")
+			require.EqualValues(t, 1, table.overflow("alice"))
+
+			refuseAfterHandshake(t, ec, h, secret.Key, tcpFrom("203.0.113.70", 50002))
+			refuseAfterHandshake(t, ec, h, secret.Key, tcpFrom("203.0.113.70", 50003))
+
+			assert.EqualValues(t, 2, h.proxy.stats.users["alice"].clientConnsRefused.Load(),
+				"the cap holds with no entry to count on")
+			assert.EqualValues(t, 1, table.overflow("alice"), "a refused connection is not an overflow")
+			assert.Equal(t, 1, clientRefs(table, rest))
+			assert.Equal(t, map[addressKey]int{"203.0.113.70": 1}, ledgerCountsOf(h.proxy, "alice"))
+
+			endStream(held, heldUp, heldDone)
+
+			assert.Nil(t, ledgerCountsOf(h.proxy, "alice"), "refused attempts leave the ledger empty")
+			assert.Zero(t, liveStreamsOf(h.proxy, "alice"))
+		})
+	}
+}
+
 // Review Focus 3 and the order of admission: the cap is read before the ledger
 // admits the stream and before the table gives it an entry. A refused
 // connection reaches neither step, so it takes nothing from the ledger and no
@@ -521,6 +602,18 @@ func TestTheSetKnowsWhetherAnySecretHasAClientControl(t *testing.T) {
 		map[string]SecretLimits{"alice": {IPLimit: 2}, "bob": {ClientConns: 3}}).anyClientControl(),
 		"one secret of several is enough")
 
+	// An OR over every secret, not the answer of the last one looked at: the
+	// controlled secret sorts first, and the ones after it have limits of
+	// their own that carry no control.
+	assert.True(t, buildSecretSet(secrets, nil, nil,
+		map[string]SecretLimits{"alice": {ClientConns: 3}, "bob": {IPLimit: 2}}).anyClientControl(),
+		"a control on the first secret is not undone by a later one without")
+	assert.True(t, buildSecretSet(secrets, nil, nil, map[string]SecretLimits{
+		"alice": {ClientConns: 3},
+		"bob":   {IPLimit: 2},
+		"carol": {SpeedBytesPerSecond: 1 << 20},
+	}).anyClientControl(), "nor by the last of three")
+
 	var none *secretSet
 
 	assert.False(t, none.anyClientControl())
@@ -547,35 +640,144 @@ func nonZeroLimitField(t *testing.T, lim *SecretLimits, i int) {
 	}
 }
 
+// limitsNotReadBack lists the SecretLimits fields that GET /secrets/{name} and
+// the /stats user object legitimately do not read back, each with the reason.
+// Empty: every limit is read back today. A field added to SecretLimits is read
+// back on both, or is listed here with a reason -- it cannot skip silently.
+var limitsNotReadBack = map[string]string{}
+
+// readBackOf is alice's limits as the API reads them back: her GET
+// /secrets/{name} object and her user object on /stats, decoded loosely so
+// that any field moving shows.
+func readBackOf(t *testing.T, p *Proxy) (map[string]any, map[string]any) {
+	t.Helper()
+
+	secret := map[string]any{}
+	require.NoError(t, json.Unmarshal(doAPI(t, p, "", http.MethodGet, "/secrets/alice", "").Body.Bytes(), &secret))
+
+	users, ok := statsRaw(t, doAPI(t, p, "", http.MethodGet, "/stats", "").Body.Bytes())["users"].(map[string]any)
+	require.True(t, ok)
+
+	user, ok := users["alice"].(map[string]any)
+	require.True(t, ok)
+
+	return secret, user
+}
+
 // Every field of SecretLimits is a limit: set any one of them alone and the
-// limits are not zero, and they survive the copy every API mutation starts from.
-// IsZero decides whether a secret's limits are kept at all -- by the config, by
-// PUT and POST /secrets, by PutSecret and by toConfig -- so a field it forgets
-// is silently dropped by each of them. Walked by reflection, so a field added
-// later is covered without anyone remembering to add it here.
+// limits are not zero, they survive the copy every API mutation starts from,
+// and they are read back. IsZero decides whether a secret's limits are kept at
+// all -- by the config, by PUT and POST /secrets, by PutSecret and by toConfig
+// -- so a field it forgets is silently dropped by each of them; and a limit the
+// read-backs (fillLimitInfo, the handleStats overlay) forget is enforced but
+// invisible. Walked by reflection, so a field added later is covered without
+// anyone remembering to add it here.
 func TestEveryLimitFieldIsALimit(t *testing.T) {
 	t.Parallel()
 
 	typ := reflect.TypeFor[SecretLimits]()
 	require.Positive(t, typ.NumField())
 
+	for name := range limitsNotReadBack {
+		_, ok := typ.FieldByName(name)
+		require.True(t, ok, "limitsNotReadBack names %s, which SecretLimits does not have", name)
+	}
+
 	for i := range typ.NumField() {
-		t.Run(typ.Field(i).Name, func(t *testing.T) {
+		name := typ.Field(i).Name
+
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			var lim SecretLimits
 
 			nonZeroLimitField(t, &lim, i)
 
-			assert.False(t, lim.IsZero(), "a limit with only %s set is still a limit", typ.Field(i).Name)
+			assert.False(t, lim.IsZero(), "a limit with only %s set is still a limit", name)
 
-			set := buildSecretSet(map[string]Secret{"alice": GenerateSecret("alice.example.com")},
-				nil, nil, map[string]SecretLimits{"alice": lim})
+			alice := GenerateSecret("alice.example.com")
+			set := buildSecretSet(map[string]Secret{"alice": alice}, nil, nil, map[string]SecretLimits{"alice": lim})
 
 			kept, ok := set.toConfig().Limits["alice"]
-			require.True(t, ok, "toConfig keeps a secret whose only limit is %s", typ.Field(i).Name)
+			require.True(t, ok, "toConfig keeps a secret whose only limit is %s", name)
 			assert.Equal(t, lim, kept)
+
+			if reason, exempt := limitsNotReadBack[name]; exempt {
+				t.Logf("%s is not read back: %s", name, reason)
+
+				return
+			}
+
+			p := newAPITestProxy(map[string]Secret{"alice": alice})
+			secretBefore, userBefore := readBackOf(t, p)
+
+			p.secrets.Store(set)
+
+			secretAfter, userAfter := readBackOf(t, p)
+
+			assert.NotEqual(t, secretBefore, secretAfter, "GET /secrets/{name} reads %s back", name)
+			assert.NotEqual(t, userBefore, userAfter, "the /stats user object reads %s back", name)
 		})
+	}
+}
+
+// limitFieldSamples is a valid value for each string field of the secrets API's
+// limit fields, by JSON name. Booleans are sent as true and numbers as 1; a
+// string field with no sample here fails the test below rather than skipping.
+var limitFieldSamples = map[string]string{
+	"quota":       `"1000"`,
+	"quota_reset": `"monthly"`,
+	"expires":     `"2030-01-01"`,
+	"speed":       `"1mbit"`,
+	"speed_up":    `"1mbit"`,
+	"speed_down":  `"1mbit"`,
+}
+
+// Every SecretLimits field can be set through the secrets API: each API field,
+// sent alone, parses into a limit, and between them they reach every field of
+// SecretLimits. A field added to SecretLimits without its API field and its
+// line in parse fails here.
+func TestEveryLimitFieldTravelsTheAPI(t *testing.T) {
+	t.Parallel()
+
+	reached := map[string]bool{}
+	fields := reflect.TypeFor[limitFields]()
+
+	for i := range fields.NumField() {
+		field := fields.Field(i)
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+
+		value, ok := limitFieldSamples[name]
+
+		switch {
+		case ok:
+		case field.Type.Kind() == reflect.Bool:
+			value = "true"
+		case field.Type.Kind() == reflect.Int:
+			value = "1"
+		default:
+			t.Fatalf("limit field %s is a %s with no sample in limitFieldSamples", name, field.Type)
+		}
+
+		var sent limitFields
+
+		require.NoError(t, json.Unmarshal([]byte(`{"`+name+`":`+value+`}`), &sent), name)
+
+		lim, err := sent.parse()
+		require.NoError(t, err, name)
+		require.False(t, lim.IsZero(), "%s alone parses into a limit", name)
+
+		parsed := reflect.ValueOf(lim)
+		for j := range parsed.NumField() {
+			if !parsed.Field(j).IsZero() {
+				reached[parsed.Type().Field(j).Name] = true
+			}
+		}
+	}
+
+	for i := range reflect.TypeFor[SecretLimits]().NumField() {
+		name := reflect.TypeFor[SecretLimits]().Field(i).Name
+		assert.True(t, reached[name], "no API field sets SecretLimits.%s", name)
 	}
 }
 

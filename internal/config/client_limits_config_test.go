@@ -3,7 +3,9 @@ package config_test
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/Arman2122/mtg-proxy/internal/config"
@@ -83,6 +85,60 @@ func TestSecretLimitClientConns(t *testing.T) {
 		_, err := config.Parse([]byte(clientLimitsConfig(t, `client-conns = "4"`)))
 		require.Error(t, err)
 	})
+}
+
+// secretLimitSamples is one valid [secret-limits.<name>] line per field of
+// ConfigSecretLimit, by the field's JSON name. A field with no line here fails
+// the test below rather than skipping.
+var secretLimitSamples = map[string]string{
+	"quota":       `quota = "1MB"`,
+	"quotaReset":  `quota-reset = "monthly"`,
+	"expires":     `expires = "2030-01-01"`,
+	"disabled":    `disabled = true`,
+	"speed":       `speed = "1mbit"`,
+	"speedUp":     `speed-up = "1mbit"`,
+	"speedDown":   `speed-down = "1mbit"`,
+	"ipLimit":     `ip-limit = 2`,
+	"clientConns": `client-conns = 3`,
+}
+
+// Every engine-level limit can be written in the config file: each field of
+// [secret-limits.<name>], written alone, is a key this binary knows and reaches
+// the engine as a limit, and between them they reach every field of
+// mtglib.SecretLimits. A field added to SecretLimits without its key, its TOML
+// mirror or its line in GetSecretLimits fails here.
+func TestEveryLimitFieldHasAConfigKey(t *testing.T) {
+	t.Parallel()
+
+	reached := map[string]bool{}
+	fields := reflect.TypeFor[config.ConfigSecretLimit]()
+
+	for i := range fields.NumField() {
+		name, _, _ := strings.Cut(fields.Field(i).Tag.Get("json"), ",")
+
+		line, ok := secretLimitSamples[name]
+		require.True(t, ok, "ConfigSecretLimit.%s has no sample line in secretLimitSamples", fields.Field(i).Name)
+
+		conf, err := config.Parse([]byte(clientLimitsConfig(t, line)))
+		require.NoError(t, err, line)
+		require.NoError(t, conf.Validate(), line)
+		require.Empty(t, conf.UnknownKeys, line)
+
+		lim, ok := conf.GetSecretLimits()["alice"]
+		require.True(t, ok, "%s alone reaches the engine as a limit", line)
+
+		engine := reflect.ValueOf(lim)
+		for j := range engine.NumField() {
+			if !engine.Field(j).IsZero() {
+				reached[engine.Type().Field(j).Name] = true
+			}
+		}
+	}
+
+	for i := range reflect.TypeFor[mtglib.SecretLimits]().NumField() {
+		name := reflect.TypeFor[mtglib.SecretLimits]().Field(i).Name
+		assert.True(t, reached[name], "no [secret-limits] key sets SecretLimits.%s", name)
+	}
 }
 
 // Config.String() is what a debug log prints. A [secret-limits] table that
