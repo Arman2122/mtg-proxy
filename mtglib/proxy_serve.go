@@ -175,10 +175,19 @@ func (p *Proxy) doEntry(ctx *streamContext, policy ListenerPolicy) bool {
 // throttling and revocation-by-hot-reload all key on the name it sets.
 //
 // It returns why it refused, or DenyNone when the stream may go on. Both doors
-// refuse every reason the same way today; they are handed the reason so a rule
-// can treat one differently without attribute knowing about doors -- a ban is
-// to be charged to the obfuscated door's failure limiter, which needs the
-// listener policy only that door has.
+// turn every reason away as they turn away a secret that matched nothing --
+// fronted on FakeTLS before the server's flight, disposed of silently on the
+// obfuscated door -- and they are handed the reason so a rule can treat one
+// differently without attribute knowing about doors: a ban is charged to the
+// obfuscated door's failure limiter, which needs the listener policy only that
+// door has.
+//
+// A ban is checked here, after the user's own limits, against the place the
+// connection comes from, and checked again when the stream registers (see
+// tryRegisterConn): this check reads the ban list without liveMu, so a ban
+// recorded a moment later is the re-check's to find. Any place with an address
+// can be banned, whether or not it stands for one place: an unkeyed address is
+// banned only by an operator who said force, and then it is to be refused.
 func (p *Proxy) attribute(ctx *streamContext, set *secretSet, i int) DenyReason {
 	ctx.matchedSecretKey = set.secrets[i].Key[:]
 	ctx.secretName = set.names[i]
@@ -188,6 +197,10 @@ func (p *Proxy) attribute(ctx *streamContext, set *secretSet, i int) DenyReason 
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName)
 
 	allowed, reason := p.checkLimits(ctx.secretName, set.limits[i])
+	if allowed && p.bannedFrom(ctx.secretName, ctx.ClientIP()) {
+		allowed, reason = false, DenyBanned
+	}
+
 	if allowed {
 		return DenyNone
 	}
@@ -235,6 +248,14 @@ func (p *Proxy) admit(ctx *streamContext) bool {
 	return true
 }
 
+// bannedFrom says whether the place ip is at is banned from the named secret.
+// A connection with no address is at no place and cannot be.
+func (p *Proxy) bannedFrom(name string, ip net.IP) bool {
+	key, ok := addressKeyOf(ip)
+
+	return ok && p.bans.banned(name, key)
+}
+
 // countAdmissionRefusal is the accounting of a connection tryRegisterConn
 // refused, one rule per reason. The address limit keeps its counter and its
 // event. The connection cap has a counter of its own and no event: a new event
@@ -254,7 +275,8 @@ func (p *Proxy) countAdmissionRefusal(ctx *streamContext, reason DenyReason) {
 		p.eventStream.Send(ctx, NewEventIPLimited(ctx.streamID, ctx.secretName))
 	case DenyClientConns:
 		p.stats.OnClientConnsRefused(ctx.secretName)
-	default: // a ban, or a reason nothing produces yet: logged above, not counted
+	case DenyBanned: // the operator's own decision: logged above, not counted
+	default: // a reason nothing produces yet: logged above, not counted
 	}
 }
 
@@ -445,12 +467,21 @@ var registerStepHook = func(registerStep, *streamContext) DenyReason { return De
 // every stream.
 //
 // The steps run in a fixed order, and a refusal at any of them leaves the
-// ledger, and the per-address table, exactly as it was found: the per-address
-// connection cap, then the address limit (the ledger's admit), then the
-// per-address table entry, then the registration. The ban re-check is to go
-// first of all. Every refusal comes before the table is asked for an entry, so
-// a refused address never holds one, and a step that refuses does so through
-// refuse, which gives back what the steps before it took.
+// ledger, and the per-address table, exactly as it was found: the ban
+// re-check, then the per-address connection cap, then the address limit (the
+// ledger's admit), then the per-address table entry, then the registration.
+// Every refusal comes before the table is asked for an entry, so a refused
+// address never holds one, and a step that refuses does so through refuse,
+// which gives back what the steps before it took.
+//
+// The ban re-check is first because it is the one that closes a race:
+// attribute checked the ban without liveMu, and a ban is recorded, and the
+// streams it ends are found, under liveMu. A stream that passed attribute
+// before a ban was recorded is either registered before the ban takes the lock,
+// and closed by it, or meets the ban here. On the FakeTLS door the server's
+// flight has gone out by now, so a refusal here is a close after the
+// handshake, as an address-limit refusal is; it takes a ban recorded in the
+// moments between the two checks.
 //
 // The cap reads the ledger's count of the address's live connections, which
 // the ledger keeps for every stream whatever else is configured, so it counts
@@ -493,6 +524,10 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 		}
 
 		return reason
+	}
+
+	if hasKey && p.bans.banned(ctx.secretName, key) {
+		return refuse(DenyBanned)
 	}
 
 	if keyed && ctx.clientConns > 0 && p.addresses[ctx.secretName].live(key) >= ctx.clientConns {

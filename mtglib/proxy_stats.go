@@ -499,6 +499,15 @@ func computeFairCaps(userConns map[string]int64, limit int64) map[string]int64 {
 // the capability actually exists in the binary — advertising an absent one
 // defeats the point of the array.
 const (
+	// FeatureClientBans means POST and GET /secrets/{name}/bans and DELETE
+	// /secrets/{name}/bans/{address...} are served: an operator refuses a
+	// secret to an address -- an IPv4 address or an IPv6 /64 -- for a ttl, in
+	// memory only, ending its live streams; the place is turned away at every
+	// door as a wrong secret is; and GET /secrets/{name}/clients rows carry
+	// banned_until. Addresses are listed and echoed only with track-client-ips.
+	// The API is strict, so a client must see this before it calls the routes.
+	FeatureClientBans = "client-bans"
+
 	// FeatureClientIPs means the binary understands the track-client-ips
 	// option, so a panel may offer the switch and may expect connected_ips and
 	// last_ip on GET /stats when it is on. It says nothing about whether the
@@ -602,6 +611,7 @@ const (
 // supportedFeatures is the sorted capability list this build advertises. Keep it
 // sorted so the response is byte-stable across restarts.
 var supportedFeatures = []string{
+	FeatureClientBans,
 	FeatureClientIPActivity,
 	FeatureClientIPs,
 	FeatureClientLimits,

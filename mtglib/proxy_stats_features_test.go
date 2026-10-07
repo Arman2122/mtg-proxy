@@ -45,10 +45,10 @@ func TestStatsFeatures(t *testing.T) {
 
 		assert.Equal(t,
 			[]string{
-				FeatureClientIPActivity, FeatureClientIPs, FeatureClientLimits, FeatureClientStats, FeatureFakeTLS,
-				FeatureHandshakeBudget, FeatureIPLimits, FeatureKick, FeatureListeners, FeatureQuotaCeiling,
-				FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretsAPI, FeatureSpeedDirections,
-				FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
+				FeatureClientBans, FeatureClientIPActivity, FeatureClientIPs, FeatureClientLimits, FeatureClientStats,
+				FeatureFakeTLS, FeatureHandshakeBudget, FeatureIPLimits, FeatureKick, FeatureListeners,
+				FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretsAPI,
+				FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
 	})
@@ -56,6 +56,7 @@ func TestStatsFeatures(t *testing.T) {
 	t.Run("the capability names are the strings downstream matches on", func(t *testing.T) {
 		t.Parallel()
 
+		assert.Equal(t, "client-bans", FeatureClientBans)
 		assert.Equal(t, "client-ips", FeatureClientIPs)
 		assert.Equal(t, "client-limits", FeatureClientLimits)
 		assert.Equal(t, "client-stats", FeatureClientStats)
@@ -112,9 +113,9 @@ func TestStatsFeatures(t *testing.T) {
 		require.True(t, ok, "features must be a JSON array")
 		assert.Equal(t,
 			[]any{
-				"client-ip-activity", "client-ips", "client-limits", "client-stats", "faketls", "handshake-budget",
-				"ip-limits", "kick", "listeners", "quota-ceiling", "quota-reset", "secret-modes", "secret-read",
-				"secrets-api", "speed-directions", "speed-limits", "web-relay", "web-relay-watch",
+				"client-bans", "client-ip-activity", "client-ips", "client-limits", "client-stats", "faketls",
+				"handshake-budget", "ip-limits", "kick", "listeners", "quota-ceiling", "quota-reset", "secret-modes",
+				"secret-read", "secrets-api", "speed-directions", "speed-limits", "web-relay", "web-relay-watch",
 			},
 			features)
 		// Asserted independently of the literal above, so appending a capability
@@ -133,10 +134,10 @@ func TestStatsFeatures(t *testing.T) {
 
 		assert.Equal(t,
 			[]string{
-				FeatureClientIPActivity, FeatureClientIPs, FeatureClientLimits, FeatureClientStats, FeatureFakeTLS,
-				FeatureHandshakeBudget, FeatureIPLimits, FeatureKick, FeatureListeners, FeatureQuotaCeiling,
-				FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretsAPI, FeatureSpeedDirections,
-				FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
+				FeatureClientBans, FeatureClientIPActivity, FeatureClientIPs, FeatureClientLimits, FeatureClientStats,
+				FeatureFakeTLS, FeatureHandshakeBudget, FeatureIPLimits, FeatureKick, FeatureListeners,
+				FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretsAPI,
+				FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			stats.buildResponse().Features)
 	})
@@ -152,10 +153,10 @@ func TestStatsFeatures(t *testing.T) {
 		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 		assert.Equal(t,
 			[]string{
-				FeatureClientIPActivity, FeatureClientIPs, FeatureClientLimits, FeatureClientStats, FeatureFakeTLS,
-				FeatureHandshakeBudget, FeatureIPLimits, FeatureKick, FeatureListeners, FeatureQuotaCeiling,
-				FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretsAPI, FeatureSpeedDirections,
-				FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
+				FeatureClientBans, FeatureClientIPActivity, FeatureClientIPs, FeatureClientLimits, FeatureClientStats,
+				FeatureFakeTLS, FeatureHandshakeBudget, FeatureIPLimits, FeatureKick, FeatureListeners,
+				FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretsAPI,
+				FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
 	})

@@ -1,11 +1,14 @@
 package mtglib
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -744,4 +747,316 @@ func TestBansAreBehindTheBearerToken(t *testing.T) {
 		assert.Equal(t, http.StatusOK, doAPI(t, p, "s3cret", route.method, route.target, route.body).Code,
 			"%s %s with it", route.method, route.target)
 	}
+}
+
+// A banned place is turned away at every door the way a wrong secret is, before
+// anything is counted: fronted on the FakeTLS door before the server's flight,
+// disposed of silently on the obfuscated ones. Every spelling of the place is
+// the place -- the v4-mapped form, another host of a banned /64 -- and the
+// refusal is no limit being felt: neither the address limit's counter nor the
+// connection cap's moves. Another place gets in, and so does the banned one
+// once its ban is lifted or has lapsed.
+func TestABannedPlaceIsTurnedAwayAtEveryDoor(t *testing.T) {
+	t.Parallel()
+
+	for _, ec := range govEntryCases() {
+		t.Run(ec.name, func(t *testing.T) {
+			t.Parallel()
+
+			secret := ec.secret(t)
+			h := ec.harness(t, map[string]Secret{"alice": secret}, nil)
+
+			clock := newFakeAddrClock()
+			h.proxy.bans.now = clock.read
+
+			mustBan(t, h.proxy, "alice", `{"ips":["203.0.113.9"],"ttl":"2h"}`)
+			mustBan(t, h.proxy, "alice", `{"ips":["2001:db8:1:2::/64"]}`)
+
+			port := 50000
+
+			for _, from := range []string{"203.0.113.9", "::ffff:203.0.113.9", "2001:db8:1:2:aaaa::1"} {
+				port++
+				refuseFrom(t, ec, h, secret.Key, tcpFrom(from, port))
+			}
+
+			user := h.proxy.stats.users["alice"]
+
+			assert.Zero(t, user.connections.Load(), "a banned place was never counted")
+			assert.Zero(t, user.ipLimitRefused.Load(), "a ban is not the address limit")
+			assert.Zero(t, user.clientConnsRefused.Load(), "nor the connection cap")
+			assert.Equal(t, 3*ec.frontingsOnEntryDeny, h.events.frontings(), "turned away as a wrong secret is")
+			assert.Zero(t, h.network.telegramDials())
+
+			connectFrom(t, h, ec, tcpFrom("198.51.100.7", 50101), "alice", secret.Key)
+
+			code, _ := liftBan(t, h.proxy, "alice", "203.0.113.9")
+			require.Equal(t, http.StatusOK, code)
+
+			connectFrom(t, h, ec, tcpFrom("203.0.113.9", 50102), "alice", secret.Key)
+
+			refuseFrom(t, ec, h, secret.Key, tcpFrom("2001:db8:1:2::5", 50103))
+			clock.advance(DefaultBanTTL)
+			connectFrom(t, h, ec, tcpFrom("2001:db8:1:2::5", 50104), "alice", secret.Key)
+		})
+	}
+}
+
+// A forced ban of an address that does not stand for one place holds at the
+// doors like any other: a loopback client -- behind a carrier that forwards no
+// address, every client -- is turned away at attribution as a wrong secret is,
+// not let through to be closed after the server's flight.
+func TestAForcedBanOfAnUnkeyedAddressHoldsAtTheDoors(t *testing.T) {
+	t.Parallel()
+
+	for _, ec := range govEntryCases() {
+		t.Run(ec.name, func(t *testing.T) {
+			t.Parallel()
+
+			secret := ec.secret(t)
+			h := ec.harness(t, map[string]Secret{"alice": secret}, nil)
+
+			mustBan(t, h.proxy, "alice", `{"ips":["127.0.0.1"],"force":true}`)
+
+			client, done := h.dialProxy(t, ec.policy)
+			ec.openEntry(t, client, secret.Key)
+
+			require.True(t, govAwait(done, govDenyBudget), "refused, not relayed")
+			assert.Equal(t, ec.frontingsOnEntryDeny, h.events.frontings(), "turned away as a wrong secret is")
+			assert.Zero(t, h.network.telegramDials())
+			assert.Zero(t, h.proxy.stats.users["alice"].connections.Load())
+		})
+	}
+}
+
+// frontFrom sends wire to the FakeTLS door from addr, ends the client's side,
+// and returns everything the cover site received for it and everything the
+// client heard back before the proxy hung up.
+func (c *coverSite) frontFrom(t *testing.T, h *entryHarness, addr net.Addr, wire []byte) ([]byte, []byte) {
+	t.Helper()
+
+	client, done := dialProxyFrom(t, h, nil, addr)
+
+	_, err := client.Write(wire)
+	require.NoError(t, err)
+	require.NoError(t, client.(*net.TCPConn).CloseWrite())
+
+	var received []byte
+
+	select {
+	case received = <-c.got:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "the cover site received nothing: the hello was not fronted")
+	}
+
+	require.True(t, govAwait(done, govDenyBudget))
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+
+	reply, err := io.ReadAll(client)
+	require.NoError(t, err)
+
+	return received, reply
+}
+
+// No oracle: a hello from a banned place reaches the cover site exactly as a
+// hello that matches no secret does. The very same bytes are sent twice from
+// the banned place: first while they are alice's hello, which the ban turns
+// away after the match, then after alice is re-keyed, when they match nothing
+// (the ban, kept, is no longer what fronts them). The cover site gets the
+// client's own bytes both times, byte for byte the same, and the client hears
+// nothing from the proxy either time: no server hello is sent to a banned place.
+func TestABannedHelloReachesTheCoverSiteAsAWrongSecretDoes(t *testing.T) {
+	t.Parallel()
+
+	const place = "203.0.113.9"
+
+	ec := fakeTLSDoor()
+	h := ec.harness(t, map[string]Secret{"alice": ec.secret(t)}, nil)
+	cover := newCoverSite(t, h)
+
+	alice := h.proxy.secrets.Load().secrets[0]
+	hello := ec.clientHello(t, alice.Key, bytes.Repeat([]byte{0x3c}, 32))
+
+	// The control, with a hello of its own: alice gets in from another place.
+	connectFrom(t, h, ec, tcpFrom("198.51.100.7", 51001), "alice", alice.Key)
+
+	mustBan(t, h.proxy, "alice", `{"ips":["`+place+`"]}`)
+
+	before := tallyOf(h.proxy)
+	banned, bannedReply := cover.frontFrom(t, h, tcpFrom(place, 51002), hello)
+
+	assert.Equal(t, doorTally{verifications: 1, scanned: 1}, tallyOf(h.proxy).minus(before),
+		"the hello matched alice: it is the ban that turned it away")
+
+	reloadSecrets(t, h.proxy, map[string]Secret{"alice": ec.secret(t)})
+	require.True(t, isBanned(h.proxy, "alice", place), "the re-key kept the ban")
+
+	before = tallyOf(h.proxy)
+	wrong, wrongReply := cover.frontFrom(t, h, tcpFrom(place, 51003), hello)
+
+	assert.Equal(t, doorTally{verifications: 1, unmatched: 1}, tallyOf(h.proxy).minus(before),
+		"the same bytes now match no secret")
+
+	assert.Equal(t, hello, banned, "the cover site gets the client's own bytes")
+	assert.Equal(t, wrong, banned, "byte for byte what a hello for no secret gives it")
+	assert.Empty(t, bannedReply, "the banned client hears nothing from the proxy")
+	assert.Empty(t, wrongReply)
+	assert.Equal(t, 2, h.events.frontings())
+}
+
+// The re-check: a stream attributed before the ban was recorded -- it passed
+// the ban check at attribution -- is refused when it comes to register, under
+// liveMu, as step one, and leaves the ledger, the registry and the counters as
+// they were. The refusal is logged as a ban and counted nowhere. A stream
+// attributed after the ban is refused at attribution, and says why.
+func TestTheReCheckRefusesAStreamThatPassedAttribution(t *testing.T) {
+	t.Parallel()
+
+	probe, _ := banProbe(t, false)
+	p := probe.proxy
+	user := p.stats.users["alice"]
+
+	set := p.secrets.Load()
+	alice := slices.Index(set.names, "alice")
+
+	early := probe.stream(t, tcpFrom("203.0.113.9", 50001), 0)
+	require.Equal(t, DenyNone, p.attribute(early, set, alice), "not banned yet")
+
+	assert.Equal(t, 0, mustBan(t, p, "alice", `{"ips":["203.0.113.9"]}`).Closed,
+		"the stream is not registered: there is nothing to close")
+
+	require.False(t, p.admit(early))
+
+	assert.Equal(t, []string{"banned"}, probe.log.denyReasons())
+	assert.Nil(t, probe.ledgerCounts(), "the ledger is as it was")
+	assert.Zero(t, probe.registered())
+	assert.False(t, early.addrCounted)
+	assert.Zero(t, user.connections.Load())
+	assert.Zero(t, user.ipLimitRefused.Load())
+	assert.Zero(t, user.clientConnsRefused.Load())
+	assert.Zero(t, probe.events.count(func(Event) bool { return true }), "a ban has no event")
+
+	late := probe.stream(t, tcpFrom("203.0.113.9", 50002), 0)
+	assert.Equal(t, DenyBanned, p.attribute(late, set, alice))
+	assert.Equal(t, []string{"banned", "banned"}, probe.log.denyReasons())
+}
+
+// The re-check is the first step of registration (spec §2): a banned place is
+// refused as banned, whatever the steps after it would have said -- the
+// connection cap with the place at its cap, the address limit with the user at
+// hers -- and a forced ban of an unkeyed address holds there too.
+func TestTheReCheckIsTheFirstStep(t *testing.T) {
+	t.Parallel()
+
+	probe, _ := banProbe(t, false)
+	p := probe.proxy
+
+	// Three places held: a cap of one on the first, a limit of three on the user.
+	require.Equal(t, DenyNone, p.tryRegisterConn(capStream(t, probe, tcpFrom("203.0.113.9", 50001), 1)))
+	require.Equal(t, DenyNone, p.tryRegisterConn(probe.stream(t, tcpFrom("198.51.100.7", 50002), 3)))
+	require.Equal(t, DenyNone, p.tryRegisterConn(probe.stream(t, tcpFrom("198.51.100.8", 50003), 3)))
+
+	require.Equal(t, DenyClientConns, p.tryRegisterConn(capStream(t, probe, tcpFrom("203.0.113.9", 50004), 1)),
+		"the control: the place is at its cap")
+	require.Equal(t, DenyIPLimit, p.tryRegisterConn(probe.stream(t, tcpFrom("198.51.100.9", 50005), 3)),
+		"the control: the user is at her limit")
+
+	mustBan(t, p, "alice", `{"ips":["203.0.113.9","198.51.100.9"]}`)
+	mustBan(t, p, "alice", `{"ips":["127.0.0.1"],"force":true}`)
+
+	before := probe.ledgerCounts()
+
+	assert.Equal(t, DenyBanned, p.tryRegisterConn(capStream(t, probe, tcpFrom("203.0.113.9", 50006), 1)))
+	assert.Equal(t, DenyBanned, p.tryRegisterConn(probe.stream(t, tcpFrom("198.51.100.9", 50007), 3)))
+	assert.Equal(t, DenyBanned, p.tryRegisterConn(probe.stream(t, tcpFrom("127.0.0.1", 50008), 0)),
+		"a forced ban of an unkeyed address")
+	assert.Equal(t, before, probe.ledgerCounts(), "none of the refusals touched the ledger")
+}
+
+// On the obfuscated door a banned client is charged to the per-address failure
+// limiter as a frame that matched nothing is, so one that keeps reconnecting is
+// soon refused before the trial loop instead of costing a trial decryption
+// every time. It is not counted as a miss: its frame did match. A place that is
+// not banned is charged nothing for getting in.
+func TestABannedObfuscatedClientIsChargedLikeAMiss(t *testing.T) {
+	t.Parallel()
+
+	const place = "203.0.113.9"
+
+	ec := govEntryCases()[1]
+	ec.policy = &ListenerPolicy{
+		Modes:           ModeSetOf(SecretModeDD),
+		Public:          true,
+		HandshakesPerIP: 1,
+		OnUnknownSecret: UnknownSecretClose,
+	}
+
+	secret := ec.secret(t)
+	h := ec.harness(t, map[string]Secret{"alice": secret}, nil)
+	limiter, stats := h.proxy.obfsLimiter, &h.proxy.obfsStats
+
+	connectFrom(t, h, ec, tcpFrom("198.51.100.7", 52001), "alice", secret.Key)
+	assert.True(t, limiter.Allow(*ec.policy, net.ParseIP("198.51.100.7")), "getting in costs nothing")
+
+	mustBan(t, h.proxy, "alice", `{"ips":["`+place+`"]}`)
+	require.True(t, limiter.Allow(*ec.policy, net.ParseIP(place)))
+
+	// A budget of one a second with a burst of two: two refusals spend it.
+	refuseFrom(t, ec, h, secret.Key, tcpFrom(place, 52002))
+	refuseFrom(t, ec, h, secret.Key, tcpFrom(place, 52003))
+
+	assert.False(t, limiter.Allow(*ec.policy, net.ParseIP(place)), "each banned attempt was charged")
+	assert.Zero(t, stats.misses.Load(), "a banned frame matched; it is not a miss")
+	assert.EqualValues(t, 3, stats.trials.Load())
+	assert.EqualValues(t, 2, stats.denied.Load())
+
+	refuseFrom(t, ec, h, secret.Key, tcpFrom(place, 52004))
+
+	assert.EqualValues(t, 1, stats.rateLimited.Load(), "the next is refused before the trial loop")
+	assert.EqualValues(t, 3, stats.trials.Load())
+}
+
+// A banned place gets no hinted verification. The ban forgets the hint, so the
+// banned hello is scanned, and a scan keeps its charge to the handshake budget;
+// the banned hello writes no hint of its own. And a hint the ban could not
+// forget -- one written by a stream admitted a moment before the ban, after it
+// -- is skipped all the same: a banned place is never verified against the
+// secret it is banned from on the strength of a hint.
+func TestABannedPlaceIsScannedNotHinted(t *testing.T) {
+	t.Parallel()
+
+	const (
+		place = "203.0.113.30"
+		cost  = 2 * 12 // two candidates, the short hello
+	)
+
+	ec := fakeTLSDoor()
+	alice, bob := ec.secret(t), ec.secret(t)
+	h, _ := budgetHarness(t, map[string]Secret{"alice": alice, "bob": bob}, nil, roomyBudget())
+	h.proxy.hints = newMatchHints(h.proxy.ctx)
+
+	recall := func() []string { return h.proxy.hints.recall(net.ParseIP(place)) }
+
+	connectFrom(t, h, ec, tcpFrom(place, 53001), "alice", alice.Key)
+	require.Equal(t, []string{"alice"}, recall())
+	require.Equal(t, doorTally{verifications: 1, hinted: 1},
+		connectFrom(t, h, ec, tcpFrom(place, 53002), "alice", alice.Key), "the control: the place is hinted")
+
+	mustBan(t, h.proxy, "alice", `{"ips":["`+place+`"]}`)
+	require.Nil(t, recall())
+
+	global0, address0 := budgetLevels(t, h, place)
+
+	assert.Equal(t, doorTally{verifications: 1, scanned: 1}, refusedFrom(t, h, tcpFrom(place, 53003), alice.Key),
+		"scanned, and matched: alice is the first candidate")
+	assert.Nil(t, recall(), "a banned hello writes no hint")
+
+	global1, address1 := budgetLevels(t, h, place)
+	assert.InDelta(t, global0-cost, global1, 1e-9, "the scan keeps its charge")
+	assert.InDelta(t, address0-cost, address1, 1e-9)
+
+	h.proxy.hints.remember(net.ParseIP(place), "alice")
+
+	assert.Equal(t, doorTally{verifications: 1, scanned: 1}, refusedFrom(t, h, tcpFrom(place, 53004), alice.Key),
+		"a hint written after the ban is not tried")
+	assert.Equal(t, 2, h.events.frontings())
 }
