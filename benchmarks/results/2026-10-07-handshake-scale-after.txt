@@ -1,0 +1,520 @@
+# ee handshake at thousands of secrets — AFTER (raw box output)
+
+Piece A of the shared-secret program. Report: benchmarks/results/2026-10-07-handshake-scale-report.md
+Baseline (before any change): benchmarks/results/2026-10-07-handshake-scale-baseline.txt
+
+Date        2026-10-07 (box clock ~04:15-04:30 UTC, the same box and settings as the baseline)
+Box         5.75.199.10 (ssh penhoon-data), Intel Xeon Skylake, no SHA-NI, 2 vCPU, linux/amd64
+Run         GOMAXPROCS=2, ulimit -n 65536, TMPDIR=/root/mtg-bench/tmp, -test.benchtime 1s; work dir /root/mtg-bench, removed afterwards
+Code        branch feat/handshake-scale at 9ac9fa4 (everything in the report); baseline binary = 393fbd5 (handshake code untouched)
+
+Sections, in order
+  1. fake package: ReadClientHelloMulti (the wrapper, plain candidates) and BenchmarkVerify rows plain|pads (-test.count 6)
+  2. mtglib door benchmarks: DoorHandshake/(ee-unpaced|dd)/secrets=... incl. the new .../last/hinted rows (-test.count 6)
+  3. SAME-SESSION A/B: the BASELINE binary (mtglib.test, 393fbd5) and the NEW binary (mtglib-after.test) alternating
+     three times, -test.count 4 each, rows secrets=1000|5000/last for ee-unpaced and dd. This is the door-level timing
+     evidence: the box drifts between sessions (the dd rows, whose code did not change, moved up to 40% between the
+     baseline session and the after session), so only same-session alternation is comparable.
+  4. BenchmarkScanBudgetReserve (the budget's own cost per unhinted scan), -test.count 6
+  Calibration read on the box by the process: 296.6 ns/block (min of three ~4 ms runs of an HMAC over a 517-byte buffer,
+  counted as 12 blocks); five probe runs read 559, 554, 266, 282, 383 ns/block.
+================================================================================================
+##### 1. fake package (fake-after.test)
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib/internal/tls/fake
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=517-2         	  130290	     10454 ns/op	     10454 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=517-2         	  130714	     10373 ns/op	     10373 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=517-2         	  107242	     10112 ns/op	     10112 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=517-2         	  132556	      8995 ns/op	      8995 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=517-2         	  121465	      9938 ns/op	      9938 ns/candidate	    5956 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=517-2         	  129148	     10115 ns/op	     10115 ns/candidate	    5956 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=4096-2        	   26208	     45886 ns/op	     45886 ns/candidate	   45342 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=4096-2        	   23817	     49313 ns/op	     49313 ns/candidate	   45345 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=4096-2        	   27139	     46710 ns/op	     46710 ns/candidate	   45343 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=4096-2        	   26079	     46025 ns/op	     46025 ns/candidate	   45344 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=4096-2        	   25428	     45077 ns/op	     45077 ns/candidate	   45342 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/first/hello=4096-2        	   25550	     48227 ns/op	     48227 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=517-2          	   91064	     11036 ns/op	     11036 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=517-2          	  116714	     10118 ns/op	     10118 ns/candidate	    5956 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=517-2          	  114848	     11004 ns/op	     11004 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=517-2          	  117282	     10279 ns/op	     10279 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=517-2          	   90733	     11096 ns/op	     11096 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=517-2          	  114055	     10436 ns/op	     10436 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=4096-2         	   23991	     49090 ns/op	     49090 ns/candidate	   45348 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=4096-2         	   25681	     53004 ns/op	     53004 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=4096-2         	   25371	     53382 ns/op	     53382 ns/candidate	   45347 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=4096-2         	   20931	     57994 ns/op	     57994 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=4096-2         	   22228	     51157 ns/op	     51157 ns/candidate	   45343 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/last/hello=4096-2         	   24012	     54664 ns/op	     54664 ns/candidate	   45347 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=517-2          	  113424	     10566 ns/op	     10566 ns/candidate	    5956 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=517-2          	  116554	     10346 ns/op	     10346 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=517-2          	  136796	     10694 ns/op	     10694 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=517-2          	  121170	     10065 ns/op	     10065 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=517-2          	  110558	     10507 ns/op	     10507 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=517-2          	  113272	     10786 ns/op	     10786 ns/candidate	    5956 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=4096-2         	   18727	     61562 ns/op	     61562 ns/candidate	   45350 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=4096-2         	   22153	     53220 ns/op	     53220 ns/candidate	   45345 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=4096-2         	   24496	     48411 ns/op	     48411 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=4096-2         	   21978	     55449 ns/op	     55449 ns/candidate	   45347 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=4096-2         	   21970	     55809 ns/op	     55809 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1/miss/hello=4096-2         	   22101	     51546 ns/op	     51546 ns/candidate	   45348 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=517-2        	   93204	     10894 ns/op	     10894 ns/candidate	    5956 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=517-2        	  138021	      9303 ns/op	      9303 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=517-2        	  118137	     10180 ns/op	     10180 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=517-2        	  108925	      9879 ns/op	      9879 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=517-2        	  121030	     10601 ns/op	     10601 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=517-2        	  132105	     10649 ns/op	     10649 ns/candidate	    5956 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=4096-2       	   24693	     51794 ns/op	     51794 ns/candidate	   45349 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=4096-2       	   23653	     47790 ns/op	     47790 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=4096-2       	   24129	     49836 ns/op	     49836 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=4096-2       	   22594	     54488 ns/op	     54488 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=4096-2       	   23966	     48536 ns/op	     48536 ns/candidate	   45345 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/first/hello=4096-2       	   23391	     50350 ns/op	     50350 ns/candidate	   45341 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=517-2         	   22770	     53870 ns/op	      5387 ns/candidate	   10279 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=517-2         	   22732	     52636 ns/op	      5264 ns/candidate	   10277 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=517-2         	   23590	     51945 ns/op	      5195 ns/candidate	   10277 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=517-2         	   22314	     56445 ns/op	      5644 ns/candidate	   10277 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=517-2         	   22396	     53540 ns/op	      5354 ns/candidate	   10279 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=517-2         	   22724	     52026 ns/op	      5203 ns/candidate	   10276 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=4096-2        	    5341	    234003 ns/op	     23400 ns/candidate	   49675 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=4096-2        	    4696	    213478 ns/op	     21348 ns/candidate	   49677 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=4096-2        	    6090	    226115 ns/op	     22612 ns/candidate	   49673 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=4096-2        	    5838	    239876 ns/op	     23988 ns/candidate	   49679 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=4096-2        	    4492	    246452 ns/op	     24645 ns/candidate	   49679 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/last/hello=4096-2        	    5172	    235597 ns/op	     23560 ns/candidate	   49676 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=517-2         	   23869	     52020 ns/op	      5202 ns/candidate	   10279 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=517-2         	   20546	     57440 ns/op	      5744 ns/candidate	   10276 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=517-2         	   21876	     55109 ns/op	      5511 ns/candidate	   10278 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=517-2         	   22546	     53116 ns/op	      5312 ns/candidate	   10277 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=517-2         	   21687	     53145 ns/op	      5315 ns/candidate	   10277 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=517-2         	   22218	     52902 ns/op	      5290 ns/candidate	   10279 B/op	      79 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=4096-2        	    6174	    242874 ns/op	     24287 ns/candidate	   49670 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=4096-2        	    5416	    234658 ns/op	     23466 ns/candidate	   49678 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=4096-2        	    6072	    234427 ns/op	     23443 ns/candidate	   49678 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=4096-2        	    5025	    242236 ns/op	     24224 ns/candidate	   49676 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=4096-2        	    5617	    244600 ns/op	     24460 ns/candidate	   49679 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=10/miss/hello=4096-2        	    4686	    239503 ns/op	     23950 ns/candidate	   49672 B/op	      85 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=517-2       	  139552	      9647 ns/op	      9647 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=517-2       	  129040	      9984 ns/op	      9984 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=517-2       	  132800	     10615 ns/op	     10615 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=517-2       	  128170	     10239 ns/op	     10239 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=517-2       	  136774	     10497 ns/op	     10497 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=517-2       	  103826	     10908 ns/op	     10908 ns/candidate	    5956 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=4096-2      	   26056	     48633 ns/op	     48633 ns/candidate	   45345 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=4096-2      	   24091	     50479 ns/op	     50479 ns/candidate	   45344 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=4096-2      	   22815	     48866 ns/op	     48866 ns/candidate	   45344 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=4096-2      	   25092	     49937 ns/op	     49937 ns/candidate	   45344 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=4096-2      	   21050	     54397 ns/op	     54397 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/first/hello=4096-2      	   26002	     51066 ns/op	     51066 ns/candidate	   45342 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=517-2        	    3188	    443572 ns/op	      4436 ns/candidate	   53524 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=517-2        	    2700	    467495 ns/op	      4675 ns/candidate	   53527 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=517-2        	    2835	    449002 ns/op	      4490 ns/candidate	   53525 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=517-2        	    3136	    452140 ns/op	      4521 ns/candidate	   53528 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=517-2        	    2358	    447757 ns/op	      4478 ns/candidate	   53528 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=517-2        	    2359	    431044 ns/op	      4310 ns/candidate	   53524 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=4096-2       	     684	   1829084 ns/op	     18291 ns/candidate	   92922 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=4096-2       	     674	   1768119 ns/op	     17681 ns/candidate	   92887 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=4096-2       	     715	   1769604 ns/op	     17696 ns/candidate	   92907 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=4096-2       	     669	   1816039 ns/op	     18160 ns/candidate	   92936 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=4096-2       	     684	   1779823 ns/op	     17798 ns/candidate	   92910 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/last/hello=4096-2       	     668	   1786807 ns/op	     17868 ns/candidate	   92961 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=517-2        	    2742	    438963 ns/op	      4390 ns/candidate	   53526 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=517-2        	    2646	    452038 ns/op	      4520 ns/candidate	   53525 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=517-2        	    2401	    452237 ns/op	      4522 ns/candidate	   53537 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=517-2        	    2887	    443102 ns/op	      4431 ns/candidate	   53521 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=517-2        	    2980	    449817 ns/op	      4498 ns/candidate	   53533 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=517-2        	    2653	    459518 ns/op	      4595 ns/candidate	   53525 B/op	     529 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=4096-2       	     620	   1751892 ns/op	     17519 ns/candidate	   92891 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=4096-2       	     662	   1808504 ns/op	     18085 ns/candidate	   92950 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=4096-2       	     690	   1785726 ns/op	     17857 ns/candidate	   92921 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=4096-2       	     628	   1875022 ns/op	     18750 ns/candidate	   92916 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=4096-2       	     742	   1760871 ns/op	     17609 ns/candidate	   92882 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=100/miss/hello=4096-2       	     706	   1793173 ns/op	     17932 ns/candidate	   92908 B/op	     535 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=517-2      	  106180	     10040 ns/op	     10040 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=517-2      	  100564	     10100 ns/op	     10100 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=517-2      	  119236	     10255 ns/op	     10255 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=517-2      	  135488	      9707 ns/op	      9707 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=517-2      	  107712	     10309 ns/op	     10309 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=517-2      	  125064	      9406 ns/op	      9406 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=4096-2     	   27063	     50654 ns/op	     50654 ns/candidate	   45347 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=4096-2     	   24663	     48919 ns/op	     48919 ns/candidate	   45344 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=4096-2     	   27966	     44840 ns/op	     44840 ns/candidate	   45347 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=4096-2     	   24793	     48074 ns/op	     48074 ns/candidate	   45343 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=4096-2     	   25964	     47466 ns/op	     47466 ns/candidate	   45346 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/first/hello=4096-2     	   25246	     48771 ns/op	     48771 ns/candidate	   45348 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=517-2       	     286	   4245850 ns/op	      4246 ns/candidate	  486140 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=517-2       	     268	   4292138 ns/op	      4292 ns/candidate	  486428 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=517-2       	     292	   4241539 ns/op	      4242 ns/candidate	  486098 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=517-2       	     295	   4073707 ns/op	      4074 ns/candidate	  486009 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=517-2       	     283	   4223674 ns/op	      4224 ns/candidate	  486000 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=517-2       	     266	   4500300 ns/op	      4500 ns/candidate	  486063 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=4096-2      	      60	  19019671 ns/op	     19020 ns/candidate	  525278 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=4096-2      	      70	  17991589 ns/op	     17992 ns/candidate	  525221 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=4096-2      	      64	  17572965 ns/op	     17573 ns/candidate	  525382 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=4096-2      	      78	  16994883 ns/op	     16995 ns/candidate	  525606 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=4096-2      	      79	  16482203 ns/op	     16482 ns/candidate	  525596 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/last/hello=4096-2      	      61	  17715957 ns/op	     17716 ns/candidate	  525679 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=517-2       	     282	   4281104 ns/op	      4281 ns/candidate	  486352 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=517-2       	     272	   4376158 ns/op	      4376 ns/candidate	  486143 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=517-2       	     286	   4269599 ns/op	      4270 ns/candidate	  486081 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=517-2       	     284	   4208211 ns/op	      4208 ns/candidate	  486259 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=517-2       	     270	   4441407 ns/op	      4441 ns/candidate	  486115 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=517-2       	     289	   4329372 ns/op	      4329 ns/candidate	  486190 B/op	    5029 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=4096-2      	      68	  16589932 ns/op	     16590 ns/candidate	  525354 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=4096-2      	      79	  16836057 ns/op	     16836 ns/candidate	  525388 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=4096-2      	      79	  17095368 ns/op	     17095 ns/candidate	  525492 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=4096-2      	      79	  16987722 ns/op	     16988 ns/candidate	  525596 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=4096-2      	      76	  16645649 ns/op	     16646 ns/candidate	  525626 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=1000/miss/hello=4096-2      	      70	  19168940 ns/op	     19169 ns/candidate	  525456 B/op	    5035 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=517-2      	  101835	     10536 ns/op	     10536 ns/candidate	    5954 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=517-2      	  132650	     10539 ns/op	     10539 ns/candidate	    5955 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=517-2      	  110652	     10272 ns/op	     10272 ns/candidate	    5954 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=517-2      	  117499	     10566 ns/op	     10566 ns/candidate	    5954 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=517-2      	  130780	     10126 ns/op	     10126 ns/candidate	    5954 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=517-2      	  115568	     10426 ns/op	     10426 ns/candidate	    5954 B/op	      34 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=4096-2     	   23030	     48603 ns/op	     48603 ns/candidate	   45336 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=4096-2     	   23319	     49598 ns/op	     49598 ns/candidate	   45334 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=4096-2     	   22314	     49549 ns/op	     49549 ns/candidate	   45337 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=4096-2     	   25708	     42031 ns/op	     42031 ns/candidate	   45329 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=4096-2     	   25786	     48230 ns/op	     48230 ns/candidate	   45336 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/first/hello=4096-2     	   25862	     45935 ns/op	     45935 ns/candidate	   45331 B/op	      40 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=517-2       	      52	  20885561 ns/op	      4177 ns/candidate	 2410557 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=517-2       	      56	  20970281 ns/op	      4194 ns/candidate	 2408450 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=517-2       	      56	  21002232 ns/op	      4200 ns/candidate	 2409185 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=517-2       	      58	  20500693 ns/op	      4100 ns/candidate	 2409053 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=517-2       	      57	  20661498 ns/op	      4132 ns/candidate	 2408540 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=517-2       	      61	  21261452 ns/op	      4252 ns/candidate	 2408482 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=4096-2      	      14	  82596985 ns/op	     16519 ns/candidate	 2449715 B/op	   25037 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=4096-2      	      13	  82582445 ns/op	     16516 ns/candidate	 2448174 B/op	   25037 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=4096-2      	      12	  85874579 ns/op	     17175 ns/candidate	 2446377 B/op	   25036 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=4096-2      	      13	  84970072 ns/op	     16994 ns/candidate	 2446910 B/op	   25036 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=4096-2      	      13	  81542400 ns/op	     16308 ns/candidate	 2447542 B/op	   25037 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/last/hello=4096-2      	      13	  81052832 ns/op	     16211 ns/candidate	 2448174 B/op	   25037 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=517-2       	      48	  21252936 ns/op	      4251 ns/candidate	 2409076 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=517-2       	      55	  21313022 ns/op	      4263 ns/candidate	 2409090 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=517-2       	      56	  20615823 ns/op	      4123 ns/candidate	 2409181 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=517-2       	      62	  20098054 ns/op	      4020 ns/candidate	 2409100 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=517-2       	      64	  19037446 ns/op	      3807 ns/candidate	 2409889 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=517-2       	      55	  21274840 ns/op	      4255 ns/candidate	 2409239 B/op	   25031 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=4096-2      	      13	  84657346 ns/op	     16931 ns/candidate	 2448174 B/op	   25037 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=4096-2      	      12	  85949702 ns/op	     17190 ns/candidate	 2448431 B/op	   25037 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=4096-2      	      14	  84664867 ns/op	     16933 ns/candidate	 2447954 B/op	   25037 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=4096-2      	      13	  85418129 ns/op	     17084 ns/candidate	 2446910 B/op	   25036 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=4096-2      	      12	  87043444 ns/op	     17409 ns/candidate	 2449116 B/op	   25037 allocs/op
+BenchmarkReadClientHelloMulti/plain/N=5000/miss/hello=4096-2      	      13	  82759526 ns/op	     16552 ns/candidate	 2448806 B/op	   25037 allocs/op
+BenchmarkVerify/plain/hello=517-2                                 	  278972	      4109 ns/op	      4109 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=517-2                                 	  288439	      4288 ns/op	      4288 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=517-2                                 	  264138	      3935 ns/op	      3935 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=517-2                                 	  309744	      3811 ns/op	      3811 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=517-2                                 	  287545	      3987 ns/op	      3987 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=517-2                                 	  265406	      4030 ns/op	      4030 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=4096-2                                	   69688	     16954 ns/op	     16954 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=4096-2                                	   76383	     16016 ns/op	     16016 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=4096-2                                	   74456	     16335 ns/op	     16335 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=4096-2                                	   70772	     16823 ns/op	     16823 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=4096-2                                	   68763	     17354 ns/op	     17354 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/plain/hello=4096-2                                	   69618	     16096 ns/op	     16096 ns/candidate	     480 B/op	       5 allocs/op
+BenchmarkVerify/pads/hello=517-2                                  	  480054	      2525 ns/op	      2525 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=517-2                                  	  478468	      2508 ns/op	      2508 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=517-2                                  	  402006	      2490 ns/op	      2490 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=517-2                                  	  415102	      2474 ns/op	      2474 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=517-2                                  	  455924	      2522 ns/op	      2522 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=517-2                                  	  506517	      2407 ns/op	      2407 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=4096-2                                 	   84502	     14685 ns/op	     14685 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=4096-2                                 	   79981	     14660 ns/op	     14660 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=4096-2                                 	   79473	     15499 ns/op	     15499 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=4096-2                                 	   73837	     14733 ns/op	     14733 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=4096-2                                 	   86300	     15435 ns/op	     15435 ns/candidate	       0 B/op	       0 allocs/op
+BenchmarkVerify/pads/hello=4096-2                                 	   69930	     14976 ns/op	     14976 ns/candidate	       0 B/op	       0 allocs/op
+PASS
+##### 2. door benchmarks (mtglib-after.test)
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1160	    969059 ns/op	   85980 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1284	    929906 ns/op	   85857 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1232	    977683 ns/op	   85969 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1333	    922482 ns/op	   85807 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1245	    934037 ns/op	   85974 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1195	    959737 ns/op	   85962 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1231	    935567 ns/op	   86222 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1398	    936876 ns/op	   85769 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1434	    943283 ns/op	   85830 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1220	    915766 ns/op	   85768 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1344	    912571 ns/op	   85814 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1120	    980738 ns/op	   85791 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1202	    939457 ns/op	   86114 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1341	    910100 ns/op	   85884 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1477	    933518 ns/op	   85765 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1323	    948957 ns/op	   85979 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1396	    934740 ns/op	   85816 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1180	    990832 ns/op	   85910 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/first-2       	    1179	   1012550 ns/op	   86139 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/first-2       	    1215	    933186 ns/op	   85788 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/first-2       	    1488	    861148 ns/op	   85718 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/first-2       	    1423	    900295 ns/op	   85838 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/first-2       	    1255	    851128 ns/op	   85944 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/first-2       	    1458	    922494 ns/op	   85817 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/last-2        	     962	   1294209 ns/op	   86081 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/last-2        	     937	   1318266 ns/op	   85972 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/last-2        	     782	   1398700 ns/op	   85925 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/last-2        	     841	   1275773 ns/op	   85729 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/last-2        	     958	   1238257 ns/op	   85882 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=100/last-2        	     870	   1324630 ns/op	   85962 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1245	    892433 ns/op	   85969 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1045	    962014 ns/op	   85796 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1290	    863515 ns/op	   85821 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1333	    921101 ns/op	   85803 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1582	    941950 ns/op	   85789 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1380	    882198 ns/op	   85712 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     283	   4112897 ns/op	   86359 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     312	   3943387 ns/op	   85991 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     254	   4141360 ns/op	   86074 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     290	   3959032 ns/op	   85987 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     332	   4044380 ns/op	   86154 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     292	   4095490 ns/op	   86151 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1177	    924201 ns/op	   86031 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1204	    936770 ns/op	   85923 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1389	    925275 ns/op	   85907 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1114	    912202 ns/op	   85867 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1538	    917391 ns/op	   85783 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1257	    895951 ns/op	   85751 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/first-2               	    1434	    907463 ns/op	   85858 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/first-2               	    1334	    958115 ns/op	   85807 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/first-2               	    1070	    938905 ns/op	   85752 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/first-2               	    1255	    968438 ns/op	   85791 B/op	     276 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/first-2               	    1405	    924590 ns/op	   85635 B/op	     275 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/first-2               	    1243	    902498 ns/op	   85720 B/op	     275 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2                	      88	  14791624 ns/op	   86917 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2                	      76	  15549676 ns/op	   87487 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2                	      70	  15689913 ns/op	   87559 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2                	      80	  15930707 ns/op	   87134 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2                	      84	  14870893 ns/op	   87058 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2                	      90	  14882402 ns/op	   87095 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2         	    1323	    946380 ns/op	   85877 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2         	    1202	    970313 ns/op	   85861 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2         	    1237	    893317 ns/op	   85807 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2         	    1242	    912847 ns/op	   85795 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2         	    1369	    946940 ns/op	   85763 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2         	    1383	    910658 ns/op	   85752 B/op	     279 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2436	    501128 ns/op	   16042 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2426	    518935 ns/op	   16025 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2355	    522001 ns/op	   16048 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2240	    518338 ns/op	   16055 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2488	    501625 ns/op	   15998 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2491	    496298 ns/op	   16009 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2293	    512642 ns/op	   16075 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2288	    530813 ns/op	   16055 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2061	    555022 ns/op	   16047 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2061	    520862 ns/op	   16012 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2290	    574477 ns/op	   16038 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2769	    516076 ns/op	   16011 B/op	     163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/first-2                        	    2431	    551198 ns/op	   18743 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/first-2                        	    2292	    515665 ns/op	   18726 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/first-2                        	    2179	    562443 ns/op	   18689 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/first-2                        	    2703	    535409 ns/op	   18683 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/first-2                        	    2136	    572310 ns/op	   18714 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/first-2                        	    2307	    504043 ns/op	   18732 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/last-2                         	    1876	    660250 ns/op	   72729 B/op	     461 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/last-2                         	    1828	    644441 ns/op	   72616 B/op	     461 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/last-2                         	    1701	    650880 ns/op	   72547 B/op	     461 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/last-2                         	    1989	    625887 ns/op	   72641 B/op	     461 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/last-2                         	    2193	    609026 ns/op	   72598 B/op	     461 allocs/op
+BenchmarkDoorHandshake/dd/secrets=100/last-2                         	    2247	    635563 ns/op	   72643 B/op	     461 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2246	    524939 ns/op	   40683 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2446	    525030 ns/op	   40610 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2358	    537002 ns/op	   40649 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2175	    573105 ns/op	   40610 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2344	    529792 ns/op	   40638 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2185	    495575 ns/op	   40594 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     764	   1641421 ns/op	  586294 B/op	    3163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     685	   1600321 ns/op	  585396 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     742	   1616481 ns/op	  585339 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     676	   1603031 ns/op	  585369 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     700	   1621829 ns/op	  585241 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     793	   1579674 ns/op	  585317 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/first-2                       	    1690	    603155 ns/op	  139052 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/first-2                       	    1851	    571699 ns/op	  139003 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/first-2                       	    2210	    563076 ns/op	  139007 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/first-2                       	    2036	    599783 ns/op	  139021 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/first-2                       	    1656	    638770 ns/op	  138991 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/first-2                       	    2167	    576212 ns/op	  138978 B/op	     164 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                        	     212	   5382132 ns/op	 2869278 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                        	     206	   5584481 ns/op	 2868942 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                        	     198	   6067300 ns/op	 2869140 B/op	   15166 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                        	     226	   5337763 ns/op	 2868849 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                        	     210	   5415855 ns/op	 2868567 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                        	     214	   5659088 ns/op	 2869375 B/op	   15165 allocs/op
+PASS
+##### 3. same-session A/B round 1 — OLD binary (baseline 393fbd5)
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     214	   5667013 ns/op	  629167 B/op	    6283 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     217	   5543245 ns/op	  628279 B/op	    6282 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     214	   5556138 ns/op	  628321 B/op	    6282 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     222	   5518434 ns/op	  627777 B/op	    6281 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      51	  23072517 ns/op	 2792443 B/op	   30291 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      51	  23063188 ns/op	 2792189 B/op	   30291 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      48	  22670461 ns/op	 2793030 B/op	   30291 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      51	  22569538 ns/op	 2794337 B/op	   30290 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     712	   1577528 ns/op	  585789 B/op	    3163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     646	   1755882 ns/op	  585287 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     694	   1641865 ns/op	  585627 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     702	   1529488 ns/op	  585173 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     201	   6071379 ns/op	 2869393 B/op	   15166 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     234	   4963018 ns/op	 2869246 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     228	   5246395 ns/op	 2869096 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     194	   5867805 ns/op	 2867556 B/op	   15165 allocs/op
+PASS
+##### 3. same-session A/B round 1 — NEW binary
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     290	   4186178 ns/op	   86189 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     254	   4598893 ns/op	   86462 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     298	   4075821 ns/op	   86013 B/op	     278 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     337	   3879098 ns/op	   86176 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1176	    906607 ns/op	   85959 B/op	     278 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1401	    970387 ns/op	   85935 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1432	    933134 ns/op	   85805 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1309	    950398 ns/op	   85894 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      80	  15577368 ns/op	   87147 B/op	     278 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      67	  15765289 ns/op	   87494 B/op	     280 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      76	  15257296 ns/op	   87451 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      79	  15121400 ns/op	   86940 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1396	    904203 ns/op	   85807 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1370	    919051 ns/op	   85794 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1333	    924208 ns/op	   85836 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1393	    961625 ns/op	   85747 B/op	     279 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     722	   1589589 ns/op	  586099 B/op	    3163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     838	   1601845 ns/op	  585332 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     750	   1567634 ns/op	  585337 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     776	   1532788 ns/op	  585155 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     207	   5433502 ns/op	 2869467 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     220	   5448784 ns/op	 2867953 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     222	   5348700 ns/op	 2869048 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     211	   5403563 ns/op	 2868999 B/op	   15165 allocs/op
+PASS
+##### 3. same-session A/B round 2 — OLD binary (baseline 393fbd5)
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     207	   5682067 ns/op	  629371 B/op	    6282 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     219	   5909959 ns/op	  627681 B/op	    6281 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     205	   5884859 ns/op	  628206 B/op	    6281 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     202	   5654791 ns/op	  627790 B/op	    6282 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      54	  22588691 ns/op	 2792673 B/op	   30290 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      50	  23026231 ns/op	 2792244 B/op	   30290 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      56	  23449778 ns/op	 2795169 B/op	   30291 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      49	  23209521 ns/op	 2791544 B/op	   30290 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     690	   1693552 ns/op	  586097 B/op	    3163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     667	   1690292 ns/op	  585553 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     788	   1628388 ns/op	  585229 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     722	   1605879 ns/op	  585183 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     206	   5687366 ns/op	 2868950 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     213	   5617587 ns/op	 2868262 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     210	   5583638 ns/op	 2868396 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     207	   6073600 ns/op	 2868473 B/op	   15165 allocs/op
+PASS
+##### 3. same-session A/B round 2 — NEW binary
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     277	   4148744 ns/op	   86402 B/op	     278 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     294	   3994390 ns/op	   85987 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     303	   4247650 ns/op	   86157 B/op	     278 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     260	   4312246 ns/op	   86330 B/op	     278 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1220	    992945 ns/op	   85955 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1276	    999419 ns/op	   85881 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1107	    974654 ns/op	   85882 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1258	    935022 ns/op	   85859 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      84	  16659412 ns/op	   86877 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      76	  15655822 ns/op	   87254 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      81	  15250540 ns/op	   87198 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      84	  15581907 ns/op	   87061 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1320	    954705 ns/op	   85871 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1347	    927090 ns/op	   85827 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1246	    973615 ns/op	   85842 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1124	    931365 ns/op	   85763 B/op	     279 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     664	   1756832 ns/op	  586160 B/op	    3163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     711	   1566919 ns/op	  585322 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     676	   1690838 ns/op	  585525 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     717	   1634174 ns/op	  585535 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     212	   5469459 ns/op	 2867807 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     201	   5598157 ns/op	 2869453 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     228	   5099634 ns/op	 2868182 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     224	   5417483 ns/op	 2868152 B/op	   15165 allocs/op
+PASS
+##### 3. same-session A/B round 3 — OLD binary (baseline 393fbd5)
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     224	   5406959 ns/op	  628691 B/op	    6281 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     256	   4759458 ns/op	  627990 B/op	    6280 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     212	   5694623 ns/op	  627980 B/op	    6281 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     212	   5506644 ns/op	  628438 B/op	    6281 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      45	  23567766 ns/op	 2793923 B/op	   30291 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      50	  22707786 ns/op	 2795383 B/op	   30290 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      58	  22119975 ns/op	 2791447 B/op	   30290 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      51	  22881151 ns/op	 2794822 B/op	   30290 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     777	   1543991 ns/op	  585938 B/op	    3163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     729	   1600005 ns/op	  585393 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     746	   1586741 ns/op	  585153 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     666	   1709119 ns/op	  585061 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     208	   5605337 ns/op	 2869783 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     241	   5297520 ns/op	 2867821 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     218	   5769910 ns/op	 2868866 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     238	   5158390 ns/op	 2868915 B/op	   15165 allocs/op
+PASS
+##### 3. same-session A/B round 3 — NEW binary
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     345	   3749848 ns/op	   86549 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     291	   3909681 ns/op	   86071 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     303	   4121103 ns/op	   86058 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2         	     301	   4093675 ns/op	   85837 B/op	     277 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1298	    949458 ns/op	   86005 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1309	    908114 ns/op	   85856 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1149	    926801 ns/op	   85890 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2  	    1538	    921559 ns/op	   85927 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      76	  15489249 ns/op	   87587 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      79	  17035826 ns/op	   87177 B/op	     278 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      74	  15759310 ns/op	   87508 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last-2         	      74	  16890260 ns/op	   87255 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1183	    960339 ns/op	   85864 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1264	    958653 ns/op	   85851 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1431	    914590 ns/op	   85849 B/op	     279 allocs/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1098	    927616 ns/op	   85801 B/op	     279 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     698	   1610364 ns/op	  586270 B/op	    3163 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     637	   1666094 ns/op	  585505 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     661	   1671309 ns/op	  585364 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                 	     753	   1566292 ns/op	  585316 B/op	    3162 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     206	   5591765 ns/op	 2868966 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     201	   5764818 ns/op	 2869117 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     198	   5804398 ns/op	 2868792 B/op	   15165 allocs/op
+BenchmarkDoorHandshake/dd/secrets=5000/last-2                 	     219	   5339391 ns/op	 2868754 B/op	   15165 allocs/op
+PASS
+##### 4. BenchmarkScanBudgetReserve (mtglib-after.test)
+BenchmarkScanBudgetReserve/keyed-2         	 2841961	       421.0 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/keyed-2         	 2718456	       426.8 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/keyed-2         	 3089330	       394.3 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/keyed-2         	 3048740	       425.2 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/keyed-2         	 2774511	       473.1 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/keyed-2         	 2400471	       496.9 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/unkeyed-2       	 3683515	       314.9 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/unkeyed-2       	 4164997	       304.9 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/unkeyed-2       	 4342364	       303.2 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/unkeyed-2       	 3931366	       295.4 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/unkeyed-2       	 3738723	       312.9 ns/op	      96 B/op	       1 allocs/op
+BenchmarkScanBudgetReserve/unkeyed-2       	 3986008	       295.0 ns/op	      96 B/op	       1 allocs/op
