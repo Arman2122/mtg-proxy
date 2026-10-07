@@ -1,0 +1,1405 @@
+==> old.wrap.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10654736	       106.7 ns/op	153558.63 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	11037031	       109.3 ns/op	149828.95 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10209973	       100.0 ns/op	163756.57 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11603571	       105.5 ns/op	155186.00 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11389387	       104.0 ns/op	157544.20 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10850352	       109.5 ns/op	149516.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10878874	       102.7 ns/op	159455.50 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12347544	        96.06 ns/op	170514.02 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10783618	       103.7 ns/op	157950.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10249437	       111.4 ns/op	147015.67 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10319342	       110.5 ns/op	148179.81 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12314895	       101.5 ns/op	161439.13 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11679888	       103.4 ns/op	158420.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	11339482	       107.1 ns/op	152885.64 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10421971	       108.5 ns/op	151005.52 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11272342	       100.8 ns/op	162480.12 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11100626	       106.2 ns/op	154237.76 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10901482	       112.5 ns/op	145627.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11324701	       106.3 ns/op	154032.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11985832	       103.1 ns/op	158851.38 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10680564	       108.4 ns/op	151127.44 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10546009	       110.3 ns/op	148536.10 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10771105	       108.4 ns/op	151055.58 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12062538	       108.0 ns/op	151675.01 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10978310	       106.5 ns/op	153809.80 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	11170188	       106.4 ns/op	153943.19 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10757917	       103.4 ns/op	158370.64 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11037828	       114.0 ns/op	143684.85 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11276467	       103.8 ns/op	157835.10 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	11309684	       110.9 ns/op	147700.79 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10241844	       105.4 ns/op	155438.42 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12522751	        98.56 ns/op	166187.32 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11298324	       106.5 ns/op	153865.58 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10828832	       108.4 ns/op	151149.14 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10684581	       104.7 ns/op	156493.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12013585	       100.3 ns/op	163325.69 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11488299	       103.4 ns/op	158422.24 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10999191	       108.6 ns/op	150845.96 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10212232	       111.0 ns/op	147521.28 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11842051	        97.86 ns/op	167375.18 MB/s	       0 B/op	       0 allocs/op
+PASS
+
+==> new.wrap.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11519156	       106.1 ns/op	154337.24 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10876657	       110.1 ns/op	148763.45 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10111196	       121.5 ns/op	134779.78 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11248387	       108.5 ns/op	150920.88 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10310916	       114.2 ns/op	143376.61 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10875409	       109.7 ns/op	149303.10 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10190492	       108.1 ns/op	151545.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10869073	       107.0 ns/op	153034.57 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10878478	       112.0 ns/op	146207.98 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10726440	       109.4 ns/op	149659.69 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	 9835915	       114.7 ns/op	142783.10 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11283555	       107.8 ns/op	151979.91 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10713280	       108.0 ns/op	151623.60 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10881102	       108.4 ns/op	151128.91 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10897387	       109.7 ns/op	149366.38 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11331478	        98.38 ns/op	166481.01 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11592088	       104.5 ns/op	156755.04 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	11381050	       109.8 ns/op	149142.43 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11074513	       113.4 ns/op	144473.59 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13542492	        91.72 ns/op	178583.65 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11275735	       104.2 ns/op	157254.58 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	11175837	       108.3 ns/op	151304.17 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10454996	       114.0 ns/op	143703.63 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12973221	        98.05 ns/op	167048.76 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10954413	       109.1 ns/op	150106.59 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10422483	       117.3 ns/op	139609.36 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11065645	       114.2 ns/op	143422.92 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11485897	       106.2 ns/op	154234.95 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11202343	       103.0 ns/op	158964.62 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	11432935	       110.1 ns/op	148746.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	 5080524	       245.4 ns/op	66745.28 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	 5039758	       232.5 ns/op	70457.93 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	11411100	       106.4 ns/op	153962.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	11099856	       109.6 ns/op	149379.54 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11239290	       106.0 ns/op	154501.91 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11910798	        96.84 ns/op	169138.87 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10603274	       109.6 ns/op	149491.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	 9533320	       109.6 ns/op	149457.63 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11012935	       108.6 ns/op	150804.54 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12569832	        98.54 ns/op	166224.71 MB/s	       0 B/op	       0 allocs/op
+PASS
+
+==> old.door.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     577	   1832249 ns/op	 572.29 MB/s	    5095 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     552	   2158272 ns/op	 485.84 MB/s	    6131 B/op	      76 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      44	  25453465 ns/op	 659.13 MB/s	  754828 B/op	    1137 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      46	  24631184 ns/op	 681.14 MB/s	  633460 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      48	  24102586 ns/op	 696.08 MB/s	  771385 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      43	  26408841 ns/op	 635.29 MB/s	  745033 B/op	    1133 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     439	   2706142 ns/op	 387.48 MB/s	    1343 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     420	   2544298 ns/op	 412.13 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      55	  21239248 ns/op	 789.92 MB/s	   22542 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      60	  22018289 ns/op	 761.97 MB/s	   22311 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      52	  21573372 ns/op	 777.68 MB/s	   22708 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      54	  22063148 ns/op	 760.42 MB/s	   22656 B/op	    1133 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     442	   2732914 ns/op	 383.68 MB/s	    1340 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     411	   2722149 ns/op	 385.20 MB/s	    1307 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      50	  22236792 ns/op	 754.48 MB/s	   22836 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      60	  20699185 ns/op	 810.53 MB/s	   22332 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      60	  21022556 ns/op	 798.06 MB/s	   22330 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      54	  22341540 ns/op	 750.94 MB/s	   22562 B/op	    1127 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     724	   1842953 ns/op	 568.96 MB/s	    6355 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     582	   2009847 ns/op	 521.72 MB/s	    4716 B/op	      76 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      48	  24523849 ns/op	 684.12 MB/s	  749554 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      52	  22671645 ns/op	 740.01 MB/s	  640907 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      46	  24090095 ns/op	 696.44 MB/s	  720854 B/op	    1131 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      51	  23163318 ns/op	 724.30 MB/s	  684442 B/op	    1134 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     459	   2723391 ns/op	 385.03 MB/s	    1354 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     394	   2842518 ns/op	 368.89 MB/s	    1379 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      54	  21202408 ns/op	 791.29 MB/s	   22648 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      48	  21512322 ns/op	 779.89 MB/s	   22904 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      51	  21695013 ns/op	 773.32 MB/s	   22764 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      61	  20973541 ns/op	 799.92 MB/s	   22287 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     459	   2717960 ns/op	 385.80 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     444	   2773445 ns/op	 378.08 MB/s	    1337 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      58	  21429015 ns/op	 782.92 MB/s	   22434 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      55	  20874746 ns/op	 803.71 MB/s	   22694 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      58	  20502855 ns/op	 818.29 MB/s	   22390 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      54	  21027492 ns/op	 797.87 MB/s	   22654 B/op	    1132 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     638	   1956747 ns/op	 535.88 MB/s	    3800 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     508	   2066236 ns/op	 507.48 MB/s	    5497 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      45	  25263678 ns/op	 664.08 MB/s	  762668 B/op	    1137 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      49	  23685092 ns/op	 708.34 MB/s	  601208 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      45	  25079873 ns/op	 668.95 MB/s	  785279 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      49	  23612743 ns/op	 710.52 MB/s	  744885 B/op	    1136 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     408	   2685748 ns/op	 390.42 MB/s	    1345 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     392	   2938753 ns/op	 356.81 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      56	  21485767 ns/op	 780.85 MB/s	   22499 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      57	  21789904 ns/op	 769.95 MB/s	   22456 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      54	  21872933 ns/op	 767.03 MB/s	   22672 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      56	  22079840 ns/op	 759.84 MB/s	   22490 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     492	   2579670 ns/op	 406.48 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     438	   2917809 ns/op	 359.37 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      54	  21976231 ns/op	 763.43 MB/s	   23367 B/op	    1131 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      58	  22123269 ns/op	 758.35 MB/s	   22385 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      50	  23700711 ns/op	 707.88 MB/s	   22803 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      50	  21218263 ns/op	 790.70 MB/s	   22854 B/op	    1131 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     608	   2202993 ns/op	 475.98 MB/s	    7887 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     538	   2037967 ns/op	 514.52 MB/s	    5268 B/op	      75 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      51	  22922221 ns/op	 731.92 MB/s	  653580 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      49	  23932361 ns/op	 701.03 MB/s	  767950 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      52	  22434047 ns/op	 747.85 MB/s	  661877 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      50	  23531664 ns/op	 712.96 MB/s	  687234 B/op	    1133 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     482	   2589662 ns/op	 404.91 MB/s	    1321 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     544	   2436288 ns/op	 430.40 MB/s	    1335 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      52	  20390039 ns/op	 822.81 MB/s	   22684 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      61	  20547413 ns/op	 816.51 MB/s	   22285 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      58	  20893231 ns/op	 803.00 MB/s	   22467 B/op	    1133 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      58	  20177504 ns/op	 831.48 MB/s	   22431 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     451	   2746305 ns/op	 381.81 MB/s	    1337 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     471	   2662387 ns/op	 393.85 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      57	  21268218 ns/op	 788.84 MB/s	   22485 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      56	  20965817 ns/op	 800.22 MB/s	   22557 B/op	    1132 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      55	  21296051 ns/op	 787.81 MB/s	   22555 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      51	  21254166 ns/op	 789.36 MB/s	   22767 B/op	    1129 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     601	   1893381 ns/op	 553.81 MB/s	    5622 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     646	   1881311 ns/op	 557.36 MB/s	    4405 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      49	  23544769 ns/op	 712.57 MB/s	  669086 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      46	  23994817 ns/op	 699.20 MB/s	  780888 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      51	  22866251 ns/op	 733.71 MB/s	  564251 B/op	    1130 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      50	  23356529 ns/op	 718.31 MB/s	  695930 B/op	    1134 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     526	   2545821 ns/op	 411.88 MB/s	    1336 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     490	   2516634 ns/op	 416.66 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      55	  21434150 ns/op	 782.73 MB/s	   22536 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      58	  20905878 ns/op	 802.51 MB/s	   22359 B/op	    1126 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      49	  21766247 ns/op	 770.79 MB/s	   22832 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      57	  21349666 ns/op	 785.83 MB/s	   22504 B/op	    1132 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     421	   2803273 ns/op	 374.05 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     445	   2837202 ns/op	 369.58 MB/s	    1347 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      54	  23183711 ns/op	 723.66 MB/s	   22575 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      57	  22457188 ns/op	 747.08 MB/s	   22517 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      60	  21546449 ns/op	 778.65 MB/s	   22306 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      51	  22056334 ns/op	 760.65 MB/s	   22726 B/op	    1128 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     529	   1989063 ns/op	 527.17 MB/s	    5351 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     646	   1933228 ns/op	 542.40 MB/s	    6440 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      50	  23711244 ns/op	 707.56 MB/s	  644917 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      49	  23953850 ns/op	 700.40 MB/s	  701864 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      49	  25962970 ns/op	 646.20 MB/s	  646517 B/op	    1131 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      50	  23334139 ns/op	 719.00 MB/s	  796936 B/op	    1138 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     476	   2673837 ns/op	 392.16 MB/s	    1321 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     441	   2633148 ns/op	 398.22 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      54	  26132429 ns/op	 642.01 MB/s	   22579 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      48	  21053066 ns/op	 796.90 MB/s	   22909 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      56	  22484722 ns/op	 746.16 MB/s	   22518 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      49	  21256125 ns/op	 789.29 MB/s	   22876 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     478	   2422232 ns/op	 432.90 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     439	   2562163 ns/op	 409.25 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      60	  21183546 ns/op	 791.99 MB/s	   22347 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      52	  22373014 ns/op	 749.89 MB/s	   22732 B/op	    1132 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      58	  21713216 ns/op	 772.67 MB/s	   22426 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      55	  22233814 ns/op	 754.58 MB/s	   22544 B/op	    1129 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     352	   3434519 ns/op	 305.31 MB/s	    8891 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     382	   3127978 ns/op	 335.22 MB/s	    9993 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      38	  29682914 ns/op	 565.21 MB/s	 1100182 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      49	  23787126 ns/op	 705.31 MB/s	  712367 B/op	    1131 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      48	  24602942 ns/op	 681.92 MB/s	  681086 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      44	  26599964 ns/op	 630.72 MB/s	  692244 B/op	    1132 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     459	   2610155 ns/op	 401.73 MB/s	    1342 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     410	   2827892 ns/op	 370.80 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      48	  22249232 ns/op	 754.06 MB/s	   22893 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      54	  20732759 ns/op	 809.21 MB/s	   22705 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      50	  21045633 ns/op	 797.18 MB/s	   22820 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      60	  21429303 ns/op	 782.91 MB/s	   22272 B/op	    1125 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     457	   2540575 ns/op	 412.73 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     435	   2812609 ns/op	 372.81 MB/s	    1323 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      52	  22261413 ns/op	 753.65 MB/s	   22773 B/op	    1133 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      62	  21556009 ns/op	 778.31 MB/s	   22230 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      55	  21183496 ns/op	 791.99 MB/s	   22867 B/op	    1131 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      52	  20899066 ns/op	 802.77 MB/s	   23356 B/op	    1129 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     580	   1851157 ns/op	 566.44 MB/s	    4974 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     712	   1801498 ns/op	 582.06 MB/s	    4162 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      50	  23127991 ns/op	 725.41 MB/s	  797690 B/op	    1136 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      51	  24074245 ns/op	 696.89 MB/s	  705995 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      50	  23291567 ns/op	 720.31 MB/s	  731464 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      49	  24275478 ns/op	 691.12 MB/s	  640731 B/op	    1137 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     396	   3121531 ns/op	 335.92 MB/s	    1378 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     424	   2649066 ns/op	 395.83 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      48	  22482066 ns/op	 746.25 MB/s	   22916 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      51	  23909902 ns/op	 701.68 MB/s	   22788 B/op	    1132 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      50	  22084382 ns/op	 759.69 MB/s	   22791 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      52	  23552196 ns/op	 712.34 MB/s	   22698 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     448	   2423056 ns/op	 432.75 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     433	   2805019 ns/op	 373.82 MB/s	    1375 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      55	  23224129 ns/op	 722.40 MB/s	   22526 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      60	  21244370 ns/op	 789.73 MB/s	   22342 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      50	  23390228 ns/op	 717.27 MB/s	   22794 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      49	  23310665 ns/op	 719.72 MB/s	   22902 B/op	    1131 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     555	   1876820 ns/op	 558.70 MB/s	    6355 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     543	   1997027 ns/op	 525.07 MB/s	    7148 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      49	  23304555 ns/op	 719.91 MB/s	  701716 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      54	  22135909 ns/op	 757.92 MB/s	  588018 B/op	    1130 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      51	  23056690 ns/op	 727.65 MB/s	  705647 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      51	  22990450 ns/op	 729.75 MB/s	  642321 B/op	    1131 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     484	   2611700 ns/op	 401.49 MB/s	    1338 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     414	   2646285 ns/op	 396.24 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      58	  20860002 ns/op	 804.28 MB/s	   22374 B/op	    1126 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      51	  22034077 ns/op	 761.42 MB/s	   22947 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      56	  20322736 ns/op	 825.54 MB/s	   22477 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      50	  22429281 ns/op	 748.01 MB/s	   22786 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     505	   2589023 ns/op	 405.01 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     488	   2566338 ns/op	 408.59 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      58	  20447918 ns/op	 820.49 MB/s	   22542 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      50	  20767924 ns/op	 807.84 MB/s	   22789 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      56	  20460574 ns/op	 819.98 MB/s	   22476 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      54	  21092249 ns/op	 795.42 MB/s	   22606 B/op	    1130 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     714	   1863649 ns/op	 562.65 MB/s	    4447 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     652	   2102257 ns/op	 498.79 MB/s	    7098 B/op	      76 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      50	  23305035 ns/op	 719.90 MB/s	  688166 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      46	  24356998 ns/op	 688.80 MB/s	  663512 B/op	    1131 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      49	  24584511 ns/op	 682.43 MB/s	  537309 B/op	    1129 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      48	  23981636 ns/op	 699.59 MB/s	  795276 B/op	    1134 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     538	   2279199 ns/op	 460.06 MB/s	    1335 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     394	   2913172 ns/op	 359.94 MB/s	    1337 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      52	  21710094 ns/op	 772.78 MB/s	   22659 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      60	  21992880 ns/op	 762.85 MB/s	   22276 B/op	    1126 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      49	  21824389 ns/op	 768.74 MB/s	   22860 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      55	  20817237 ns/op	 805.93 MB/s	   22626 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     423	   2774832 ns/op	 377.89 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     447	   2684755 ns/op	 390.57 MB/s	    1355 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      50	  22892303 ns/op	 732.88 MB/s	   22751 B/op	    1126 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      56	  21447348 ns/op	 782.25 MB/s	   22495 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      46	  23868014 ns/op	 702.92 MB/s	   23043 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      56	  22075971 ns/op	 759.98 MB/s	   22482 B/op	    1128 allocs/op
+PASS
+
+==> new.door.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     590	   1947750 ns/op	 538.35 MB/s	    6451 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     650	   1890870 ns/op	 554.55 MB/s	    3736 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      44	  24996029 ns/op	 671.20 MB/s	  779335 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      50	  23519299 ns/op	 713.34 MB/s	  687116 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      49	  23078966 ns/op	 726.95 MB/s	  701604 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      52	  22312426 ns/op	 751.92 MB/s	  603339 B/op	    1131 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     458	   2570912 ns/op	 407.86 MB/s	    1323 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     444	   2936219 ns/op	 357.12 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      55	  22100047 ns/op	 759.15 MB/s	   22545 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      55	  21535355 ns/op	 779.05 MB/s	   22538 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      55	  21118035 ns/op	 794.45 MB/s	   22541 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      57	  21068571 ns/op	 796.31 MB/s	   22443 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     432	   2848084 ns/op	 368.17 MB/s	    1337 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     445	   2853196 ns/op	 367.51 MB/s	    1337 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      51	  21806965 ns/op	 769.35 MB/s	   22732 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      49	  21461224 ns/op	 781.75 MB/s	   23505 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      58	  21744476 ns/op	 771.56 MB/s	   22578 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      49	  23523228 ns/op	 713.22 MB/s	   22859 B/op	    1129 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     615	   2056120 ns/op	 509.98 MB/s	    4843 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     610	   1911393 ns/op	 548.59 MB/s	    7099 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      50	  23554052 ns/op	 712.29 MB/s	  721065 B/op	    1136 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      49	  23835983 ns/op	 703.86 MB/s	  801026 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      50	  23584781 ns/op	 711.36 MB/s	  660669 B/op	    1131 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      43	  26034992 ns/op	 644.41 MB/s	  770154 B/op	    1132 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     483	   2502457 ns/op	 419.02 MB/s	    1321 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     423	   2708657 ns/op	 387.12 MB/s	    1356 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      54	  22144894 ns/op	 757.61 MB/s	   22574 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      52	  22293084 ns/op	 752.57 MB/s	   22793 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      57	  21073808 ns/op	 796.12 MB/s	   22472 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      62	  23643328 ns/op	 709.60 MB/s	   22254 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     447	   2768599 ns/op	 378.74 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     482	   2560602 ns/op	 409.50 MB/s	    1330 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      54	  20662108 ns/op	 811.98 MB/s	   22582 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      61	  21247361 ns/op	 789.61 MB/s	   22281 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      52	  20971481 ns/op	 800.00 MB/s	   22645 B/op	    1126 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      50	  23264723 ns/op	 721.14 MB/s	   22810 B/op	    1130 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     603	   1845858 ns/op	 568.07 MB/s	    6554 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     542	   2099211 ns/op	 499.51 MB/s	    6228 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      52	  22916822 ns/op	 732.09 MB/s	  652552 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      51	  22843845 ns/op	 734.43 MB/s	  737639 B/op	    1136 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      43	  26107158 ns/op	 642.63 MB/s	  870941 B/op	    1142 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      48	  25985550 ns/op	 645.64 MB/s	  794282 B/op	    1134 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     445	   2627368 ns/op	 399.10 MB/s	    1323 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     428	   2743174 ns/op	 382.25 MB/s	    1375 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      56	  21703599 ns/op	 773.02 MB/s	   22509 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      45	  22327722 ns/op	 751.41 MB/s	   23136 B/op	    1131 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      52	  22364599 ns/op	 750.17 MB/s	   22676 B/op	    1126 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      52	  22183882 ns/op	 756.28 MB/s	   22678 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     432	   2695075 ns/op	 389.07 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     450	   2819669 ns/op	 371.88 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      43	  25218095 ns/op	 665.28 MB/s	   23431 B/op	    1131 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      50	  24406728 ns/op	 687.40 MB/s	   22756 B/op	    1126 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      60	  21227340 ns/op	 790.36 MB/s	   22316 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      52	  22098013 ns/op	 759.22 MB/s	   22703 B/op	    1129 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     687	   1771984 ns/op	 591.75 MB/s	    4165 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     609	   1916343 ns/op	 547.18 MB/s	    5262 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      51	  23175881 ns/op	 723.91 MB/s	  664853 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      42	  27463730 ns/op	 610.89 MB/s	  917412 B/op	    1136 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      50	  24209038 ns/op	 693.01 MB/s	  665934 B/op	    1131 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      49	  24131195 ns/op	 695.25 MB/s	  811930 B/op	    1136 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     454	   2710825 ns/op	 386.81 MB/s	    1323 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     490	   2553330 ns/op	 410.67 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      51	  22612294 ns/op	 741.95 MB/s	   22804 B/op	    1133 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      48	  21618223 ns/op	 776.07 MB/s	   22911 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      54	  23378049 ns/op	 717.65 MB/s	   22583 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      49	  22536391 ns/op	 744.45 MB/s	   23041 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     535	   2482166 ns/op	 422.44 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     445	   2779345 ns/op	 377.27 MB/s	    1374 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      54	  20970385 ns/op	 800.04 MB/s	   22573 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      63	  21278738 ns/op	 788.45 MB/s	   22255 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      50	  20869798 ns/op	 803.90 MB/s	   22800 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      55	  21960852 ns/op	 763.96 MB/s	   22516 B/op	    1127 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     768	   1868163 ns/op	 561.29 MB/s	    6163 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     600	   1824899 ns/op	 574.59 MB/s	    4843 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      50	  23002504 ns/op	 729.36 MB/s	  600385 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      51	  23800901 ns/op	 704.90 MB/s	  652527 B/op	    1136 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      49	  23400943 ns/op	 716.95 MB/s	  701348 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      49	  24962258 ns/op	 672.10 MB/s	  711406 B/op	    1134 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     451	   2652486 ns/op	 395.32 MB/s	    1355 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     453	   2557928 ns/op	 409.93 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      51	  28580816 ns/op	 587.01 MB/s	   22761 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      48	  26254406 ns/op	 639.02 MB/s	   23232 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      54	  22566182 ns/op	 743.47 MB/s	   22756 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      51	  21696732 ns/op	 773.26 MB/s	   23401 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     474	   2813064 ns/op	 372.75 MB/s	    1337 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     426	   2426858 ns/op	 432.07 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      50	  21640613 ns/op	 775.27 MB/s	   22800 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      57	  21587902 ns/op	 777.16 MB/s	   22492 B/op	    1132 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      49	  20971152 ns/op	 800.01 MB/s	   22832 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      55	  21208071 ns/op	 791.08 MB/s	   22518 B/op	    1128 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     693	   1929773 ns/op	 543.37 MB/s	    4523 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     657	   1803056 ns/op	 581.55 MB/s	    3787 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      49	  25156776 ns/op	 666.91 MB/s	  779124 B/op	    1137 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      49	  23242092 ns/op	 721.85 MB/s	  705702 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      51	  22445967 ns/op	 747.45 MB/s	  706272 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      49	  23668346 ns/op	 708.85 MB/s	  676002 B/op	    1134 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     480	   2399418 ns/op	 437.01 MB/s	    1371 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     504	   2434968 ns/op	 430.63 MB/s	    1306 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      54	  21796433 ns/op	 769.72 MB/s	   22601 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      57	  21005091 ns/op	 798.72 MB/s	   22497 B/op	    1132 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      60	  20972717 ns/op	 799.95 MB/s	   22296 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      61	  20860073 ns/op	 804.27 MB/s	   22245 B/op	    1126 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     445	   2798669 ns/op	 374.67 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     451	   2768966 ns/op	 378.69 MB/s	    1373 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      51	  24014999 ns/op	 698.61 MB/s	   22786 B/op	    1132 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      52	  21566452 ns/op	 777.93 MB/s	   22688 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      51	  20554690 ns/op	 816.22 MB/s	   22901 B/op	    1126 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      48	  23723268 ns/op	 707.21 MB/s	   22906 B/op	    1129 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     378	   2880885 ns/op	 363.98 MB/s	    8369 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     601	   2016073 ns/op	 520.11 MB/s	    3940 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      49	  23630991 ns/op	 709.97 MB/s	  579622 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      43	  28514833 ns/op	 588.37 MB/s	  782930 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      52	  23156047 ns/op	 724.53 MB/s	  826363 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      49	  23780704 ns/op	 705.50 MB/s	  677947 B/op	    1132 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     480	   2444344 ns/op	 428.98 MB/s	    1325 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     514	   2552447 ns/op	 410.81 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      55	  21276538 ns/op	 788.53 MB/s	   22575 B/op	    1131 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      58	  21739753 ns/op	 771.73 MB/s	   22372 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      45	  25321621 ns/op	 662.56 MB/s	   23087 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      54	  20790308 ns/op	 806.97 MB/s	   22550 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     427	   2839427 ns/op	 369.29 MB/s	    1337 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     399	   2824332 ns/op	 371.27 MB/s	    1337 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      54	  21323370 ns/op	 786.80 MB/s	   22726 B/op	    1132 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      56	  21714260 ns/op	 772.64 MB/s	   22476 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      61	  22088788 ns/op	 759.54 MB/s	   22275 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      48	  22514638 ns/op	 745.17 MB/s	   22939 B/op	    1129 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     481	   2360764 ns/op	 444.17 MB/s	    6020 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     531	   1888760 ns/op	 555.17 MB/s	    6636 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      49	  23680805 ns/op	 708.47 MB/s	  744490 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      51	  22903510 ns/op	 732.52 MB/s	  610020 B/op	    1130 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      49	  23920784 ns/op	 701.37 MB/s	  811741 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      50	  23153699 ns/op	 724.60 MB/s	  730698 B/op	    1133 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     432	   2623985 ns/op	 399.61 MB/s	    1355 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     399	   2789349 ns/op	 375.92 MB/s	    1378 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      45	  22286775 ns/op	 752.79 MB/s	   23089 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      63	  21943236 ns/op	 764.57 MB/s	   22193 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      58	  21014952 ns/op	 798.35 MB/s	   22396 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      56	  21352620 ns/op	 785.72 MB/s	   22469 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     441	   2624823 ns/op	 399.48 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     511	   2615005 ns/op	 400.98 MB/s	    1337 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      51	  21974389 ns/op	 763.49 MB/s	   22922 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      55	  20949667 ns/op	 800.83 MB/s	   22634 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      55	  21129404 ns/op	 794.02 MB/s	   22698 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      50	  21499789 ns/op	 780.34 MB/s	   22790 B/op	    1127 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     666	   1983887 ns/op	 528.55 MB/s	    4543 B/op	      76 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     592	   2014375 ns/op	 520.55 MB/s	    6246 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      49	  23376546 ns/op	 717.69 MB/s	  645841 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      44	  25691338 ns/op	 653.03 MB/s	  816077 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      50	  22873720 ns/op	 733.47 MB/s	  654311 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      51	  22949122 ns/op	 731.06 MB/s	  759304 B/op	    1134 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     493	   2509802 ns/op	 417.79 MB/s	    1321 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     471	   2622967 ns/op	 399.77 MB/s	    1339 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      58	  21168241 ns/op	 792.57 MB/s	   22383 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      52	  21355416 ns/op	 785.62 MB/s	   22669 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      54	  23166549 ns/op	 724.20 MB/s	   23296 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      60	  21010906 ns/op	 798.50 MB/s	   22327 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     411	   2685718 ns/op	 390.43 MB/s	    1306 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     436	   2669064 ns/op	 392.86 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      54	  22382948 ns/op	 749.55 MB/s	   23218 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      49	  22018785 ns/op	 761.95 MB/s	   22796 B/op	    1125 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      52	  22038641 ns/op	 761.26 MB/s	   23008 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      49	  21785016 ns/op	 770.13 MB/s	   22843 B/op	    1128 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2         	     601	   1969451 ns/op	 532.42 MB/s	    5449 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2 	     534	   2143973 ns/op	 489.08 MB/s	    4266 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2        	      49	  24386104 ns/op	 687.98 MB/s	  735971 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2         	      46	  23801064 ns/op	 704.89 MB/s	  816382 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2                  	      50	  23269179 ns/op	 721.01 MB/s	  718840 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2          	      49	  24085257 ns/op	 696.58 MB/s	  656887 B/op	    1133 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2                          	     487	   2548025 ns/op	 411.53 MB/s	    1321 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped/tracked-2                  	     444	   2616112 ns/op	 400.81 MB/s	    1306 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2                         	      48	  21704100 ns/op	 773.00 MB/s	   22884 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped/tracked-2                 	      61	  20376010 ns/op	 823.38 MB/s	   22276 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2                          	      58	  22546351 ns/op	 744.12 MB/s	   22393 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared/tracked-2                  	      52	  22089194 ns/op	 759.52 MB/s	   22700 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2                       	     456	   2713579 ns/op	 386.42 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped/tracked-2               	     421	   2739164 ns/op	 382.81 MB/s	    1344 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2                      	      57	  21168298 ns/op	 792.56 MB/s	   22484 B/op	    1131 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped/tracked-2              	      56	  20995205 ns/op	 799.10 MB/s	   22455 B/op	    1126 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2                       	      60	  21087562 ns/op	 795.60 MB/s	   22342 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared/tracked-2               	      54	  21871948 ns/op	 767.07 MB/s	   22558 B/op	    1127 allocs/op
+PASS
+
+==> hs.hs.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1047	   1001750 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1065	    989694 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1154	   1023736 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1107	    961198 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     295	   4275542 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1168	    900157 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2475	    509047 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2504	    528226 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2584	    521768 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     705	   1618730 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1172	    956933 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1267	    910592 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1425	    888767 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1364	    949433 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1243	   1009531 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     274	   4039900 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1354	    885480 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2853	    495471 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2332	    464398 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2718	    480266 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     716	   1763789 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1380	    877121 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1237	    949212 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1394	    915058 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1134	   1166538 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1352	    905341 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     266	   4116844 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1153	    933033 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2556	    498754 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2514	    468441 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2632	    477281 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     591	   1955569 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1275	   1014154 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	     991	   1124858 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1423	    961496 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1213	   1007559 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1147	    957183 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     286	   4150170 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1144	   1050401 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2210	    500967 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2364	    527649 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2414	    504831 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     691	   1736948 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1396	    869395 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1177	    916547 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1084	    971594 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1216	   1002343 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1407	    905881 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     312	   4036180 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1239	    954637 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2767	    484333 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2308	    488756 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2161	    511948 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     738	   1734562 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1162	    939006 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1330	    878890 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1462	    904456 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1363	    891952 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1276	    875388 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     316	   3778610 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1368	    855365 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2460	    461982 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2523	    514095 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2442	    489908 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     666	   1658488 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1233	    950660 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1237	    877143 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1369	    919170 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1251	    861845 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1201	    920505 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     303	   3869800 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1358	    877942 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2724	    505862 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2164	    498057 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2846	    526948 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     634	   1646636 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1288	    841173 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1334	    891103 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1272	   1075072 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1204	    927179 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1305	    922385 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     327	   3745192 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1357	    866761 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2698	    462415 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2398	    455331 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2378	    512277 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     618	   1820952 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1522	    895297 ns/op
+PASS
+
+==> new.hs.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1508	    904308 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1135	   1000310 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1179	    935015 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1130	    921760 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     331	   4000898 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1275	    987922 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2428	    526917 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2190	    547391 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2102	    561830 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     735	   1597551 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1327	    914719 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1430	    872698 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1551	    964277 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1454	    897025 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1383	    908718 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     318	   3772209 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1370	    893574 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2847	    458819 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2797	    490032 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2689	    504317 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     720	   1841611 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1382	    847484 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1352	    938389 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1304	   1053073 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1515	    931883 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1382	    966893 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     314	   3774932 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1336	    964984 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2707	    521311 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2550	    496247 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2355	    505321 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     720	   1861534 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	     996	   1267569 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1166	    952517 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1402	    905385 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1398	    911805 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1146	    931983 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     318	   4028009 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1054	   1127256 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2206	    586719 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2204	    584548 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2151	    621460 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     553	   2453236 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1336	    923244 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1207	    936126 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1414	    876027 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1387	    890292 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1168	    981147 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     307	   3943026 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1357	    886741 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2364	    502691 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2704	    477501 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2422	    513863 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     568	   1918783 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1056	   1022569 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1293	    972844 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1296	    959095 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1044	    991702 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1158	    922830 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     304	   3757416 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1197	    992138 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2497	    487184 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2703	    480413 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2286	    529785 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     654	   1940347 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1342	    897552 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1320	    952902 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1336	    963182 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1201	    981965 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1372	   1064144 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     308	   3742707 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1443	    916963 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2592	    469697 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2119	    480921 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    2524	    524473 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     690	   1740162 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1432	    872372 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/first-2         	    1375	    936785 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last-2          	    1298	    889390 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1/last/hinted-2   	    1346	    966829 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/first-2      	    1256	    888361 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last-2       	     294	   3801348 ns/op
+BenchmarkDoorHandshake/ee-unpaced/secrets=1000/last/hinted-2         	    1270	    968672 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/first-2                          	    2022	    499379 ns/op
+BenchmarkDoorHandshake/dd/secrets=1/last-2                           	    2611	    482025 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/first-2                       	    1999	    501126 ns/op
+BenchmarkDoorHandshake/dd/secrets=1000/last-2                        	     788	   1656469 ns/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorHandshake/ee-unpaced/secrets=5000/last/hinted-2  	    1178	    918318 ns/op
+PASS
+
+==> old.recheck.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	 8945302	       125.1 ns/op	130976.84 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	 9274303	       130.7 ns/op	125321.29 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11955999	        98.75 ns/op	165866.90 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12431580	       106.7 ns/op	153515.07 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	10523862	       118.7 ns/op	137933.99 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10412080	       122.0 ns/op	134280.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12116992	       102.8 ns/op	159258.08 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12097363	       104.1 ns/op	157331.48 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	 8908645	       122.5 ns/op	133683.51 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	 9890532	       123.8 ns/op	132308.40 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11828001	        96.03 ns/op	170562.60 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12081900	        96.47 ns/op	169785.73 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	10682158	       100.7 ns/op	162587.73 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11453307	        99.41 ns/op	164766.68 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13338926	       100.1 ns/op	163603.87 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12504909	        96.28 ns/op	170119.47 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	12247960	       117.1 ns/op	139823.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	12290832	       124.1 ns/op	131958.33 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12767240	        91.42 ns/op	179169.37 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11574558	        93.41 ns/op	175343.88 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	13189240	       119.2 ns/op	137450.85 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	13297598	       118.6 ns/op	138102.17 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13602561	        95.83 ns/op	170912.23 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11859789	        94.34 ns/op	173620.37 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	10124167	       114.1 ns/op	143582.31 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10912285	       109.7 ns/op	149310.49 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11043501	       110.1 ns/op	148803.46 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11153047	       106.1 ns/op	154411.75 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	11055600	       105.5 ns/op	155304.35 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10507394	       109.7 ns/op	149344.00 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11368390	       106.5 ns/op	153782.86 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10829899	       112.7 ns/op	145303.04 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	11749179	       114.4 ns/op	143231.61 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11104796	       107.8 ns/op	151924.11 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11298542	       108.8 ns/op	150550.18 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11291062	       108.6 ns/op	150869.20 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	11000614	       101.7 ns/op	160983.43 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11296524	       105.2 ns/op	155631.37 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10940835	       112.7 ns/op	145327.97 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11925873	       109.7 ns/op	149241.15 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	11849745	       113.1 ns/op	144851.29 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11557736	       112.5 ns/op	145574.81 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11000607	       113.8 ns/op	143903.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11196382	       114.4 ns/op	143143.96 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	 9969777	       106.5 ns/op	153776.08 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11704665	       110.4 ns/op	148419.13 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10013655	       101.5 ns/op	161299.10 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11922398	       124.1 ns/op	131962.57 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	 8518916	       147.1 ns/op	111364.06 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10492945	       113.6 ns/op	144174.93 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11947087	       110.9 ns/op	147711.17 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	 8472777	       164.6 ns/op	99484.66 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	11666773	        96.23 ns/op	170209.90 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	13243813	       111.2 ns/op	147239.70 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11713390	       102.5 ns/op	159810.51 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11746783	       108.1 ns/op	151555.76 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	10710867	       116.8 ns/op	140194.22 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	 9429822	       120.8 ns/op	135635.88 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12102853	       104.1 ns/op	157269.27 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11271380	       108.8 ns/op	150581.02 MB/s	       0 B/op	       0 allocs/op
+PASS
+
+==> new.recheck.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	13376598	       126.2 ns/op	129789.28 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	13314126	       122.3 ns/op	133978.57 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13093911	        91.75 ns/op	178522.51 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12988670	        93.61 ns/op	174977.12 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	 8661567	       139.4 ns/op	117487.47 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	 8687276	       141.4 ns/op	115797.90 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11746588	       101.6 ns/op	161243.20 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12686580	        93.71 ns/op	174786.81 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	 9601850	       119.1 ns/op	137490.37 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	12008008	       123.3 ns/op	132825.83 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13267081	        97.69 ns/op	167666.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12137944	       103.9 ns/op	157637.31 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	14503963	       125.8 ns/op	130203.45 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	14403667	       124.8 ns/op	131204.82 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11596822	        93.76 ns/op	174683.85 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13052728	        92.15 ns/op	177739.37 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	13328161	       115.7 ns/op	141585.98 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10627972	        97.54 ns/op	167921.62 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13415625	        95.10 ns/op	172229.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13310964	        89.29 ns/op	183443.22 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	 9486956	       130.6 ns/op	125460.20 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	 9371390	       127.2 ns/op	128786.93 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13420086	        99.93 ns/op	163898.77 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	13017456	        90.26 ns/op	181462.91 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	10698338	       109.3 ns/op	149859.49 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11310621	       112.4 ns/op	145727.59 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11451156	       102.3 ns/op	160167.50 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11257975	       141.9 ns/op	115392.44 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	10327545	       105.7 ns/op	154996.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11372612	       127.0 ns/op	128995.02 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10935237	       108.3 ns/op	151234.74 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11645707	       107.2 ns/op	152826.53 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	11646091	       108.4 ns/op	151142.40 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11067141	       114.3 ns/op	143348.41 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10498399	       109.5 ns/op	149584.41 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11249216	       113.6 ns/op	144135.84 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	11429157	       108.0 ns/op	151589.91 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11183152	       111.7 ns/op	146570.37 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11247145	       114.8 ns/op	142618.51 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10956236	       109.0 ns/op	150277.05 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	10519124	       106.4 ns/op	153998.05 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	12247243	       116.0 ns/op	141182.07 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11128945	       120.0 ns/op	136505.56 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11681426	       104.9 ns/op	156187.96 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	10670702	       101.8 ns/op	160920.54 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11255244	       118.9 ns/op	137733.78 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12099469	       106.7 ns/op	153540.65 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11647224	       103.1 ns/op	158791.49 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	11535242	       116.1 ns/op	141024.94 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10659895	       104.7 ns/op	156437.85 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10435834	        98.83 ns/op	165723.80 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12439800	       113.2 ns/op	144712.70 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	11145036	       113.1 ns/op	144871.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11204996	       115.6 ns/op	141666.81 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12775126	       106.0 ns/op	154563.48 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12735594	       106.8 ns/op	153312.49 MB/s	       0 B/op	       0 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConnParallel/read/noentry-2 	10748882	       117.3 ns/op	139582.68 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	10712754	       113.4 ns/op	144497.36 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10927527	       100.1 ns/op	163702.62 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11931261	       101.5 ns/op	161307.12 MB/s	       0 B/op	       0 allocs/op
+PASS
+
+==> new.info1.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/entry-2         	10006574	       119.4 ns/op	137161.33 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/entry-2         	 9156711	       121.9 ns/op	134407.31 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/entry-2         	10184826	       116.2 ns/op	140933.88 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/entry-2         	 8145000	       126.6 ns/op	129415.81 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/entry-2         	10146963	       118.5 ns/op	138173.85 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/ceiling-2       	 3751234	       349.6 ns/op	46849.29 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/ceiling-2       	 3432697	       345.2 ns/op	47446.07 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/ceiling-2       	 3464101	       341.7 ns/op	47938.27 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/ceiling-2       	 3703410	       356.0 ns/op	46003.94 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/ceiling-2       	 3459450	       334.8 ns/op	48929.02 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/fair+user-2     	 1098652	      1090 ns/op	15031.93 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/fair+user-2     	  956202	      1107 ns/op	14792.68 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/fair+user-2     	 1000000	      1040 ns/op	15749.12 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/fair+user-2     	 1000000	      1124 ns/op	14566.78 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/fair+user-2     	 1000000	      1098 ns/op	14917.91 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/entry-2        	 8961709	       141.7 ns/op	115581.58 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/entry-2        	 7827622	       127.9 ns/op	128052.20 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/entry-2        	 9628633	       128.7 ns/op	127279.56 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/entry-2        	 9533241	       126.1 ns/op	129892.31 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/entry-2        	 9827864	       123.0 ns/op	133207.30 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/ceiling-2      	 3511177	       353.8 ns/op	46293.64 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/ceiling-2      	 3589099	       336.4 ns/op	48686.81 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/ceiling-2      	 3675436	       341.4 ns/op	47974.54 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/ceiling-2      	 3422704	       410.1 ns/op	39935.57 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/ceiling-2      	 3060879	       356.9 ns/op	45894.61 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/fair+user-2    	  880167	      1137 ns/op	14407.51 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/fair+user-2    	 1000000	      1072 ns/op	15271.94 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/fair+user-2    	 1088505	      1094 ns/op	14973.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/fair+user-2    	 1000000	      1071 ns/op	15290.78 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/fair+user-2    	 1000000	      1033 ns/op	15854.54 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/entry-2 	 8592949	       138.3 ns/op	118462.42 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/entry-2 	 8815338	       136.1 ns/op	120356.48 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/entry-2 	 8312047	       141.4 ns/op	115816.11 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/entry-2 	 8712432	       140.4 ns/op	116665.97 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/entry-2 	 8692300	       141.8 ns/op	115498.46 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/ceiling-2         	 2690400	       405.0 ns/op	40441.61 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/ceiling-2         	 2940351	       443.7 ns/op	36911.15 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/ceiling-2         	 2862727	       430.0 ns/op	38087.35 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/ceiling-2         	 2742112	       414.9 ns/op	39480.03 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/ceiling-2         	 2646663	       404.4 ns/op	40500.19 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/fair+user-2       	  974845	      1170 ns/op	14004.71 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/fair+user-2       	 1000000	      1175 ns/op	13941.32 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/fair+user-2       	 1000000	      1072 ns/op	15278.97 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/fair+user-2       	 1000000	      1071 ns/op	15294.68 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/fair+user-2       	 1000000	      1048 ns/op	15634.79 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/entry-2          	 7731522	       166.2 ns/op	98553.50 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/entry-2          	 7119310	       170.8 ns/op	95876.41 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/entry-2          	 7207743	       166.2 ns/op	98569.54 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/entry-2          	 7104110	       169.4 ns/op	96711.35 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/entry-2          	 7121281	       171.4 ns/op	95552.54 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/ceiling-2        	 2326341	       540.7 ns/op	30294.04 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/ceiling-2        	 2311653	       507.4 ns/op	32281.43 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/ceiling-2        	 2314119	       541.2 ns/op	30262.90 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/ceiling-2        	 2438966	       551.7 ns/op	29688.81 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/ceiling-2        	 2241847	       457.0 ns/op	35839.63 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/fair+user-2      	  941804	      1229 ns/op	13325.62 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/fair+user-2      	 1000000	      1227 ns/op	13350.11 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/fair+user-2      	 1000000	      1128 ns/op	14522.34 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/fair+user-2      	 1000000	      1173 ns/op	13962.76 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/fair+user-2      	 1000000	      1133 ns/op	14456.39 MB/s	       0 B/op	       0 allocs/op
+PASS
+
+==> new.info2.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkDoorBulkControls/ee-unpaced/conns=1/addr=stamped/ceiling-2         	     667	   1810282 ns/op	 579.23 MB/s	    5268 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=1/addr=stamped/ceiling-2         	     628	   1994545 ns/op	 525.72 MB/s	    5869 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=1/addr=stamped/ceiling-2         	     590	   2044971 ns/op	 512.76 MB/s	    4931 B/op	      76 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=1/addr=stamped/fair-2            	     488	   2416980 ns/op	 433.84 MB/s	    5940 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=1/addr=stamped/fair-2            	     664	   1964885 ns/op	 533.66 MB/s	    6038 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=1/addr=stamped/fair-2            	     500	   2424215 ns/op	 432.54 MB/s	    8821 B/op	      76 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=stamped/ceiling-2        	      48	  24283342 ns/op	 690.89 MB/s	  738954 B/op	    1138 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=stamped/ceiling-2        	      45	  23568718 ns/op	 711.84 MB/s	  630528 B/op	    1130 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=stamped/ceiling-2        	      51	  23816337 ns/op	 704.44 MB/s	  653423 B/op	    1132 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=stamped/fair-2           	      34	  32308235 ns/op	 519.29 MB/s	 1015248 B/op	    1138 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=stamped/fair-2           	      46	  24214538 ns/op	 692.86 MB/s	  888205 B/op	    1135 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=stamped/fair-2           	      50	  23378415 ns/op	 717.64 MB/s	  753040 B/op	    1135 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=shared/ceiling-2         	      50	  22948791 ns/op	 731.07 MB/s	  675930 B/op	    1133 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=shared/ceiling-2         	      50	  23165955 ns/op	 724.22 MB/s	  806875 B/op	    1135 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=shared/ceiling-2         	      48	  23897194 ns/op	 702.06 MB/s	  760253 B/op	    1132 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=shared/fair-2            	      48	  24169872 ns/op	 694.14 MB/s	  635497 B/op	    1131 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=shared/fair-2            	      49	  24245007 ns/op	 691.99 MB/s	  622975 B/op	    1134 allocs/op
+BenchmarkDoorBulkControls/ee-unpaced/conns=16/addr=shared/fair-2            	      48	  24473174 ns/op	 685.53 MB/s	  750205 B/op	    1133 allocs/op
+BenchmarkDoorBulkControls/dd/conns=1/addr=stamped/ceiling-2                 	     523	   2566317 ns/op	 408.59 MB/s	    1336 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/dd/conns=1/addr=stamped/ceiling-2                 	     487	   2516647 ns/op	 416.66 MB/s	    1321 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/dd/conns=1/addr=stamped/ceiling-2                 	     463	   3147381 ns/op	 333.16 MB/s	    1355 B/op	      76 allocs/op
+BenchmarkDoorBulkControls/dd/conns=1/addr=stamped/fair-2                    	     400	   2778445 ns/op	 377.40 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/dd/conns=1/addr=stamped/fair-2                    	     492	   2569253 ns/op	 408.12 MB/s	    1323 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/dd/conns=1/addr=stamped/fair-2                    	     378	   2863516 ns/op	 366.18 MB/s	    1337 B/op	      76 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=stamped/ceiling-2                	      45	  22953670 ns/op	 730.92 MB/s	   23071 B/op	    1127 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=stamped/ceiling-2                	      55	  21643580 ns/op	 775.16 MB/s	   22566 B/op	    1131 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=stamped/ceiling-2                	      49	  21206149 ns/op	 791.15 MB/s	   22870 B/op	    1130 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=stamped/fair-2                   	      50	  21152570 ns/op	 793.15 MB/s	   22888 B/op	    1130 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=stamped/fair-2                   	      51	  22929628 ns/op	 731.68 MB/s	   22818 B/op	    1129 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=stamped/fair-2                   	      57	  22766875 ns/op	 736.91 MB/s	   22519 B/op	    1129 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=shared/ceiling-2                 	      55	  22124660 ns/op	 758.30 MB/s	   22535 B/op	    1129 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=shared/ceiling-2                 	      54	  22526827 ns/op	 744.77 MB/s	   22567 B/op	    1128 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=shared/ceiling-2                 	      57	  21595102 ns/op	 776.90 MB/s	   22443 B/op	    1127 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=shared/fair-2                    	      58	  22558275 ns/op	 743.73 MB/s	   22597 B/op	    1129 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=shared/fair-2                    	      50	  22305597 ns/op	 752.15 MB/s	   23241 B/op	    1134 allocs/op
+BenchmarkDoorBulkControls/dd/conns=16/addr=shared/fair-2                    	      54	  22293617 ns/op	 752.56 MB/s	   22539 B/op	    1126 allocs/op
+BenchmarkDoorBulkControls/plain/conns=1/addr=stamped/ceiling-2              	     454	   2607053 ns/op	 402.21 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/plain/conns=1/addr=stamped/ceiling-2              	     404	   2906166 ns/op	 360.81 MB/s	    1422 B/op	      76 allocs/op
+BenchmarkDoorBulkControls/plain/conns=1/addr=stamped/ceiling-2              	     392	   2762502 ns/op	 379.57 MB/s	    1336 B/op	      76 allocs/op
+BenchmarkDoorBulkControls/plain/conns=1/addr=stamped/fair-2                 	     472	   2635848 ns/op	 397.81 MB/s	    1323 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/plain/conns=1/addr=stamped/fair-2                 	     364	   2958394 ns/op	 354.44 MB/s	    1338 B/op	      76 allocs/op
+BenchmarkDoorBulkControls/plain/conns=1/addr=stamped/fair-2                 	     406	   2649205 ns/op	 395.81 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=stamped/ceiling-2             	      49	  23090111 ns/op	 726.60 MB/s	   22857 B/op	    1128 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=stamped/ceiling-2             	      56	  21164123 ns/op	 792.72 MB/s	   23082 B/op	    1127 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=stamped/ceiling-2             	      51	  23426441 ns/op	 716.17 MB/s	   22770 B/op	    1131 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=stamped/fair-2                	      50	  21308198 ns/op	 787.36 MB/s	   22919 B/op	    1131 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=stamped/fair-2                	      54	  21975257 ns/op	 763.46 MB/s	   22662 B/op	    1128 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=stamped/fair-2                	      43	  28240105 ns/op	 594.09 MB/s	   23338 B/op	    1129 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=shared/ceiling-2              	      49	  20713218 ns/op	 809.98 MB/s	   23025 B/op	    1128 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=shared/ceiling-2              	      60	  20551410 ns/op	 816.35 MB/s	   22309 B/op	    1127 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=shared/ceiling-2              	      49	  21454559 ns/op	 781.99 MB/s	   23083 B/op	    1132 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=shared/fair-2                 	      56	  21663132 ns/op	 774.46 MB/s	   22524 B/op	    1129 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=shared/fair-2                 	      48	  21461363 ns/op	 781.74 MB/s	   22911 B/op	    1128 allocs/op
+BenchmarkDoorBulkControls/plain/conns=16/addr=shared/fair-2                 	      46	  22336762 ns/op	 751.10 MB/s	   23071 B/op	    1130 allocs/op
+PASS
+
+==> new.tick.raw <==
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkFairTick/entries=16-2         	  158954	      8582 ns/op	    4608 B/op	       5 allocs/op
+BenchmarkFairTick/entries=16-2         	  149000	      8773 ns/op	    4608 B/op	       5 allocs/op
+BenchmarkFairTick/entries=16-2         	  146307	      8902 ns/op	    4608 B/op	       5 allocs/op
+BenchmarkFairTick/entries=512-2        	    4202	    253043 ns/op	  143360 B/op	       5 allocs/op
+BenchmarkFairTick/entries=512-2        	    4566	    288150 ns/op	  143360 B/op	       5 allocs/op
+BenchmarkFairTick/entries=512-2        	    4303	    254098 ns/op	  143360 B/op	       5 allocs/op
+BenchmarkFairTick/entries=4096-2       	     505	   2407224 ns/op	 1089536 B/op	       5 allocs/op
+BenchmarkFairTick/entries=4096-2       	     436	   2532747 ns/op	 1089536 B/op	       5 allocs/op
+BenchmarkFairTick/entries=4096-2       	     487	   2494852 ns/op	 1089536 B/op	       5 allocs/op
+PASS
