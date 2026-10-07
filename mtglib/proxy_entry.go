@@ -20,62 +20,66 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	rewind := newConnRewind(ctx.client())
 
 	// Read the active secret snapshot once so a concurrent ReloadSecrets swap
-	// cannot desync the key list, hostnames and matched index mid-handshake.
+	// cannot desync the candidates, hostnames and the index a match maps back to
+	// mid-handshake.
 	set := p.secrets.Load()
 
-	// Only HOSTED secrets are HMAC candidates. ReadClientHelloMulti matches SNI
-	// against the global hostname list and then HMACs against every key it is
-	// given, so leaving a hostless key in this list would let a client borrow
-	// another secret's hostname to authenticate with it.
-	secretKeys := make([][]byte, 0, len(set.hosted))
-	for _, i := range set.hosted {
-		secretKeys = append(secretKeys, set.secrets[i].Key[:])
-	}
-
-	result, err := fake.ReadClientHelloMulti(
-		rewind,
-		secretKeys,
-		set.hostnames,
-		p.tolerateTimeSkewness,
-	)
+	// The hello is read and put through the SNI gate once; what is tried against
+	// it is set.cands, which are the HOSTED secrets only. The gate matches SNI
+	// against the global hostname list, so a hostless key among the candidates
+	// would let a client borrow another secret's hostname to authenticate with it.
+	parsed, err := fake.ParseClientHelloFor(rewind, set.hostnames)
 	if err != nil {
 		p.logger.InfoError("cannot read client hello", err)
-
-		frontHost := set.frontHost
-		if result != nil && result.MatchedHost != "" {
-			frontHost = result.MatchedHost
-		}
-
-		p.doDomainFrontingForHost(ctx, rewind, frontHost)
+		p.doDomainFrontingForHost(ctx, rewind, set.frontHost)
 
 		return false
 	}
 
-	if p.antiReplayCache.SeenBefore(result.Hello.SessionID) {
+	pos, _ := p.scanCandidates(parsed, set, nil)
+	if pos < 0 {
+		p.logger.InfoError("cannot read client hello", fake.ErrBadDigest)
+		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
+
+		return false
+	}
+
+	// pos is a position in set.cands; map it back into the full secret list
+	// before anything reads names, limits or ad tags by it.
+	return p.completeFakeTLS(ctx, rewind, set, parsed, set.candIdx[pos])
+}
+
+// completeFakeTLS is what follows a hello that matched one secret, idx being its
+// index into set.secrets: the replay check, the per-user limits, and the
+// server's flight.
+func (p *Proxy) completeFakeTLS(
+	ctx *streamContext,
+	rewind *connRewind,
+	set *secretSet,
+	parsed *fake.Parsed,
+	idx int,
+) bool {
+	if p.antiReplayCache.SeenBefore(parsed.Hello.SessionID) {
 		p.logger.Warning("replay attack has been detected!")
 		p.eventStream.Send(p.ctx, NewEventReplayAttack(ctx.streamID))
-		p.doDomainFrontingForHost(ctx, rewind, result.MatchedHost)
+		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
 
 		return false
 	}
-
-	// MatchedIndex indexes the hosted candidate list; map it back into the full
-	// secret list before anything reads names, limits or ad tags by it.
-	idx := set.hosted[result.MatchedIndex]
 
 	// Enforce per-user governance limits before we speak TLS back. A denied
 	// user (disabled, expired, or over quota) is routed to the cover site just
 	// like a wrong secret, so the outcome is indistinguishable to a prober.
 	if !p.attribute(ctx, set, idx) {
-		p.doDomainFrontingForHost(ctx, rewind, result.MatchedHost)
+		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
 
 		return false
 	}
 
-	gangerNoise := p.doppelGanger.NoiseParamsFor(result.MatchedHost)
+	gangerNoise := p.doppelGanger.NoiseParamsFor(parsed.MatchedHost)
 	noiseParams := fake.NoiseParams{Mean: gangerNoise.Mean, Jitter: gangerNoise.Jitter}
 
-	if err := fake.SendServerHello(ctx.client(), set.secrets[idx].Key[:], result.Hello, noiseParams); err != nil {
+	if err := fake.SendServerHello(ctx.client(), set.secrets[idx].Key[:], parsed.Hello, noiseParams); err != nil {
 		p.logger.InfoError("cannot send welcome packet", err)
 		return false
 	}
@@ -83,6 +87,26 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	ctx.setClient(tls.New(ctx.client(), true, false))
 
 	return true
+}
+
+// scanCandidates verifies parsed against set.cands in order and returns the
+// position of the first that matches, or -1; tried is how many it verified.
+// Positions skip reports true for are passed over, unverified and uncounted;
+// nil skips none. A set with no candidates is scanned for nothing: -1, 0.
+func (p *Proxy) scanCandidates(parsed *fake.Parsed, set *secretSet, skip func(pos int) bool) (pos, tried int) {
+	for at, cand := range set.cands {
+		if skip != nil && skip(at) {
+			continue
+		}
+
+		tried++
+
+		if parsed.Verify(cand, p.tolerateTimeSkewness) {
+			return at, tried
+		}
+	}
+
+	return -1, tried
 }
 
 // obfuscatedDrainBytes bounds the drain disposal by volume; the handshake
