@@ -38,12 +38,12 @@ const (
 	fairDoorPiece = 16 << 10
 )
 
-// fairDownload is one of alice's streams through the door, and what its client
-// has received.
+// fairDownload is one of alice's streams through the door, what Telegram has
+// written down it, and what its client has received.
 type fairDownload struct {
 	*ceilingStream
 
-	received atomic.Int64
+	sent, received atomic.Int64
 }
 
 // openFairDownload connects one of alice's clients from where and counts what
@@ -92,7 +92,10 @@ func (d *fairDownload) push(piece int, every time.Duration) {
 				<-tick
 			}
 
-			if _, err := d.upstream.Write(buf); err != nil {
+			n, err := d.upstream.Write(buf)
+			d.sent.Add(int64(n))
+
+			if err != nil {
 				return
 			}
 		}
@@ -244,8 +247,10 @@ func TestFairShareThroughTheDoorAnIdleAddressStallsNobody(t *testing.T) {
 	busy := openFairDownload(t, ec, h, secret.Key, tcpFrom("203.0.113.81", 50001))
 	idle := openFairDownload(t, ec, h, secret.Key, tcpFrom("198.51.100.82", 50002))
 
+	// Alone, the busy address runs at the whole total from its first byte:
+	// there is nothing to converge, only the first ticks to pass.
 	busy.push(fairDoorPiece, 0)
-	time.Sleep(4 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	const window = 4 * time.Second
 
@@ -272,6 +277,10 @@ func TestFairShareThroughTheDoorAnIdleAddressStallsNobody(t *testing.T) {
 // Max-min, not the total over the number of addresses: a quiet address asking
 // for a tenth of the total keeps all of it, and a greedy one beside it has the
 // rest, nine tenths -- not the half an even split would hold it to.
+//
+// What the quiet address asks for is what Telegram actually wrote down its
+// stream in the window, not the schedule the writer aims at: a writer the
+// machine descheduled asks for less, and the proxy is not to blame for that.
 func TestFairShareThroughTheDoorAQuietAddressKeepsItsDemand(t *testing.T) {
 	t.Parallel()
 
@@ -293,13 +302,15 @@ func TestFairShareThroughTheDoorAQuietAddressKeepsItsDemand(t *testing.T) {
 	// three more.
 	time.Sleep(5 * time.Second)
 
+	sentBefore := quiet.sent.Load()
 	got := fairWindow(window, fairAddress{greedy}, fairAddress{quiet})
-	asked := int64(quietPiece * int(window/quietEvery))
+	asked := quiet.sent.Load() - sentBefore
 
-	t.Logf("greedy %d (%.2f of the total), quiet %d of the %d it asked for, over %s",
+	t.Logf("greedy %d (%.2f of the total), quiet %d of the %d Telegram wrote for it, over %s",
 		got[0], fairOfTotal(got[0], window), got[1], asked, window)
 
-	assert.GreaterOrEqual(t, got[1], asked*3/4, "the quiet address keeps what it asks for")
+	// A piece written as the window closes may still be on its way.
+	assert.GreaterOrEqual(t, got[1], (asked-quietPiece)*3/4, "the quiet address keeps what it asks for")
 	assert.Greater(t, fairOfTotal(got[0], window), 0.7, "the greedy one has the rest, not half")
 	assertWithinTheTotal(t, got, window, "greedy and quiet")
 }

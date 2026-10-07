@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -80,8 +80,9 @@ func TestTheFairShareTickerRunsWithTheMaintenanceLoop(t *testing.T) {
 	assert.True(t, awaitFairPass(passes, 3*fairTickInterval), "the maintenance loop starts fair share's ticker")
 }
 
-// The ticker stops with the context it runs under, and the proxy can wait for
-// it: once its goroutine has returned, nothing ticks any more.
+// The ticker runs at the period it is given and stops with the context it runs
+// under, and the proxy can wait for it: once its goroutine has returned,
+// nothing ticks any more.
 func TestTheFairShareTickerStopsWithItsContext(t *testing.T) {
 	t.Parallel()
 
@@ -93,7 +94,15 @@ func TestTheFairShareTickerStopsWithItsContext(t *testing.T) {
 	t.Cleanup(cancel)
 
 	p.startFairShare(ctx, 5*time.Millisecond)
-	require.True(t, awaitFairPass(passes, 2*time.Second), "the ticker passes")
+
+	// Three passes of a 5 ms ticker take 15 ms; one of fairTickInterval
+	// takes a second.
+	deadline := time.Now().Add(500 * time.Millisecond)
+
+	for i := range 3 {
+		require.True(t, awaitFairPass(passes, time.Until(deadline)),
+			"pass %d within 500 ms: the ticker runs at the period it is given", i+1)
+	}
 
 	cancel()
 
@@ -183,10 +192,16 @@ func TestShutdownStopsTheFairShareTicker(t *testing.T) {
 	proxy, err := NewProxy(opts)
 	require.NoError(t, err)
 
-	var once sync.Once
+	// The cleanup shuts the proxy down only if the test never began to. A
+	// Shutdown that hangs must fail the test by name below, not hang the
+	// whole package in a cleanup waiting behind it.
+	var shuttingDown atomic.Bool
 
-	shutdown := func() { once.Do(proxy.Shutdown) }
-	t.Cleanup(shutdown)
+	t.Cleanup(func() {
+		if !shuttingDown.Load() {
+			proxy.Shutdown()
+		}
+	})
 
 	require.NotNil(t, proxy.clients.acquire("alice", "203.0.113.9", true, entryInitOf(lim)))
 
@@ -195,10 +210,12 @@ func TestShutdownStopsTheFairShareTicker(t *testing.T) {
 
 	stopped := make(chan struct{})
 
+	shuttingDown.Store(true)
+
 	go func() {
 		defer close(stopped)
 
-		shutdown()
+		proxy.Shutdown()
 	}()
 
 	require.True(t, govAwait(stopped, 10*time.Second), "Shutdown returns once the ticker has stopped")
@@ -209,11 +226,12 @@ func TestShutdownStopsTheFairShareTicker(t *testing.T) {
 	assert.Equal(t, last, fairLastTick(proxy.clients, "alice"), "and nothing ticks after it")
 }
 
-// A pass ticks every secret whose client-fair divides a speed, and no other:
-// not one with speeds and fair share off -- its own bucket holds it and
-// nothing divides it -- and not one switched on with no speed to divide. Each
-// is ticked at the table's clock, the one the data path stamps the blocked
-// trackers by, not the wall clock.
+// A pass ticks every secret whose client-fair divides a speed -- the second
+// such secret in name order as well as the first -- and no other: not one
+// with speeds and fair share off, which its own bucket holds and nothing
+// divides, and not one switched on with no speed to divide. Each is ticked at
+// the table's clock, the one the data path stamps the blocked trackers by, not
+// the wall clock.
 func TestTheFairShareTickerTicksTheFairSecretsAtTheTablesClock(t *testing.T) {
 	t.Parallel()
 
@@ -226,12 +244,14 @@ func TestTheFairShareTickerTicksTheFairSecretsAtTheTablesClock(t *testing.T) {
 		"alice": {SpeedDownBytesPerSecond: fairTestTotal, ClientFair: true},
 		"bob":   {SpeedBytesPerSecond: fairTestTotal, SpeedDownBytesPerSecond: fairTestTotal},
 		"carol": {ClientFair: true},
+		"dave":  {SpeedUpBytesPerSecond: fairTestTotal, ClientFair: true},
 	}
 
 	p.secrets.Store(buildSecretSet(map[string]Secret{
 		"alice": GenerateSecret("alice.example.com"),
 		"bob":   GenerateSecret("bob.example.com"),
 		"carol": GenerateSecret("carol.example.com"),
+		"dave":  GenerateSecret("dave.example.com"),
 	}, nil, nil, limits))
 
 	for name, lim := range limits {
@@ -240,10 +260,12 @@ func TestTheFairShareTickerTicksTheFairSecretsAtTheTablesClock(t *testing.T) {
 
 	p.tickFairShare()
 	assert.Equal(t, clock.read(), fairLastTick(p.clients, "alice"), "a fair secret is ticked, at the table's clock")
+	assert.Equal(t, clock.read(), fairLastTick(p.clients, "dave"), "and so is every other one")
 
 	clock.advance(fairTickInterval)
 	p.tickFairShare()
 	assert.Equal(t, clock.read(), fairLastTick(p.clients, "alice"))
+	assert.Equal(t, clock.read(), fairLastTick(p.clients, "dave"))
 
 	assert.True(t, fairLastTick(p.clients, "bob").IsZero(), "a secret whose fair share is off is not ticked")
 	assert.True(t, fairLastTick(p.clients, "carol").IsZero(), "nor one with no speed to divide")
