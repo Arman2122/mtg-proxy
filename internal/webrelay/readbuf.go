@@ -2,6 +2,7 @@ package webrelay
 
 import (
 	"sync"
+	"weak"
 
 	"github.com/Arman2122/mtg-proxy/internal/webrelay/frame"
 )
@@ -25,12 +26,20 @@ const (
 // touches after a release can be one a stream has since taken.
 type readBufferPools struct {
 	small, large sync.Pool
+
+	// released is, while poisonReleased is set, every buffer released and not
+	// taken since. It cannot be read off the buffer: a read puts the backend's
+	// bytes in it, and those may be the poison's. Weak, so a buffer the pool
+	// drops is not kept alive by its entry.
+	mu       sync.Mutex
+	released map[weak.Pointer[byte]]struct{}
 }
 
 func newReadBufferPools() *readBufferPools {
 	return &readBufferPools{
-		small: sync.Pool{New: func() any { return make([]byte, smallRead) }},
-		large: sync.Pool{New: func() any { return make([]byte, largeRead) }},
+		small:    sync.Pool{New: func() any { return make([]byte, smallRead) }},
+		large:    sync.Pool{New: func() any { return make([]byte, largeRead) }},
+		released: make(map[weak.Pointer[byte]]struct{}),
 	}
 }
 
@@ -39,7 +48,7 @@ var readBuffers = newReadBufferPools()
 // poisonReleased is set by this package's tests: every released buffer is then
 // overwritten with poison, so a buffer used after its release corrupts what
 // the client receives and the byte-exact tests fail, and a buffer released
-// twice -- still all poison -- panics.
+// twice -- not taken in between -- panics.
 var poisonReleased bool
 
 const poison = 0xA5
@@ -59,8 +68,8 @@ func (p *readBufferPools) get(large bool) []byte {
 	buf := pool.Get().([]byte) //nolint: forcetypeassert // the pool's own New
 
 	if poisonReleased {
-		// Taken: no longer all poison, so its next release is its first.
-		buf[0] = 0
+		// Taken, so its next release is its first.
+		p.mark(buf, false)
 	}
 
 	return buf
@@ -81,7 +90,7 @@ func (p *readBufferPools) release(b []byte) {
 	}
 
 	if poisonReleased {
-		if allPoison(b) {
+		if p.mark(b, true) {
 			panic("webrelay: a read buffer was released twice")
 		}
 
@@ -93,14 +102,23 @@ func (p *readBufferPools) release(b []byte) {
 	pool.Put(b) //nolint: staticcheck // SA6002: boxing the slice header is 24 bytes against a 4-64 KiB buffer
 }
 
-func allPoison(b []byte) bool {
-	for _, c := range b {
-		if c != poison {
-			return false
-		}
+// mark records whether b's buffer is released, and reports whether it already
+// was.
+func (p *readBufferPools) mark(b []byte, released bool) bool {
+	key := weak.Make(&b[0])
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	_, was := p.released[key]
+
+	if released {
+		p.released[key] = struct{}{}
+	} else {
+		delete(p.released, key)
 	}
 
-	return true
+	return was
 }
 
 // nextReadLarge is the size of a stream's next read, from its last: large
