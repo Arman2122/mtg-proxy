@@ -444,22 +444,7 @@ func BenchmarkDoorBulk(b *testing.B) {
 func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int, addrOf func(i int) net.Addr, places int, tracked bool) {
 	b.Helper()
 
-	secret := dc.entry.secret(b)
-	h := dc.build(b, map[string]Secret{"alice": secret}, nil)
-
-	// The harness builds a Proxy literal, so ProxyOpts.TrackClientIPs cannot
-	// reach it; this is the field that option sets. Before the first stream:
-	// admission reads it.
-	h.proxy.trackClientIPs = tracked
-
-	streams := make([]doorStream, conns)
-
-	for i := range streams {
-		streams[i] = openStreamFrom(b, dc, h, "alice", secret.Key, 256<<10, addrOf(i))
-	}
-
-	requireStampedAddresses(b, h.proxy, "alice", conns, places)
-	requireTracking(b, h.proxy, "alice", places, tracked)
+	h, streams := stampedDoor(b, dc, conns, addrOf, places, tracked)
 
 	b.SetBytes(int64(conns) * doorChunk)
 	b.ReportAllocs()
@@ -486,6 +471,37 @@ func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int, addrOf func(i in
 
 	require.Equal(b, want, st.bytesOut.Load(), "every byte sent down must be counted, once")
 	require.Zero(b, st.bytesIn.Load(), "a download reads nothing from the client")
+}
+
+// stampedDoor is the setup of a BenchmarkDoorBulk row: a door hosting alice
+// alone, keeping client addresses when tracked says so, with conns of her
+// streams carried into the relay, connection i from a client at addrOf(i), and
+// read back as places distinct keyed addresses. A test of what a newer proxy
+// does with these streams builds them here too, so that what it checks is what
+// the rows time.
+func stampedDoor(
+	tb testing.TB, dc doorCase, conns int, addrOf func(i int) net.Addr, places int, tracked bool,
+) (*entryHarness, []doorStream) {
+	tb.Helper()
+
+	secret := dc.entry.secret(tb)
+	h := dc.build(tb, map[string]Secret{"alice": secret}, nil)
+
+	// The harness builds a Proxy literal, so ProxyOpts.TrackClientIPs cannot
+	// reach it; this is the field that option sets. Before the first stream:
+	// admission reads it.
+	h.proxy.trackClientIPs = tracked
+
+	streams := make([]doorStream, conns)
+
+	for i := range streams {
+		streams[i] = openStreamFrom(tb, dc, h, "alice", secret.Key, 256<<10, addrOf(i))
+	}
+
+	requireStampedAddresses(tb, h.proxy, "alice", conns, places)
+	requireTracking(tb, h.proxy, "alice", places, tracked)
+
+	return h, streams
 }
 
 // requireStampedAddresses reads back, from the proxy's own registry, what the

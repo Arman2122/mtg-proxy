@@ -2,11 +2,13 @@ package mtglib
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -47,6 +49,70 @@ func clientStream(
 	held.Store(entry)
 
 	return newCountingConn(ctx, nil, far, stats, "alice").withClient(held), far, held
+}
+
+// governedCase is one path a stream takes to its user's speed limit and quota.
+// noentry is the wrapper of a stream whose secret keeps no per-address entries.
+// entry is that of a stream with an entry and no limiter installed, which is
+// every keyed stream of a proxy that keeps client addresses -- a panel's -- and
+// runs the entry path's own copy of the user's waits. entry-ceiling has a
+// ceiling far above anything a test moves, so the path that pays the address's
+// limiters first runs, and holds nothing itself. The user's limits must hold
+// the same on all three: the tests of them run once per case.
+type governedCase struct {
+	name string
+
+	// entry gives the stream an entry, and ceiling is its client-speed, 0 for
+	// none.
+	entry   bool
+	ceiling int64
+}
+
+// governedCases is every governedCase.
+func governedCases() []governedCase {
+	return []governedCase{
+		{name: "noentry"},
+		{name: "entry", entry: true},
+		{name: "entry-ceiling", entry: true, ceiling: 1 << 40},
+	}
+}
+
+// govern points conn at an entry as the case has it and returns it.
+func (gc governedCase) govern(t *testing.T, conn *countingConn) *countingConn {
+	t.Helper()
+
+	conn, _ = gc.governEntry(t, conn)
+
+	return conn
+}
+
+// governEntry is govern that also returns the entry, nil for noentry. The
+// entry's table runs on the real clock, as NewProxy's does. A case with an
+// entry fails the test at its end if no byte went through the entry, so it
+// cannot pass by having taken the path without one.
+func (gc governedCase) governEntry(t *testing.T, conn *countingConn) (*countingConn, *clientEntry) {
+	t.Helper()
+
+	if !gc.entry {
+		return conn, nil
+	}
+
+	entry := newClientTable(addrClock{}).acquire("alice", "203.0.113.9", true, entryInit{})
+
+	if gc.ceiling > 0 {
+		entry.ceiling.install(gc.ceiling, ceilingBurst(gc.ceiling))
+	}
+
+	held := new(atomic.Pointer[clientEntry])
+	held.Store(entry)
+
+	t.Cleanup(func() {
+		if entry.bytesIn.Load()+entry.bytesOut.Load() == 0 {
+			t.Errorf("the %s stream moved nothing through its entry", gc.name)
+		}
+	})
+
+	return conn.withClient(held), entry
 }
 
 // readChunk reads one testClientChunk through conn.
@@ -264,6 +330,45 @@ func TestUnlimitedUserWithAnEntryWritesOnce(t *testing.T) {
 	assert.Equal(t, 1<<20, n)
 	assert.Equal(t, 1, counter.calls, "an entry with no limiter must not cut a write")
 	assert.EqualValues(t, 1<<20, entry.bytesOut.Load())
+}
+
+// errShortWrite is what shortWriter fails with.
+var errShortWrite = errors.New("short write")
+
+// shortWriter is a far end that takes half of every write and then fails, as a
+// client socket that resets mid-write does. Anything but Write panics.
+type shortWriter struct {
+	essentials.Conn
+}
+
+func (shortWriter) Write(p []byte) (int, error) {
+	return len(p) / 2, errShortWrite
+}
+
+// A write the client's socket took only part of is counted for what it took:
+// on the user as before there were entries, and on the entry the same, on every
+// path a stream takes (governedCases). Counting what was asked for would bill
+// the address for bytes that never left.
+func TestAShortWriteIsCountedForWhatItMoved(t *testing.T) {
+	t.Parallel()
+
+	for _, gc := range governedCases() {
+		t.Run(gc.name, func(t *testing.T) {
+			t.Parallel()
+
+			stats := NewProxyStats()
+			conn, entry := gc.governEntry(t, newCountingConn(t.Context(), nil, shortWriter{}, stats, "alice"))
+
+			n, err := conn.Write(make([]byte, 1000))
+			require.ErrorIs(t, err, errShortWrite)
+			assert.Equal(t, 500, n, "what the socket took")
+			assert.EqualValues(t, 500, stats.getOrCreate("alice").bytesOut.Load(), "the user counts what was written")
+
+			if entry != nil {
+				assert.EqualValues(t, 500, entry.bytesOut.Load(), "and so does the entry")
+			}
+		})
+	}
 }
 
 // An address limiter that is installed cuts a transfer to its burst, as the
@@ -720,6 +825,74 @@ func TestACancelledWaitLetsGoOfTheTracker(t *testing.T) {
 
 	clock.advance(time.Second)
 	assert.Zero(t, entry.blockedDown.snapshot(clock.read()), "the second after the wait is nobody's")
+}
+
+// The /tracked rows of BenchmarkDoorBulk time a panel's case only if every
+// stream they move holds a per-address entry, and they cannot check that
+// themselves: they must also build against a proxy from before there was a
+// table, for the A/B. So this checks their setup, stampedDoor, on this proxy.
+// On every door a tracking proxy gives each stamped stream an entry of its own,
+// keyed by its address, and the sixteen streams from one address one entry
+// between them. If admission stopped handing entries out, the rows would time
+// the old cost under the panel's name; this fails instead.
+func TestTheTrackedDoorRowsHoldTheirEntries(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"ee-unpaced", "dd", "plain"} {
+		dc := doorNamed(name)
+
+		t.Run(name+"/addr=stamped", func(t *testing.T) {
+			t.Parallel()
+
+			h, _ := stampedDoor(t, dc, 16, distinctAddr, 16, true)
+			distinct := make(map[*clientEntry]bool)
+
+			for stream, entry := range liveEntries(t, h.proxy, "alice") {
+				require.NotNil(t, entry, "every stream holds an entry")
+				assert.False(t, entry.rest, "of its own")
+				assert.Equal(t, stream.addrKey, entry.key, "the entry is its address's")
+
+				distinct[entry] = true
+			}
+
+			assert.Len(t, distinct, 16, "sixteen addresses, sixteen entries")
+		})
+
+		t.Run(name+"/addr=shared", func(t *testing.T) {
+			t.Parallel()
+
+			h, _ := stampedDoor(t, dc, 16, sharedAddr, 1, true)
+			distinct := make(map[*clientEntry]bool)
+
+			for _, entry := range liveEntries(t, h.proxy, "alice") {
+				require.NotNil(t, entry, "every stream holds an entry")
+				assert.False(t, entry.rest, "the address's own, not the rest entry")
+				assert.Equal(t, addressKey(benchSharedAddr), entry.key)
+
+				distinct[entry] = true
+			}
+
+			assert.Len(t, distinct, 1, "the streams of one address share its entry")
+		})
+	}
+}
+
+// liveEntries is the entry each of name's live streams holds, read under
+// liveMu, where admission stores it.
+func liveEntries(t *testing.T, p *Proxy, name string) map[*streamContext]*clientEntry {
+	t.Helper()
+
+	p.liveMu.Lock()
+	defer p.liveMu.Unlock()
+
+	entries := make(map[*streamContext]*clientEntry, len(p.liveConns[name]))
+	for stream := range p.liveConns[name] {
+		entries[stream] = stream.addrEntry.Load()
+	}
+
+	require.NotEmpty(t, entries, "the user has live streams")
+
+	return entries
 }
 
 // ServeConn hands the relay's wrapper the stream's entry: a keyed stream on a
