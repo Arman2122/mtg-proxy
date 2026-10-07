@@ -392,7 +392,8 @@ between 0.5 and 2").
   holds up to the floor remainder, strictly less than the number of participants); extremes:
   one participant, all ∞, all zero demand, `T` at its 8,000 B/s minimum with 4,097
   participants (`L = 1`, never zero; the floor only ever raises a computed 0 to 1 — `L` itself
-  is *above* `T/n` whenever some demand is below it).
+  is `≥ floor(T/n)` and exceeds it whenever some demand is far enough below it — never assert
+  `L ≤ T/n`).
 - *Tick* (synthetic duties and observed rates, no clocks): a high-demand and a low-demand
   address — the low one keeps its demand, the high one gets the rest (work-conserving); a
   participant held by its **ceiling** and not fair-throttled reports its true demand and the
