@@ -377,8 +377,9 @@ func (p *Proxy) coverHosts(set *secretSet) []doppel.CoverHost {
 
 // applyLimits installs, from the set just swapped in, the limits that are
 // enforced on the data path rather than at admission: every user's speed
-// bucket is re-rated and their quota ceiling is set, so a change reaches the
-// connections already open without a reconnect.
+// bucket is re-rated and their quota ceiling is set, and every address's
+// ceiling is moved, so a change reaches the connections already open without a
+// reconnect.
 // It runs on every swap -- startup, reload, the API -- so a changed limit
 // reaches the user's live connections at once, and a removed one frees them
 // at once. A user dropped from the set keeps their bucket, which is harmless:
@@ -396,30 +397,55 @@ func (p *Proxy) applyLimits(set *secretSet) {
 		p.stats.SetQuotaCeiling(name, lim.QuotaBytes)
 	}
 
-	p.backfillClients(set)
+	p.applyClientLimits(set)
 }
 
-// backfillClients gives every live stream that has no per-address entry, of
-// every secret in set that needs entries, the entry admission would have given
-// it: its address's own when it is keyed, the secret's rest entry when it is
-// not. A control a reload turned on must reach the connections already open --
-// they live for hours -- and an unkeyed stream left without the rest entry
-// would be exactly the ungoverned stream the rest entry exists to prevent.
-// A stream that already has an entry keeps it, so a reload that changes
-// nothing changes nothing here.
+// applyClientLimits is applyLimits for the per-address table, in one critical
+// section under liveMu, the lock admission takes an entry under: every entry's
+// ceiling is moved to its secret's client-speed, and then every live stream
+// that has no entry and now needs one is given it, made from the set just
+// swapped in.
 //
-// Under liveMu, the same critical section admission takes its entry in, so a
-// stream is either admitted before this and backfilled by it, or admitted
-// after it from the set already swapped in. A set none of whose secrets wants
-// entries (clientEntriesWantedBy) needs none for anyone, and the walk is
-// skipped.
-func (p *Proxy) backfillClients(set *secretSet) {
-	if p.clients == nil || !p.clientEntriesWantedBy(set) {
+// The ceilings are moved whatever the set says about entries. A reload that
+// takes away the last per-address control leaves a set that wants no entries
+// at all, and the backfill skips its walk then; the entries made while the
+// control was there are still held by the streams that were open, and their
+// ceilings have to come off all the same.
+func (p *Proxy) applyClientLimits(set *secretSet) {
+	if p.clients == nil {
 		return
 	}
 
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
+
+	p.clients.applyCeilings(func(name string) int64 {
+		lim, _ := set.limitsOf(name)
+
+		return lim.ClientSpeedBytesPerSecond
+	})
+
+	p.backfillClientsLocked(set)
+}
+
+// backfillClientsLocked gives every live stream that has no per-address entry,
+// of every secret in set that needs entries, the entry admission would have
+// given it: its address's own when it is keyed, the secret's rest entry when it
+// is not. A control a reload turned on must reach the connections already open
+// -- they live for hours -- and an unkeyed stream left without the rest entry
+// would be exactly the ungoverned stream the rest entry exists to prevent. A
+// stream that already has an entry keeps it, so a reload that changes nothing
+// changes nothing here.
+//
+// The caller holds liveMu, the same critical section admission takes its entry
+// in, so a stream is either admitted before this and backfilled by it, or
+// admitted after it from the set already swapped in. A set none of whose
+// secrets wants entries (clientEntriesWantedBy) needs none for anyone, and the
+// walk is skipped.
+func (p *Proxy) backfillClientsLocked(set *secretSet) {
+	if p.clients == nil || !p.clientEntriesWantedBy(set) {
+		return
+	}
 
 	for i, name := range set.names {
 		var lim SecretLimits

@@ -129,10 +129,9 @@ func (l SecretLimits) IsZero() bool {
 // table to hold an entry for every address of the secret even when the proxy
 // does not track client addresses. It is the one place that says which limits
 // are per-address: admission, a reload's backfill and the secret set's own
-// summary all ask it. Each control adds itself here as it lands; client-conns
-// is the first.
+// summary all ask it. Each control adds itself here as it lands.
 func (l SecretLimits) hasClientControl() bool {
-	return l.ClientConns > 0
+	return l.ClientConns > 0 || l.ClientSpeedBytesPerSecond > 0
 }
 
 // DenyReason explains why a connection was refused by the per-user limits.

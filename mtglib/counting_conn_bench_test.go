@@ -2,6 +2,7 @@ package mtglib
 
 import (
 	"context"
+	"math"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -110,6 +111,43 @@ func benchClientEntry(b *testing.B) *clientEntry {
 	return entry
 }
 
+// benchCeiling is the client-speed of the ceiling rows: the largest rate a
+// bucket can be given, so that the row times the ceiling's wait without ever
+// sleeping in it. Not merely above link speed: the far end here hands over a
+// chunk in tens of nanoseconds, close to a terabyte a second, and the clock
+// the bucket refills by can stand still for half a millisecond on some hosts,
+// so a row at any rate a link could have drains the bucket and sleeps. At this
+// one whatever the bucket is short by is due in less than a nanosecond, which
+// is no delay at all.
+const benchCeiling = math.MaxInt64
+
+// benchCeilingEntry is a keyed entry of alice's whose only limiter is a
+// ceiling that never holds anything back: what a secret with client-speed set
+// above link speed gives every keyed stream. It is made with its ceiling, as
+// admission makes one, on the real clock.
+func benchCeilingEntry(b *testing.B) *clientEntry {
+	b.Helper()
+
+	entry := newClientTable(addrClock{}).acquire("alice", benchSharedAddr, true, entryInit{CeilingRate: benchCeiling})
+
+	// The row is about the ceiling alone: a fair share in place would time
+	// fair share's brackets under the ceiling's name.
+	require.False(b, entry.rest, "the entry must be the address's own")
+	require.NotNil(b, entry.ceiling.limiter.Load(), "the entry must have its ceiling")
+	require.Greater(b, entry.ceiling.limiter.Load().Burst(), countingChunk, "a chunk must never be cut")
+	require.Nil(b, entry.fairSpeed.limiter.Load(), "the entry must have no fair share")
+	require.Nil(b, entry.fairUp.limiter.Load(), "the entry must have no upload fair share")
+	require.Nil(b, entry.fairDown.limiter.Load(), "the entry must have no download fair share")
+
+	b.Cleanup(func() {
+		if waited := entry.throttledNanos.Load(); waited != 0 {
+			b.Errorf("the ceiling held the row back for %s: it timed a sleep, not the ceiling", time.Duration(waited))
+		}
+	})
+
+	return entry
+}
+
 // countingStream is one stream's wrapper as ServeConn builds it -- over the
 // user's stats, with the activity stamp and the entry pointer ServeConn points
 // it at, both the stream's own -- and the far end behind it. The pointer holds
@@ -163,7 +201,10 @@ func requireEntryCounted(b *testing.B, entry *clientEntry, want int64, write boo
 // entry and no limiter installed -- every keyed stream of a proxy that keeps
 // client addresses, which a panel always has it do -- so the bytes are counted
 // on the entry as well and its last-seen stamp is kept. entry over noentry, in
-// one binary, is what the panel's case costs a call.
+// one binary, is what the panel's case costs a call. ceiling is entry with a
+// client-speed far above link speed: the address's bucket is paid before the
+// user's on every call and never holds anything back, so ceiling over entry is
+// what a ceiling costs a call that it does not slow.
 //
 // Every row verifies what it timed, from the wrapper's counters and from the far
 // end's own tally, which do not share a source.
@@ -171,10 +212,12 @@ func BenchmarkCountingConn(b *testing.B) {
 	b.Run("read", func(b *testing.B) {
 		b.Run("noentry", func(b *testing.B) { benchCountingRead(b, nil) })
 		b.Run("entry", func(b *testing.B) { benchCountingRead(b, benchClientEntry(b)) })
+		b.Run("ceiling", func(b *testing.B) { benchCountingRead(b, benchCeilingEntry(b)) })
 	})
 	b.Run("write", func(b *testing.B) {
 		b.Run("noentry", func(b *testing.B) { benchCountingWrite(b, nil) })
 		b.Run("entry", func(b *testing.B) { benchCountingWrite(b, benchClientEntry(b)) })
+		b.Run("ceiling", func(b *testing.B) { benchCountingWrite(b, benchCeilingEntry(b)) })
 	})
 }
 
@@ -261,8 +304,9 @@ func benchCountingWrite(b *testing.B, entry *clientEntry) {
 // every stream is at the one address and holds the one entry, as the streams of
 // a client that opens several do, or a carrier's NAT's: they share the entry's
 // counters and its last-seen stamp as well, and the rise over noentry is what
-// that sharing costs. The serial rows cannot show it, and a door row resolves
-// only a few percent of it behind its socket work.
+// that sharing costs. The ceiling rows share the address's bucket too, whose
+// lock every call of every stream takes. The serial rows cannot show it, and a
+// door row resolves only a few percent of it behind its socket work.
 //
 // Run it with -cpu 1,2 (or as many as the box has): at one the rows are the
 // serial ones plus RunParallel's own overhead, and the rise from there is the
@@ -278,10 +322,12 @@ func BenchmarkCountingConnParallel(b *testing.B) {
 	b.Run("read", func(b *testing.B) {
 		b.Run("noentry", func(b *testing.B) { benchCountingParallel(b, false, nil) })
 		b.Run("entry", func(b *testing.B) { benchCountingParallel(b, false, benchClientEntry(b)) })
+		b.Run("ceiling", func(b *testing.B) { benchCountingParallel(b, false, benchCeilingEntry(b)) })
 	})
 	b.Run("write", func(b *testing.B) {
 		b.Run("noentry", func(b *testing.B) { benchCountingParallel(b, true, nil) })
 		b.Run("entry", func(b *testing.B) { benchCountingParallel(b, true, benchClientEntry(b)) })
+		b.Run("ceiling", func(b *testing.B) { benchCountingParallel(b, true, benchCeilingEntry(b)) })
 	})
 }
 

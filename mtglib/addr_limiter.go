@@ -127,6 +127,28 @@ func (l *addrLimiter) setRate(bytesPerSecond int64) {
 	current.SetLimitAt(l.clock.read(), rate.Limit(max(bytesPerSecond, 1)))
 }
 
+// apply puts the limiter at bytesPerSecond with burst, the way a reload moves
+// a limit onto a limiter that may already be in use: none -- unlimited -- for a
+// rate that is not positive; a new bucket when there is none, or when the one
+// there has another burst, since install is the only way a burst changes; the
+// bucket there re-rated in place when only the rate moved, so the tokens it
+// has spent stay spent; and nothing at all when neither moved, so a reload
+// that changes nothing hands nobody a full bucket.
+func (l *addrLimiter) apply(bytesPerSecond int64, burst int) {
+	current := l.limiter.Load()
+
+	switch {
+	case bytesPerSecond <= 0:
+		if current != nil {
+			l.install(0, 0)
+		}
+	case current == nil || current.Burst() != burst:
+		l.install(bytesPerSecond, burst)
+	case current.Limit() != rate.Limit(bytesPerSecond):
+		l.setRate(bytesPerSecond)
+	}
+}
+
 // chunk bounds one read or write to the burst, so that a wait for it is never
 // refused for being larger than the bucket. Unlimited passes n through
 // untouched: an unlimited user still writes once. One load and one read of a

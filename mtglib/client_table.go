@@ -88,11 +88,11 @@ type entryInit struct {
 	FairTotals  fairTotals
 }
 
-// entryInitOf is what a new entry of a secret with these limits starts from.
-// No per-address limit exists yet, so it is nothing, and every limiter of a new
-// entry is unlimited; client-speed and client-fair fill it in as they land.
-func entryInitOf(SecretLimits) entryInit {
-	return entryInit{}
+// entryInitOf is what a new entry of a secret with these limits starts from:
+// its client-speed as the ceiling. Fair share is not here yet, so a new entry's
+// fair limiters are unlimited; client-fair fills them in when it lands.
+func entryInitOf(lim SecretLimits) entryInit {
+	return entryInit{CeilingRate: lim.ClientSpeedBytesPerSecond}
 }
 
 // clientEntry is one address of one secret: an IPv4 address or an IPv6 /64,
@@ -442,6 +442,35 @@ func (t *clientTable) forgetLocked(entry *clientEntry) {
 		delete(sc.entries, entry.key)
 
 		t.keyed--
+	}
+}
+
+// applyCeilings moves the ceiling of every address entry the table holds to
+// what ceilingOf says for the entry's secret, 0 for none: how a reload reaches
+// the entries made before it. Entries no stream holds are moved too: an
+// address that comes back finds its entry as it left it, and must not find the
+// ceiling of a reload ago. Rest entries are left alone, because they never have
+// a ceiling.
+//
+// The caller holds liveMu, the lock admission makes an entry under from the
+// secret set it reads there. A reload swaps its set in before it gets here, so
+// an admission that read the set before the swap made its entry before this
+// walk, which moves it, and one after it read the new set: no entry is ever
+// left on a ceiling a reload has replaced.
+func (t *clientTable) applyCeilings(ceilingOf func(name string) int64) {
+	if t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for name, sc := range t.secrets {
+		bytesPerSecond := ceilingOf(name)
+
+		for _, entry := range sc.entries {
+			entry.ceiling.apply(bytesPerSecond, ceilingBurst(bytesPerSecond))
+		}
 	}
 }
 
