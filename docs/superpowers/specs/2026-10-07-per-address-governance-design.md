@@ -391,7 +391,8 @@ between 0.5 and 2").
   and the allocations are floored, and the reference floors the same way, so `Σ a_i = T`
   holds up to the floor remainder, strictly less than the number of participants); extremes:
   one participant, all ∞, all zero demand, `T` at its 8,000 B/s minimum with 4,097
-  participants (`L = 1`, never zero, never above `T/n`).
+  participants (`L = 1`, never zero; the floor only ever raises a computed 0 to 1 — `L` itself
+  is *above* `T/n` whenever some demand is below it).
 - *Tick* (synthetic duties and observed rates, no clocks): a high-demand and a low-demand
   address — the low one keeps its demand, the high one gets the rest (work-conserving); a
   participant held by its **ceiling** and not fair-throttled reports its true demand and the
@@ -402,7 +403,8 @@ between 0.5 and 2").
   the other at once (the `L/2` rule); a new arrival is set to the current `L` and the others
   shrink within two ticks; hysteresis keeps a throttled address at ∞ for three ticks; an entry
   with a live stream but no bytes for ten seconds is still set to `L`; the rest entry
-  participates and has no ceiling; rates are never zero and never lifted above `T/n`;
+  participates and has no ceiling; rates are never zero and no clamp lifts them (the floor
+  only raises a computed 0 to 1);
   duty is rate-independent (the same outcome at 1 MB/s and 100 MB/s).
 - *addrLimiter* (fake clock): the waited time is the exact reservation delay summed over the
   pieces; every call uses the injected clock; the fixed burst never shrinks under a waiter;
@@ -515,9 +517,9 @@ Audit these; each was a judgement call, not an instruction.
 5. Fair share = water level over measured demand; throttled = a **duty** (wait time at the fair
    limiter or the secret-level bucket, not the ceiling, divided by the tick) of at least 25%,
    3-tick hysteresis released when the rate falls below `L/2`; 1 s tick; the limiter of every
-   entry with a live stream set to the level; floored, at least 1 B/s and never lifted above
-   `T/n`; the static ceiling is a separate bucket; the rest entry is one participant with no
-   ceiling.
+   entry with a live stream set to the level; floored, at least 1 B/s (the floor only raises a
+   computed 0 to 1; no larger clamp); the static ceiling is a separate bucket; the rest entry
+   is one participant with no ceiling.
 6. Fixed-burst per-address limiters, re-rated with `SetLimitAt(now)` only (the injected
    clock); `speedLimiter.wait` hardened to retry and `chunk` to read the burst once.
 7. Per-address waits count into the user's `throttled_ms`.
