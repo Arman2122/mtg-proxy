@@ -400,18 +400,37 @@ func sharedAddr(i int) net.Addr {
 //
 // The harness has no limits at all -- no ip-limit in particular -- so every
 // connection is admitted whatever its address.
+//
+// Each row has a twin named <row>/tracked: the same streams on a proxy that
+// keeps client addresses (track-client-ips), which is how a panel always runs
+// the proxy. A proxy that keeps addresses gives every keyed stream a
+// per-address entry, so the twins are the panel's case end to end and the rows
+// without the suffix are the case of a proxy with no entries. Each twin is a
+// row of its own beside the other, not a sub-benchmark of it, so the row
+// without the suffix still reports. The twins use only what the old binary of
+// an A/B has too, so both binaries run them.
 func BenchmarkDoorBulk(b *testing.B) {
 	for _, name := range []string{"ee-unpaced", "dd", "plain"} {
 		dc := doorNamed(name)
 
 		for _, conns := range []int{1, 16} {
-			b.Run(fmt.Sprintf("%s/conns=%d/addr=stamped", name, conns), func(b *testing.B) {
-				benchDoorBulkStamped(b, dc, conns, distinctAddr, conns)
+			row := fmt.Sprintf("%s/conns=%d/addr=stamped", name, conns)
+
+			b.Run(row, func(b *testing.B) {
+				benchDoorBulkStamped(b, dc, conns, distinctAddr, conns, false)
+			})
+			b.Run(row+"/tracked", func(b *testing.B) {
+				benchDoorBulkStamped(b, dc, conns, distinctAddr, conns, true)
 			})
 		}
 
-		b.Run(name+"/conns=16/addr=shared", func(b *testing.B) {
-			benchDoorBulkStamped(b, dc, 16, sharedAddr, 1)
+		row := name + "/conns=16/addr=shared"
+
+		b.Run(row, func(b *testing.B) {
+			benchDoorBulkStamped(b, dc, 16, sharedAddr, 1, false)
+		})
+		b.Run(row+"/tracked", func(b *testing.B) {
+			benchDoorBulkStamped(b, dc, 16, sharedAddr, 1, true)
 		})
 	}
 }
@@ -420,12 +439,19 @@ func BenchmarkDoorBulk(b *testing.B) {
 // iteration, connection i from a client at addrOf(i), which the proxy must see
 // as places distinct addresses. moveChunk fails a short count, and the proxy's
 // own counters are read back at the end: every byte must have been counted once,
-// as the stamped user's.
-func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int, addrOf func(i int) net.Addr, places int) {
+// as the stamped user's. tracked runs the proxy with track-client-ips on, and
+// the proxy's own address report must then list the places.
+func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int, addrOf func(i int) net.Addr, places int, tracked bool) {
 	b.Helper()
 
 	secret := dc.entry.secret(b)
 	h := dc.build(b, map[string]Secret{"alice": secret}, nil)
+
+	// The harness builds a Proxy literal, so ProxyOpts.TrackClientIPs cannot
+	// reach it; this is the field that option sets. Before the first stream:
+	// admission reads it.
+	h.proxy.trackClientIPs = tracked
+
 	streams := make([]doorStream, conns)
 
 	for i := range streams {
@@ -433,6 +459,7 @@ func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int, addrOf func(i in
 	}
 
 	requireStampedAddresses(b, h.proxy, "alice", conns, places)
+	requireTracking(b, h.proxy, "alice", places, tracked)
 
 	b.SetBytes(int64(conns) * doorChunk)
 	b.ReportAllocs()
@@ -510,6 +537,31 @@ func requireStampedAddresses(tb testing.TB, p *Proxy, name string, conns, places
 	}
 
 	require.Equal(tb, conns, held, "the ledger must hold every connection")
+}
+
+// requireTracking reads back, from the proxy's own address report, whether it
+// keeps client addresses: a tracked row's proxy lists the user's places, every
+// one inside benchStampedNet, and an untracked row's lists nothing. A row that
+// claims to be tracked without the proxy keeping addresses would time the
+// untracked path under the panel's name.
+func requireTracking(tb testing.TB, p *Proxy, name string, places int, tracked bool) {
+	tb.Helper()
+
+	listed := p.connectedIPs()[name]
+
+	if !tracked {
+		require.Empty(tb, listed, "an untracked proxy lists no addresses")
+
+		return
+	}
+
+	require.Len(tb, listed, places, "a tracking proxy lists every place the user is at")
+
+	for _, text := range listed {
+		addr, err := netip.ParseAddr(text)
+		require.NoError(tb, err)
+		require.True(tb, benchStampedNet.Contains(addr), "the proxy must list a stamped address, listed %s", addr)
+	}
 }
 
 // BenchmarkDoorRoundTrip sends a 100-byte message to the fake Telegram, which
