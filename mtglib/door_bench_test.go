@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"runtime"
 	"slices"
 	"sync"
@@ -108,7 +109,28 @@ type doorStream struct {
 func openStream(tb testing.TB, dc doorCase, h *entryHarness, name string, key [SecretKeyLength]byte, readerSize int) doorStream {
 	tb.Helper()
 
-	client, done := h.dialProxy(tb, dc.entry.policy)
+	return openStreamFrom(tb, dc, h, name, key, readerSize, nil)
+}
+
+// openStreamFrom is openStream for a client the proxy sees at addr -- the
+// address the accepted end reports, whatever the loopback socket really is. A
+// nil addr is the plain loopback client of openStream.
+func openStreamFrom(
+	tb testing.TB, dc doorCase, h *entryHarness, name string, key [SecretKeyLength]byte, readerSize int, addr net.Addr,
+) doorStream {
+	tb.Helper()
+
+	var (
+		client net.Conn
+		done   <-chan struct{}
+	)
+
+	if addr == nil {
+		client, done = h.dialProxy(tb, dc.entry.policy)
+	} else {
+		client, done = dialProxyFrom(tb, h, dc.entry.policy, addr)
+	}
+
 	upstream := connectThrough(tb, dc.entry, h, client, name, key)
 
 	// Reset, not closed, for the reason BenchmarkDoorHandshake gives: the idle
@@ -331,6 +353,121 @@ func BenchmarkDoor(b *testing.B) {
 		benchDoorBulk(b, dd, true, []string{"alice"},
 			map[string]SecretLimits{"alice": {SpeedBytesPerSecond: 1 << 40}})
 	})
+}
+
+// benchStampedNet is where the addresses of the stamped rows come from: the
+// documentation range of RFC 5737, which looks public to the proxy (its address
+// classes are loopback, private, link-local, unspecified and multicast) and
+// never routes anywhere.
+var benchStampedNet = netip.MustParsePrefix("203.0.113.0/24")
+
+// BenchmarkDoorBulk is the download of BenchmarkDoor from clients that are not
+// on loopback: every client connection is stamped with an address of its own, one
+// per connection, so the proxy sees 1 or 16 distinct keyed places. It exists
+// because loopback is the one address class a per-address control never governs,
+// so BenchmarkDoor's rows cannot tell whether the per-address step costs anything;
+// these can. The rows are named <door>/conns=<n>/addr=stamped and are meant to
+// be run old binary against new in one session.
+//
+// Download only: the bytes go Telegram -> proxy -> client, through the client
+// wrapper's Write. The Read side is timed directly by BenchmarkCountingConn, and
+// a second direction here would double the bytes and the rows for the same
+// per-address step.
+//
+// The harness has no limits at all -- no ip-limit in particular -- so every
+// connection is admitted whatever its address.
+func BenchmarkDoorBulk(b *testing.B) {
+	for _, name := range []string{"ee-unpaced", "dd", "plain"} {
+		dc := doorNamed(name)
+
+		for _, conns := range []int{1, 16} {
+			b.Run(fmt.Sprintf("%s/conns=%d/addr=stamped", name, conns), func(b *testing.B) {
+				benchDoorBulkStamped(b, dc, conns)
+			})
+		}
+	}
+}
+
+// benchDoorBulkStamped moves doorChunk down every one of conns streams per
+// iteration, each from a client at its own documentation address. moveChunk
+// fails a short count, and the proxy's own counters are read back at the end:
+// every byte must have been counted once, as the stamped user's.
+func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int) {
+	b.Helper()
+
+	secret := dc.entry.secret(b)
+	h := dc.build(b, map[string]Secret{"alice": secret}, nil)
+	streams := make([]doorStream, conns)
+
+	for i := range streams {
+		// One address and one port per connection: sixteen places, not sixteen
+		// sockets of one.
+		addr := tcpFrom(fmt.Sprintf("203.0.113.%d", 1+i), 40000+i)
+		streams[i] = openStreamFrom(b, dc, h, "alice", secret.Key, 256<<10, addr)
+	}
+
+	requireStampedAddresses(b, h.proxy, "alice", conns)
+
+	b.SetBytes(int64(conns) * doorChunk)
+	b.ReportAllocs()
+
+	iterations := 0
+
+	for b.Loop() {
+		if err := moveChunk(dc, streams, true); err != nil {
+			b.Fatal(err)
+		}
+
+		iterations++
+	}
+
+	st := h.proxy.stats.getOrCreate("alice")
+	want := int64(iterations) * int64(conns) * doorChunk
+
+	// The wrapper counts a byte after the socket write that carried it returns,
+	// which can be after the client has read it, so the last chunk's count may
+	// still be arriving.
+	for deadline := time.Now().Add(10 * time.Second); st.bytesOut.Load() != want && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+
+	require.Equal(b, want, st.bytesOut.Load(), "every byte sent down must be counted, once")
+	require.Zero(b, st.bytesIn.Load(), "a download reads nothing from the client")
+}
+
+// requireStampedAddresses reads back, from the proxy's own registry, what the
+// stamping did: every one of conns streams is admitted under name, is counted in
+// the address ledger, and sits at its own address inside benchStampedNet that
+// hintKey -- the class the automatic per-address controls use -- keys. It is
+// not derived from the addresses the benchmark chose, which a stamping bug would
+// change with it; a loopback peer, an unstamped one, or sixteen connections all
+// stamped with one address each fail it.
+func requireStampedAddresses(tb testing.TB, p *Proxy, name string, conns int) {
+	tb.Helper()
+
+	p.liveMu.Lock()
+	defer p.liveMu.Unlock()
+
+	live := p.liveConns[name]
+	require.Len(tb, live, conns, "every stamped connection must have been admitted")
+
+	seen := make(map[addressKey]struct{}, conns)
+
+	for stream := range live {
+		require.True(tb, stream.addrCounted, "the connection must be counted at its address")
+
+		addr, err := netip.ParseAddr(string(stream.addrKey))
+		require.NoError(tb, err)
+		require.True(tb, benchStampedNet.Contains(addr),
+			"the proxy must see a stamped documentation address, saw %s", addr)
+
+		_, keyed := hintKey(net.IP(addr.AsSlice()))
+		require.True(tb, keyed, "%s must be a keyed address", addr)
+
+		seen[stream.addrKey] = struct{}{}
+	}
+
+	require.Len(tb, seen, conns, "every connection must be at an address of its own")
 }
 
 // BenchmarkDoorRoundTrip sends a 100-byte message to the fake Telegram, which
