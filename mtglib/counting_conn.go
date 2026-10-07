@@ -87,33 +87,33 @@ func (c *countingConn) entry() *clientEntry {
 	return c.client.Load()
 }
 
-// markActive stamps the stream's latest byte to the second, on the stream and,
-// when it has one, on its address's entry. One clock reading serves both: the
-// entry's clock -- the table's, the real one outside tests -- when there is an
-// entry, so that lastSeen agrees with the sweep that reads it, and the real
-// clock otherwise. Each store is skipped while its second is unchanged, so the
-// data path pays a clock read and a load or two per call, and a write once a
-// second.
-func (c *countingConn) markActive(entry *clientEntry) {
-	if entry == nil {
-		if c.active != nil {
-			c.stampActive(time.Now().Unix())
-		}
-
+// markActive stamps the stream's latest byte to the second. The store is
+// skipped while the second is unchanged, so the data path pays a clock read
+// and a load per call, and a write once a second.
+func (c *countingConn) markActive() {
+	if c.active == nil {
 		return
 	}
 
-	now := entry.clock.read()
-	entry.seen(now)
-
-	if c.active != nil {
-		c.stampActive(now.Unix())
+	if now := time.Now().Unix(); c.active.Load() != now {
+		c.active.Store(now)
 	}
 }
 
-// stampActive stores second in the stream's stamp unless it is there already.
-func (c *countingConn) stampActive(second int64) {
-	if c.active.Load() != second {
+// markSeen is markActive for a stream with a per-address entry: the entry's
+// lastSeen is stamped as well, and one clock reading serves both. It is the
+// entry's clock -- the table's, the real one outside tests -- so that lastSeen
+// agrees with the sweep that reads it, and production still reads the time
+// once per call.
+func (c *countingConn) markSeen(entry *clientEntry) {
+	now := entry.clock.read()
+	entry.seen(now)
+
+	if c.active == nil {
+		return
+	}
+
+	if second := now.Unix(); c.active.Load() != second {
 		c.active.Store(second)
 	}
 }
@@ -126,25 +126,6 @@ func (c *countingConn) waitBoth(combined, direction *speedLimiter, n int) error 
 	}
 
 	return direction.wait(c.ctx, n)
-}
-
-// payUpload charges a read's n bytes: to the address's own limiters first when
-// it has one that a read pays, and to the user's buckets.
-func (c *countingConn) payUpload(entry *clientEntry, paced bool, n int) error {
-	if !paced {
-		return c.waitBoth(&c.st.speed, &c.st.speedUp, n)
-	}
-
-	return c.payAddress(entry, &entry.fairUp, &entry.blockedUp, &c.st.speedUp, n)
-}
-
-// payDownload is payUpload for a write's n bytes.
-func (c *countingConn) payDownload(entry *clientEntry, paced bool, n int) error {
-	if !paced {
-		return c.waitBoth(&c.st.speed, &c.st.speedDown, n)
-	}
-
-	return c.payAddress(entry, &entry.fairDown, &entry.blockedDown, &c.st.speedDown, n)
 }
 
 // payAddress charges n bytes to everything a transfer from an address with a
@@ -312,10 +293,41 @@ func (c *countingConn) exhausted() error {
 // cut to the quota's allowance, so what reaches the cap is delivered and
 // nothing past it is read.
 //
-// The stream's entry is read once per call, and the bytes are counted on it
-// where they are counted on the user, before the quota can end the stream.
+// A stream with a per-address entry reads through readAddress. A stream with
+// none -- the common case -- runs the wrapper exactly as it was before entries
+// existed, after the one load that finds no entry.
 func (c *countingConn) Read(p []byte) (int, error) {
-	entry := c.entry()
+	if entry := c.entry(); entry != nil {
+		return c.readAddress(entry, p)
+	}
+
+	limit, ok := c.allowance(c.st.speedUp.chunk(c.st.speed.chunk(len(p))))
+	if !ok {
+		return 0, c.exhausted()
+	}
+
+	n, err := c.Conn.Read(p[:limit])
+	if n > 0 {
+		c.st.bytesIn.Add(int64(n))
+		c.markActive()
+
+		if c.charge(n) {
+			return n, c.exhausted()
+		}
+
+		if waitErr := c.waitBoth(&c.st.speed, &c.st.speedUp, n); waitErr != nil && err == nil {
+			err = waitErr
+		}
+	}
+
+	return n, err
+}
+
+// readAddress is Read for a stream with a per-address entry. The bytes are
+// counted on the entry where they are counted on the user, before the quota can
+// end the stream. An entry with no limiter installed -- one kept for its counts
+// alone -- neither cuts the read nor adds a wait.
+func (c *countingConn) readAddress(entry *clientEntry, p []byte) (int, error) {
 	paced := entry.pacesUpload()
 
 	limit := c.st.speedUp.chunk(c.st.speed.chunk(len(p)))
@@ -331,18 +343,22 @@ func (c *countingConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p[:limit])
 	if n > 0 {
 		c.st.bytesIn.Add(int64(n))
-
-		if entry != nil {
-			entry.bytesIn.Add(int64(n))
-		}
-
-		c.markActive(entry)
+		entry.bytesIn.Add(int64(n))
+		c.markSeen(entry)
 
 		if c.charge(n) {
 			return n, c.exhausted()
 		}
 
-		if waitErr := c.payUpload(entry, paced, n); waitErr != nil && err == nil {
+		var waitErr error
+
+		if paced {
+			waitErr = c.payAddress(entry, &entry.fairUp, &entry.blockedUp, &c.st.speedUp, n)
+		} else {
+			waitErr = c.waitBoth(&c.st.speed, &c.st.speedUp, n)
+		}
+
+		if waitErr != nil && err == nil {
 			err = waitErr
 		}
 	}
@@ -356,9 +372,52 @@ func (c *countingConn) Read(p []byte) (int, error) {
 // exactly as before there was a limit. Each piece is cut to the quota's
 // allowance, so the last piece ends exactly at the cap.
 //
-// The stream's entry is read once per call, not once per piece.
+// A stream with a per-address entry writes through writeAddress; a stream with
+// none runs the wrapper as it was, after the one load that finds no entry.
 func (c *countingConn) Write(p []byte) (int, error) {
-	entry := c.entry()
+	if entry := c.entry(); entry != nil {
+		return c.writeAddress(entry, p)
+	}
+
+	var written int
+
+	for len(p) > 0 {
+		piece, ok := c.allowance(c.st.speedDown.chunk(c.st.speed.chunk(len(p))))
+		if !ok {
+			return written, c.exhausted()
+		}
+
+		if err := c.waitBoth(&c.st.speed, &c.st.speedDown, piece); err != nil {
+			return written, err
+		}
+
+		n, err := c.Conn.Write(p[:piece])
+		if n > 0 {
+			c.st.bytesOut.Add(int64(n))
+			c.markActive()
+		}
+
+		written += n
+
+		if err != nil {
+			return written, err //nolint: wrapcheck // the underlying connection's own error
+		}
+
+		if c.charge(n) {
+			return written, c.exhausted()
+		}
+
+		p = p[piece:]
+	}
+
+	return written, nil
+}
+
+// writeAddress is Write for a stream with a per-address entry, which is read
+// once per call, not once per piece. Each piece is cut to the address's
+// limiters as well and paid for at them first; an entry with no limiter
+// installed neither cuts nor waits, so an unlimited user still writes once.
+func (c *countingConn) writeAddress(entry *clientEntry, p []byte) (int, error) {
 	paced := entry.pacesDownload()
 
 	var written int
@@ -374,19 +433,23 @@ func (c *countingConn) Write(p []byte) (int, error) {
 			return written, c.exhausted()
 		}
 
-		if err := c.payDownload(entry, paced, piece); err != nil {
-			return written, err
+		var waitErr error
+
+		if paced {
+			waitErr = c.payAddress(entry, &entry.fairDown, &entry.blockedDown, &c.st.speedDown, piece)
+		} else {
+			waitErr = c.waitBoth(&c.st.speed, &c.st.speedDown, piece)
+		}
+
+		if waitErr != nil {
+			return written, waitErr
 		}
 
 		n, err := c.Conn.Write(p[:piece])
 		if n > 0 {
 			c.st.bytesOut.Add(int64(n))
-
-			if entry != nil {
-				entry.bytesOut.Add(int64(n))
-			}
-
-			c.markActive(entry)
+			entry.bytesOut.Add(int64(n))
+			c.markSeen(entry)
 		}
 
 		written += n
