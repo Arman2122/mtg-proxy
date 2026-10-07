@@ -283,12 +283,13 @@ say so). Each configured secret bucket is divided separately: `speed` → `fairS
   that overflow is bounded, not free. **The per-secret entry cap is `min(4,096, ip-limit)`
   when `ip-limit` is set**, which is why the docs say to pair `client-fair` with `ip-limit`.
 - Properties, all tested on the pure `waterLevel(total, demands)`, where a participant's
-  allocation is `a_i = min(d_i, L)`: `Σ a_i ≤ T`, with equality when some demand exceeds `L`;
-  `L ≥ T/n`; **raising one participant's demand never lowers its own allocation and never
-  raises anyone else's** (the max-min property: the throttled addresses' level falls when a
-  quiet address starts using more — that is the point, not a defect); permutation-invariant;
-  `L = T/n` when every demand is ∞; `L = T` when there is one participant; a brute-force
-  max-min reference agrees on 10,000 seeded inputs.
+  allocation is `a_i = min(d_i, L)`: `Σ a_i ≤ T`, with equality up to a floor remainder
+  (`< n`) when some demand exceeds `L`; `L ≥ floor(T/n)`; **raising one participant's demand
+  never lowers its own allocation and never raises anyone else's** (the max-min property: the
+  throttled addresses' level falls when a quiet address starts using more — that is the
+  point, not a defect); permutation-invariant; `L = floor(T/n)` when every demand is ∞;
+  `L = T` when there is one participant; a brute-force max-min reference agrees on 10,000
+  seeded inputs.
 
 ## 4. Stats
 
