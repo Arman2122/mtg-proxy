@@ -16,8 +16,10 @@ const (
 	maxScanBlocks = 128
 
 	// maxHintNames is how many secret names one address keeps, most recent
-	// first: a carrier NAT puts many users behind one address, and sixteen
-	// failed hint verifications cost about what one large-hello scan step does.
+	// first, since a carrier NAT puts many users behind one address. It bounds
+	// what hints can cost before the scan: at most 16 verifications of a hello
+	// of at most maxScanBlocks, so 16 x 128 blocks in the worst case (192 for
+	// a real client's 517-byte hello).
 	maxHintNames = 16
 
 	// maxHintAddresses bounds the addresses held across BOTH generations.
