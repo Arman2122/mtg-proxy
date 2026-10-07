@@ -167,8 +167,9 @@ func (p *Proxy) reserveScan(
 // refuseOverBudget fronts a hello the budget refused, through the same call a
 // hello that matched nothing takes: the cover site gets the same bytes. What
 // differs is the time to the first fronted byte -- a no-match is fronted after
-// its scan, a refusal at once or after at most the wait -- the same kind of
-// difference hello size and the SNI gate already made.
+// its scan, a refusal at once (a scan that is granted may wait, but then it
+// runs and is not refused) -- the same kind of difference hello size and the
+// SNI gate already made.
 func (p *Proxy) refuseOverBudget(ctx *streamContext, rewind *connRewind, parsed *fake.Parsed, reason string) {
 	ctx.logger.BindStr("reason", reason).Info("ee hello refused by the scan budget")
 	p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)

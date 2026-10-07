@@ -294,9 +294,10 @@ type ProxyOpts struct {
 	// is over its CPU budget, or when the hello is above the scan cap of 128
 	// SHA-256 blocks (about 8 KiB; a real client sends 0.5 to 2 KiB):
 	//
-	//   - "enforce" (or empty, the default) waits up to 150 ms for budget, then
-	//     fronts the hello to the cover site exactly as a hello that matched
-	//     nothing is fronted -- never closes it;
+	//   - "enforce" (or empty, the default) lets a scan the budget can pay for
+	//     within 150 ms wait for it and run, and fronts any other hello at once to
+	//     the cover site exactly as a hello that matched nothing is fronted --
+	//     never closes it;
 	//   - "observe" keeps the same accounting but never waits and never refuses:
 	//     it counts what enforce would have refused, and the refused hellos that
 	//     then matched a secret, and scans anyway;

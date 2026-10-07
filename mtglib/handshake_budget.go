@@ -48,9 +48,11 @@ const (
 	perIPBurst  = 4 * time.Second
 	globalBurst = time.Second
 
-	// defaultBudgetMaxWait is the longest a scan waits for budget before its
-	// hello is fronted instead. It smooths a burst of real clients (a restart,
-	// a network coming back) into a short queue rather than refusals.
+	// defaultBudgetMaxWait is the longest a scan may be made to wait for budget.
+	// A scan that would have to wait longer is refused, and its hello is
+	// fronted at once; one that would not waits, and runs. It smooths a burst of
+	// real clients (a restart, a network coming back) into a short queue rather
+	// than refusals.
 	defaultBudgetMaxWait = 150 * time.Millisecond
 
 	// minCostBlocks is the least one candidate is charged for: what a real
