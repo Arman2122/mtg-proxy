@@ -361,13 +361,37 @@ func BenchmarkDoor(b *testing.B) {
 // never routes anywhere.
 var benchStampedNet = netip.MustParsePrefix("203.0.113.0/24")
 
+// benchSharedAddr is the one address every connection of an addr=shared row
+// comes from.
+const benchSharedAddr = "203.0.113.7"
+
+// distinctAddr is the address of connection i of an addr=stamped row: one place
+// per connection, and one port each, so the sockets are distinct as well.
+func distinctAddr(i int) net.Addr {
+	return tcpFrom(fmt.Sprintf("203.0.113.%d", 1+i), 40000+i)
+}
+
+// sharedAddr is the address of connection i of an addr=shared row: one place for
+// every connection, and one port each, so they are still distinct sockets.
+func sharedAddr(i int) net.Addr {
+	return tcpFrom(benchSharedAddr, 40000+i)
+}
+
 // BenchmarkDoorBulk is the download of BenchmarkDoor from clients that are not
-// on loopback: every client connection is stamped with an address of its own, one
-// per connection, so the proxy sees 1 or 16 distinct keyed places. It exists
-// because loopback is the one address class a per-address control never governs,
-// so BenchmarkDoor's rows cannot tell whether the per-address step costs anything;
-// these can. The rows are named <door>/conns=<n>/addr=stamped and are meant to
-// be run old binary against new in one session.
+// on loopback, each connection stamped with a documentation address. It exists
+// because a loopback peer is unkeyed: it gets no address entry of its own and
+// joins the secret's shared one, so BenchmarkDoor's rows cannot show what a
+// keyed address's own entry costs. These can. The rows are meant to be run old
+// binary against new in one session.
+//
+// Two shapes of keyed place. <door>/conns=<n>/addr=stamped gives every
+// connection a place of its own, so 1 or 16 distinct addresses, each touched by
+// one stream: the best case for state kept per address, nothing shared.
+// <door>/conns=16/addr=shared puts all sixteen connections at one address, as a
+// client that opens several does and as a carrier's NAT does for many: the
+// streams of one place share that place's state, which is where a counter costs
+// more than it does unshared. Only at 16, because one connection at one address
+// is the stamped row at 1.
 //
 // Download only: the bytes go Telegram -> proxy -> client, through the client
 // wrapper's Write. The Read side is timed directly by BenchmarkCountingConn, and
@@ -382,17 +406,22 @@ func BenchmarkDoorBulk(b *testing.B) {
 
 		for _, conns := range []int{1, 16} {
 			b.Run(fmt.Sprintf("%s/conns=%d/addr=stamped", name, conns), func(b *testing.B) {
-				benchDoorBulkStamped(b, dc, conns)
+				benchDoorBulkStamped(b, dc, conns, distinctAddr, conns)
 			})
 		}
+
+		b.Run(name+"/conns=16/addr=shared", func(b *testing.B) {
+			benchDoorBulkStamped(b, dc, 16, sharedAddr, 1)
+		})
 	}
 }
 
 // benchDoorBulkStamped moves doorChunk down every one of conns streams per
-// iteration, each from a client at its own documentation address. moveChunk
-// fails a short count, and the proxy's own counters are read back at the end:
-// every byte must have been counted once, as the stamped user's.
-func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int) {
+// iteration, connection i from a client at addrOf(i), which the proxy must see
+// as places distinct addresses. moveChunk fails a short count, and the proxy's
+// own counters are read back at the end: every byte must have been counted once,
+// as the stamped user's.
+func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int, addrOf func(i int) net.Addr, places int) {
 	b.Helper()
 
 	secret := dc.entry.secret(b)
@@ -400,13 +429,10 @@ func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int) {
 	streams := make([]doorStream, conns)
 
 	for i := range streams {
-		// One address and one port per connection: sixteen places, not sixteen
-		// sockets of one.
-		addr := tcpFrom(fmt.Sprintf("203.0.113.%d", 1+i), 40000+i)
-		streams[i] = openStreamFrom(b, dc, h, "alice", secret.Key, 256<<10, addr)
+		streams[i] = openStreamFrom(b, dc, h, "alice", secret.Key, 256<<10, addrOf(i))
 	}
 
-	requireStampedAddresses(b, h.proxy, "alice", conns)
+	requireStampedAddresses(b, h.proxy, "alice", conns, places)
 
 	b.SetBytes(int64(conns) * doorChunk)
 	b.ReportAllocs()
@@ -437,12 +463,15 @@ func benchDoorBulkStamped(b *testing.B, dc doorCase, conns int) {
 
 // requireStampedAddresses reads back, from the proxy's own registry, what the
 // stamping did: every one of conns streams is admitted under name, is counted in
-// the address ledger, and sits at its own address inside benchStampedNet that
-// hintKey -- the class the automatic per-address controls use -- keys. It is
-// not derived from the addresses the benchmark chose, which a stamping bug would
-// change with it; a loopback peer, an unstamped one, or sixteen connections all
-// stamped with one address each fail it.
-func requireStampedAddresses(tb testing.TB, p *Proxy, name string, conns int) {
+// the address ledger, and sits at an address inside benchStampedNet that
+// hintKey -- the class the automatic per-address controls use -- keys; and the
+// streams are at places distinct addresses, no more and no fewer, with the
+// ledger holding the same connections at the same places. It is not derived from
+// the addresses the benchmark chose, which a stamping bug would change with it:
+// a loopback peer, an unstamped one, sixteen connections of an addr=stamped row
+// all stamped with one address, and one connection of an addr=shared row at
+// another each fail it.
+func requireStampedAddresses(tb testing.TB, p *Proxy, name string, conns, places int) {
 	tb.Helper()
 
 	p.liveMu.Lock()
@@ -467,7 +496,20 @@ func requireStampedAddresses(tb testing.TB, p *Proxy, name string, conns int) {
 		seen[stream.addrKey] = struct{}{}
 	}
 
-	require.Len(tb, seen, conns, "every connection must be at an address of its own")
+	require.Len(tb, seen, places, "the connections must be at %d distinct addresses", places)
+
+	// The ledger is what a per-address count reads: the same places, holding all
+	// the connections between them.
+	ledger := p.addresses[name]
+	require.NotNil(tb, ledger, "the address ledger must be counting the stamped user")
+	require.Len(tb, ledger.local, places)
+
+	held := 0
+	for _, n := range ledger.local {
+		held += n
+	}
+
+	require.Equal(tb, conns, held, "the ledger must hold every connection")
 }
 
 // BenchmarkDoorRoundTrip sends a 100-byte message to the fake Telegram, which
