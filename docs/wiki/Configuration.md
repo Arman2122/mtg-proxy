@@ -625,14 +625,15 @@ The cost of a block is measured once, when the first proxy in the process
 starts, on the HMAC the door actually runs. "25% of the cores" is therefore 25%
 of this machine's real time whatever its CPU: blocks are several times cheaper
 on a CPU with SHA extensions. The reading is `ns_per_block` in `/stats`, and is
-logged at start at info level, which `debug = true` shows. As an illustration, at
-2,000 secrets and 34 ns a block a full scan of an ordinary hello is 24,000 blocks,
-about 0.8 ms of CPU, so the defaults let one address make about 60 unhinted
-scans a second (a burst of about 240) and let the process make about 1,200 on
-four cores. A returning client with a hint costs one HMAC in the usual case (at
-most 16) and none of that. Both bursts are floored at the full scans of four
-ordinary hellos, so a very large secret count cannot shrink the budget below a
-few real clients.
+logged at start at info level, which `debug = true` shows. As an illustration, on
+a 4-core machine with SHA extensions (34 ns a block) hosting 2,000 secrets, a full
+scan of an ordinary hello is 24,000 blocks, about 0.8 ms of CPU, so under the
+defaults one *address* may make about 60 unhinted scans a second (a burst of
+about 240) and the whole *process* about 1,200 on those four cores. (This is not
+the machine in the lock-out example below.) A returning client with a hint costs
+one HMAC in the usual case (at most 16) and none of that. Both bursts are floored
+at the full scans of four ordinary hellos, so a very large secret count cannot
+shrink the budget below a few real clients.
 
 Loopback, private, link-local, unspecified and multicast addresses, and a
 connection with no address, do not stand for one place. They have no bucket of
@@ -671,15 +672,21 @@ unmatched 517-byte hellos a second. On a 2-core machine without SHA extensions
 (about 340 ns a block) with 2,000 hosted secrets that is about 60 a second,
 roughly 30 KB/s from about ten addresses (one, where there is no per-address
 bucket): the connections need not be held, because a refused hello is fronted at
-once and a granted one waits at most 150 ms. (The 4-core illustration above
-gives about 1,200 a second.) Before the budget the same proxy needed about four
-times that rate to saturate its CPU, about 240 a second on that 2-core machine.
-So `enforce` **deliberately makes locking out unhinted clients cheaper to cause
-than CPU exhaustion was**, and in exchange keeps the relays, the data path and
-every hinted client up while an attack lasts.
+once and a granted one waits at most 150 ms. That is the figure for 517-byte
+hellos, not the minimum: a hello under 12 blocks is charged as 517 bytes, so
+about 60 a second of roughly 100 bytes (about 6 KB/s) do the same, and a hello
+near the 128-block cap (about 8 KiB) costs about ten times as much, so about 6 a
+second of those do. (The 4-core illustration above is a different machine: it
+gives about 1,200 a second for the whole process.) Before the budget the same
+proxy needed about four times that rate to saturate its CPU, about 240 a second
+on that 2-core machine. So `enforce` **deliberately makes locking out unhinted
+clients cheaper to cause than CPU exhaustion was**, and in exchange keeps the
+relays, the data path and every hinted client up while an attack lasts.
 
 That is why `hints` matter, and so does `track-client-ips` (which `hints` follows):
-without it a returning client is as exposed as a stranger. It is also why the
+without it a returning client is as exposed as a stranger, and behind a loopback
+or private carrier that sends no PROXY header there are no hints at all. It is
+also why the
 first deployment should run `mode = "observe"`: its counters show whether this
 ever touches your users before you enforce. See [[Security]] for what the budget
 defends and what it cannot.

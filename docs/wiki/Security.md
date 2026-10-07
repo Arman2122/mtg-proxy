@@ -270,26 +270,34 @@ only there to stop a single source from spending all of it.
   budget bounds the proxy's CPU; the two must not be confused. To keep the
   process-wide bucket empty an attacker needs a hello *rate* of
   `(cpu-percent/100 × GOMAXPROCS × 1e9 / ns_per_block) / (candidates × 12)`
-  unmatched 517-byte hellos a second (`ns_per_block` is in `/stats`; `candidates`
-  is the number of hosted `ee` secrets). On a 2-core machine without SHA
-  extensions (about 340 ns a block) with 2,000 hosted secrets that is about 60 a
-  second — roughly 30 KB/s from about ten addresses, or one where there is no
-  per-address bucket. The connections need not be held: a refused hello is
-  fronted at once and a granted one waits at most 150 ms. Before the budget the
-  same proxy needed about four times that rate, about 240 a second, to saturate
-  its CPU. So `enforce` **deliberately makes locking out unhinted clients cheaper
-  to cause than CPU exhaustion was**, and in exchange keeps the relays, the data
-  path and every hinted client up while an attack lasts. While it lasts, a client
-  with **no hint** is fronted at once and retries; hinted clients (when `hints` is
-  on; it follows `track-client-ips`), streams already established and the data
-  path are unaffected. That is why hints matter — turn on `track-client-ips` (or
-  `hints = true`) if returning clients should survive an attack — and why the
-  first deployment should run `mode = "observe"`, which shows whether the budget
-  ever touches a real client before it is enforced. A legitimate user behind an
+  unmatched 517-byte hellos a second (`ns_per_block` is in `/stats`;
+  `candidates` is the hosted `ee` secrets, without any whose key repeats an
+  earlier one's and without those already tried as hints). On a 2-core machine
+  without SHA extensions (about 340 ns a block) with 2,000 hosted secrets that is
+  about 60 a second — roughly 30 KB/s from about ten addresses, or one where there
+  is no per-address bucket. That is the figure for 517-byte hellos, not the
+  minimum: a hello under 12 blocks is charged as 517 bytes, so about 60 a second
+  of roughly 100 bytes (about 6 KB/s) do the same, and a hello near the 128-block
+  cap (about 8 KiB) costs about ten times as much, so about 6 a second of those
+  do. The connections need not be held: a refused hello is fronted at once and a
+  granted one waits at most 150 ms. Before the budget the same proxy needed about
+  four times that rate, about 240 a second, to saturate its CPU. So `enforce`
+  **deliberately makes locking out unhinted clients cheaper to cause than CPU
+  exhaustion was**, and in exchange keeps the relays, the data path and every
+  hinted client up while an attack lasts. While it lasts, a client with **no
+  hint** is fronted at once and retries; hinted clients (when `hints` is on; it
+  follows `track-client-ips`), streams already established and the data path are
+  unaffected. That is why hints matter — turn on `track-client-ips` (or
+  `hints = true`) if returning clients should survive an attack, though it helps
+  only where the client's address is known: behind a loopback or private carrier
+  that sends no PROXY header there are no hints at all — and why the first
+  deployment should run `mode = "observe"`, which shows whether the budget ever
+  touches a real client before it is enforced. A legitimate user behind an
   address whose bucket a flooder has drained is treated the same way unless a hint
-  exists. Behind a carrier that connects from a loopback or private address and
-  does not forward the client's, there is no per-address bucket and only the
-  process-wide one applies. Behind a front proxy on a **public** address that
+  exists. Behind a
+  carrier that connects from a loopback or private address and does not forward
+  the client's, there is no per-address bucket and no hints, and only the
+  process-wide bucket applies. Behind a front proxy on a **public** address that
   sends no PROXY header, every client lands in that one address's bucket (50 ms of
   scan CPU a second by default), so set `per-ip-ms = 0` there and leave the
   process-wide bucket to bound the work. This is the accepted degradation.

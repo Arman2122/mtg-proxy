@@ -653,14 +653,20 @@ drs = false
 #
 # The budget bounds the proxy's CPU; it does not make an attack expensive. To
 # keep the process-wide bucket empty an attacker needs about
-# (cpu-percent/100 x GOMAXPROCS x 1e9 / ns_per_block) / (secrets x 12) unmatched
-# hellos a second: about 60 a second on 2 cores at 340 ns a block with 2,000
-# secrets, where saturating the CPU used to take about 240. So "enforce"
-# deliberately makes locking out clients WITHOUT a hint cheaper to cause than
-# CPU exhaustion was, and in exchange keeps the relays, the data path and every
-# hinted client up while an attack lasts. Hints follow track-client-ips (or set
-# hints below), and "observe" below is how to see whether any of this touches
-# your users before you enforce. See the Security and Configuration pages of the
+# (cpu-percent/100 x GOMAXPROCS x 1e9 / ns_per_block) / (candidates x 12)
+# unmatched 517-byte hellos a second (candidates: the hosted ee secrets, less
+# duplicate keys and any already tried as hints): about 60 a second on 2 cores
+# at 340 ns a block with 2,000 secrets, where saturating the CPU used to take
+# about 240. That is the figure for 517-byte hellos, not the minimum: a hello
+# under 12 blocks is charged as 517 bytes, so about 60 a second of roughly 100
+# bytes do the same, and one near the 128-block cap (about 8 KiB) costs about
+# ten times as much, so about 6 a second do. So "enforce" deliberately makes
+# locking out clients WITHOUT a hint cheaper to cause than CPU exhaustion was,
+# and in exchange keeps the relays, the data path and every hinted client up
+# while an attack lasts. Hints follow track-client-ips (or set hints below);
+# behind a loopback or private carrier that sends no PROXY header there are no
+# hints at all. "observe" below is how to see whether any of this touches your
+# users before you enforce. See the Security and Configuration pages of the
 # wiki.
 #
 # [defense.handshake-budget]
