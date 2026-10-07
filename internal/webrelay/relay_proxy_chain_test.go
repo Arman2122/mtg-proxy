@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"runtime"
 	"sync"
 	"testing"
@@ -502,11 +503,18 @@ func TestAWebStreamOutlastsTheInitialWindow(t *testing.T) {
 }
 
 // A DELETEd session ends: its carrier and the streams on it stop, even if the
-// client keeps the socket open. Today they do not -- store.remove cancels the
-// session's context, but nothing watching it closes the WebSocket, so a client
-// that holds the socket keeps its streams while the session is already gone
-// from the table and from MaxSessions. Found while building the measurement
-// tooling; it is the WEB relay project's to fix, and this test is its pin.
+// client keeps the socket open. They once did not -- store.remove cancelled the
+// session's context, but nothing watching it closed the WebSocket, so a client
+// that held the socket kept its streams while the session was already gone
+// from the table and from MaxSessions.
+//
+// The carrier is closed on the goroutine the cancel starts, not before the 204,
+// so a byte sent right after the 204 may still make the round trip; asserting
+// that it cannot failed whenever that goroutine ran late. What must follow the
+// DELETE is the close itself, and the read below waits for it. The two ways a
+// session that kept serving could end that read both fail it: the deadline,
+// and io.EOF from the CLOSE the relay sends once the proxy's idle timeout drops
+// the backend.
 func TestADeletedSessionStopsServing(t *testing.T) {
 	t.Parallel()
 
@@ -530,13 +538,11 @@ func TestADeletedSessionStopsServing(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, response.StatusCode)
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
-	_, err = conn.Write([]byte("after"))
-
-	if err == nil {
-		_, err = io.ReadFull(conn, make([]byte, len("after")))
-	}
+	_, err = conn.Read(make([]byte, 1))
 
 	require.Error(t, err, "the stream of a deleted session must end")
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded, "the carrier was never closed: %v", err)
+	require.NotErrorIs(t, err, io.EOF, "the stream ended, not its carrier: %v", err)
 	require.Eventually(t, func() bool { return c.counters.streamsActive.Load() == 0 },
 		5*time.Second, 20*time.Millisecond, "no stream may outlive its deleted session")
 }
