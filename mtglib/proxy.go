@@ -62,6 +62,7 @@ type Proxy struct {
 	stats         *ProxyStats
 	obfsStats     obfuscatedCounters
 	obfsLimiter   *obfuscatedLimiter
+	fakeStats     fakeTLSCounters
 	listeners     []ListenerJSON
 	listenerModes ModeSet
 	secrets       atomic.Pointer[secretSet]
@@ -69,6 +70,12 @@ type Proxy struct {
 	reloadMu      sync.Mutex
 	liveMu        sync.Mutex
 	liveConns     map[string]map[*streamContext]struct{}
+
+	// hints is the FakeTLS door's address -> recently matched secret names
+	// cache. nil is "hints off": NewProxy builds it only when HandshakeHints (or
+	// TrackClientIPs, which it follows by default) asks for it, and a Proxy{}
+	// literal in a test has none.
+	hints *matchHints
 
 	// addresses is each user's counted-address ledger, guarded by liveMu so
 	// that the address-limit check and the registration of a stream are one
@@ -215,6 +222,12 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	// The limiter's bucket aging runs under the proxy's own context, so it stops
 	// with Shutdown.
 	proxy.obfsLimiter = newObfuscatedLimiter(ctx)
+
+	// So does the hint cache's rotation. Off unless asked for: it keeps client
+	// addresses past their connection.
+	if opts.handshakeHints() {
+		proxy.hints = newMatchHints(ctx)
+	}
 
 	// W1: a hostless secret with no door is stored, valid and unreachable. It is
 	// deliberately a warning and not an error -- one odd client must never take

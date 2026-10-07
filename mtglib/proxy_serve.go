@@ -89,6 +89,14 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 
 	defer p.release(ctx)
 
+	// The whole FakeTLS success path is behind us -- the hello verified, not a
+	// replay, the user within its limits, admitted -- so this client's address
+	// may now remember the name. Nothing before this line may write a hint: a
+	// replay, a denied, throttled or address-limited user must not leave one.
+	if ctx.entry == entryFakeTLS {
+		p.hints.remember(ctx.ClientIP(), ctx.secretName)
+	}
+
 	// Phase 3: the FakeTLS write framing.
 	//
 	// doppel.Conn.start() emits records through tls.WriteRecordInPlace and

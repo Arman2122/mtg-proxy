@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/mtglib/internal/relay"
@@ -36,13 +37,31 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		return false
 	}
 
-	pos, _ := p.scanCandidates(parsed, set, nil)
+	// First the secrets this client's address completed a handshake with
+	// before, if any: a returning client is found here in one verification.
+	hinted := p.hintedPositions(ctx, parsed, set)
+
+	pos, tried := p.verifyHinted(parsed, set, hinted)
+	if pos >= 0 {
+		p.fakeStats.addVerifications(tried)
+		p.fakeStats.OnHinted()
+
+		return p.completeFakeTLS(ctx, rewind, set, parsed, set.candIdx[pos])
+	}
+
+	// Then the scan, over every candidate the hints did not already try.
+	pos, scanned := p.scanCandidates(parsed, set, skipPositions(hinted))
+	p.fakeStats.addVerifications(tried + scanned)
+
 	if pos < 0 {
+		p.fakeStats.OnUnmatched()
 		p.logger.InfoError("cannot read client hello", fake.ErrBadDigest)
 		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
 
 		return false
 	}
+
+	p.fakeStats.OnScanned()
 
 	// pos is a position in set.cands; map it back into the full secret list
 	// before anything reads names, limits or ad tags by it.
@@ -107,6 +126,62 @@ func (p *Proxy) scanCandidates(parsed *fake.Parsed, set *secretSet, skip func(po
 	}
 
 	return -1, tried
+}
+
+// hintedPositions resolves the names this client's address completed a
+// handshake with before into positions in set.cands, in the order to try them.
+// It is nil when hints do not apply: the cache is off, the address is unkeyed or
+// has none, or the hello is above maxScanBlocks.
+//
+// A hint is a name, and only the snapshot this hello met says where that name
+// is, so a reload between the write and now cannot misdirect it: a name the set
+// no longer holds as a candidate is skipped, a re-keyed name is tried under its
+// new key, and a re-sorted name is found where it is now.
+func (p *Proxy) hintedPositions(ctx *streamContext, parsed *fake.Parsed, set *secretSet) []int {
+	if p.hints == nil || parsed.Blocks() > maxScanBlocks {
+		return nil
+	}
+
+	names := p.hints.recall(ctx.ClientIP())
+	if len(names) == 0 {
+		return nil
+	}
+
+	positions := make([]int, 0, len(names))
+
+	for _, name := range names {
+		if pos, ok := set.candByName[name]; ok && !slices.Contains(positions, pos) {
+			positions = append(positions, pos)
+		}
+	}
+
+	return positions
+}
+
+// verifyHinted verifies parsed against the candidates at positions, in order,
+// and returns the first that matches, or -1; tried is how many it verified.
+func (p *Proxy) verifyHinted(parsed *fake.Parsed, set *secretSet, positions []int) (pos, tried int) {
+	for _, at := range positions {
+		tried++
+
+		if parsed.Verify(set.cands[at], p.tolerateTimeSkewness) {
+			return at, tried
+		}
+	}
+
+	return -1, tried
+}
+
+// skipPositions is the scanCandidates skip that passes over positions already
+// verified, or nil when there are none.
+func skipPositions(positions []int) func(pos int) bool {
+	if len(positions) == 0 {
+		return nil
+	}
+
+	return func(pos int) bool {
+		return slices.Contains(positions, pos)
+	}
 }
 
 // obfuscatedDrainBytes bounds the drain disposal by volume; the handshake

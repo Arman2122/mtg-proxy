@@ -267,6 +267,27 @@ type ProxyOpts struct {
 	// This is an optional setting.
 	TrackClientIPs bool
 
+	// HandshakeHints makes the FakeTLS door remember, per client address (an
+	// IPv4 address or an IPv6 /64), the names of up to 16 secrets that recently
+	// completed a handshake from it, and verify a hello from that address
+	// against those first. A returning client then costs one HMAC instead of a
+	// scan over every hosted secret. A hint is only an order to try things in:
+	// every hinted secret passes the same verification, so it never makes a
+	// wrong secret match, and a hello that matches nothing can neither read nor
+	// plant one. Loopback, private, link-local and unspecified addresses get
+	// none -- behind a carrier that does not forward the client address they
+	// would be one shared key.
+	//
+	// nil follows TrackClientIPs, and that default is the point: the cache holds
+	// address -> secret name in memory for 30 to 60 minutes after the last
+	// successful handshake, so it is on exactly when the operator has already
+	// chosen to keep client addresses past a connection. A non-nil value
+	// overrides it either way. Nothing here is logged, exported or written to
+	// disk.
+	//
+	// This is an optional setting.
+	HandshakeHints *bool
+
 	// AllowFallbackOnUnknownDC defines how proxy behaves if unknown DC was
 	// requested. If this setting is set to false, then such connection will be
 	// rejected. Otherwise, proxy will chose any DC.
@@ -486,6 +507,16 @@ func (p ProxyOpts) getSecrets() map[string]Secret {
 	}
 
 	return nil
+}
+
+// handshakeHints is whether the FakeTLS door keeps a hint cache: HandshakeHints
+// when set, otherwise whatever TrackClientIPs is.
+func (p ProxyOpts) handshakeHints() bool {
+	if p.HandshakeHints != nil {
+		return *p.HandshakeHints
+	}
+
+	return p.TrackClientIPs
 }
 
 func (p ProxyOpts) getConcurrency() int {
