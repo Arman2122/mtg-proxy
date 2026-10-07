@@ -394,14 +394,23 @@ seen 4,096 addresses in the last ten minutes, or a proxy whose table holds
 and made again starts its counters from zero.
 
 **What it costs.** A connection with no entry — tracking off and no per-address
-control on its secret — pays one atomic load per read and write. With an entry
-and no limiter, which is every connection of a proxy with `track-client-ips` on,
-each relay call cost about 14 ns more (106 to 120 ns, +13%), and about 75 ns more
-when two cores used one entry at once. A 1 MiB transfer is 64 relay calls, so
-the worst case is about 0.4% of bulk throughput, and the bulk-throughput
-benchmarks showed no difference above their noise. These figures are a
-same-session A/B on a shared 2-vCPU server over loopback. They do not include the
-cost of a ceiling or a fair share that is actually limiting.
+control on its secret — pays one atomic load per read and write: about 106 ns
+per 16 KiB relay call, as before. With an entry and no limiter, which is every
+connection of a proxy with `track-client-ips` on, a call cost 119–128 ns, and
+140–170 ns when two cores used one entry at once. Controls that are set but
+never had to wait cost more per call: about 345–540 ns with a `client-speed`
+ceiling, and about 1.07–1.17 µs with a fair share and the secret's own speed
+together. A 1 MiB transfer is 64 relay calls, so even 1.1 µs a call is 2–3% of
+the CPU at the door. The fair-share tick, once a second per fair secret, took
+8.8 µs at 16 entries, 254 µs at 512 and 2.5 ms at 4,096. At the door, no
+bulk-throughput row differed from the code before any per-address work (18 of
+18), and no handshake row from the code this was built on (11 of 11). These
+figures come from a same-session A/B on a shared 2-vCPU server over loopback
+(`benchmarks/results/2026-10-08-per-address-ab-final.txt`); those for the
+controls are indicative, from 3 to 5 samples. The door rows there vary by ±3%
+to ±24% from run to run, so they cannot show a cost of a few percent; the
+per-call figures are what bound it. None of this counts time spent waiting at a
+limit, which is the limit at work.
 
 ### Fair share: what to expect
 

@@ -356,14 +356,16 @@ Then:
   counts every entry, not the page.
 
 **Watching fair share work.** With `client-fair` on, every row with a live
-connection shows the same fair rate, the level of the last tick (or its own
-ceiling, when that is lower), whether the address is busy or quiet. A row with
-`"connections": 0` keeps the rate it left at until it comes back. A quiet address
-moves less than the level and keeps what it asks for; the busy ones share the
-rest. If two busy addresses move very different amounts for long, read
-*Fair share: what to expect* on [[Configuration]]: with thousands of addresses
-the share can take about a minute to settle, and a client that waits less than a
-quarter of the time is not corrected at all.
+connection shows the same fair rate, the level of the last tick, whether the
+address is busy or quiet: in `speed_limit` for a `speed` total (or the row's
+own ceiling there, when that is lower), and in `speed_limit_up` or
+`speed_limit_down` for a `speed-up` or `speed-down` total, with no ceiling
+folded in. A row with `"connections": 0` keeps the rate it left at until it
+comes back. A quiet address moves less than the level and keeps what it asks
+for; the busy ones share the rest. If two busy addresses move very different
+amounts for long, read *Fair share: what to expect* on [[Configuration]]: with
+thousands of addresses the share can take about a minute to settle, and a
+client that waits less than a quarter of the time is not corrected at all.
 
 ## The WEB relay stats server 🌐
 
