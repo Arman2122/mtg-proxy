@@ -95,6 +95,22 @@ GOMAXPROCS=2 ./webrelay.test -test.run '^$' -test.bench BenchmarkDoor -test.benc
 
 Its figures include the test client's own WebSocket work, in the same process.
 
+The FakeTLS scan by itself (`BenchmarkReadClientHelloMulti`) is a package of its
+own too. Its thirty rows at six one-second samples are about three minutes, and
+the secrets-count rows of `BenchmarkDoorHandshake` add sixteen more rows to what
+`-test.bench .` runs on `mtglib.test`, so filter rather than run everything in
+one ten-minute session. A `-bench` element is an unanchored regular expression:
+`N=100` also selects `N=1000`, so write `N=100$`.
+
+```bash
+# here
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -o fake.test ./mtglib/internal/tls/fake
+
+# on the box
+GOMAXPROCS=2 ./fake.test -test.run '^$' -test.bench ReadClientHelloMulti -test.benchmem -test.count 6 -test.benchtime 1s > fake-p2.txt
+GOMAXPROCS=2 ./mtglib.test -test.run '^$' -test.bench 'DoorHandshake/(ee-unpaced|dd)/secrets=' -test.benchmem -test.count 6 -test.benchtime 1s > door-secrets-p2.txt
+```
+
 ## mtgbench on the bench box
 
 mtgbench starts the binary with a config of its own: Telegram is mtgbench's
