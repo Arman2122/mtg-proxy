@@ -115,7 +115,15 @@ names of up to 16 secrets that recently matched from it, most recent first.
   generations; when full, new addresses are **not** added until the 30-minute
   rotation drops the older generation. A valid-secret holder who controls many
   addresses can therefore keep new hints out, never evict existing ones.
-- **Privacy.** The cache holds address → secret name (the panel's names are
+- **Privacy (budget).** Separately from hints, the per-address budget bucket
+  (§3) holds an address (IPv4, or IPv6 /64) and the time of its last scan — no secret
+  name — in process memory for 30 to 60 minutes after its last unhinted scan,
+  whatever `hints` and `track-client-ips` say; it is never logged, exported or
+  persisted. The older dd limiter keeps anonymous IP-keyed buckets the same way.
+  `per-ip-ms = 0` keeps none, at the price of per-source isolation. What
+  `track-client-ips` governs (`connected_ips`, `last_ip`, the address ledger) is
+  unchanged.
+- **Privacy (hints).** The cache holds address → secret name (the panel's names are
   emails) in process memory for 30 to 60 minutes after the last use. Never logged,
   exported or persisted; gone on restart. It **follows `track-client-ips`** by
   default (on exactly when the operator has already chosen to keep client addresses
@@ -372,6 +380,13 @@ Audit these; each was a judgement call, not an instruction.
 8. The new `/stats` object is `faketls_handshake`; the feature string is
    `handshake-budget`; `hints` defaults to the value of `track-client-ips` (the
    privacy switch), so only deployments that already keep addresses keep hints.
+10. The per-address budget bucket keeps an address (no secret name) in memory for
+    30 to 60 minutes even when `track-client-ips` is off, so the repo's "no address
+    outlives its connection" promise is scoped to what `track-client-ips` governs
+    and the budget's retention is documented instead of removed (found by the
+    Task 7 review; `per-ip-ms = 0` keeps none). Alternative not taken: make the
+    per-address layer follow `track-client-ips` — it would leave one source able to
+    lock out everyone on a standalone deployment.
 9. The first deployment to the live server runs `mode = "observe"`, and `enforce` is
    enabled only once `over_budget_matched` stays near zero (release-notes item, not
    code).
