@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -483,6 +484,42 @@ func TestClientsRowCarriesTheEntrysNumbers(t *testing.T) {
 	}
 }
 
+// first_seen is the second the entry was made, not the instant. last_seen is
+// stored in whole seconds, so an entry made half way through a second would
+// otherwise read as first seen half a second after it was last seen, and a
+// panel subtracting the two would get a negative time online; it would also be
+// the only time on the API with a fraction. The fake clock starts on a whole
+// second, which is why the row test above cannot see this.
+func TestClientsFirstSeenIsAWholeSecondNotAfterLastSeen(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeAddrClock()
+	probe := clientsStatsProbe(t, true, SecretLimits{})
+	p := probe.proxy
+	p.clients = newClientTable(clock.clock())
+
+	clock.advance(500 * time.Millisecond)
+	p.clients.acquire("alice", "203.0.113.9", true, entryInit{})
+
+	row := rawRowsByAddress(t, clientsRaw(t, p, ""))["203.0.113.9"]
+
+	first, ok := row["first_seen"].(string)
+	require.True(t, ok)
+
+	last, ok := row["last_seen"].(string)
+	require.True(t, ok)
+
+	assert.NotContains(t, first, ".", "first_seen carries no fraction of a second")
+
+	firstAt, err := time.Parse(time.RFC3339Nano, first)
+	require.NoError(t, err)
+
+	lastAt, err := time.Parse(time.RFC3339Nano, last)
+	require.NoError(t, err)
+
+	assert.False(t, firstAt.After(lastAt), "first_seen %s must not be after last_seen %s", first, last)
+}
+
 // The route answers as every secret route does: 404 for a secret the set does
 // not have, 200 for one with nothing held -- an empty list with tracking, the
 // counts alone without, and on a proxy with no table at all -- and nothing
@@ -546,8 +583,10 @@ func TestClientsAnswersLikeEverySecretRoute(t *testing.T) {
 // while zero, and adds no key under users: the keys there are the secrets and
 // nothing else, even when the table holds a name /stats does not know. The two
 // numbers are the ones GET /clients reports as total and overflow. GET /secrets
-// carries neither: spec §4 puts the counters in the /stats user object, and
-// what /secrets reads back is the limits.
+// carries neither, though it does carry runtime counters of its own
+// (connections, last_seen, active_ips): spec §4 places these two "inside the
+// existing user object", which is /stats's, and client_conns_refused was kept
+// off /secrets on the same reading.
 func TestStatsCountsClientsInsideTheUserObject(t *testing.T) {
 	t.Parallel()
 
@@ -652,12 +691,130 @@ func TestClientsHoldsNoLockWhileWriting(t *testing.T) {
 	}
 
 	close(w.release)
-	<-done
 
+	// Bounded, so that a handler that deadlocks on its own locks fails here
+	// rather than holding the package until go test's timeout.
+	require.True(t, govAwait(done, 5*time.Second), "the handler must finish")
 	require.True(t, reached, "the handler must reach its write")
 	assert.True(t, liveFree, "liveMu is let go before the answer is written")
 	assert.True(t, tableFree, "and so is the table's lock")
 	assert.Contains(t, w.body.String(), "203.0.113.7", "the answer is the report")
+}
+
+// The list reads the address ledger, a map that admission and release write,
+// and it reads it under liveMu, the lock they write it under (spec §5). Read
+// outside it, the Go runtime's answer is "fatal error: concurrent map read and
+// map write" -- a throw, not a panic, which no recover catches -- and the whole
+// proxy dies while a panel polls the list and users come and go. So the list,
+// /stats and the table's sweep run here beside streams being admitted, counted
+// on their entries and released -- places, two of them in one /64, and unkeyed
+// peers on the rest entry -- for the race detector to watch. The streams are
+// net.Pipe ends: no TCP port is opened.
+//
+// Not parallel: it keeps every core busy for a second and a half, and the
+// timing-sensitive tests must neither slow it down nor be slowed down by it.
+func TestClientsReadsAreSafeBesideTheDataPath(t *testing.T) { //nolint: paralleltest // see above
+	probe := clientsStatsProbe(t, true, SecretLimits{})
+	p := probe.proxy
+	handler := p.buildAPIHandler("")
+
+	addrs := []string{
+		"203.0.113.1", "203.0.113.2", "203.0.113.3", "198.51.100.4",
+		"2001:db8::1", "2001:db8::2", "2001:db8:0:1::9", "127.0.0.1", "10.0.0.7",
+	}
+
+	const workers = 4
+
+	stop := make(chan struct{})
+	running := func() bool {
+		select {
+		case <-stop:
+			return false
+		default:
+			return true
+		}
+	}
+
+	var (
+		wg       sync.WaitGroup
+		admitted atomic.Int64
+		reads    atomic.Int64
+	)
+
+	for worker := range workers {
+		streams := make([]*streamContext, len(addrs))
+		for i, addr := range addrs {
+			streams[i] = probe.stream(t, tcpFrom(addr, 40000+worker*100+i), 0)
+		}
+
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for running() {
+				for _, sc := range streams {
+					if p.tryRegisterConn(sc) != DenyNone {
+						continue
+					}
+
+					admitted.Add(1)
+
+					if entry := sc.addrEntry.Load(); entry != nil {
+						entry.bytesIn.Add(7)
+						entry.bytesOut.Add(11)
+						entry.throttledNanos.Add(1)
+						entry.seen(time.Now())
+					}
+				}
+
+				for _, sc := range streams {
+					p.unregisterConn(sc)
+				}
+			}
+		}()
+	}
+
+	// The sweep, told it is later than it is, so it forgets every entry no
+	// stream holds, two entries per hold of the table's lock.
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		for running() {
+			p.clients.sweep(time.Now().Add(clientIdleRetention+time.Minute), 2)
+		}
+	}()
+
+	for _, target := range []string{"/secrets/alice/clients?limit=3", "/secrets/alice/clients", "/stats"} {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for running() {
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+
+				if !assert.Equal(t, http.StatusOK, rec.Code, target) {
+					return
+				}
+
+				reads.Add(1)
+			}
+		}()
+	}
+
+	time.Sleep(1500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	t.Logf("%d admissions and %d API reads", admitted.Load(), reads.Load())
+
+	require.Positive(t, admitted.Load(), "streams came and went")
+	require.Positive(t, reads.Load(), "and the API was read meanwhile")
+	assert.Nil(t, probe.ledgerCounts(), "every stream was released, and the ledger with it")
 }
 
 // Through the real door: the stamped address, not the transport's, with the

@@ -73,6 +73,10 @@ type ClientUsageJSON struct {
 // ClientJSON is one row of the list: an address -- an IPv4 address, or an
 // IPv6 /64 in prefix form, the unit the address limit and kick count -- and
 // its usage.
+//
+// The /64 form ("2001:db8::/64") is how the list spells the unit, not
+// something kick reads back: kick takes an address, and any address inside the
+// /64 -- its prefix without the "/64", say -- ends every stream of it.
 type ClientJSON struct {
 	Address string `json:"address"`
 
