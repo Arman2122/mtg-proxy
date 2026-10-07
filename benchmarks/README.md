@@ -27,6 +27,8 @@ compared with what came before it rather than with memory.
 | `BenchmarkDoorRoundTrip/<door>` | a 100-byte round trip: `p50-µs`, `p99-µs`, `p999-µs` |
 | `BenchmarkDoorRoundTrip/direct` | the same with no proxy: a door's added latency is its figure minus this |
 | `BenchmarkDoorHandshake/<door>` | one whole connection, set up and torn down |
+| `BenchmarkDoorHandshake/<ee-unpaced\|dd>/secrets=<1\|100\|1000\|5000>/<first\|last>` | the same against a door hosting that many secrets, the client's sorting first or last in the list; the ee rows send a 517-byte hello |
+| `BenchmarkReadClientHelloMulti/plain/N=<1\|10\|100\|1000\|5000>/<first\|last\|miss>/hello=<517\|4096>` | the FakeTLS scan alone (`./mtglib/internal/tls/fake`): ns/op, `ns/candidate` and allocs/op |
 | `BenchmarkDoorIdle/<door>` | `heap-B/conn`, `stack-B/conn`, `goroutines/conn` for 1,000 open streams |
 
 Every bulk benchmark counts every byte and fails on a short count. The fake

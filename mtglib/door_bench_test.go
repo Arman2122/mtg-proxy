@@ -478,6 +478,13 @@ func reportPercentiles(b *testing.B, samples []time.Duration) {
 // whose old connections are still settling, a fresh SYN is dropped and
 // retried with backoff, and one iteration stalls ~15 s. That is the test's
 // churn, not the proxy's cost, so the test does not create it.
+//
+// The rows named <door> are one secret and the short forged hello. The rows
+// named <door>/secrets=<N>/<first|last> are the same connection against a door
+// that hosts N secrets -- N-1 decoys and the client's -- with the client's
+// sorting first or last, so the scan finds it at once or walks them all. They
+// exist for ee-unpaced and dd only, and the ee ones send a 517-byte hello, the
+// size a real client sends.
 func BenchmarkDoorHandshake(b *testing.B) {
 	for _, dc := range doorCases() {
 		b.Run(dc.name, func(b *testing.B) {
@@ -493,6 +500,92 @@ func BenchmarkDoorHandshake(b *testing.B) {
 				endStream(client, upstream, done)
 			}
 		})
+	}
+
+	for _, name := range []string{"ee-unpaced", "dd"} {
+		dc := doorNamed(name)
+
+		if dc.entry.mode == SecretModeFakeTLS {
+			dc.entry = dc.entry.withHelloSize(benchHelloSize)
+		}
+
+		for _, n := range []int{1, 100, 1000, 5000} {
+			for _, target := range []string{"first", "last"} {
+				b.Run(fmt.Sprintf("%s/secrets=%d/%s", name, n, target), func(b *testing.B) {
+					benchDoorHandshakeAmong(b, dc, n, target)
+				})
+			}
+		}
+	}
+}
+
+// benchHelloSize is the size of the whole ClientHello record a Telegram client
+// sends to an ee door.
+const benchHelloSize = 517
+
+// benchTargetFirst and benchTargetLast are the names the client of a
+// secrets-count benchmark is hosted under. buildSecretSet sorts names, and every
+// decoy's name starts with a letter between these two, so where the name sorts
+// is where the secret sits in the list the door scans.
+const (
+	benchTargetFirst = "aaa"
+	benchTargetLast  = "zzz"
+)
+
+// hostedAmongDecoys is n secrets of the door's wire form: n-1 decoys and the
+// client's, named so that the client's sorts first or last. It returns them and
+// the client's name.
+func hostedAmongDecoys(tb testing.TB, ec govEntryCase, n int, target string) (map[string]Secret, string) {
+	tb.Helper()
+
+	var name string
+
+	switch target {
+	case "first":
+		name = benchTargetFirst
+	case "last":
+		name = benchTargetLast
+	default:
+		tb.Fatalf("no such target %q", target)
+	}
+
+	secrets := make(map[string]Secret, n)
+	secrets[name] = ec.secret(tb)
+
+	for i := range n - 1 {
+		secrets[fmt.Sprintf("d%05d", i)] = ec.secret(tb)
+	}
+
+	return secrets, name
+}
+
+// benchDoorHandshakeAmong is one whole connection per iteration, as the loop in
+// BenchmarkDoorHandshake, against a door that hosts n secrets.
+func benchDoorHandshakeAmong(b *testing.B, dc doorCase, n int, target string) {
+	b.Helper()
+
+	secrets, name := hostedAmongDecoys(b, dc.entry, n, target)
+	h := dc.build(b, secrets, nil)
+
+	// Where the client really sits in the door's list, read back from the door
+	// and not trusted from the names: a target that is not where its row says
+	// would time the wrong scan, and every iteration would still succeed.
+	set := h.proxy.secrets.Load()
+	require.Len(b, set.names, n)
+
+	index := map[string]int{"first": 0, "last": n - 1}[target]
+	require.Equal(b, name, set.names[index], "the client must sort %s", target)
+	require.Equal(b, secrets[name].Key, set.secrets[index].Key)
+
+	key := secrets[name].Key
+
+	for b.Loop() {
+		client, done := h.dialProxy(b, dc.entry.policy)
+		upstream := connectThrough(b, dc.entry, h, client, name, key)
+
+		resetOnClose(b, client)
+		resetOnClose(b, upstream)
+		endStream(client, upstream, done)
 	}
 }
 
