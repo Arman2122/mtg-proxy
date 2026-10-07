@@ -284,6 +284,17 @@ func (b *scanBudget) enforced() bool {
 	return b != nil && b.mode == budgetEnforce
 }
 
+// blockNanos is what the budget believes one SHA-256 block costs, in
+// nanoseconds, as /stats reports it: the process's calibrated reading, or an
+// injected one. A nil budget has none and says zero.
+func (b *scanBudget) blockNanos() float64 {
+	if b == nil {
+		return 0
+	}
+
+	return b.nsPerBlock
+}
+
 // oversized reports whether a hello of blocks is above the scan cap, which only
 // a budget that is on has.
 func (b *scanBudget) oversized(blocks int) bool {

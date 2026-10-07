@@ -102,6 +102,22 @@ type tomlConfig struct {
 			// explicit "scout-covers = false" turns it off.
 			ScoutCovers *bool `toml:"scout-covers" json:"scout_covers,omitempty"`
 		} `toml:"doppelganger" json:"doppelganger"`
+		HandshakeBudget struct {
+			Mode string `toml:"mode" json:"mode,omitempty"`
+			// Pointers, so an explicit 0 (and false) survives the trip through
+			// "omitempty" instead of reading as "not set": per-ip-ms = 0 turns
+			// the per-address bucket off while unset is 50, cpu-percent = 0 is
+			// an error while unset is 25, and hints = false beats
+			// track-client-ips = true while unset follows it.
+			//
+			// The two numbers are signed here on purpose. A uint field would
+			// have the TOML decoder refuse a negative with an error that names
+			// no key; as an int64 it reaches TypeHandshakeBudgetPerIP and
+			// TypeHandshakeBudgetCPU, which refuse it by name.
+			PerIPMillis *int64 `toml:"per-ip-ms" json:"perIpMs,omitempty"`
+			CPUPercent  *int64 `toml:"cpu-percent" json:"cpuPercent,omitempty"`
+			Hints       *bool  `toml:"hints" json:"hints,omitempty"`
+		} `toml:"handshake-budget" json:"handshakeBudget"`
 	} `toml:"defense" json:"defense"`
 	Network struct {
 		Timeout struct {

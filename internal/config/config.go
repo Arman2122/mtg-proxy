@@ -150,6 +150,26 @@ type Config struct {
 			// sites are then measured. Only an explicit false turns it off.
 			ScoutCovers *TypeBool `json:"scout_covers"`
 		} `json:"doppelganger"`
+
+		// HandshakeBudget is [defense.handshake-budget]. Its fields are the
+		// zero value when the config does not say, which every getter below
+		// reads as "the default"; omitzero keeps a config that does not use
+		// the table rendering exactly as it did before the table existed.
+		HandshakeBudget struct {
+			Mode TypeHandshakeBudgetMode `json:"mode"`
+
+			// PerIPMillis is nil when the config does not say (50); an
+			// explicit 0 is a non-nil pointer to 0 and turns the per-address
+			// bucket off.
+			PerIPMillis *TypeHandshakeBudgetPerIP `json:"perIpMs,omitempty"`
+
+			CPUPercent TypeHandshakeBudgetCPU `json:"cpuPercent"`
+
+			// Hints is nil when the config does not say: the cache then
+			// follows track-client-ips. Only an explicit value overrides it,
+			// in either direction.
+			Hints *TypeBool `json:"hints,omitempty"`
+		} `json:"handshakeBudget,omitzero"`
 	} `json:"defense"`
 	Network struct {
 		Timeout struct {
@@ -450,6 +470,50 @@ func (c *Config) GetSecretLimits() map[string]mtglib.SecretLimits {
 	}
 
 	return out
+}
+
+// GetHandshakeBudgetMode returns [defense.handshake-budget] mode, or "" when the
+// config does not say, which mtglib reads as enforce.
+func (c *Config) GetHandshakeBudgetMode() string {
+	return c.Defense.HandshakeBudget.Mode.Get("")
+}
+
+// GetHandshakeBudgetPerIPMillis returns [defense.handshake-budget] per-ip-ms, or
+// nil when the config does not say, which mtglib reads as 50. An explicit 0 is
+// returned as a pointer to 0: it turns the per-address bucket off.
+func (c *Config) GetHandshakeBudgetPerIPMillis() *uint {
+	perIP := c.Defense.HandshakeBudget.PerIPMillis
+	if perIP == nil {
+		return nil
+	}
+
+	value := perIP.Value
+
+	return &value
+}
+
+// GetHandshakeBudgetCPUPercent returns [defense.handshake-budget] cpu-percent, or
+// 0 when the config does not say, which mtglib reads as 25. The file cannot say
+// 0: it is refused when parsed.
+func (c *Config) GetHandshakeBudgetCPUPercent() uint {
+	return c.Defense.HandshakeBudget.CPUPercent.Get(0)
+}
+
+// GetHandshakeHints returns [defense.handshake-budget] hints, or nil when the
+// config does not say, which mtglib reads as "follow track-client-ips". An
+// explicit false is returned as a pointer to false, and is what keeps the hint
+// cache off under track-client-ips = true.
+func (c *Config) GetHandshakeHints() *bool {
+	hints := c.Defense.HandshakeBudget.Hints
+	if hints == nil {
+		return nil
+	}
+
+	// Get(false), never Get(true): TypeBool.Get is an OR, so a true default
+	// would turn an explicit false into true.
+	value := hints.Get(false)
+
+	return &value
 }
 
 // GetAPIToken returns the bearer token guarding the management API, or an empty
