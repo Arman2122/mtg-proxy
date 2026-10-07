@@ -28,12 +28,21 @@ const testCeiling = 256 << 10
 // ceiling cannot finish twice testCeiling in under heldAtLeast, two addresses
 // held each to its own finish both well inside eachOnItsOwn, which two sharing
 // one bucket cannot, and a peer the ceiling does not reach finishes inside
-// notHeld.
+// notHeld. Each band is about a second from what it tells apart, on both sides.
 const (
 	heldAtLeast  = time.Second
 	eachOnItsOwn = 2750 * time.Millisecond
 	notHeld      = time.Second
 )
+
+// ceilingRefill is how long a transfer against the clock waits for the bucket
+// the transfer before it drained to fill again: testCeiling refills the 64 KiB
+// floor in a quarter of a second, and the rest is room for the last bytes of the
+// transfer before to clear. The bucket is one for both directions, so without
+// it a transfer that follows another starts empty and takes a quarter of a
+// second longer than one that starts full, and the bands above would have to
+// allow for both.
+const ceilingRefill = 400 * time.Millisecond
 
 // ceilingTransfer is one timed transfer of a stream, or why it failed: a
 // goroutine reports it, and only the test's own goroutine may fail the test.
@@ -174,7 +183,8 @@ func ceilingOf(entry *clientEntry) (int64, int) {
 // one place and is governed as the secret's rest entry, is not held at all. It
 // is client-speed alone that asks for entries here: the proxy keeps no
 // addresses. The time the places spent held is the user's throttled time, and
-// the ceiling reads back on /stats.
+// the ceiling reads back on /stats. That the two places have a bucket each is
+// asserted on the objects first; the clock is what shows the buckets hold.
 func TestClientSpeedHoldsEachAddressToItsCeiling(t *testing.T) {
 	t.Parallel()
 
@@ -205,31 +215,41 @@ func TestClientSpeedHoldsEachAddressToItsCeiling(t *testing.T) {
 				assert.Equal(t, ceilingBurst(testCeiling), burst)
 			}
 
+			assert.NotSame(t, installedLimiter(t, &firstEntry.ceiling), installedLimiter(t, &secondEntry.ceiling),
+				"two places, two buckets: the clock below shows what one shared between them would do")
+
 			rest := local.ctx.addrEntry.Load()
 			require.NotNil(t, rest, "a loopback peer is governed, as the rest entry")
 			require.True(t, rest.rest)
 			assert.False(t, rest.ceiling.installed(), "and the rest entry has no ceiling")
 
-			for direction, start := range map[string]func(s *ceilingStream) <-chan ceilingTransfer{
-				"download": func(s *ceilingStream) <-chan ceilingTransfer {
+			for i, direction := range []struct {
+				name  string
+				start func(s *ceilingStream) <-chan ceilingTransfer
+			}{
+				{"download", func(s *ceilingStream) <-chan ceilingTransfer {
 					return timeDownload(s.client, s.upstream, 2*testCeiling)
-				},
-				"upload": func(s *ceilingStream) <-chan ceilingTransfer {
+				}},
+				{"upload", func(s *ceilingStream) <-chan ceilingTransfer {
 					return timeUpload(ec, s.client, s.upstream, 2*testCeiling)
-				},
+				}},
 			} {
-				firstTook, secondTook, localTook := start(first), start(second), start(local)
+				if i > 0 {
+					time.Sleep(ceilingRefill)
+				}
 
-				a := tookFor(t, firstTook, direction+" from the first place")
-				b := tookFor(t, secondTook, direction+" from the second place")
-				free := tookFor(t, localTook, direction+" from loopback")
+				firstTook, secondTook, localTook := direction.start(first), direction.start(second), direction.start(local)
 
-				assert.GreaterOrEqual(t, a, heldAtLeast, "%s: the first place is held to its ceiling", direction)
-				assert.GreaterOrEqual(t, b, heldAtLeast, "%s: the second place is held to its ceiling", direction)
+				a := tookFor(t, firstTook, direction.name+" from the first place")
+				b := tookFor(t, secondTook, direction.name+" from the second place")
+				free := tookFor(t, localTook, direction.name+" from loopback")
+
+				assert.GreaterOrEqual(t, a, heldAtLeast, "%s: the first place is held to its ceiling", direction.name)
+				assert.GreaterOrEqual(t, b, heldAtLeast, "%s: the second place is held to its ceiling", direction.name)
 				assert.Less(t, max(a, b), eachOnItsOwn,
-					"%s: each place is held to the ceiling on its own, not to the ceiling between them", direction)
-				assert.Less(t, free, notHeld, "%s: the rest entry has no ceiling", direction)
-				assert.Less(t, free, min(a, b)/2, "%s: the loopback peer was not paced", direction)
+					"%s: each place is held to the ceiling on its own, not to the ceiling between them", direction.name)
+				assert.Less(t, free, notHeld, "%s: the rest entry has no ceiling", direction.name)
+				assert.Less(t, free, min(a, b)/2, "%s: the loopback peer was not paced", direction.name)
 			}
 
 			user := h.proxy.stats.getOrCreate("alice")
@@ -391,9 +411,10 @@ func admitFrom(t *testing.T, probe *denyProbe, addr net.Addr) *streamContext {
 // a reload that changes nothing replaces and refills nothing; a new rate inside
 // the band the bucket's burst was sized for re-rates the same bucket, its spent
 // tokens still spent; a rate outside it gets a new bucket with the burst of
-// that rate, the only way a burst changes; an entry no stream holds is moved
-// with the others, so its address finds the new ceiling when it comes back; a
-// reconnect finds the bucket its address left; the rest entry never has one;
+// that rate, the only way a burst changes, and a new entry is made with that
+// burst too; an entry no stream holds is moved with the others, so its address
+// finds the new ceiling when it comes back; a reconnect finds the bucket its
+// address left; the rest entry never has one;
 // and removing the key leaves no ceiling, whatever else the entry carries -- a
 // fair share is not the ceiling's to touch.
 func TestAReloadReRatesTheCeilingInPlace(t *testing.T) {
@@ -450,6 +471,22 @@ func TestAReloadReRatesTheCeilingInPlace(t *testing.T) {
 	assert.NotSame(t, bucket, raised, "raised past the band: a new bucket")
 	assert.Equal(t, ceilingBurst(16<<20), raised.Burst())
 	assert.InDelta(t, float64(16<<20), float64(raised.Limit()), 0)
+
+	// An address new at that rate is made with the burst of that rate, above
+	// the floor -- the burst a reload gives it too -- so a reload that changes
+	// nothing refills nobody, whatever burst an entry was made with.
+	fresh := admitFrom(t, probe, tcpFrom("203.0.113.47", 50006)).addrEntry.Load()
+	require.NotNil(t, fresh)
+
+	made := installedLimiter(t, &fresh.ceiling)
+	require.Greater(t, ceilingBurst(16<<20), minAddrBurst, "the rate is above the floor's band")
+	assert.Equal(t, ceilingBurst(16<<20), made.Burst(), "a new entry has the burst of its rate")
+	drainAddrLimiter(t, &fresh.ceiling)
+
+	reload(16 << 20)
+	assert.Same(t, made, installedLimiter(t, &fresh.ceiling), "a reload that changes nothing replaces nothing")
+	assert.Less(t, made.TokensAt(clock.read()), 1.0, "and refills nothing")
+	assert.Same(t, raised, installedLimiter(t, &entry.ceiling))
 
 	back := admitFrom(t, probe, tcpFrom("203.0.113.41", 50005))
 	require.Same(t, idleEntry, back.addrEntry.Load())
@@ -533,10 +570,12 @@ func TestANewEntryIsPublishedWithItsCeiling(t *testing.T) { //nolint: parallelte
 	}, seen, "a keyed entry is never seen without its ceiling, the rest entry never with one")
 }
 
-// The lock order's reason: a reload moves the ceilings under liveMu, the lock
-// admission makes an entry under, so an admission that read the old set cannot
-// make its entry after the reload's walk has passed. Held here, liveMu keeps the
-// reload from moving any ceiling until it is let go.
+// The lock order's reason, in both of its halves: a reload swaps its set in
+// first and only then moves the ceilings, under liveMu, the lock admission makes
+// an entry under. So an admission that read the old set made its entry before
+// the walk, which moves it, and one after the walk reads the new set. With
+// liveMu held here, the new set is already in place -- the swap did not wait for
+// liveMu -- and no ceiling has moved until liveMu is let go.
 func TestAReloadMovesCeilingsUnderLiveMu(t *testing.T) {
 	t.Parallel()
 
@@ -557,6 +596,13 @@ func TestAReloadMovesCeilingsUnderLiveMu(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() { done <- p.ReplaceSecrets(cfg) }()
+
+	// Not require: the reload must be let go below whatever happens here.
+	assert.Eventually(t, func() bool {
+		lim, _ := p.secrets.Load().limitsOf("alice")
+
+		return lim.ClientSpeedBytesPerSecond == 2<<20
+	}, 2*time.Second, 5*time.Millisecond, "the reload swaps its set in before it needs liveMu")
 
 	assert.Never(t, func() bool {
 		rate, _ := ceilingOf(entry)
