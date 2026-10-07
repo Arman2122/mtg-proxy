@@ -619,6 +619,54 @@ func TestTheSetKnowsWhetherAnySecretHasAClientControl(t *testing.T) {
 	assert.False(t, none.anyClientControl())
 }
 
+// The set's answer is the OR of every secret's: with tracking on or off, with
+// no limits and with each SecretLimits field set alone on one secret of two,
+// clientEntriesWantedBy says yes exactly when clientEntriesWanted says yes for
+// some secret. Admission and the backfill skip the per-secret question on the
+// set's no, so a reason added to the per-secret predicate and not to the set's
+// would silently stop entries; one added only to the set's would cost the
+// common case its free admission.
+func TestTheSetAndItsSecretsAgreeOnEntries(t *testing.T) {
+	t.Parallel()
+
+	typ := reflect.TypeFor[SecretLimits]()
+	secrets := map[string]Secret{
+		"alice": GenerateSecret("alice.example.com"),
+		"bob":   GenerateSecret("bob.example.com"),
+	}
+
+	for _, tracking := range []bool{false, true} {
+		p := &Proxy{trackClientIPs: tracking}
+
+		for i := -1; i < typ.NumField(); i++ {
+			var lim SecretLimits
+
+			label := "no limits"
+
+			if i >= 0 {
+				nonZeroLimitField(t, &lim, i)
+
+				label = typ.Field(i).Name
+			}
+
+			set := buildSecretSet(secrets, nil, nil, map[string]SecretLimits{"bob": lim})
+
+			wanted := false
+
+			for _, name := range set.names {
+				secretLim, ok := set.limitsOf(name)
+				require.True(t, ok)
+
+				wanted = wanted || p.clientEntriesWanted(secretLim)
+			}
+
+			assert.Equal(t, wanted, p.clientEntriesWantedBy(set), "tracking %v, %s", tracking, label)
+		}
+	}
+
+	assert.False(t, (&Proxy{}).clientEntriesWantedBy(nil), "a nil set wants nothing")
+}
+
 // nonZeroLimitField sets field i of lim to a value that is not its zero, by
 // kind, and fails the test on a kind it does not know: a field added to
 // SecretLimits must be handled here, not skipped.

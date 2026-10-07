@@ -545,9 +545,20 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 // client addresses (track-client-ips, which a panel always sets) or the secret
 // has a per-address control. Otherwise there is no entry, and the data path
 // reads a nil pointer. This is the one place that decides it, for admission and
-// for a reload's backfill alike.
+// for a reload's backfill alike; clientEntriesWantedBy asks it of a whole set.
 func (p *Proxy) clientEntriesWanted(lim SecretLimits) bool {
 	return p.trackClientIPs || lim.hasClientControl()
+}
+
+// clientEntriesWantedBy is clientEntriesWanted for every secret of a set at
+// once, answered without looking a secret up: false exactly when no secret of
+// the set wants entries -- the proxy keeps no addresses and no secret has a
+// per-address control -- which is the common case, and then admission and a
+// reload's backfill do no table work at all. Both ask it, and nothing else
+// writes the shortcut out; a reason added to clientEntriesWanted belongs here
+// too, and a test holds the two to the same answer.
+func (p *Proxy) clientEntriesWantedBy(set *secretSet) bool {
+	return p.trackClientIPs || set.anyClientControl()
 }
 
 // acquireClientLocked takes the per-address entry a stream of the named secret
@@ -557,17 +568,13 @@ func (p *Proxy) clientEntriesWanted(lim SecretLimits) bool {
 // made here is either made from the new set or reached by that reload. A
 // secret the set no longer has gets no entry; its stream is about to be
 // closed. Caller holds liveMu.
-//
-// A proxy that keeps no addresses, with no per-address control on any secret,
-// needs no entry for anyone; the set knows that without the secret being
-// looked up, so admission in the common case does no table work at all.
 func (p *Proxy) acquireClientLocked(name string, key addressKey, keyed bool) *clientEntry {
 	if p.clients == nil {
 		return nil
 	}
 
 	set := p.secrets.Load()
-	if !p.trackClientIPs && !set.anyClientControl() {
+	if !p.clientEntriesWantedBy(set) {
 		return nil
 	}
 

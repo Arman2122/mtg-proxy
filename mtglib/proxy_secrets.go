@@ -410,11 +410,11 @@ func (p *Proxy) applyLimits(set *secretSet) {
 //
 // Under liveMu, the same critical section admission takes its entry in, so a
 // stream is either admitted before this and backfilled by it, or admitted
-// after it from the set already swapped in. A set none of whose secrets has a
-// per-address control, on a proxy that keeps no addresses, needs no entry for
-// anyone, and the walk is skipped.
+// after it from the set already swapped in. A set none of whose secrets wants
+// entries (clientEntriesWantedBy) needs none for anyone, and the walk is
+// skipped.
 func (p *Proxy) backfillClients(set *secretSet) {
-	if p.clients == nil || !p.trackClientIPs && !set.anyClientControl() {
+	if p.clients == nil || !p.clientEntriesWantedBy(set) {
 		return
 	}
 
