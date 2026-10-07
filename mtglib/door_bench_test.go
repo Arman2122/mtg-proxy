@@ -485,6 +485,14 @@ func reportPercentiles(b *testing.B, samples []time.Duration) {
 // sorting first or last, so the scan finds it at once or walks them all. They
 // exist for ee-unpaced and dd only, and the ee ones send a 517-byte hello, the
 // size a real client sends.
+//
+// ee-unpaced alone has a third kind, <door>/secrets=<N>/last/hinted: the same
+// connection from one fixed, keyed client address that has connected before, so
+// the door verifies the hello against the address's hint and never scans. The
+// other rows cannot show that, since their peers are loopback, which gets no
+// hints. The row proves what it timed (see benchDoorHandshakeHinted), and its
+// figure at N = 5,000 over its figure at N = 1 is the hint path's cost of
+// hosting many secrets.
 func BenchmarkDoorHandshake(b *testing.B) {
 	for _, dc := range doorCases() {
 		b.Run(dc.name, func(b *testing.B) {
@@ -515,9 +523,23 @@ func BenchmarkDoorHandshake(b *testing.B) {
 					benchDoorHandshakeAmong(b, dc, n, target)
 				})
 			}
+
+			if name == "ee-unpaced" && slices.Contains(benchHintedSecrets, n) {
+				b.Run(fmt.Sprintf("%s/secrets=%d/last/hinted", name, n), func(b *testing.B) {
+					benchDoorHandshakeHinted(b, dc, n)
+				})
+			}
 		}
 	}
 }
+
+// benchHintedSecrets are the secrets counts that have a hinted row.
+var benchHintedSecrets = []int{1, 1000, 5000}
+
+// benchHintedAddr is the client address of the hinted rows: a documentation
+// address (RFC 5737), public-looking, so the hint cache keys on it; loopback,
+// private and link-local ones are not keyed.
+const benchHintedAddr = "203.0.113.7"
 
 // benchHelloSize is the size of the whole ClientHello record a Telegram client
 // sends to an ee door.
@@ -559,9 +581,11 @@ func hostedAmongDecoys(tb testing.TB, ec govEntryCase, n int, target string) (ma
 	return secrets, name
 }
 
-// benchDoorHandshakeAmong is one whole connection per iteration, as the loop in
-// BenchmarkDoorHandshake, against a door that hosts n secrets.
-func benchDoorHandshakeAmong(b *testing.B, dc doorCase, n int, target string) {
+// hostedDoorAmong is a door built over n secrets, as hostedAmongDecoys makes
+// them, with the client's name and key.
+func hostedDoorAmong(
+	b *testing.B, dc doorCase, n int, target string,
+) (*entryHarness, string, [SecretKeyLength]byte) {
 	b.Helper()
 
 	secrets, name := hostedAmongDecoys(b, dc.entry, n, target)
@@ -577,7 +601,15 @@ func benchDoorHandshakeAmong(b *testing.B, dc doorCase, n int, target string) {
 	require.Equal(b, name, set.names[index], "the client must sort %s", target)
 	require.Equal(b, secrets[name].Key, set.secrets[index].Key)
 
-	key := secrets[name].Key
+	return h, name, secrets[name].Key
+}
+
+// benchDoorHandshakeAmong is one whole connection per iteration, as the loop in
+// BenchmarkDoorHandshake, against a door that hosts n secrets.
+func benchDoorHandshakeAmong(b *testing.B, dc doorCase, n int, target string) {
+	b.Helper()
+
+	h, name, key := hostedDoorAmong(b, dc, n, target)
 
 	for b.Loop() {
 		client, done := h.dialProxy(b, dc.entry.policy)
@@ -587,6 +619,63 @@ func benchDoorHandshakeAmong(b *testing.B, dc doorCase, n int, target string) {
 		resetOnClose(b, upstream)
 		endStream(client, upstream, done)
 	}
+}
+
+// benchDoorHandshakeHinted is one whole connection per iteration against a door
+// that hosts n secrets, the client's sorting last, as benchDoorHandshakeAmong
+// does -- from one fixed, keyed address, with hints on.
+//
+// One untimed connection comes first. It scans (the address has no hint yet),
+// and the hint is written after admit, before the Telegram dial that
+// connectThrough waits for, so it is in place when the timed ones begin.
+//
+// What the timed connections went through is read back from the door's own
+// counters, because every one of them would succeed as a scan too: each must
+// have been a hint hit, none a scan, and a hit costs exactly one verification.
+// A setup that does not hit -- hints off, an unkeyed address -- fails the
+// benchmark rather than time a scan under the hinted name.
+func benchDoorHandshakeHinted(b *testing.B, dc doorCase, n int) {
+	b.Helper()
+
+	h, name, key := hostedDoorAmong(b, dc, n, "last")
+
+	// The entry harness builds a Proxy literal, which has no hint cache.
+	h.proxy.hints = newMatchHints(h.proxy.ctx)
+
+	// One address, one port: a hint belongs to the address, so the port does not
+	// matter, and the connections are distinct sockets either way.
+	addr := tcpFrom(benchHintedAddr, 41000)
+
+	connect := func() {
+		client, done := dialProxyFrom(b, h, dc.entry.policy, addr)
+		upstream := connectThrough(b, dc.entry, h, client, name, key)
+
+		resetOnClose(b, client)
+		resetOnClose(b, upstream)
+		endStream(client, upstream, done)
+	}
+
+	connect()
+
+	warm := tallyOf(h.proxy)
+	require.EqualValues(b, 1, warm.scanned, "the untimed connection is the scan that writes the hint")
+	require.Zero(b, warm.hinted)
+
+	iterations := 0
+
+	for b.Loop() {
+		connect()
+
+		iterations++
+	}
+
+	moved := tallyOf(h.proxy).minus(warm)
+
+	require.EqualValues(b, iterations, moved.hinted,
+		"every timed connection must be a hint hit: the benchmark would otherwise time a scan")
+	require.Zero(b, moved.scanned, "no timed connection may scan")
+	require.LessOrEqual(b, moved.verifications, 2*int64(iterations),
+		"a hint hit costs one verification, not a walk of the candidates")
 }
 
 // BenchmarkDoorIdle holds 1,000 streams open and reports what each costs. The

@@ -28,6 +28,8 @@ compared with what came before it rather than with memory.
 | `BenchmarkDoorRoundTrip/direct` | the same with no proxy: a door's added latency is its figure minus this |
 | `BenchmarkDoorHandshake/<door>` | one whole connection, set up and torn down |
 | `BenchmarkDoorHandshake/<ee-unpaced\|dd>/secrets=<1\|100\|1000\|5000>/<first\|last>` | the same against a door hosting that many secrets, the client's sorting first or last in the list; the ee rows send a 517-byte hello |
+| `BenchmarkDoorHandshake/ee-unpaced/secrets=<1\|1000\|5000>/last/hinted` | the same from one fixed public address that has connected before, so the door verifies the hello against its hint and does not scan; it fails unless every timed connection was a hint hit |
+| `BenchmarkScanBudgetReserve/<keyed\|unkeyed>` | the scan budget's own cost: ns/op and allocs/op of one `reserve` and `settle` |
 | `BenchmarkReadClientHelloMulti/plain/N=<1\|10\|100\|1000\|5000>/<first\|last\|miss>/hello=<517\|4096>` | the FakeTLS scan alone (`./mtglib/internal/tls/fake`): ns/op, `ns/candidate` and allocs/op |
 | `BenchmarkDoorIdle/<door>` | `heap-B/conn`, `stack-B/conn`, `goroutines/conn` for 1,000 open streams |
 
@@ -97,10 +99,11 @@ Its figures include the test client's own WebSocket work, in the same process.
 
 The FakeTLS scan by itself (`BenchmarkReadClientHelloMulti`) is a package of its
 own too. Its thirty rows at six one-second samples are about three minutes, and
-the secrets-count rows of `BenchmarkDoorHandshake` add sixteen more rows to what
+the secrets-count rows of `BenchmarkDoorHandshake` add nineteen more rows to what
 `-test.bench .` runs on `mtglib.test`, so filter rather than run everything in
 one ten-minute session. A `-bench` element is an unanchored regular expression:
-`N=100` also selects `N=1000`, so write `N=100$`.
+`N=100` also selects `N=1000`, so write `N=100$`. The three `last/hinted` rows
+sit below the `last` rows, so a pattern ending in `last` selects them too.
 
 ```bash
 # here
@@ -109,6 +112,8 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -o fake.test ./mtglib/internal/
 # on the box
 GOMAXPROCS=2 ./fake.test -test.run '^$' -test.bench ReadClientHelloMulti -test.benchmem -test.count 6 -test.benchtime 1s > fake-p2.txt
 GOMAXPROCS=2 ./mtglib.test -test.run '^$' -test.bench 'DoorHandshake/(ee-unpaced|dd)/secrets=' -test.benchmem -test.count 6 -test.benchtime 1s > door-secrets-p2.txt
+GOMAXPROCS=2 ./mtglib.test -test.run '^$' -test.bench 'DoorHandshake/ee-unpaced/secrets=[0-9]+/last/hinted$' -test.benchmem -test.count 6 -test.benchtime 1s > door-hinted-p2.txt
+GOMAXPROCS=2 ./mtglib.test -test.run '^$' -test.bench ScanBudgetReserve -test.benchmem -test.count 6 -test.benchtime 1s > budget-p2.txt
 ```
 
 ## mtgbench on the bench box
