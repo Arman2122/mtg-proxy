@@ -70,7 +70,8 @@ Failure modes the spec implies that no single task's headline test covers; each 
 **Files:**
 - Create: `mtglib/internal/tls/fake/verify.go`
 - Modify: `mtglib/internal/tls/fake/client_side.go` (`ReadClientHelloMulti` becomes a wrapper)
-- Test: `mtglib/internal/tls/fake/verify_test.go`
+- Modify: `mtglib/internal/tls/fake/verify_bench_test.go` (add `BenchmarkVerify` rows `plain` and `pads`, ns per candidate, so Task 8's A/B needs no new code)
+- Test: `mtglib/internal/tls/fake/verify_test.go` (in package `fake`, not `fake_test`: the RFC 4231 test drives an unexported `(*Candidate).mac` over arbitrary data)
 
 **Interfaces:**
 - Produces:
@@ -86,7 +87,7 @@ Failure modes the spec implies that no single task's headline test covers; each 
   - `TestVerifyAgreesWithTheReferenceMatcher`: a copy of the pre-change `ReadClientHelloMulti` loop lives in this test file as `referenceMatch`; over 10,000 seeded scenarios (key at position k of 1–20 secrets, wrong key, duplicate keys, fresh and 10 s-skewed timestamps, hello sizes 100 B–4 KiB via `testclient.ClientHelloPadded`) `Verify` over `NewCandidate` and over `NewPlainCandidate` both agree with `referenceMatch` on every scenario.
   - `TestPlainFallbackWhenStateCannotBeExported`: build a `Candidate` forced into fallback (test hook) and assert it still verifies the right key and rejects a wrong one.
   - `TestVerifyDoesNotAllocateOnThePrecomputedPath`: `testing.AllocsPerRun` over 100 `Verify` calls == 0.
-  - `TestBlocksCountsTheHMACBlocks`: `Blocks()` is 12 for a 517-byte record and 1,030 for 65,531 bytes (derive each by the formula in the test comment).
+  - `TestBlocksCountsTheHMACBlocks`: `Blocks()` is 12 for a 517-byte record and 1,028 for 65,531 bytes (derive each by the formula in the test comment: `3 + ceil((L+9)/64)`).
   - `TestReadClientHelloMultiBehaviourIsUnchanged`: the existing package tests (snapshot, fragmented, fuzz seeds) still pass — assert by running them; add one case that the no-match partial result is still returned.
   Run: FAIL (undefined).
 - [ ] **Step 2: Implement** `verify.go` per the Interfaces block; pad precompute: `ipad = key⊕0x36`, `opad = key⊕0x5c` padded to the 64-byte block (a key longer than 64 bytes is hashed first, per RFC 2104), absorb into two `sha256.New()` digests, `MarshalBinary` each; `Verify` unmarshals into two per-`Parsed` scratch digests, writes `handshake[:RandomOffset] ‖ zeros(32) ‖ handshake[RandomOffset+RandomLen:]`, finishes inner then outer into a stack `[32]byte`.
@@ -139,7 +140,7 @@ Failure modes the spec implies that no single task's headline test covers; each 
 - Test: `mtglib/handshake_budget_test.go`, `mtglib/proxy_entry_budget_test.go`
 
 **Interfaces:**
-- Produces: `type budgetMode int` (`budgetEnforce` zero value, `budgetObserve`, `budgetOff`); `type scanBudgetConfig struct{ Mode budgetMode; PerIPMillis, CPUPercent uint; Procs int }` (zero fields mean the spec defaults 50 ms, 25 %, `runtime.GOMAXPROCS(0)`); `func newScanBudget(ctx context.Context, cfg scanBudgetConfig, now func() time.Time) *scanBudget`; `func (b *scanBudget) reserve(ip net.IP, cost int64) (scanReservation, budgetVerdict)` with `budgetVerdict` ∈ {`budgetGranted`, `budgetDeniedIP`, `budgetDeniedGlobal`}; `func (b *scanBudget) refund(r scanReservation)`.
+- Produces: `type budgetMode int` (`budgetEnforce` zero value, `budgetObserve`, `budgetOff`); `type scanBudgetConfig struct{ Mode budgetMode; PerIPMillis, CPUPercent uint; Procs int }` (zero fields mean the spec defaults 50 ms, 25 %, `runtime.GOMAXPROCS(0)`); `func newScanBudget(ctx context.Context, cfg scanBudgetConfig, now func() time.Time) *scanBudget`; `func (b *scanBudget) reserve(ip net.IP, cost int64) (scanReservation, budgetVerdict)` with `budgetVerdict` ∈ {`budgetGranted`, `budgetDeniedIP`, `budgetDeniedGlobal`}; `func (b *scanBudget) refund(r scanReservation)`; `func (b *scanBudget) enforced() bool` (true in `enforce` mode; Task 7's `/stats` reads it).
 - Produces on `ProxyOpts`: `HandshakeBudgetMode string` (`""`→enforce, `"enforce"`, `"observe"`, `"off"`; anything else fails `valid()`), `HandshakeBudgetPerIPMillis uint` (0→50; >1000 fails `valid()`), `HandshakeBudgetCPUPercent uint` (0→25; >100 fails `valid()`).
 - Consumes: `(*Parsed).Blocks()`, `scanCandidates`, `limiterKey`, `fakeStats`.
 
