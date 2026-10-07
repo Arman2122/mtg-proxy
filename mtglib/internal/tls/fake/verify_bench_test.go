@@ -127,3 +127,71 @@ func benchReadClientHelloMulti(b *testing.B, sni string, n int, target string, s
 
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(candidates), "ns/candidate")
 }
+
+// BenchmarkVerify is one candidate on its own: a hello parsed once, then Verify
+// against a key that is not its own, the case every candidate but one in a scan
+// is. The names are
+//
+//	<path>/hello=<bytes>
+//
+// where path is plain (NewPlainCandidate: a fresh hmac.New per Verify, the
+// reference) or pads (NewCandidate: the key's pad blocks hashed once, up front),
+// so the two line up row for row. One op is one candidate, so ns/candidate is
+// ns/op; it is reported under the scan benchmark's name to compare with it.
+func BenchmarkVerify(b *testing.B) {
+	const sni = "cover.example.com"
+
+	for _, path := range []struct {
+		name  string
+		build func([]byte) *fake.Candidate
+	}{
+		{"plain", fake.NewPlainCandidate},
+		{"pads", fake.NewCandidate},
+	} {
+		for _, size := range []int{517, 4096} {
+			b.Run(fmt.Sprintf("%s/hello=%d", path.name, size), func(b *testing.B) {
+				benchVerify(b, sni, path.build, size)
+			})
+		}
+	}
+}
+
+func benchVerify(b *testing.B, sni string, build func([]byte) *fake.Candidate, size int) {
+	b.Helper()
+
+	var key, decoy [16]byte
+
+	_, err := rand.Read(key[:])
+	require.NoError(b, err)
+
+	_, err = rand.Read(decoy[:])
+	require.NoError(b, err)
+
+	sessionID := make([]byte, 32)
+	_, err = rand.Read(sessionID)
+	require.NoError(b, err)
+
+	hello, err := testclient.ClientHelloPadded(key, sni, sessionID, size)
+	require.NoError(b, err)
+
+	conn := &helloConn{}
+	conn.flight.Reset(hello)
+
+	parsed, err := fake.ParseClientHelloFor(conn, []string{sni})
+	require.NoError(b, err)
+
+	// The hello is good: its own key takes it, so the miss below is the key's.
+	require.True(b, parsed.Verify(build(key[:]), TolerateTime))
+
+	candidate := build(decoy[:])
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if parsed.Verify(candidate, TolerateTime) {
+			b.Fatal("a key that did not make the hello took it")
+		}
+	}
+
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N), "ns/candidate")
+}
