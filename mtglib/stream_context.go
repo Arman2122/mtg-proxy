@@ -64,6 +64,12 @@ type streamContext struct {
 	addrKey     addressKey
 	addrCounted bool
 
+	// scanRes is what the FakeTLS door's scan was charged to the handshake
+	// budget, or nil when nothing was (a hinted match, the budget off, another
+	// door). ServeConn refunds it once admission has succeeded; every earlier
+	// exit leaves it unsettled, which keeps the charge.
+	scanRes *scanReservation
+
 	// lastActiveUnix is the second this stream last moved a byte, stamped at
 	// admission and by the data path, for the per-address activity report.
 	lastActiveUnix atomic.Int64

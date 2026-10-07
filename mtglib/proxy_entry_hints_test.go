@@ -530,7 +530,8 @@ func TestHintsFollowTrackClientIPsUnlessOverridden(t *testing.T) {
 }
 
 // Hints are for a hello of at most maxScanBlocks. Above it a hello is never
-// hinted, whatever its address earned.
+// hinted, whatever its address earned -- and under the handshake budget's
+// default mode, enforce, never scanned either: it is fronted.
 func TestAnOversizedHelloNeverConsultsHints(t *testing.T) {
 	t.Parallel()
 
@@ -540,6 +541,11 @@ func TestAnOversizedHelloNeverConsultsHints(t *testing.T) {
 	secrets, name := hostedAmongDecoys(t, ec, hosted, "last")
 	key := secrets[name].Key
 	h := hintedHarness(t, secrets, nil)
+
+	// The harness is a Proxy literal, whose budget is off, so the scan cap
+	// would not apply. An enforce budget with room for every scan here; the
+	// observe twin is TestAnOversizedHelloIsScannedInObserveMode.
+	h.proxy.scanBudget = newScanBudget(scanBudgetConfig{NsPerBlock: 10, CPUPercent: 100, Procs: 1000}, time.Now)
 
 	blocksOf := func(size int) int {
 		hello := fakeTLSClientHelloPadded(t, key, govCoverHost, make([]byte, 32), size)
@@ -560,9 +566,14 @@ func TestAnOversizedHelloNeverConsultsHints(t *testing.T) {
 		connectFrom(t, h, ec.withHelloSize(7991), tcpFrom(place, 46002), name, key),
 		"128 blocks is within the cap: hinted")
 
-	assert.Equal(t, doorTally{verifications: hosted, scanned: 1},
-		connectFrom(t, h, ec.withHelloSize(7992), tcpFrom(place, 46003), name, key),
-		"129 blocks is above it: the hint is not consulted")
+	before, oversized := tallyOf(h.proxy), h.proxy.fakeStats.oversized.Load()
+
+	refuseFrom(t, ec.withHelloSize(7992), h, key, tcpFrom(place, 46003))
+
+	assert.Equal(t, doorTally{}, tallyOf(h.proxy).minus(before),
+		"129 blocks is above it: the hint is not consulted, and nothing is scanned")
+	assert.Equal(t, oversized+1, h.proxy.fakeStats.oversized.Load(), "it is counted as oversized")
+	assert.Equal(t, 1, h.events.frontings(), "and fronted")
 }
 
 // TestConcurrentEEHandshakesShareOneSnapshotAndHints runs real door handshakes

@@ -91,10 +91,13 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 
 	// The whole FakeTLS success path is behind us -- the hello verified, not a
 	// replay, the user within its limits, admitted -- so this client's address
-	// may now remember the name. Nothing before this line may write a hint: a
-	// replay, a denied, throttled or address-limited user must not leave one.
+	// may now remember the name, and the scan that found it is refunded to the
+	// handshake budget. Nothing before this line may write a hint or refund a
+	// scan: a replay, a denied, throttled or address-limited user must not
+	// leave a hint, and keeps its charge.
 	if ctx.entry == entryFakeTLS {
 		p.hints.remember(ctx.ClientIP(), ctx.secretName)
+		ctx.scanRes.settle(true)
 	}
 
 	// Phase 3: the FakeTLS write framing.

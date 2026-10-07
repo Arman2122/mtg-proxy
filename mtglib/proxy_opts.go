@@ -289,6 +289,55 @@ type ProxyOpts struct {
 	// This is an optional setting.
 	HandshakeHints *bool
 
+	// HandshakeBudgetMode is what the FakeTLS door does with a hello it would
+	// have to scan every hosted secret for (one no hint matched) when that scan
+	// is over its CPU budget, or when the hello is above the scan cap of 128
+	// SHA-256 blocks (about 8 KiB; a real client sends 0.5 to 2 KiB):
+	//
+	//   - "enforce" (or empty, the default) waits up to 150 ms for budget, then
+	//     fronts the hello to the cover site exactly as a hello that matched
+	//     nothing is fronted -- never closes it;
+	//   - "observe" keeps the same accounting but never waits and never refuses:
+	//     it counts what enforce would have refused, and the refused hellos that
+	//     then matched a secret, and scans anyway;
+	//   - "off" has no budget and no scan cap.
+	//
+	// The budget is in real CPU: the cost of a SHA-256 block on this machine is
+	// measured once per process. Under enforce a legitimate client with no hint
+	// can be fronted while a flood keeps the budget spent; it retries. A client
+	// whose address matched a secret recently is verified against that hint
+	// first and is exempt.
+	//
+	// The zero values of this and the next two settings are the defaults:
+	// enforce, 50 ms per address, 25% of the cores.
+	//
+	// This is an optional setting.
+	HandshakeBudgetMode string
+
+	// HandshakeBudgetPerIPMillis is the scan CPU one client address (an IPv4
+	// address or an IPv6 /64) may spend per second, in milliseconds, with a
+	// burst of four seconds' worth. Loopback, private, link-local and other
+	// addresses that do not stand for one place have no bucket of their own;
+	// they share the process-wide one.
+	//
+	// nil is 50. 0 disables the per-address bucket, leaving only the
+	// process-wide one -- which is what peers behind a carrier that does not
+	// forward client addresses get anyway, since they all arrive from
+	// loopback. Above 1000 is invalid.
+	//
+	// This is an optional setting.
+	HandshakeBudgetPerIPMillis *uint
+
+	// HandshakeBudgetCPUPercent is the share of the cores (GOMAXPROCS, read
+	// once at start) the whole process may spend scanning, with a burst of one
+	// second's worth. This is the bound that holds against many addresses and
+	// against forged ones.
+	//
+	// 0 is 25. Above 100 is invalid.
+	//
+	// This is an optional setting.
+	HandshakeBudgetCPUPercent uint
+
 	// AllowFallbackOnUnknownDC defines how proxy behaves if unknown DC was
 	// requested. If this setting is set to false, then such connection will be
 	// rejected. Otherwise, proxy will chose any DC.
@@ -482,6 +531,19 @@ func (p ProxyOpts) valid() error {
 		return fmt.Errorf("invalid doppelganger shaping: %w", err)
 	}
 
+	if _, err := parseBudgetMode(p.HandshakeBudgetMode); err != nil {
+		return fmt.Errorf("invalid handshake budget: %w", err)
+	}
+
+	if ms := p.HandshakeBudgetPerIPMillis; ms != nil && *ms > maxBudgetPerIPMillis {
+		return fmt.Errorf("invalid handshake budget: %d ms per address is above %d", *ms, maxBudgetPerIPMillis)
+	}
+
+	if p.HandshakeBudgetCPUPercent > maxBudgetCPUPercent {
+		return fmt.Errorf("invalid handshake budget: %d%% of the cores is above %d%%",
+			p.HandshakeBudgetCPUPercent, maxBudgetCPUPercent)
+	}
+
 	secrets := p.getSecrets()
 	if len(secrets) == 0 {
 		return ErrSecretInvalid
@@ -518,6 +580,27 @@ func (p ProxyOpts) handshakeHints() bool {
 	}
 
 	return p.TrackClientIPs
+}
+
+// handshakeBudget is the budget the three HandshakeBudget settings describe,
+// for this process's block cost and core count, which NewProxy supplies.
+// valid() has checked the mode.
+func (p ProxyOpts) handshakeBudget(nsPerBlock float64, procs int) scanBudgetConfig {
+	mode, _ := parseBudgetMode(p.HandshakeBudgetMode)
+
+	cfg := scanBudgetConfig{
+		Mode:       mode,
+		CPUPercent: p.HandshakeBudgetCPUPercent,
+		Procs:      procs,
+		NsPerBlock: nsPerBlock,
+	}
+
+	if ms := p.HandshakeBudgetPerIPMillis; ms != nil {
+		cfg.PerIPMillis = *ms
+		cfg.PerIPDisabled = *ms == 0
+	}
+
+	return cfg
 }
 
 func (p ProxyOpts) getConcurrency() int {

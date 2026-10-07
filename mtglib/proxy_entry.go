@@ -1,10 +1,12 @@
 package mtglib
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
+	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/mtglib/internal/relay"
@@ -37,8 +39,23 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		return false
 	}
 
+	// The scan cap, past the SNI gate and before anything is verified: a hello
+	// above it is never hinted and never scanned. Observe mode counts it and
+	// goes on.
+	overBudget := p.scanBudget.oversized(parsed.Blocks())
+	if overBudget {
+		p.fakeStats.OnOversized()
+
+		if p.scanBudget.enforced() {
+			p.refuseOverBudget(ctx, rewind, parsed, "oversized")
+
+			return false
+		}
+	}
+
 	// First the secrets this client's address completed a handshake with
 	// before, if any: a returning client is found here in one verification.
+	// Hinted verification is outside the budget; it is bounded by the cap.
 	hinted := p.hintedPositions(ctx, parsed, set)
 
 	pos, tried := p.verifyHinted(parsed, set, hinted)
@@ -49,11 +66,21 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		return p.completeFakeTLS(ctx, rewind, set, parsed, set.candIdx[pos])
 	}
 
-	// Then the scan, over every candidate the hints did not already try.
+	// Then the scan, over every candidate the hints did not already try, which
+	// the budget has to pay for first.
+	res, overBudget, ok := p.reserveScan(ctx, rewind, parsed, len(set.cands)-tried, overBudget)
+	if !ok {
+		p.fakeStats.addVerifications(tried)
+
+		return false
+	}
+
 	pos, scanned := p.scanCandidates(parsed, set, skipPositions(hinted))
 	p.fakeStats.addVerifications(tried + scanned)
 
 	if pos < 0 {
+		// The charge is kept: a hello that matched nothing is what the budget
+		// is for.
 		p.fakeStats.OnUnmatched()
 		p.logger.InfoError("cannot read client hello", fake.ErrBadDigest)
 		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
@@ -63,9 +90,102 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 
 	p.fakeStats.OnScanned()
 
+	if overBudget {
+		p.fakeStats.OnOverBudgetMatched()
+	}
+
+	// Refunded only once the whole handshake has succeeded, which is decided
+	// after this returns: ServeConn settles it once admit has. Every exit
+	// before that -- a replay, a denied user, a refused admission -- keeps it.
+	ctx.scanRes = res
+
 	// pos is a position in set.cands; map it back into the full secret list
 	// before anything reads names, limits or ad tags by it.
 	return p.completeFakeTLS(ctx, rewind, set, parsed, set.candIdx[pos])
+}
+
+// reserveScan has the budget pay for scanning remaining candidates, and waits
+// until it has. It returns the reservation to settle once the handshake is
+// decided (nil when nothing was charged), whether the scan is over budget --
+// which only observe mode goes on with -- and false when the hello has been
+// disposed of and must not be scanned: fronted because enforce refused it, or
+// abandoned because the stream ended during the wait.
+//
+// overBudget comes in true for an oversized hello in observe mode, which has
+// been counted already and is not charged: enforce would have refused it
+// without charging, and observe keeps enforce's accounting.
+func (p *Proxy) reserveScan(
+	ctx *streamContext, rewind *connRewind, parsed *fake.Parsed, remaining int, overBudget bool,
+) (*scanReservation, bool, bool) {
+	if overBudget || remaining <= 0 {
+		return nil, overBudget, true
+	}
+
+	res, wait, verdict := p.scanBudget.reserve(ctx.ClientIP(), parsed.Blocks(), remaining)
+
+	var reason string
+
+	switch verdict {
+	case budgetGranted:
+	case budgetDeniedIP:
+		p.fakeStats.OnDeniedIP()
+
+		reason = "denied_ip"
+	case budgetDeniedGlobal:
+		p.fakeStats.OnDeniedGlobal()
+
+		reason = "denied_global"
+	case budgetOversized:
+		// The cap was applied before the hints; a hello above it never gets
+		// here. Kept so the switch says what every verdict means.
+		p.fakeStats.OnOversized()
+
+		reason = "oversized"
+	}
+
+	if reason != "" {
+		if p.scanBudget.enforced() {
+			p.refuseOverBudget(ctx, rewind, parsed, reason)
+
+			return nil, true, false
+		}
+
+		return nil, true, true
+	}
+
+	if wait > 0 && !waitForBudget(ctx, wait) {
+		// The stream ended while it waited -- the proxy is shutting down --
+		// so nothing was scanned and nobody is left to front.
+		res.settle(true)
+
+		return nil, false, false
+	}
+
+	return res, false, true
+}
+
+// refuseOverBudget fronts a hello the budget refused, through the same call a
+// hello that matched nothing takes: the cover site gets the same bytes. What
+// differs is the time to the first fronted byte -- a no-match is fronted after
+// its scan, a refusal at once or after at most the wait -- the same kind of
+// difference hello size and the SNI gate already made.
+func (p *Proxy) refuseOverBudget(ctx *streamContext, rewind *connRewind, parsed *fake.Parsed, reason string) {
+	ctx.logger.BindStr("reason", reason).Info("ee hello refused by the scan budget")
+	p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
+}
+
+// waitForBudget waits d, or until ctx is done; it reports whether the wait ran
+// its course.
+func waitForBudget(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // completeFakeTLS is what follows a hello that matched one secret, idx being its
