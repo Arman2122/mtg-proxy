@@ -11,37 +11,21 @@ import (
 // settles one while there is still a share to compute.
 const demandInfinite = int64(math.MaxInt64)
 
-// waterLevel is the fair-share ticker's split of one secret's speed limit total
-// among its participants, whose measured demands in bytes per second are
-// demands. It returns the level L at which the sum of min(d, L) over every
-// participant is the total: a participant that wants less than L gets what it
-// wants, and everyone else gets L. That is a max-min split, and it is
-// work-conserving, because what the quiet participants leave unused goes to the
-// ones that want more.
+// waterLevel splits one secret's speed limit total among its participants, whose
+// measured demands in bytes per second are demands, and returns the level L: the
+// largest at which the sum of min(d, L) over every participant is at most the
+// total (exactly the total, short of a floor remainder, when someone is held at
+// L). A participant that wants less than L gets what it wants and the rest get
+// L, so what the quiet ones leave unused goes to the ones that want more.
 //
-// The demands are sorted, smallest first, and settled one at a time. With
-// remaining starting at the total and k at the number of participants, a demand
-// that is no more than an equal share of what remains, remaining/k, is
-// subtracted and k drops by one; the first demand that is more, or one that is
-// demandInfinite, ends the loop, and the level is an equal share of what is
-// left, remaining/k. If every demand was settled there is nobody to hold at a
-// level, and the level is the total, which is at least what any of them asked
-// for. A settlement can only raise the equal share of what remains, so the
-// level is never below total/n, and it rises above it by the slack that the
-// quiet participants leave.
-//
-// All division floors, and a demand of zero or less counts as zero. The result
-// is at least 1: a level of zero would read as unlimited. The floor only raises
-// a computed 0 to 1, and it can only fire when there are fewer bytes than
-// participants, which a speed limit of at least 8,000 bytes a second and the
-// at most 4,097 participants of a secret never reach. There is deliberately no
-// larger clamp, because a level lifted above what the algorithm computed would
-// put the sum of the rates over the total. The total must be positive; with no
-// participants it is returned as it is.
-//
-// The function is pure. It works on a sorted copy, so the caller can go on
-// using demands, and no step can divide by zero or overflow: remaining and a
-// demand are only subtracted when the demand is at most remaining/k.
+// The demands are sorted ascending and settled one at a time: while a demand is
+// at most remaining/k (remaining starts at the total, k at the number of
+// participants) it is subtracted and k drops by one. The first demand that is
+// more, or is demandInfinite, ends the loop, and L is remaining/k, or the total
+// if nobody is left. Division floors, a demand of zero or less counts as zero,
+// and L is at least total/n, floored. The result is raised to 1, because a zero
+// would read as unlimited; spec §3 says why nothing larger clamps it. The total
+// must be positive. The function is pure and sorts a copy of demands.
 func waterLevel(total int64, demands []int64) int64 {
 	n := int64(len(demands))
 	if n == 0 {

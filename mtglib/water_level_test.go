@@ -61,9 +61,9 @@ func referenceWaterLevel(total int64, demands []int64) int64 {
 	return max(total, 1)
 }
 
-// allocations is what each participant gets at a level: its demand, or the
+// waterLevelAllocations is what each participant gets at a level: its demand, or the
 // level if the demand is more.
-func allocations(demands []int64, level int64) []int64 {
+func waterLevelAllocations(demands []int64, level int64) []int64 {
 	out := make([]int64, len(demands))
 
 	for i, d := range demands {
@@ -73,20 +73,20 @@ func allocations(demands []int64, level int64) []int64 {
 	return out
 }
 
-// allocationSum adds the allocations in arbitrary precision, so that a wrong
+// waterLevelAllocationSum adds the allocations in arbitrary precision, so that a wrong
 // level near MaxInt64 fails an assertion instead of wrapping the sum around.
-func allocationSum(demands []int64, level int64) *big.Int {
+func waterLevelAllocationSum(demands []int64, level int64) *big.Int {
 	sum := new(big.Int)
 
-	for _, a := range allocations(demands, level) {
+	for _, a := range waterLevelAllocations(demands, level) {
 		sum.Add(sum, big.NewInt(a))
 	}
 
 	return sum
 }
 
-// anyExceeds reports whether some participant wants more than the level.
-func anyExceeds(demands []int64, level int64) bool {
+// waterLevelAnyExceeds reports whether some participant wants more than the level.
+func waterLevelAnyExceeds(demands []int64, level int64) bool {
 	return slices.ContainsFunc(demands, func(d int64) bool { return d > level })
 }
 
@@ -222,7 +222,7 @@ func TestWaterLevelMatchesBruteForce(t *testing.T) {
 		require.Equal(t, before, demands, "the demands were changed: total=%d", total)
 
 		switch {
-		case anyExceeds(demands, got):
+		case waterLevelAnyExceeds(demands, got):
 			exceeding++
 		default:
 			fitting++
@@ -256,18 +256,19 @@ func TestWaterLevelProperties(t *testing.T) {
 		require.GreaterOrEqual(t, level, int64(1), "total=%d demands=%v", total, demands)
 		require.LessOrEqual(t, level, total, "total=%d demands=%v", total, demands)
 
-		// Nobody gets less than an equal share, and the level is above it
-		// whenever somebody wants less than that.
+		// Nobody gets less than an equal share, floored; the level rises above it
+		// only once the slack the quiet participants leave exceeds the floor
+		// remainder.
 		require.GreaterOrEqual(t, level, total/n, "total=%d demands=%v", total, demands)
 
 		if total >= n {
 			// With a byte for each participant the floor of 1 never fires, so the
 			// allocations add up: never over the total, and short of it by less
 			// than a byte per participant when somebody is held at the level.
-			sum := allocationSum(demands, level)
+			sum := waterLevelAllocationSum(demands, level)
 			require.LessOrEqual(t, sum.Cmp(big.NewInt(total)), 0, "total=%d demands=%v level=%d", total, demands, level)
 
-			if anyExceeds(demands, level) {
+			if waterLevelAnyExceeds(demands, level) {
 				shortfall := new(big.Int).Sub(big.NewInt(total), sum)
 				require.Less(t, shortfall.Cmp(big.NewInt(n)), 0, "total=%d demands=%v level=%d", total, demands, level)
 			}
@@ -295,7 +296,7 @@ func TestWaterLevelProperties(t *testing.T) {
 		}
 
 		raisedLevel := waterLevel(total, raised)
-		before, after := allocations(demands, level), allocations(raised, raisedLevel)
+		before, after := waterLevelAllocations(demands, level), waterLevelAllocations(raised, raisedLevel)
 
 		require.GreaterOrEqual(t, after[at], before[at], "raising %d of total=%d demands=%v to %d lowered its own allocation", at, total, demands, raised[at])
 
@@ -321,7 +322,7 @@ func TestWaterLevelRaisingADemandIsMonotonic(t *testing.T) {
 		for n := 1; n <= 4; n++ {
 			demands := make([]int64, n)
 
-			for code := range pow(len(values), n) {
+			for code := range waterLevelPow(len(values), n) {
 				rest := code
 				for i := range demands {
 					demands[i] = values[rest%len(values)]
@@ -333,7 +334,7 @@ func TestWaterLevelRaisingADemandIsMonotonic(t *testing.T) {
 				level := waterLevel(total, demands)
 				require.Equal(t, referenceWaterLevel(total, demands), level, "total=%d demands=%v", total, demands)
 
-				before := allocations(demands, level)
+				before := waterLevelAllocations(demands, level)
 
 				for at := range demands {
 					for _, newValue := range values {
@@ -344,7 +345,7 @@ func TestWaterLevelRaisingADemandIsMonotonic(t *testing.T) {
 						raised := slices.Clone(demands)
 						raised[at] = newValue
 
-						after := allocations(raised, waterLevel(total, raised))
+						after := waterLevelAllocations(raised, waterLevel(total, raised))
 
 						require.GreaterOrEqual(t, after[at], before[at], "total=%d demands=%v raising %d to %d lowered its own allocation", total, demands, at, newValue)
 
@@ -362,7 +363,8 @@ func TestWaterLevelRaisingADemandIsMonotonic(t *testing.T) {
 	assert.Equal(t, 8*(7+49+343+2401), inputs)
 }
 
-func pow(base, exp int) int {
+// waterLevelPow is base to the power exp, for the size of the exhaustive domain.
+func waterLevelPow(base, exp int) int {
 	out := 1
 	for range exp {
 		out *= base
@@ -399,10 +401,10 @@ func TestWaterLevelNearTheLimitsOfInt64(t *testing.T) {
 		require.Equal(t, referenceWaterLevel(total, before), level, "total=%d demands=%v", total, before)
 		require.GreaterOrEqual(t, level, int64(1))
 		require.LessOrEqual(t, level, total)
-		require.LessOrEqual(t, allocationSum(demands, level).Cmp(big.NewInt(total)), 0, "total=%d demands=%v level=%d", total, before, level)
+		require.LessOrEqual(t, waterLevelAllocationSum(demands, level).Cmp(big.NewInt(total)), 0, "total=%d demands=%v level=%d", total, before, level)
 
-		if anyExceeds(demands, level) {
-			shortfall := new(big.Int).Sub(big.NewInt(total), allocationSum(demands, level))
+		if waterLevelAnyExceeds(demands, level) {
+			shortfall := new(big.Int).Sub(big.NewInt(total), waterLevelAllocationSum(demands, level))
 			require.Less(t, shortfall.Cmp(big.NewInt(int64(len(demands)))), 0, "total=%d demands=%v level=%d", total, before, level)
 		}
 	}
