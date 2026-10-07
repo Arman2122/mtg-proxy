@@ -274,9 +274,10 @@ type ProxyOpts struct {
 	// scan over every hosted secret. A hint is only an order to try things in:
 	// every hinted secret passes the same verification, so it never makes a
 	// wrong secret match, and a hello that matches nothing can neither read nor
-	// plant one. Loopback, private, link-local and unspecified addresses get
-	// none -- behind a carrier that does not forward the client address they
-	// would be one shared key.
+	// plant one. Loopback, private, link-local, unspecified and multicast
+	// addresses get none -- behind a carrier that does not forward the client
+	// address they would be one shared key, and a multicast address is no
+	// client at all.
 	//
 	// nil follows TrackClientIPs, and that default is the point: the cache holds
 	// address -> secret name in memory for 30 to 60 minutes after the last

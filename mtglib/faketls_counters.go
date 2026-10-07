@@ -4,13 +4,17 @@ import "sync/atomic"
 
 // fakeTLSCounters count what the FakeTLS door decided about each hello that got
 // past the SNI gate. Like obfuscatedCounters they live on Proxy, and the
-// reporting side reads them with Load().
+// reporting side reads them with Load(); nothing reports them yet.
 //
-// In enforce mode each such hello moves exactly one of hinted, scanned,
-// unmatched, deniedIP, deniedGlobal and oversized. overBudgetMatched is extra:
-// observe mode counts a match the budget would have refused. A replay or a
-// denied user after a match counts as its match: the counter names how the
-// secret was found, not what happened after.
+// Today the door moves exactly one of hinted, scanned and unmatched for each
+// such hello, and adds what it verified to verifications. A replay or a denied
+// user after a match counts as its match: the counter names how the secret was
+// found, not what happened after.
+//
+// deniedIP, deniedGlobal, oversized and overBudgetMatched are declared here so
+// the set is complete, but nothing moves them yet: the handshake budget will
+// (refused by an address's or the process-wide bucket, above the scan cap, and
+// in observe mode a match the budget would have refused).
 type fakeTLSCounters struct {
 	hinted            atomic.Int64
 	scanned           atomic.Int64

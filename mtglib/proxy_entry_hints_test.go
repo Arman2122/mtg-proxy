@@ -138,6 +138,48 @@ func TestAReturningClientIsVerifiedBeforeTheScan(t *testing.T) {
 		"another host in the same /64 is the same place")
 }
 
+// Review Focus 2, at the door: a peer whose address is not one place -- private
+// here, as behind a carrier that does not forward the client address -- gets
+// no hint, however often it comes back.
+func TestAnUnkeyedPeerIsScannedEveryTime(t *testing.T) {
+	t.Parallel()
+
+	const hosted = 20
+
+	ec := fakeTLSDoor()
+	secrets, name := hostedAmongDecoys(t, ec, hosted, "last")
+	key := secrets[name].Key
+	h := hintedHarness(t, secrets, nil)
+
+	port := 48000
+	from := func(place string) net.Addr {
+		port++
+
+		return tcpFrom(place, port)
+	}
+
+	for _, place := range []string{"10.0.0.7", "fd00::7"} {
+		for visit := 1; visit <= 2; visit++ {
+			assert.Equal(t, doorTally{verifications: hosted, scanned: 1},
+				connectFrom(t, h, ec, from(place), name, key),
+				"%s, visit %d: every candidate up to the last, every time", place, visit)
+		}
+
+		assert.Nil(t, h.proxy.hints.recall(net.ParseIP(place)), "%s has no hint", place)
+	}
+
+	// The control: the same client from a routable address is hinted on its
+	// second visit, so this harness does have hints on.
+	const routable = "203.0.113.60"
+
+	assert.Equal(t, doorTally{verifications: hosted, scanned: 1}, connectFrom(t, h, ec, from(routable), name, key))
+	assert.Equal(t, doorTally{verifications: 1, hinted: 1}, connectFrom(t, h, ec, from(routable), name, key),
+		"the control: a routable address is hinted on its second visit")
+
+	current, previous := hintsSize(h.proxy.hints)
+	assert.Equal(t, 1, current+previous, "the routable address is the only one ever stored")
+}
+
 func TestAStaleHintFallsThroughAndStillMatches(t *testing.T) {
 	t.Parallel()
 
@@ -364,6 +406,36 @@ func TestAReloadNeverMisattributesAHint(t *testing.T) {
 			connectFrom(t, h, ec, tcpFrom(place, 44022), "bob", bob.Key),
 			"bob's hint finds bob where he is now; position 1, where he was, is alice's")
 	})
+
+	t.Run("a name that became a dropped repeat", func(t *testing.T) {
+		t.Parallel()
+
+		alice, bob := ec.secret(t), ec.secret(t)
+		h := hintedHarness(t, map[string]Secret{"alice": alice, "bob": bob}, nil)
+
+		connectFrom(t, h, ec, tcpFrom(place, 44031), "bob", bob.Key)
+		require.Equal(t, []string{"bob"}, h.proxy.hints.recall(net.ParseIP(place)))
+
+		// aaron sorts first and takes bob's key, so bob is now the later
+		// duplicate: no candidate, absent from candByName. The key's hello
+		// belongs to aaron, as it would with no hints at all.
+		reloadSecrets(t, h.proxy, map[string]Secret{
+			"aaron": eeSecretOf(bob.Key, govCoverHost),
+			"alice": alice,
+			"bob":   bob,
+		})
+		require.Equal(t, map[string]int{"aaron": 0, "alice": 1}, h.proxy.secrets.Load().candByName)
+
+		assert.Equal(t, doorTally{verifications: 1, scanned: 1},
+			connectFrom(t, h, ec, tcpFrom("203.0.113.41", 44032), "aaron", bob.Key),
+			"the reference: from an address with no hints, the key is aaron's, found by the scan")
+
+		assert.Equal(t, doorTally{verifications: 1, scanned: 1},
+			connectFrom(t, h, ec, tcpFrom(place, 44033), "aaron", bob.Key),
+			"bob's hint names no candidate and is skipped; the scan finds aaron, exactly as with no hints")
+		assert.Equal(t, []string{"aaron", "bob"}, h.proxy.hints.recall(net.ParseIP(place)),
+			"and the admission is written under the name it was attributed to")
+	})
 }
 
 // A carrier NAT puts many users behind one address. Sixteen of them each keep
@@ -405,12 +477,15 @@ func TestSixteenUsersBehindOneAddressAllGetHints(t *testing.T) {
 	slices.Reverse(want)
 	require.Equal(t, want, h.proxy.hints.recall(net.ParseIP(nat)), "all sixteen, most recent first")
 
+	// Round two in the order of round one: each user in turn is the least
+	// recently seen, so the last of sixteen hints, and is found after the
+	// fifteen others -- exactly sixteen verifications, then to the front.
 	for _, user := range users[:maxHintNames] {
 		got := connectFrom(t, h, ec, from(), user, secrets[user].Key)
 
 		assert.EqualValues(t, 1, got.hinted, "%s is found among the hints", user)
 		assert.Zero(t, got.scanned, user)
-		assert.LessOrEqual(t, got.verifications, int64(maxHintNames), user)
+		assert.EqualValues(t, maxHintNames, got.verifications, "%s is the last hint tried", user)
 	}
 
 	newcomer := users[maxHintNames]
@@ -449,7 +524,7 @@ func TestHintsFollowTrackClientIPsUnlessOverridden(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(proxy.Shutdown)
 
-			assert.Equal(t, tc.want, proxy.hints != nil)
+			assert.Equal(t, tc.want, proxy.hints != nil, "the proxy has a hint cache exactly when hints are on")
 		})
 	}
 }
@@ -535,10 +610,19 @@ func TestConcurrentEEHandshakesShareOneSnapshotAndHints(t *testing.T) {
 		wantVerifications += int64(c+1) + rounds - 1
 	}
 
+	// Released together, so the first-round scans -- every one of which
+	// verifies u00's Candidate, and all but one u01's -- overlap by
+	// construction rather than by scheduling luck. That overlap is what lets
+	// the race detector see a write to a shared Candidate: a throwaway write in
+	// Verify was reported in 20 runs out of 20.
 	var wg sync.WaitGroup
+
+	start := make(chan struct{})
 
 	for _, cl := range all {
 		wg.Go(func() {
+			<-start
+
 			for round := range rounds {
 				if err := handshakeFrom(h, cl.addr, cl.name, secrets[cl.name].Key); err != nil {
 					t.Errorf("%s, round %d: %v", cl.name, round, err)
@@ -549,6 +633,7 @@ func TestConcurrentEEHandshakesShareOneSnapshotAndHints(t *testing.T) {
 		})
 	}
 
+	close(start)
 	wg.Wait()
 
 	assert.Equal(t, doorTally{

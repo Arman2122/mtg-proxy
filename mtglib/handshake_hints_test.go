@@ -273,11 +273,15 @@ func TestUnkeyedPeersGetNoHints(t *testing.T) {
 func TestANilHintCacheIsOff(t *testing.T) {
 	t.Parallel()
 
-	var h *matchHints
+	var (
+		h   *matchHints
+		got []string
+	)
 
-	assert.NotPanics(t, func() {
-		h.remember(net.ParseIP("203.0.113.7"), "alice")
-		h.rotate()
-	})
-	assert.Nil(t, h.recall(net.ParseIP("203.0.113.7")))
+	ip := net.ParseIP("203.0.113.7")
+
+	assert.NotPanics(t, func() { h.remember(ip, "alice") }, "remember on a nil cache")
+	assert.NotPanics(t, func() { h.rotate() }, "rotate on a nil cache")
+	assert.NotPanics(t, func() { got = h.recall(ip) }, "recall on a nil cache")
+	assert.Nil(t, got, "a nil cache has no hints")
 }
