@@ -516,6 +516,13 @@ const (
 	// it sends either field.
 	FeatureClientLimits = "client-limits"
 
+	// FeatureClientStats means GET /secrets/{name}/clients is served: each
+	// source address of a secret, with the bytes it moved, its live
+	// connections and the per-address rates in force, most bytes first --
+	// listed only with track-client-ips, the counts answered either way -- and
+	// that /stats carries clients and clients_overflow inside the user object.
+	FeatureClientStats = "client-stats"
+
 	// FeatureFakeTLS means the proxy speaks the FakeTLS (obfuscated) handshake.
 	FeatureFakeTLS = "faketls"
 
@@ -598,6 +605,7 @@ var supportedFeatures = []string{
 	FeatureClientIPActivity,
 	FeatureClientIPs,
 	FeatureClientLimits,
+	FeatureClientStats,
 	FeatureFakeTLS,
 	FeatureHandshakeBudget,
 	FeatureIPLimits,
@@ -780,6 +788,15 @@ type UserStatsJSON struct {
 	// back as SpeedLimit is, and absent for unlimited. Time an address spent
 	// held to it is in ThrottledMillis.
 	ClientSpeedLimit int64 `json:"client_speed_limit,omitempty"`
+
+	// Clients is how many source addresses the per-address table holds an
+	// entry for, the shared rest entry not counted, and ClientsOverflow how
+	// many connections were sent to the rest entry because the table had no
+	// room for their address, since the secret was added. Counts, never
+	// addresses: both are absent when zero and neither is gated. The addresses
+	// themselves are on GET /secrets/{name}/clients, never here.
+	Clients         int   `json:"clients,omitempty"`
+	ClientsOverflow int64 `json:"clients_overflow,omitempty"`
 
 	// ConnectedIPs lists the distinct client addresses holding a live
 	// connection right now, sorted. LastIP is the address of the most recent

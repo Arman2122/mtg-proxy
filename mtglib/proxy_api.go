@@ -401,6 +401,7 @@ func (p *Proxy) buildAPIHandler(token string) http.Handler {
 	mux.HandleFunc("DELETE /secrets/{name}", p.handleDeleteSecret)
 	mux.HandleFunc("POST /secrets/{name}/reset-quota", p.handleResetQuota)
 	mux.HandleFunc("POST /secrets/{name}/kick", p.handleKick)
+	mux.HandleFunc("GET /secrets/{name}/clients", p.handleGetClients)
 	mux.HandleFunc("GET /secrets/{name}/external-ips", p.handleGetExternalIPs)
 	mux.HandleFunc("PUT /secrets/{name}/external-ips", p.handlePutExternalIPs)
 	mux.HandleFunc("DELETE /secrets/{name}/external-ips", p.handleDeleteExternalIPs)
@@ -488,6 +489,23 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		user.ConnectedIPsLastSeen = report.ConnectedIPsLastSeen
 		user.ExternalIPs = report.ExternalIPs
 		user.ExternalExpiresAt = report.ExternalExpiresAt
+		resp.Users[name] = user
+	}
+
+	// The per-address table's counts are scalars inside the user object, and
+	// the overlay only ever fills a user that is already there: a name the table
+	// holds and the counters do not is skipped, never added, because every key
+	// under Users is billed as a client. A count is not an address, so neither
+	// is gated on track-client-ips. The table's lock is taken alone, after
+	// liveMu was let go above.
+	for name, counts := range p.clients.counts() {
+		user, ok := resp.Users[name]
+		if !ok {
+			continue
+		}
+
+		user.Clients = counts.clients
+		user.ClientsOverflow = counts.overflow
 		resp.Users[name] = user
 	}
 

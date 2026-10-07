@@ -570,3 +570,88 @@ func (t *clientTable) overflow(name string) int64 {
 
 	return 0
 }
+
+// clientCounts is one secret's two numbers on /stats: the addresses it holds an
+// entry for, the rest entry not counted, and its overflow count.
+type clientCounts struct {
+	clients  int
+	overflow int64
+}
+
+// counts is every secret's clientCounts, read under one hold of the lock
+// rather than two per secret, so a /stats scrape of many users takes the table's
+// lock once. Nil on a nil table.
+func (t *clientTable) counts() map[string]clientCounts {
+	if t == nil {
+		return nil
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	out := make(map[string]clientCounts, len(t.secrets))
+	for name, sc := range t.secrets {
+		out[name] = clientCounts{clients: len(sc.entries), overflow: sc.overflow}
+	}
+
+	return out
+}
+
+// clientsView is one secret's part of the table as GET /secrets/{name}/clients
+// reads it, copied under one hold of the lock so the numbers agree with each
+// other. The entries are the live objects, read through their atomics after
+// the lock is let go; only what the lock guards is copied here.
+type clientsView struct {
+	// entries are the secret's address entries, the rest entry not among them,
+	// in no order. Nil unless the caller asked for them.
+	entries []*clientEntry
+
+	// rest is the secret's rest entry, nil when it has none or the caller did
+	// not ask for the entries, and restRefs how many streams hold it, which
+	// only the lock may read.
+	rest     *clientEntry
+	restRefs int
+
+	// total is how many address entries the secret holds, and overflow its
+	// overflow count.
+	total    int
+	overflow int64
+}
+
+// view copies the named secret's part of the table: the counts always, and the
+// entries only when withEntries says so, so a caller that may not list
+// addresses never holds them. The zero view for a secret the table holds
+// nothing for, and on a nil table.
+//
+// It takes the table's lock alone. GET /secrets/{name}/clients calls it under
+// liveMu, which comes before tableMu in the lock order, so that the ledger's
+// connection counts it reads beside are from the same moment.
+func (t *clientTable) view(name string, withEntries bool) clientsView {
+	if t == nil {
+		return clientsView{}
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	sc := t.secrets[name]
+	if sc == nil {
+		return clientsView{}
+	}
+
+	view := clientsView{total: len(sc.entries), overflow: sc.overflow}
+	if !withEntries {
+		return view
+	}
+
+	view.entries = make([]*clientEntry, 0, len(sc.entries))
+	for _, entry := range sc.entries {
+		view.entries = append(view.entries, entry)
+	}
+
+	if sc.rest != nil {
+		view.rest, view.restRefs = sc.rest, sc.rest.refs
+	}
+
+	return view
+}
