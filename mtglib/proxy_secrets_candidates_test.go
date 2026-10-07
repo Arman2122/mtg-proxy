@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/internal/testclient"
 	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls/fake"
 	"github.com/stretchr/testify/assert"
@@ -195,6 +196,89 @@ func TestLaterDuplicateKeysAreDroppedFromTheCandidates(t *testing.T) {
 		assert.Empty(t, refused.secretName)
 		assert.Equal(t, 1, h.events.frontings())
 	})
+}
+
+// fakeTLSAttemptFlight is fakeTLSAttempt that also keeps the client end open
+// and, when the hello is admitted, returns the server's flight read off it: what
+// the ServerHello was signed with is the one thing the context does not show.
+func (h *entryHarness) fakeTLSAttemptFlight(t *testing.T, hello []byte) (*streamContext, bool, []byte) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	defer listener.Close() //nolint: errcheck
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+
+	t.Cleanup(func() { client.Close() }) //nolint: errcheck
+
+	server, err := listener.Accept()
+	require.NoError(t, err)
+
+	t.Cleanup(func() { server.Close() }) //nolint: errcheck
+
+	_, err = client.Write(hello)
+	require.NoError(t, err)
+
+	ctx := newStreamContext(h.proxy.ctx, h.proxy.logger, essentials.WrapNetConn(server))
+	t.Cleanup(ctx.Close)
+
+	if !h.proxy.doFakeTLSHandshake(ctx) {
+		return ctx, false, nil
+	}
+
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(10*time.Second)))
+
+	_, flight := goldenReadFlight(t, client)
+
+	return ctx, true, flight
+}
+
+// TestFakeTLSMapsAMatchBackThroughTheCandidatesNotTheHostedList: once a repeated
+// key has been dropped, a position in set.cands stops being a position in
+// set.hosted, and everything that follows a match -- the name it is billed to,
+// the limits, the key the ServerHello is signed with -- is read by the index
+// candIdx gives. Here hosted is [0 1 2] and candIdx is [0 2], so the secret at
+// hosted[1] ("b", a repeat of a's key) is not the one at candIdx[1] ("c"):
+// the other door-level fixtures have their repeat last, or none, and agree
+// either way.
+func TestFakeTLSMapsAMatchBackThroughTheCandidatesNotTheHostedList(t *testing.T) {
+	t.Parallel()
+
+	k1, k2 := keyFilledFrom(9), keyFilledFrom(99)
+
+	h := newEntryHarness(t, map[string]Secret{
+		"a": eeSecretOf(k1, candidatesCover),
+		"b": eeSecretOf(k1, candidatesCover),
+		"c": eeSecretOf(k2, candidatesCover),
+	}, nil)
+
+	set := h.proxy.secrets.Load()
+	require.Equal(t, []int{0, 1, 2}, set.hosted)
+	require.Equal(t, []int{0, 2}, set.candIdx, "b repeats a's key and is dropped")
+
+	for _, tc := range []struct {
+		name string
+		key  [SecretKeyLength]byte
+		id   byte
+	}{
+		{"c", k2, 0x71},
+		{"a", k1, 0x72},
+	} {
+		t.Run("a hello made with the key of "+tc.name, func(t *testing.T) {
+			hello := fakeTLSClientHello(t, tc.key, candidatesCover, bytes.Repeat([]byte{tc.id}, 32))
+			clientRandom := slices.Clone(hello[fake.RandomOffset : fake.RandomOffset+fake.RandomLen])
+
+			ctx, ok, flight := h.fakeTLSAttemptFlight(t, hello)
+			require.True(t, ok)
+
+			assert.Equal(t, tc.name, ctx.secretName, "admitted as the secret that owns the key (the earlier name for a repeat)")
+			assert.Equal(t, tc.key[:], ctx.matchedSecretKey)
+			assertFakeTLSDigest(t, tc.key, clientRandom, flight)
+		})
+	}
 }
 
 func TestCandByNameMapsNamesToPositions(t *testing.T) {
