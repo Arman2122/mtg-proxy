@@ -88,7 +88,7 @@ An address is what the existing per-address features count: an IPv4 address, or 
    never evict** (eviction would hand a drained bucket back full). A new address past a cap
    joins the secret's "rest" pseudo-address, counted in `clients_overflow`.
 5. **Fixed-burst per-address limiters, and a hardened `wait`.** Per-address limiters get a
-   burst chosen once when the limiter is created and are re-rated with `SetLimit` only;
+   burst chosen once when the limiter is created and are re-rated with `SetLimitAt(now)` only;
    changing the burst means replacing the limiter object (an in-flight wait keeps the old one).
    Independently, `speedLimiter.wait` is hardened to re-chunk and retry when `WaitN` fails
    because the burst shrank under it. The rate package returns only three kinds of error from
@@ -189,7 +189,7 @@ are not capped (they are not one place).
 `addrLimiter` (a small type beside `speedLimiter`, which keeps its behaviour apart from the
 hardened `wait`): an atomic pointer to a `rate.Limiter` with a **fixed burst** chosen at
 creation (`clamp(T/20, 64 KiB, 4 MiB)` for fair limiters from the secret's configured total
-`T`; `clamp(rate/20, 64 KiB, 4 MiB)` for the ceiling), `SetLimit` for re-rating, a nil limiter
+`T`; `clamp(rate/20, 64 KiB, 4 MiB)` for the ceiling), `SetLimitAt(now)` for re-rating, a nil limiter
 = unlimited (one atomic load). Its wait is built on `ReserveN` plus a sleep with an
 **injectable clock**, so the reservation's delay is known: it records
 the summed delay. **Every call on the limiter uses the injected clock** (`ReserveN(now)`,
@@ -394,9 +394,12 @@ between 0.5 and 2").
   with a live stream but no bytes for ten seconds is still set to `L`; the rest entry
   participates and has no ceiling; rates are never zero and never lifted above `T/n`;
   duty is rate-independent (the same outcome at 1 MB/s and 100 MB/s).
-- *addrLimiter*: a delay of at least 1 ms is recorded as throttle and a sub-millisecond wait is
-  not; fixed burst never shrinks under a waiter; replacing the limiter lets an in-flight wait
-  finish on the old one.
+- *addrLimiter* (fake clock): the waited time is the exact reservation delay summed over the
+  pieces; every call uses the injected clock; the fixed burst never shrinks under a waiter;
+  replacing the limiter lets an in-flight wait finish on the old one; a cancelled sleep
+  refunds its reservation; `setRate` never creates a limiter and never reaches zero. (The
+  throttle signal is the duty of §3, accumulated by `countingConn` — not a property of the
+  limiter.)
 - *Table*: created only where decision 3 says; refs through connect/disconnect; the sweep keeps
   live and recently idle entries and works in chunks of at most 1,024; per-secret and global
   caps drop new addresses to the rest entry and never evict or reset an existing entry;
@@ -505,7 +508,8 @@ Audit these; each was a judgement call, not an instruction.
    entry with a live stream set to the level; floored, at least 1 B/s and never lifted above
    `T/n`; the static ceiling is a separate bucket; the rest entry is one participant with no
    ceiling.
-6. Fixed-burst per-address limiters, `SetLimit` only; `speedLimiter.wait` hardened to retry.
+6. Fixed-burst per-address limiters, re-rated with `SetLimitAt(now)` only (the injected
+   clock); `speedLimiter.wait` hardened to retry and `chunk` to read the burst once.
 7. Per-address waits count into the user's `throttled_ms`.
 8. Bans are memory-only, max 4,096, TTL default 1 h / max 30 d, new routes rather than a body
    field on `kick`, charged like a miss on the obfuscated door; listing gated.
