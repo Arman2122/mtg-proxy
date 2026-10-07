@@ -210,6 +210,10 @@ To keep the process-wide bucket empty an attacker needs a hello *rate* of
 517-byte hellos per second: on the bench box (2 cores, about 340 ns per block) with
 2,000 hosted secrets that is about 60 a second, roughly 30 KB/s from a few
 connections (a refused hello costs nothing and a granted one waits at most 150 ms).
+That is the figure for 517-byte hellos, not the minimum: a hello under 12 blocks is
+charged as 517 bytes, so about 60 hellos of roughly 100 bytes (about 6 KB/s) do the
+same, and a hello near the 128-block cap (about 8 KB) costs about ten times as much,
+so about 6 a second of those do.
 Before this change the same proxy needed about four times that rate (about 240 a
 second) to saturate its CPU. So `enforce` deliberately makes locking out *unhinted*
 clients cheaper to cause than CPU exhaustion was, and in exchange keeps the relays,
