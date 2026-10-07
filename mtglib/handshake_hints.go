@@ -11,8 +11,10 @@ import (
 
 const (
 	// maxScanBlocks is the largest hello, in SHA-256 blocks per candidate (see
-	// fake.Parsed.Blocks), that the FakeTLS door consults hints for. 128 blocks
-	// is a record of about 8 KiB; a real client sends 0.5 to 2 KiB.
+	// fake.Parsed.Blocks), that the FakeTLS door consults hints for, and -- the
+	// handshake budget's scan cap -- that it scans at all unless the budget is
+	// off. 128 blocks is a record of about 8 KiB; a real client sends 0.5 to
+	// 2 KiB.
 	maxScanBlocks = 128
 
 	// maxHintNames is how many secret names one address keeps, most recent

@@ -6,15 +6,16 @@ import "sync/atomic"
 // past the SNI gate. Like obfuscatedCounters they live on Proxy, and the
 // reporting side reads them with Load(); nothing reports them yet.
 //
-// Today the door moves exactly one of hinted, scanned and unmatched for each
-// such hello, and adds what it verified to verifications. A replay or a denied
-// user after a match counts as its match: the counter names how the secret was
-// found, not what happened after.
+// Under the handshake budget's enforce mode the door moves exactly one of
+// hinted, scanned, unmatched, deniedIP, deniedGlobal and oversized for each such
+// hello, and adds what it verified to verifications. A replay or a denied user
+// after a match counts as its match: the counter names how the secret was found,
+// not what happened after. The one exit that moves none is a wait for budget cut
+// short by the proxy shutting down: nothing was decided about that hello.
 //
-// deniedIP, deniedGlobal, oversized and overBudgetMatched are declared here so
-// the set is complete, but nothing moves them yet: the handshake budget will
-// (refused by an address's or the process-wide bucket, above the scan cap, and
-// in observe mode a match the budget would have refused).
+// In observe mode deniedIP, deniedGlobal and oversized count what enforce would
+// have refused, and move together with the scanned or unmatched of the scan
+// that went ahead anyway; overBudgetMatched counts those that then matched.
 type fakeTLSCounters struct {
 	hinted            atomic.Int64
 	scanned           atomic.Int64
