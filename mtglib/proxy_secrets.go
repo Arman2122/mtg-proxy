@@ -382,8 +382,8 @@ func (p *Proxy) coverHosts(set *secretSet) []doppel.CoverHost {
 // applyLimits installs, from the set just swapped in, the limits that are
 // enforced on the data path rather than at admission: every user's speed
 // bucket is re-rated and their quota ceiling is set, and every address's
-// ceiling is moved, so a change reaches the connections already open without a
-// reconnect.
+// ceiling and fair limiters are moved, so a change reaches the connections
+// already open without a reconnect.
 // It runs on every swap -- startup, reload, the API -- so a changed limit
 // reaches the user's live connections at once, and a removed one frees them
 // at once. A user dropped from the set keeps their bucket, which is harmless:
@@ -406,15 +406,15 @@ func (p *Proxy) applyLimits(set *secretSet) {
 
 // applyClientLimits is applyLimits for the per-address table, in one critical
 // section under liveMu, the lock admission takes an entry under: every entry's
-// ceiling is moved to its secret's client-speed, and then every live stream
-// that has no entry and now needs one is given it, made from the set just
-// swapped in.
+// ceiling is moved to its secret's client-speed and its fair limiters to what
+// the secret's fair share divides, and then every live stream that has no
+// entry and now needs one is given it, made from the set just swapped in.
 //
-// The ceilings are moved whatever the set says about entries. A reload that
+// The limiters are moved whatever the set says about entries. A reload that
 // takes away the last per-address control leaves a set that wants no entries
 // at all, and the backfill skips its walk then; the entries made while the
 // control was there are still held by the streams that were open, and their
-// ceilings have to come off all the same.
+// ceilings and fair shares have to come off all the same.
 func (p *Proxy) applyClientLimits(set *secretSet) {
 	if p.clients == nil {
 		return
@@ -427,6 +427,12 @@ func (p *Proxy) applyClientLimits(set *secretSet) {
 		lim, kept := set.limitsOf(name)
 
 		return lim.ClientSpeedBytesPerSecond, kept
+	})
+
+	p.clients.applyFair(func(name string) (fairTotals, bool) {
+		lim, kept := set.limitsOf(name)
+
+		return lim.fairTotals(), kept
 	})
 
 	p.backfillClientsLocked(set)
@@ -602,7 +608,8 @@ const denySweepInterval = 5 * time.Second
 // periods roll over and streams of users who are now denied are closed;
 // every flushEvery, the usage counters are written to usageStateFile if one
 // is configured; every clientSweepInterval, the per-address table forgets the
-// addresses that have been gone long enough.
+// addresses that have been gone long enough; and every fairTickInterval, fair
+// share divides each fair secret's speed among its addresses again.
 //
 // It runs whether or not there is a usage file. The sweep is what makes an
 // expiry a deadline rather than a hint: without it, a user already connected
@@ -614,7 +621,13 @@ func (p *Proxy) startMaintenance(ctx context.Context, sweepEvery, flushEvery tim
 
 // startMaintenanceEvery is startMaintenance with the per-address sweep's
 // interval as well, so a test need not wait a minute for it.
+//
+// Fair share's ticker is a goroutine of its own. The loop below closes denied
+// streams under liveMu and writes the usage file, and a tick held up behind
+// either would measure a second that is not one.
 func (p *Proxy) startMaintenanceEvery(ctx context.Context, sweepEvery, flushEvery, clientsEvery time.Duration) {
+	p.startFairShare(ctx, fairTickInterval)
+
 	go func() {
 		sweep := time.NewTicker(sweepEvery)
 		defer sweep.Stop()
@@ -657,4 +670,63 @@ func (p *Proxy) sweepClients() int {
 	}
 
 	return p.clients.sweep(p.clients.clock.read(), clientSweepChunk)
+}
+
+// startFairShare runs fair share's ticker until ctx is cancelled: one pass
+// (tickFairShare) every period. It is one goroutine, and the only one that
+// ticks: a tick takes the blocked trackers' windows with it, so a second tick
+// beside it would measure next to nothing. Shutdown waits for it.
+func (p *Proxy) startFairShare(ctx context.Context, every time.Duration) {
+	p.fairWaitGroup.Add(1)
+
+	go func() {
+		defer p.fairWaitGroup.Done()
+
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				p.tickFairShare()
+			}
+		}
+	}()
+}
+
+// tickFairShare is one pass of fair share's ticker: every secret of the set as
+// it is now whose fair share divides a speed is ticked, each at the table's
+// clock as it reads when the secret's turn comes, the clock the data path
+// stamps the blocked trackers by. A secret whose fair share is off is not
+// ticked at all; a reload that turns it on again makes its next tick a
+// baseline.
+//
+// It reads the set without a lock and takes nothing the tick does not -- the
+// table's lock and the leaf locks after it -- so never liveMu or reloadMu: a
+// pass never holds up an admission or a reload behind it. A reload that moves
+// a secret's fair limiters while that secret's tick is measuring makes the
+// tick publish nothing (clientTable.tick). One that lands after the pass read
+// the set and before the secret's tick began costs one tick at a level worked
+// out for the old totals, which the next pass replaces; the user's own bucket
+// holds the new total meanwhile.
+func (p *Proxy) tickFairShare() {
+	if p.clients != nil {
+		if set := p.secrets.Load(); set != nil {
+			for i, name := range set.names {
+				if i >= len(set.limits) {
+					break
+				}
+
+				if totals := set.limits[i].fairTotals(); totals != (fairTotals{}) {
+					p.clients.tick(p.clients.clock.read(), fairSecret{name: name, totals: totals})
+				}
+			}
+		}
+	}
+
+	if p.afterFairPass != nil {
+		p.afterFairPass()
+	}
 }

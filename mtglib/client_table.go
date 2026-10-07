@@ -90,10 +90,10 @@ type entryInit struct {
 }
 
 // entryInitOf is what a new entry of a secret with these limits starts from:
-// its client-speed as the ceiling. Fair share is not here yet, so a new entry's
-// fair limiters are unlimited; client-fair fills them in when it lands.
+// its client-speed as the ceiling, and the totals its fair share divides, none
+// when fair share is off.
 func entryInitOf(lim SecretLimits) entryInit {
-	return entryInit{CeilingRate: lim.ClientSpeedBytesPerSecond}
+	return entryInit{CeilingRate: lim.ClientSpeedBytesPerSecond, FairTotals: lim.fairTotals()}
 }
 
 // clientEntry is one address of one secret: an IPv4 address or an IPv6 /64,

@@ -441,10 +441,6 @@ func TestAReloadReRatesTheCeilingInPlace(t *testing.T) {
 	require.NotNil(t, rest)
 	require.True(t, rest.rest)
 
-	// What client-fair will install; the ceiling's reload must leave it be.
-	entry.fairSpeed.install(8<<20, fairBurst(8<<20))
-	fair := installedLimiter(t, &entry.fairSpeed)
-
 	spent := func() float64 { return bucket.TokensAt(clock.read()) }
 
 	reload(1 << 20)
@@ -501,6 +497,17 @@ func TestAReloadReRatesTheCeilingInPlace(t *testing.T) {
 
 	assert.False(t, entry.ceiling.installed(), "removed: no ceiling, unlimited")
 	assert.False(t, idleEntry.ceiling.installed())
+
+	// The ceilings' walk on its own, whatever it does to the ceiling, leaves a
+	// fair share beside it as it is: that one follows client-fair, which a
+	// reload applies in a walk of its own.
+	entry.fairSpeed.install(8<<20, fairBurst(8<<20))
+	fair := installedLimiter(t, &entry.fairSpeed)
+
+	table.applyCeilings(func(string) (int64, bool) { return 1 << 20, true })
+	table.applyCeilings(func(string) (int64, bool) { return 0, true })
+
+	assert.False(t, entry.ceiling.installed())
 	assert.Same(t, fair, installedLimiter(t, &entry.fairSpeed), "and the fair share is not the ceiling's to touch")
 	assert.InDelta(t, float64(8<<20), float64(fair.Limit()), 0)
 }

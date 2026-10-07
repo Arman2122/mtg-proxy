@@ -57,6 +57,12 @@ const (
 	// been blocked waiting to, to take part. A connected address quiet for
 	// longer asks for nothing, and is still set to the level.
 	fairActiveWindow = 10 * time.Second
+
+	// fairTickInterval is how often the proxy's ticker ticks every fair
+	// secret. A second is short enough that a share follows an address that
+	// starts or stops within about two, and long enough that a tick's work --
+	// a walk of the secret's entries -- is nothing beside it.
+	fairTickInterval = time.Second
 )
 
 // fairBucket is one of a secret's speed limits as fair share divides it, with

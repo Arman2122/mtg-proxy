@@ -134,6 +134,14 @@ func (l SecretLimits) hasClientControl() bool {
 	return l.ClientConns > 0 || l.ClientSpeedBytesPerSecond > 0
 }
 
+// fairTotals is what fair share divides among the secret's addresses: none
+// yet. client-fair is the switch, and it divides the secret's speed limits
+// once it lands; until then every secret's fair limiters stay off, and the
+// ticker has no secret to tick.
+func (l SecretLimits) fairTotals() fairTotals {
+	return fairTotals{}
+}
+
 // DenyReason explains why a connection was refused by the per-user limits.
 type DenyReason int
 

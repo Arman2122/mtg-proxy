@@ -37,6 +37,15 @@ type Proxy struct {
 	// waits for so the socket is released by the time it returns.
 	apiWaitGroup sync.WaitGroup
 
+	// fairWaitGroup is fair share's ticker (startFairShare), which Shutdown
+	// waits for so that no tick runs once it has returned.
+	fairWaitGroup sync.WaitGroup
+
+	// afterFairPass, when set, runs after each pass of fair share's ticker.
+	// Only tests set it, and it is read without a lock: a test sets it before
+	// the ticker starts.
+	afterFairPass func()
+
 	allowFallbackOnUnknownDC    bool
 	trackClientIPs              bool
 	tolerateTimeSkewness        time.Duration
@@ -140,6 +149,8 @@ func (p *Proxy) Shutdown() {
 	// The management API shuts itself down on the cancellation above; waiting
 	// for it here is what makes its port free again before this returns.
 	p.apiWaitGroup.Wait()
+	// So does fair share's ticker, and no tick runs once this has returned.
+	p.fairWaitGroup.Wait()
 	p.workerPool.Release()
 	p.configUpdater.Wait()
 	p.doppelGanger.Shutdown()

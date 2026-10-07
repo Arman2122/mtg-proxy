@@ -1,6 +1,7 @@
 package mtglib
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -164,6 +165,7 @@ func TestFairShareConstantsAreTheSpecs(t *testing.T) {
 	assert.Equal(t, 4, fairThrottleDivisor, "throttled at a duty of a quarter of the tick")
 	assert.Equal(t, 3, fairHoldTicks, "a throttle holds three ticks")
 	assert.Equal(t, 10*time.Second, fairActiveWindow, "a participant moved a byte in the last ten seconds")
+	assert.Equal(t, time.Second, fairTickInterval, "the ticker ticks once a second")
 }
 
 // ---- the pure decision -------------------------------------------------------
@@ -1366,9 +1368,10 @@ func TestNilClientTableHasNoFairShare(t *testing.T) {
 }
 
 // The lock order is reloadMu, liveMu, tableMu: the fair-share tick takes the
-// table's lock alone, like the sweep. This holds liveMu and requires two ticks
-// -- a baseline and a decision -- to finish anyway. (The table holds no route to
-// liveMu, so the ticker that would take it is 12b's; this pins the table half.)
+// table's lock alone, like the sweep, and so does the ticker that drives it.
+// This holds reloadMu and liveMu and requires two ticks of the table -- a
+// baseline and a decision -- to finish anyway, and then a pass of the proxy's
+// ticker, running in its own goroutine as it does in production.
 func TestTheFairTickNeverWaitsForLiveMu(t *testing.T) {
 	t.Parallel()
 
@@ -1380,6 +1383,13 @@ func TestTheFairTickNeverWaitsForLiveMu(t *testing.T) {
 
 	secret := fairSecret{name: "alice", totals: fairTotals{Speed: 1 << 20}}
 
+	// Set before the ticker starts, as the hook's rule says.
+	passes := countFairPasses(p)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	p.reloadMu.Lock()
 	p.liveMu.Lock()
 
 	done := make(chan struct{})
@@ -1394,10 +1404,16 @@ func TestTheFairTickNeverWaitsForLiveMu(t *testing.T) {
 
 	finished := govAwait(done, 2*time.Second)
 
+	p.startFairShare(ctx, 5*time.Millisecond)
+
+	passed := awaitFairPass(passes, 2*time.Second)
+
 	p.liveMu.Unlock()
+	p.reloadMu.Unlock()
 	<-done
 
 	require.True(t, finished, "the fair-share tick must not wait for liveMu")
+	require.True(t, passed, "the fair-share ticker must not wait for liveMu or reloadMu")
 }
 
 // ---- applyFair: the fair limiters follow the secret's totals ----------------
