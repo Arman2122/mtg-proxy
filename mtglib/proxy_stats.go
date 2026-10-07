@@ -80,6 +80,14 @@ type secretStats struct {
 	// on top of the combined one. Unlimited when the user has no such cap.
 	speedUp   speedLimiter
 	speedDown speedLimiter
+
+	// clientThrottledNanos is the time this user's connections have spent
+	// waiting at the per-address limiters of the addresses they came from, the
+	// ceilings' included; throttled_ms reports it with the user's own buckets'.
+	// A counter of the user's own, added to at every wait, rather than a sum
+	// over the per-address table: the table forgets an address ten minutes
+	// after its last stream, and the figure must never go back.
+	clientThrottledNanos atomic.Int64
 }
 
 // rolloverIfNeeded zeroes quotaUsed when the monthly quota period has elapsed.
@@ -742,7 +750,8 @@ type UserStatsJSON struct {
 
 	// SpeedLimitUp and SpeedLimitDown are the per-direction caps in bytes per
 	// second, from the client's side, or absent for unlimited. ThrottledMillis
-	// above counts the time held to any of the three buckets.
+	// above counts the time held to any of the three buckets, and to the
+	// per-address limiters of the addresses the user connects from.
 	SpeedLimitUp   int64 `json:"speed_limit_up,omitempty"`
 	SpeedLimitDown int64 `json:"speed_limit_down,omitempty"`
 
@@ -818,7 +827,7 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 			AdTagSkipped: st.adTagSkipped.Load(),
 			AdTagFailed:  st.adTagFailed.Load(),
 			ThrottledMillis: (st.speed.throttledNanos.Load() + st.speedUp.throttledNanos.Load() +
-				st.speedDown.throttledNanos.Load()) / int64(time.Millisecond),
+				st.speedDown.throttledNanos.Load() + st.clientThrottledNanos.Load()) / int64(time.Millisecond),
 			IPLimitRefused:     st.ipLimitRefused.Load(),
 			ClientConnsRefused: st.clientConnsRefused.Load(),
 			LastIP:             lastIP,

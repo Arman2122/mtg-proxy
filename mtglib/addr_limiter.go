@@ -194,6 +194,12 @@ func (l *addrLimiter) wait(ctx context.Context, n int) (waited time.Duration, er
 	return waited, nil
 }
 
+// installed says whether a bucket is in place: one load, and false is
+// unlimited.
+func (l *addrLimiter) installed() bool {
+	return l.limiter.Load() != nil
+}
+
 // bytesPerSecond reports the current rate, 0 for unlimited. setRate never
 // stores a zero, so a 0 here always means no bucket.
 func (l *addrLimiter) bytesPerSecond() int64 {

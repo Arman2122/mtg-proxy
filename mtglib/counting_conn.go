@@ -19,6 +19,10 @@ var errQuotaExhausted = errors.New("quota exhausted")
 // *secretStats pointer is resolved once at construction so the data path never
 // takes a lock; the speed bucket and the ceiling are fields of the same
 // struct, so both cost one atomic load when there is no limit.
+//
+// A stream whose address has an entry in the per-address table is also where
+// that address's bytes become the address's: they are counted on the entry,
+// and the address's own limiters are paid before the user's.
 type countingConn struct {
 	essentials.Conn
 
@@ -44,6 +48,13 @@ type countingConn struct {
 	// byte, for the per-address activity report. Nil in tests that exercise
 	// the wrapper on its own.
 	active *atomic.Int64
+
+	// client is where the stream's per-address entry is kept. It is read on
+	// every call rather than once: a reload's backfill can store an entry after
+	// the wrapper is built. Nil, or holding nil, for a stream whose secret keeps
+	// no entries, which costs the data path one load. Nil in tests that
+	// exercise the wrapper on its own.
+	client *atomic.Pointer[clientEntry]
 }
 
 func newCountingConn(
@@ -59,16 +70,51 @@ func (c *countingConn) withActivity(active *atomic.Int64) *countingConn {
 	return c
 }
 
-// markActive stamps the stream's latest byte to the second. The store is
-// skipped while the second is unchanged, so the data path pays a clock read
-// and a load per call, and a write once a second.
-func (c *countingConn) markActive() {
-	if c.active == nil {
+// withClient points the wrapper at where the stream's per-address entry is
+// kept.
+func (c *countingConn) withClient(client *atomic.Pointer[clientEntry]) *countingConn {
+	c.client = client
+
+	return c
+}
+
+// entry is the stream's per-address entry as it is now, or nil.
+func (c *countingConn) entry() *clientEntry {
+	if c.client == nil {
+		return nil
+	}
+
+	return c.client.Load()
+}
+
+// markActive stamps the stream's latest byte to the second, on the stream and,
+// when it has one, on its address's entry. One clock reading serves both: the
+// entry's clock -- the table's, the real one outside tests -- when there is an
+// entry, so that lastSeen agrees with the sweep that reads it, and the real
+// clock otherwise. Each store is skipped while its second is unchanged, so the
+// data path pays a clock read and a load or two per call, and a write once a
+// second.
+func (c *countingConn) markActive(entry *clientEntry) {
+	if entry == nil {
+		if c.active != nil {
+			c.stampActive(time.Now().Unix())
+		}
+
 		return
 	}
 
-	if now := time.Now().Unix(); c.active.Load() != now {
-		c.active.Store(now)
+	now := entry.clock.read()
+	entry.seen(now)
+
+	if c.active != nil {
+		c.stampActive(now.Unix())
+	}
+}
+
+// stampActive stores second in the stream's stamp unless it is there already.
+func (c *countingConn) stampActive(second int64) {
+	if c.active.Load() != second {
+		c.active.Store(second)
 	}
 }
 
@@ -80,6 +126,139 @@ func (c *countingConn) waitBoth(combined, direction *speedLimiter, n int) error 
 	}
 
 	return direction.wait(c.ctx, n)
+}
+
+// payUpload charges a read's n bytes: to the address's own limiters first when
+// it has one that a read pays, and to the user's buckets.
+func (c *countingConn) payUpload(entry *clientEntry, paced bool, n int) error {
+	if !paced {
+		return c.waitBoth(&c.st.speed, &c.st.speedUp, n)
+	}
+
+	return c.payAddress(entry, &entry.fairUp, &entry.blockedUp, &c.st.speedUp, n)
+}
+
+// payDownload is payUpload for a write's n bytes.
+func (c *countingConn) payDownload(entry *clientEntry, paced bool, n int) error {
+	if !paced {
+		return c.waitBoth(&c.st.speed, &c.st.speedDown, n)
+	}
+
+	return c.payAddress(entry, &entry.fairDown, &entry.blockedDown, &c.st.speedDown, n)
+}
+
+// payAddress charges n bytes to everything a transfer from an address with a
+// limiter of its own pays, in this order: the address's ceiling, its combined
+// fair share and then the direction's, and then the user's combined bucket and
+// the direction's, exactly as a stream with no entry pays those. The address's
+// own limiters come first. Bytes the address may not move yet must not sit in
+// the user's shared bucket while it waits: the user's other streams, from other
+// addresses, would be the ones held back for them.
+//
+// The waits at a fair share, and at a user's bucket a fair share divides, are
+// what fair share's duty is made of, and each is bracketed by the tracker of
+// that share. The ceiling's are not: an address its own ceiling holds back is
+// not short of its share, and saying it was would hand it a bigger one at
+// everyone else's cost.
+func (c *countingConn) payAddress(
+	entry *clientEntry, fair *addrLimiter, blocked *blockedTracker, direction *speedLimiter, n int,
+) error {
+	if err := c.waitAddress(entry, &entry.ceiling, nil, n); err != nil {
+		return err
+	}
+
+	if err := c.waitAddress(entry, &entry.fairSpeed, &entry.blockedSpeed, n); err != nil {
+		return err
+	}
+
+	if err := c.waitAddress(entry, fair, blocked, n); err != nil {
+		return err
+	}
+
+	if err := c.waitShared(entry, &c.st.speed, &entry.fairSpeed, &entry.blockedSpeed, n); err != nil {
+		return err
+	}
+
+	return c.waitShared(entry, direction, fair, blocked, n)
+}
+
+// waitAddress pays n bytes at one of the address's limiters, and adds what it
+// slept to the user's throttled time and to the address's: the user's is a
+// counter of its own, not a sum over entries, so the sweep forgetting an address
+// never takes time back out of it. A wait that feeds the duty is bracketed by
+// blocked, which is nil for the ceiling. Every way out of the wait leaves the
+// tracker: a stream left counted as blocked would make its address look held
+// back for ever after.
+func (c *countingConn) waitAddress(entry *clientEntry, limiter *addrLimiter, blocked *blockedTracker, n int) error {
+	if !limiter.installed() {
+		return nil
+	}
+
+	if blocked != nil {
+		blocked.enter(entry.clock.read())
+	}
+
+	waited, err := limiter.wait(c.ctx, n)
+
+	if blocked != nil {
+		blocked.leave(entry.clock.read())
+	}
+
+	if waited > 0 {
+		c.st.clientThrottledNanos.Add(int64(waited))
+		entry.throttledNanos.Add(int64(waited))
+	}
+
+	return err
+}
+
+// waitShared pays n bytes at one of the user's buckets, as a stream with no
+// entry does. A wait there is part of the address's duty when the address has a
+// fair share of that bucket: an address starved at the shared bucket, which
+// divides its tokens per connection and not per address, is never held at its
+// own share, which sits at or above what it gets, so without it a
+// four-connection address would keep four shares to a one-connection address's
+// one. The bucket's wait reports no time of its own, so it is bracketed here.
+// Where the address has no fair share of the bucket there is no duty to feed,
+// and nothing is bracketed.
+func (c *countingConn) waitShared(
+	entry *clientEntry, bucket *speedLimiter, fair *addrLimiter, blocked *blockedTracker, n int,
+) error {
+	if !fair.installed() || bucket.limiter.Load() == nil {
+		return bucket.wait(c.ctx, n)
+	}
+
+	blocked.enter(entry.clock.read())
+	err := bucket.wait(c.ctx, n)
+	blocked.leave(entry.clock.read())
+
+	return err
+}
+
+// pacesUpload says whether a read from this address pays a limiter of the
+// address's own: the ceiling, or the combined or upload fair share. False for no
+// entry, and for an entry with none installed -- an entry kept for its counts
+// alone, which is a panel's case -- which then costs three loads and nothing
+// more.
+func (e *clientEntry) pacesUpload() bool {
+	return e != nil && (e.ceiling.installed() || e.fairSpeed.installed() || e.fairUp.installed())
+}
+
+// pacesDownload is pacesUpload for a write.
+func (e *clientEntry) pacesDownload() bool {
+	return e != nil && (e.ceiling.installed() || e.fairSpeed.installed() || e.fairDown.installed())
+}
+
+// cutUpload bounds a read of n bytes to the bursts of the address's limiters a
+// read pays, so that each wait is payable whole. A limiter with nothing
+// installed cuts nothing.
+func (e *clientEntry) cutUpload(n int) int {
+	return e.fairUp.chunk(e.fairSpeed.chunk(e.ceiling.chunk(n)))
+}
+
+// cutDownload is cutUpload for a write.
+func (e *clientEntry) cutDownload(n int) int {
+	return e.fairDown.chunk(e.fairSpeed.chunk(e.ceiling.chunk(n)))
 }
 
 // allowance cuts a transfer of n bytes down to what the quota still permits.
@@ -132,8 +311,19 @@ func (c *countingConn) exhausted() error {
 // grant at once is what makes a single read always payable. The read is also
 // cut to the quota's allowance, so what reaches the cap is delivered and
 // nothing past it is read.
+//
+// The stream's entry is read once per call, and the bytes are counted on it
+// where they are counted on the user, before the quota can end the stream.
 func (c *countingConn) Read(p []byte) (int, error) {
-	limit, ok := c.allowance(c.st.speedUp.chunk(c.st.speed.chunk(len(p))))
+	entry := c.entry()
+	paced := entry.pacesUpload()
+
+	limit := c.st.speedUp.chunk(c.st.speed.chunk(len(p)))
+	if paced {
+		limit = entry.cutUpload(limit)
+	}
+
+	limit, ok := c.allowance(limit)
 	if !ok {
 		return 0, c.exhausted()
 	}
@@ -141,13 +331,18 @@ func (c *countingConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p[:limit])
 	if n > 0 {
 		c.st.bytesIn.Add(int64(n))
-		c.markActive()
+
+		if entry != nil {
+			entry.bytesIn.Add(int64(n))
+		}
+
+		c.markActive(entry)
 
 		if c.charge(n) {
 			return n, c.exhausted()
 		}
 
-		if waitErr := c.waitBoth(&c.st.speed, &c.st.speedUp, n); waitErr != nil && err == nil {
+		if waitErr := c.payUpload(entry, paced, n); waitErr != nil && err == nil {
 			err = waitErr
 		}
 	}
@@ -160,23 +355,38 @@ func (c *countingConn) Read(p []byte) (int, error) {
 // block followed by a stall. Unlimited is a single pass with a single write,
 // exactly as before there was a limit. Each piece is cut to the quota's
 // allowance, so the last piece ends exactly at the cap.
+//
+// The stream's entry is read once per call, not once per piece.
 func (c *countingConn) Write(p []byte) (int, error) {
+	entry := c.entry()
+	paced := entry.pacesDownload()
+
 	var written int
 
 	for len(p) > 0 {
-		piece, ok := c.allowance(c.st.speedDown.chunk(c.st.speed.chunk(len(p))))
+		limit := c.st.speedDown.chunk(c.st.speed.chunk(len(p)))
+		if paced {
+			limit = entry.cutDownload(limit)
+		}
+
+		piece, ok := c.allowance(limit)
 		if !ok {
 			return written, c.exhausted()
 		}
 
-		if err := c.waitBoth(&c.st.speed, &c.st.speedDown, piece); err != nil {
+		if err := c.payDownload(entry, paced, piece); err != nil {
 			return written, err
 		}
 
 		n, err := c.Conn.Write(p[:piece])
 		if n > 0 {
 			c.st.bytesOut.Add(int64(n))
-			c.markActive()
+
+			if entry != nil {
+				entry.bytesOut.Add(int64(n))
+			}
+
+			c.markActive(entry)
 		}
 
 		written += n

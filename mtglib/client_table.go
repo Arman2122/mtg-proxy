@@ -32,8 +32,9 @@ import (
 // holds liveMu and then takes tableMu to find its entry. The sweep and the
 // fair-share ticker take tableMu alone and never liveMu, so neither can hold
 // up an admission for longer than one short hold of the table. The data path
-// takes no lock at all: it reaches an entry through the stream's pointer and
-// touches only atomics.
+// takes none of these: it reaches an entry through the stream's pointer and
+// touches only atomics, and, around a wait that feeds fair share, a blocked
+// tracker's own lock, which is a leaf.
 //
 // Every method is safe on a nil receiver, which is "off": a Proxy{} literal in
 // a test has no table.
@@ -117,10 +118,16 @@ type clientEntry struct {
 
 	// firstSeen is when the entry was made and never changes. lastSeen is the
 	// second the address was last seen -- a connection opening or closing, or
-	// a byte moving -- stored only when the second changes. The sweep measures
+	// a byte moving -- stored only when the second moves on. The sweep measures
 	// idleness from it.
 	firstSeen time.Time
 	lastSeen  atomic.Int64
+
+	// clock is the table's, set when the entry is made and never changed: the
+	// clock the entry's limiters run on, and the one the data path stamps
+	// lastSeen and the blocked trackers by, so that all of them agree with the
+	// sweep and the fair-share ticker about what time it is.
+	clock addrClock
 
 	// ceiling is client-speed, combined across both directions; the rest
 	// entry never has one. The fair limiters are client-fair's share of the
@@ -128,14 +135,109 @@ type clientEntry struct {
 	// nothing installed is unlimited.
 	ceiling                     addrLimiter
 	fairSpeed, fairUp, fairDown addrLimiter
+
+	// throttledNanos is the time the address's streams spent waiting at its
+	// own limiters, the ceiling's included. Only grows.
+	throttledNanos atomic.Int64
+
+	// The blocked trackers measure fair share's duty, one per fair limiter:
+	// the time at least one of the address's streams was waiting at that fair
+	// limiter or at the user's bucket it divides. Never the ceiling's waits.
+	blockedSpeed, blockedUp, blockedDown blockedTracker
 }
 
-// seen stamps lastSeen with now, to the second, writing only when the second
-// changed, as markActive does.
+// seen stamps lastSeen with now, to the second. It only ever moves the stamp
+// forward, and writes only when the second has moved on past it, as markActive
+// does: the streams of one address stamp it from many goroutines, and one that
+// read the clock a moment before another must not take the stamp back when it
+// stores after it. A stamp that is current costs one load.
 func (e *clientEntry) seen(now time.Time) {
-	if second := now.Unix(); e.lastSeen.Load() != second {
-		e.lastSeen.Store(second)
+	second := now.Unix()
+
+	for {
+		last := e.lastSeen.Load()
+		if second <= last || e.lastSeen.CompareAndSwap(last, second) {
+			return
+		}
 	}
+}
+
+// blockedTracker is the time at least one of an address's streams spent
+// blocked at one bucket: a union over the streams, not a sum. Fifty streams each
+// blocked a hundredth of the time are an address blocked a hundredth of the
+// time, or a little more, not one blocked half of it.
+//
+// It is kept incrementally, so a wait is credited while it lasts and not only
+// when it ends: a chunk held for seconds at a small fair share must show in the
+// ticks it spans, or those ticks would see an address with no duty and next to
+// no rate, and release it as one that had paused. A stream enters before a wait
+// and leaves after it, and a snapshot counts an interval still open up to its
+// own instant.
+//
+// It is touched only around a wait that can block, never on the unthrottled
+// path, so a small mutex of its own is enough. It is a leaf in the lock order:
+// nothing is taken while it is held. The zero value is ready, with nothing
+// blocked.
+type blockedTracker struct {
+	mu sync.Mutex
+
+	// blocked is how many streams are waiting now, and since is when that last
+	// rose from zero -- or the last snapshot, if one was taken while they were.
+	blocked int
+	since   time.Time
+
+	// total is the blocked time closed in the current window.
+	total time.Duration
+}
+
+// enter counts one more stream blocked from now.
+func (b *blockedTracker) enter(now time.Time) {
+	b.mu.Lock()
+
+	if b.blocked == 0 {
+		b.since = now
+	}
+
+	b.blocked++
+
+	b.mu.Unlock()
+}
+
+// leave counts one stream let go at now. The last one to leave closes the
+// interval. A leave with nothing blocked changes nothing.
+func (b *blockedTracker) leave(now time.Time) {
+	b.mu.Lock()
+
+	if b.blocked > 0 {
+		b.blocked--
+
+		if b.blocked == 0 && now.After(b.since) {
+			b.total += now.Sub(b.since)
+		}
+	}
+
+	b.mu.Unlock()
+}
+
+// snapshot is the blocked time since the last snapshot, up to now: the
+// intervals that closed in the window, and the one still open if streams are
+// blocked now. It starts the next window at now, with an open interval carried
+// into it from there. An instant before the open interval began -- two clocks
+// read moments apart -- credits none of it.
+func (b *blockedTracker) snapshot(now time.Time) time.Duration {
+	b.mu.Lock()
+
+	total := b.total
+	b.total = 0
+
+	if b.blocked > 0 && now.After(b.since) {
+		total += now.Sub(b.since)
+		b.since = now
+	}
+
+	b.mu.Unlock()
+
+	return total
 }
 
 // secretClients is one secret's part of the table. It lives until the secret
@@ -250,7 +352,7 @@ func (t *clientTable) acquire(name string, key addressKey, keyed bool, init entr
 // makeLocked builds an entry with its limiters already made and appends it to
 // all. The caller publishes it. Caller holds mu.
 func (t *clientTable) makeLocked(name string, key addressKey, rest bool, init entryInit, now time.Time) *clientEntry {
-	entry := &clientEntry{key: key, name: name, rest: rest, firstSeen: now}
+	entry := &clientEntry{key: key, name: name, rest: rest, firstSeen: now, clock: t.clock}
 
 	// The clock first: a limiter must run on the table's clock from the first
 	// call made on it.
