@@ -108,8 +108,10 @@ func fairRate(e *clientEntry, b fairBucket) int64 {
 // the duty only when the matching fair limiter is installed
 // (countingConn.waitShared), so an entry missing one fails silently: its duty
 // reads nothing and the 4:1 lock-in comes back. 12b calls this after
-// applyLimits, with the totals of the secret's client-fair, or none.
-func assertFairInvariant(t *testing.T, table *clientTable, name string, totals fairTotals) bool {
+// applyLimits, with the totals of the secret's client-fair, or none. A
+// testing.TB, so that the door benchmarks check the entries they time with the
+// same function.
+func assertFairInvariant(t testing.TB, table *clientTable, name string, totals fairTotals) bool {
 	t.Helper()
 
 	ok := true
