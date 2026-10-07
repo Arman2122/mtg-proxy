@@ -89,6 +89,20 @@ func keyOfAddr(addr netip.Addr) addressKey {
 	return addressKey(prefix.String())
 }
 
+// unitBase is the first address of the unit keyOfAddr counts addr in: the
+// address itself for IPv4, a v4-mapped one unmapped, and the first address of
+// its /64 for IPv6.
+func unitBase(addr netip.Addr) netip.Addr {
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return addr
+	}
+
+	prefix, _ := addr.Prefix(ipv6AddressPrefixBits)
+
+	return prefix.Addr()
+}
+
 // externalEntry is one reported address: when it stops counting, and the
 // spelling it was reported with, so a report reads back as it was written.
 type externalEntry struct {

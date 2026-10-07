@@ -92,10 +92,16 @@ func (l *banList) clock() time.Time {
 	return time.Now()
 }
 
+// none reports whether the list holds no ban at all, lapsed ones not yet pruned
+// counted: one atomic load, and no lock.
+func (l *banList) none() bool {
+	return l.held.Load() == 0
+}
+
 // banned reports whether key's place is banned from the named secret now. A
 // ban found lapsed is dropped.
 func (l *banList) banned(name string, key addressKey) bool {
-	if l.held.Load() == 0 {
+	if l.none() {
 		return false
 	}
 
@@ -303,15 +309,28 @@ func parseBanAddress(text string) (netip.Addr, error) {
 }
 
 // ParseBanAddresses validates a ban request as the API receives it: at least
-// one place, each a literal IP address or an IPv6 /64 (parseBanAddress); a ttl
-// within (0, MaxBanTTL], with an empty one meaning DefaultBanTTL; and, unless
-// force is set, no address that does not stand for one place (clientKeyed:
+// one place and at most maxBans, since more could never fit, each a literal IP
+// address or an IPv6 /64 (parseBanAddress); a ttl within (0, MaxBanTTL], with
+// an empty one meaning DefaultBanTTL; and, unless force is set, no place whose
+// unit takes in an address that does not stand for one place (clientKeyed:
 // loopback, private, link-local, unspecified, multicast), because behind a
 // front or a PROXY-protocol listener one such address is every client. Every
 // failure wraps ErrBanAddresses.
+//
+// The unit is what the ban is held at (keyOfAddr), so the check is asked of
+// the address as named and of its unit's first address. That is the whole of
+// it: every IPv6 range of such addresses -- fc00::/7, fe80::/10, ff00::/8 -- is
+// aligned far above a /64, so a /64 is all one kind, except ::/64, which holds
+// :: and ::1 beside ::2 and the IPv4-compatible ::a.b.c.d, and whose first
+// address, ::, is unspecified. An IPv4 address is its own unit.
 func ParseBanAddresses(ips []string, ttl string, force bool) ([]netip.Addr, time.Duration, error) {
 	if len(ips) == 0 {
 		return nil, 0, fmt.Errorf("%w: no addresses", ErrBanAddresses)
+	}
+
+	if len(ips) > maxBans {
+		return nil, 0, fmt.Errorf("%w: %d addresses, the most one request may name is %d",
+			ErrBanAddresses, len(ips), maxBans)
 	}
 
 	addrs := make([]netip.Addr, 0, len(ips))
@@ -322,10 +341,11 @@ func ParseBanAddresses(ips []string, ttl string, force bool) ([]netip.Addr, time
 			return nil, 0, err
 		}
 
-		if !force && !clientKeyed(net.IP(addr.AsSlice())) {
+		if !force && (!clientKeyed(net.IP(addr.AsSlice())) || !clientKeyed(net.IP(unitBase(addr).AsSlice()))) {
 			return nil, 0, fmt.Errorf(
-				"%w: %q does not stand for one place, and behind a front or a PROXY-protocol listener "+
-					`it can be every client; send "force": true to ban it anyway`, ErrBanAddresses, text)
+				"%w: %q, banned as %s, is or takes in an address that does not stand for one place, and "+
+					"behind a front or a PROXY-protocol listener such an address can be every client; "+
+					`send "force": true to ban it anyway`, ErrBanAddresses, text, keyOfAddr(addr))
 		}
 
 		addrs = append(addrs, addr)

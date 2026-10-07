@@ -249,8 +249,14 @@ func (p *Proxy) admit(ctx *streamContext) bool {
 }
 
 // bannedFrom says whether the place ip is at is banned from the named secret.
-// A connection with no address is at no place and cannot be.
+// A connection with no address is at no place and cannot be. With no ban held
+// it answers before building the place's key, so a hello that matched a secret
+// pays nothing for the question in the common case.
 func (p *Proxy) bannedFrom(name string, ip net.IP) bool {
+	if p.bans.none() {
+		return false
+	}
+
 	key, ok := addressKeyOf(ip)
 
 	return ok && p.bans.banned(name, key)

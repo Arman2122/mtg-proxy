@@ -174,8 +174,12 @@ func TestBanConstantsAreTheSpecs(t *testing.T) {
 // An address that does not stand for one place -- loopback, private,
 // link-local, unspecified, multicast, read off the unmapped address -- is
 // refused with 400 unless the request says force: behind a front or a
-// PROXY-protocol listener one such address is every client. A request with one
-// such address among keyed ones is refused whole.
+// PROXY-protocol listener one such address is every client. So is an address
+// that stands for one place but is held at a unit that takes in such an
+// address: ::2 and the IPv4-compatible ::203.0.113.9 are keyed, and a ban of
+// either is held at ::/64, where ::1 and :: are too. A request with one such
+// address among keyed ones is refused whole; a keyed IPv6 address whose /64 is
+// all keyed needs no force.
 func TestAnUnkeyedAddressIsBannedOnlyWhenForced(t *testing.T) {
 	t.Parallel()
 
@@ -186,6 +190,7 @@ func TestAnUnkeyedAddressIsBannedOnlyWhenForced(t *testing.T) {
 		"127.0.0.1", "10.1.2.3", "172.16.0.9", "192.168.1.1", "169.254.1.1", "0.0.0.0", "224.0.0.1",
 		"::1", "::", "fe80::1", "fd00::7", "ff02::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1",
 		"fd00:1:2:3::/64", "fe80::/64",
+		"::2", "::203.0.113.9", "::1:0:0:1",
 	} {
 		before := bansHeld(t, p)
 
@@ -204,6 +209,67 @@ func TestAnUnkeyedAddressIsBannedOnlyWhenForced(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, code)
 	assert.Equal(t, before, bansHeld(t, p), "refused whole: the keyed address is not banned either")
 	assert.False(t, isBanned(p, "alice", "203.0.113.9"))
+
+	result := mustBan(t, p, "alice", `{"ips":["2001:db8::1","::ffff:203.0.113.9"]}`)
+	assert.Equal(t, []string{"2001:db8::/64", "203.0.113.9"}, result.Addresses,
+		"the control: a keyed /64, and a v4-mapped address, which is its IPv4 address, need no force")
+}
+
+// A request names at most as many places as the list can hold. One that names
+// more could never fit, and is refused with 400 before anything is taken for
+// it -- in particular before liveMu, which every admission waits on. One that
+// names exactly that many fits an empty list.
+func TestABanRequestNamesAtMost4096Places(t *testing.T) {
+	t.Parallel()
+
+	places := func(n int) string {
+		ips := make([]string, n)
+		for i := range ips {
+			ips[i] = string(syntheticClientKey(i))
+		}
+
+		body, err := json.Marshal(banRequest{IPs: ips})
+		require.NoError(t, err)
+
+		return string(body)
+	}
+
+	probe, _ := banProbe(t, false)
+	p := probe.proxy
+
+	code, text := postBan(t, p, "alice", places(maxBans+1))
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Contains(t, text, "4096", "the answer names the bound")
+	assert.Zero(t, bansHeld(t, p))
+
+	assert.Equal(t, maxBans, mustBan(t, p, "alice", places(maxBans)).Banned)
+	assert.Equal(t, maxBans, bansHeld(t, p))
+}
+
+// With no ban held, asking whether a place is banned costs nothing: no address
+// key is built, so a hello that matched a secret pays no allocation for the
+// ban check, on either address family. With bans held the answers are as
+// before. Not parallel: AllocsPerRun counts every allocation in the process.
+func TestABanCheckWithNoBansHeldAllocatesNothing(t *testing.T) { //nolint: paralleltest // see above
+	probe, _ := banProbe(t, false)
+	p := probe.proxy
+
+	v4, v6 := net.ParseIP("203.0.113.9"), net.ParseIP("2001:db8:1:2::5")
+
+	allocs := testing.AllocsPerRun(100, func() {
+		if p.bannedFrom("alice", v4) || p.bannedFrom("alice", v6) {
+			panic("nothing is banned")
+		}
+	})
+	assert.Zero(t, allocs)
+
+	mustBan(t, p, "alice", `{"ips":["203.0.113.9","2001:db8:1:2::/64"]}`)
+
+	assert.True(t, p.bannedFrom("alice", v4))
+	assert.True(t, p.bannedFrom("alice", v6))
+	assert.False(t, p.bannedFrom("bob", v4))
+	assert.False(t, p.bannedFrom("alice", net.ParseIP("198.51.100.7")))
+	assert.False(t, p.bannedFrom("alice", nil), "no address is no place")
 }
 
 // A ban is held at the unit kick counts and ends every live stream the
