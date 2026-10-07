@@ -113,8 +113,11 @@ func (l *addrLimiter) install(bytesPerSecond int64, burst int) {
 // read back as unlimited -- so anything below one byte a second is one. And it
 // never touches the burst.
 //
-// A setRate that races an install re-rates the object install replaced; the
-// callers that drive both serialize them.
+// Nothing orders a setRate against an install -- the fair-share ticker
+// re-rates and a reload installs, each when it runs -- so a setRate can land on
+// an object install has just replaced. It is lost, which is harmless: the new
+// object runs at the rate install gave it until the next tick re-rates it, a
+// second later at most.
 func (l *addrLimiter) setRate(bytesPerSecond int64) {
 	current := l.limiter.Load()
 	if current == nil {
