@@ -364,6 +364,30 @@ func TestACostAboveWhatTheWaitAllowsIsRefused(t *testing.T) {
 		assert.Equal(t, budgetGranted, v, "the control")
 		assert.Zero(t, wait)
 	})
+
+	t.Run("one bucket refusing leaves the other untouched", func(t *testing.T) {
+		t.Parallel()
+
+		b, _ := testBudget(scanBudgetConfig{NsPerBlock: nsPerBlockForTests, CPUPercent: 25, Procs: 4})
+		ip := net.ParseIP("203.0.113.6")
+
+		// The address has a bucket with room in it; the process has none left.
+		_, _, v := b.reserve(ip, 12, 10)
+		require.Equal(t, budgetGranted, v)
+		require.Equal(t, budgetDeniedGlobal, drainBudget(t, b, nil, 12, 10))
+
+		address, held := b.addressAvailable(ip, 10)
+		require.True(t, held)
+
+		global := b.globalAvailable(10)
+
+		_, _, v = b.reserve(ip, 12, 10)
+		assert.Equal(t, budgetDeniedGlobal, v)
+
+		after, _ := b.addressAvailable(ip, 10)
+		assert.InDelta(t, address, after, 0, "the address's bucket could pay, and is not charged")
+		assert.InDelta(t, global, b.globalAvailable(10), 0)
+	})
 }
 
 func TestChargeIsRefundedExactlyOnceAndOnlyOnSuccess(t *testing.T) {
@@ -972,6 +996,16 @@ func TestBucketsStayWithinTheirBounds(t *testing.T) {
 
 		check(step)
 	}
+
+	// A clock that steps back neither refills nor drains: the bucket holds
+	// what it was left with.
+	back, backClock := testBudget(scanBudgetConfig{NsPerBlock: nsPerBlockForTests, CPUPercent: 25, Procs: 4})
+
+	_, _, v := back.reserve(nil, 12, 10)
+	require.Equal(t, budgetGranted, v)
+
+	backClock.advance(-time.Second)
+	assert.InDelta(t, 1e6-120, back.globalAvailable(10), 0, "a step back in time is no time at all")
 
 	clock.advance(24 * time.Hour)
 
