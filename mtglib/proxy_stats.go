@@ -659,7 +659,7 @@ func fakeTLSJSONOf(c *fakeTLSCounters, b *scanBudget) *FakeTLSJSON {
 		Oversized:         c.oversized.Load(),
 		OverBudgetMatched: c.overBudgetMatched.Load(),
 		Enforced:          b.enforced(),
-		NsPerBlock:        b.blockNanos(),
+		NsPerBlock:        b.reportedBlockNanos(),
 	}
 }
 

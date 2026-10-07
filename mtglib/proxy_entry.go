@@ -136,10 +136,12 @@ func (p *Proxy) reserveScan(
 
 		reason = "denied_global"
 	case budgetOversized:
-		// The cap was applied before the hints; a hello above it never gets
-		// here. Kept so the switch says what every verdict means.
-		p.fakeStats.OnOversized()
-
+		// Unreachable today: the cap is applied, and the hello counted as
+		// oversized, before the hints, and a budget that is off grants before it
+		// looks at the size. It counts nothing here on purpose: were it ever
+		// reachable, the hello would already have been counted, and a second
+		// count would break the one-counter-per-hello rule. It only names the
+		// reason, so the switch says what every verdict means.
 		reason = "oversized"
 	}
 

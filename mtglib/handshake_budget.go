@@ -286,10 +286,11 @@ func (b *scanBudget) enforced() bool {
 	return b != nil && b.mode == budgetEnforce
 }
 
-// blockNanos is what the budget believes one SHA-256 block costs, in
+// reportedBlockNanos is what the budget believes one SHA-256 block costs, in
 // nanoseconds, as /stats reports it: the process's calibrated reading, or an
-// injected one. A nil budget has none and says zero.
-func (b *scanBudget) blockNanos() float64 {
+// injected one. A nil budget has none and says zero. It is the value held, not
+// the measurement: that is the package function blockNanos.
+func (b *scanBudget) reportedBlockNanos() float64 {
 	if b == nil {
 		return 0
 	}

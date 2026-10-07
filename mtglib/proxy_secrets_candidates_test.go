@@ -447,7 +447,11 @@ func TestRefusedHelloIsFrontedWithTheHostItNamed(t *testing.T) {
 		return h, recorder
 	}
 
-	hello := func(key [SecretKeyLength]byte, sni string, id byte) []byte {
+	// It takes the calling subtest's t: the subtests run in parallel, and a
+	// failure has to end the goroutine that is running it, not the parent's.
+	hello := func(t *testing.T, key [SecretKeyLength]byte, sni string, id byte) []byte {
+		t.Helper()
+
 		return fakeTLSClientHello(t, key, sni, bytes.Repeat([]byte{id}, 32))
 	}
 
@@ -456,7 +460,7 @@ func TestRefusedHelloIsFrontedWithTheHostItNamed(t *testing.T) {
 
 		h, recorder := newHarness(t, nil)
 
-		_, ok := h.fakeTLSAttempt(t, hello(keyFilledFrom(200), namedHost, 0x61))
+		_, ok := h.fakeTLSAttempt(t, hello(t, keyFilledFrom(200), namedHost, 0x61))
 		assert.False(t, ok)
 		assert.Equal(t, []string{namedHost + ":443"}, recorder.dialed())
 	})
@@ -466,7 +470,7 @@ func TestRefusedHelloIsFrontedWithTheHostItNamed(t *testing.T) {
 
 		h, recorder := newHarness(t, nil)
 
-		_, ok := h.fakeTLSAttempt(t, hello(bbb, "elsewhere.example.org", 0x62))
+		_, ok := h.fakeTLSAttempt(t, hello(t, bbb, "elsewhere.example.org", 0x62))
 		assert.False(t, ok)
 		assert.Equal(t, []string{frontHost + ":443"}, recorder.dialed())
 	})
@@ -486,7 +490,7 @@ func TestRefusedHelloIsFrontedWithTheHostItNamed(t *testing.T) {
 
 		h, recorder := newHarness(t, nil)
 
-		captured := hello(bbb, namedHost, 0x63)
+		captured := hello(t, bbb, namedHost, 0x63)
 
 		_, ok := h.fakeTLSAttempt(t, captured)
 		require.True(t, ok)
@@ -503,7 +507,7 @@ func TestRefusedHelloIsFrontedWithTheHostItNamed(t *testing.T) {
 
 		h, recorder := newHarness(t, map[string]SecretLimits{"bbb": {Disabled: true}})
 
-		ctx, ok := h.fakeTLSAttempt(t, hello(bbb, namedHost, 0x64))
+		ctx, ok := h.fakeTLSAttempt(t, hello(t, bbb, namedHost, 0x64))
 		assert.False(t, ok)
 		assert.Equal(t, "bbb", ctx.secretName, "the match was made before the limit refused it")
 		assert.Equal(t, []string{namedHost + ":443"}, recorder.dialed())

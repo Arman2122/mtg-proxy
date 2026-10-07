@@ -4,7 +4,8 @@ import "sync/atomic"
 
 // fakeTLSCounters count what the FakeTLS door decided about each hello that got
 // past the SNI gate. Like obfuscatedCounters they live on Proxy, and the
-// reporting side reads them with Load(); nothing reports them yet.
+// reporting side reads them with Load(): GET /stats carries all of them but
+// verifications as the top-level faketls_handshake object.
 //
 // Under the handshake budget's enforce mode the door moves exactly one of
 // hinted, scanned, unmatched, deniedIP, deniedGlobal and oversized for each such
