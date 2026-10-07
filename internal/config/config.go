@@ -17,8 +17,8 @@ type Optional struct {
 
 // ConfigSecretLimit is the typed form of a single [secret-limits.<name>] table:
 // an optional data quota (with reset policy), a speed limit, an expiry
-// deadline, a disabled flag and an address limit. All fields are optional; the
-// zero value leaves the secret unrestricted.
+// deadline, a disabled flag, an address limit and a per-address connection
+// cap. All fields are optional; the zero value leaves the secret unrestricted.
 type ConfigSecretLimit struct {
 	Quota      TypeBytes      `json:"quota"`
 	QuotaReset TypeQuotaReset `json:"quotaReset"`
@@ -28,6 +28,11 @@ type ConfigSecretLimit struct {
 	SpeedUp    TypeSpeed      `json:"speedUp"`
 	SpeedDown  TypeSpeed      `json:"speedDown"`
 	IPLimit    TypeIPLimit    `json:"ipLimit"`
+
+	// The per-address controls carry omitzero, so a table that does not use
+	// them -- every one a panel writes -- renders in Config.String() exactly
+	// as it did before they existed.
+	ClientConns TypeClientConns `json:"clientConns,omitzero"`
 }
 
 // ConfigListener is one [[listener]] block: an extra socket serving the
@@ -452,6 +457,7 @@ func (c *Config) GetSecretLimits() map[string]mtglib.SecretLimits {
 			SpeedUpBytesPerSecond:   l.SpeedUp.Get(0),
 			SpeedDownBytesPerSecond: l.SpeedDown.Get(0),
 			IPLimit:                 l.IPLimit.Get(0),
+			ClientConns:             l.ClientConns.Get(0),
 		}
 
 		if l.QuotaReset.Get("none") == mtglib.QuotaResetMonthly.String() {

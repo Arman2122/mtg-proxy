@@ -61,6 +61,19 @@ type secretSet struct {
 	// secrets[0].Host, which under a management panel was whichever client name
 	// sorted first -- operator-uncontrolled, and now possibly hostless.
 	frontHost string
+
+	// clientControl says whether any secret in the set has a per-address
+	// control (SecretLimits.hasClientControl), worked out once when the set is
+	// built. With it false and track-client-ips off no secret needs an entry
+	// in the per-address table, and admission knows that without looking the
+	// secret up.
+	clientControl bool
+}
+
+// anyClientControl reports whether any secret in the set has a per-address
+// control. False on a nil set, which holds nothing.
+func (s *secretSet) anyClientControl() bool {
+	return s != nil && s.clientControl
 }
 
 // effectiveAdTag returns the advertising tag that applies to secrets[i]: the
@@ -144,6 +157,7 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 	secretsList := make([]Secret, 0, len(secretsMap))
 	adTags := make([]*[AdTagLength]byte, len(names))
 	limits := make([]SecretLimits, len(names))
+	clientControl := false
 
 	for i, name := range names {
 		secretsList = append(secretsList, secretsMap[name])
@@ -155,6 +169,7 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 
 		if lim, ok := limitsMap[name]; ok {
 			limits[i] = lim
+			clientControl = clientControl || lim.hasClientControl()
 		}
 	}
 
@@ -192,17 +207,18 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 	cands, candIdx, candByName := buildCandidates(secretsList, names, hosted)
 
 	return &secretSet{
-		secrets:     secretsList,
-		names:       names,
-		hostnames:   hostnames,
-		adTags:      adTags,
-		globalAdTag: global,
-		limits:      limits,
-		hosted:      hosted,
-		cands:       cands,
-		candIdx:     candIdx,
-		candByName:  candByName,
-		frontHost:   frontHost,
+		secrets:       secretsList,
+		names:         names,
+		hostnames:     hostnames,
+		adTags:        adTags,
+		globalAdTag:   global,
+		limits:        limits,
+		hosted:        hosted,
+		cands:         cands,
+		candIdx:       candIdx,
+		candByName:    candByName,
+		frontHost:     frontHost,
+		clientControl: clientControl,
 	}
 }
 
@@ -394,9 +410,11 @@ func (p *Proxy) applyLimits(set *secretSet) {
 //
 // Under liveMu, the same critical section admission takes its entry in, so a
 // stream is either admitted before this and backfilled by it, or admitted
-// after it from the set already swapped in.
+// after it from the set already swapped in. A set none of whose secrets has a
+// per-address control, on a proxy that keeps no addresses, needs no entry for
+// anyone, and the walk is skipped.
 func (p *Proxy) backfillClients(set *secretSet) {
-	if p.clients == nil {
+	if p.clients == nil || !p.trackClientIPs && !set.anyClientControl() {
 		return
 	}
 

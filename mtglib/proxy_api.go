@@ -49,6 +49,10 @@ type SecretInfo struct {
 	IPLimit   int `json:"ip_limit,omitempty"`
 	ActiveIPs int `json:"active_ips,omitempty"`
 
+	// ClientConns is how many live connections one address may hold to this
+	// secret at once, or absent for unlimited. A limit, not an address.
+	ClientConns int `json:"client_conns,omitempty"`
+
 	// Mode is the wire form this secret serialises to: "ee", "dd" or "plain".
 	Mode string `json:"mode"`
 
@@ -172,6 +176,7 @@ func fillLimitInfo(info *SecretInfo, lim SecretLimits, used int64) {
 	info.SpeedLimitUp = lim.SpeedUpBytesPerSecond
 	info.SpeedLimitDown = lim.SpeedDownBytesPerSecond
 	info.IPLimit = lim.IPLimit
+	info.ClientConns = lim.ClientConns
 }
 
 // ReplaceSecrets swaps the entire secret configuration (secrets + advertising
@@ -514,6 +519,7 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		user.SpeedLimitUp = lim.SpeedUpBytesPerSecond
 		user.SpeedLimitDown = lim.SpeedDownBytesPerSecond
 		user.IPLimit = lim.IPLimit
+		user.ClientConns = lim.ClientConns
 
 		resp.Users[name] = user
 	}
@@ -650,23 +656,29 @@ func (p *Proxy) hasSecret(name string) bool {
 // clears the corresponding limit. Quota accepts human sizes ("10GB"), expires
 // accepts RFC3339 or YYYY-MM-DD, quota_reset is "none" or "monthly", and speed
 // accepts a rate ("5mbit", "1MB/s") -- the same spellings the config file
-// takes, from the same parsers -- and ip_limit is a count of addresses.
+// takes, from the same parsers -- ip_limit is a count of addresses, and
+// client_conns a count of one address's live connections.
 type limitFields struct {
-	Quota      string `json:"quota,omitempty"`
-	QuotaReset string `json:"quota_reset,omitempty"`
-	Expires    string `json:"expires,omitempty"`
-	Disabled   bool   `json:"disabled,omitempty"`
-	Speed      string `json:"speed,omitempty"`
-	SpeedUp    string `json:"speed_up,omitempty"`
-	SpeedDown  string `json:"speed_down,omitempty"`
-	IPLimit    int    `json:"ip_limit,omitempty"`
+	Quota       string `json:"quota,omitempty"`
+	QuotaReset  string `json:"quota_reset,omitempty"`
+	Expires     string `json:"expires,omitempty"`
+	Disabled    bool   `json:"disabled,omitempty"`
+	Speed       string `json:"speed,omitempty"`
+	SpeedUp     string `json:"speed_up,omitempty"`
+	SpeedDown   string `json:"speed_down,omitempty"`
+	IPLimit     int    `json:"ip_limit,omitempty"`
+	ClientConns int    `json:"client_conns,omitempty"`
 }
 
 // parse turns the raw string fields into a SecretLimits, returning an error for
-// a malformed quota, reset policy, expiry, speed or ip limit.
+// a malformed quota, reset policy, expiry, speed, ip limit or connection cap.
 func (l limitFields) parse() (SecretLimits, error) {
 	if l.IPLimit < 0 {
 		return SecretLimits{}, fmt.Errorf("%w: ip_limit must not be negative (%d)", ErrSecretInvalid, l.IPLimit)
+	}
+
+	if l.ClientConns < 0 {
+		return SecretLimits{}, fmt.Errorf("%w: client_conns must not be negative (%d)", ErrSecretInvalid, l.ClientConns)
 	}
 
 	quota, err := ParseQuotaBytes(l.Quota)
@@ -708,6 +720,7 @@ func (l limitFields) parse() (SecretLimits, error) {
 		SpeedUpBytesPerSecond:   speedUp,
 		SpeedDownBytesPerSecond: speedDown,
 		IPLimit:                 l.IPLimit,
+		ClientConns:             l.ClientConns,
 	}, nil
 }
 

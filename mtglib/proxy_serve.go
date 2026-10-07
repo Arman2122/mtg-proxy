@@ -183,6 +183,7 @@ func (p *Proxy) attribute(ctx *streamContext, set *secretSet, i int) DenyReason 
 	ctx.secretName = set.names[i]
 	ctx.adTag = set.effectiveAdTag(i)
 	ctx.ipLimit = set.limits[i].IPLimit
+	ctx.clientConns = set.limits[i].ClientConns
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName)
 
 	allowed, reason := p.checkLimits(ctx.secretName, set.limits[i])
@@ -443,12 +444,19 @@ var registerStepHook = func(registerStep, *streamContext) DenyReason { return De
 // every stream.
 //
 // The steps run in a fixed order, and a refusal at any of them leaves the
-// ledger, and the per-address table, exactly as it was found. Today that is
-// the address limit, then the per-address table entry, then the registration;
-// the ban re-check and the per-address connection cap come before the ledger
-// (the cap reads the ledger's count BEFORE the admit, which increments it). A
-// step that refuses does so through refuse, which gives back what the steps
-// before it took.
+// ledger, and the per-address table, exactly as it was found: the per-address
+// connection cap, then the address limit (the ledger's admit), then the
+// per-address table entry, then the registration. The ban re-check is to go
+// first of all. Every refusal comes before the table is asked for an entry, so
+// a refused address never holds one, and a step that refuses does so through
+// refuse, which gives back what the steps before it took.
+//
+// The cap reads the ledger's count of the address's live connections, which
+// the ledger keeps for every stream whatever else is configured, so it counts
+// the streams that were open before the cap was set and it holds when the
+// table has no room for the address. It reads the count BEFORE the admit, which
+// increments it: reading after would refuse the cap-th connection instead of
+// the one past it. An address that does not stand for one place is not capped.
 //
 // A limit with no address to count against fails closed. The only way a TCP
 // listener yields no address is a PROXY header that declared a non-TCP
@@ -484,6 +492,10 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 		}
 
 		return reason
+	}
+
+	if keyed && ctx.clientConns > 0 && p.addresses[ctx.secretName].live(key) >= ctx.clientConns {
+		return refuse(DenyClientConns)
 	}
 
 	switch {
@@ -545,12 +557,21 @@ func (p *Proxy) clientEntriesWanted(lim SecretLimits) bool {
 // made here is either made from the new set or reached by that reload. A
 // secret the set no longer has gets no entry; its stream is about to be
 // closed. Caller holds liveMu.
+//
+// A proxy that keeps no addresses, with no per-address control on any secret,
+// needs no entry for anyone; the set knows that without the secret being
+// looked up, so admission in the common case does no table work at all.
 func (p *Proxy) acquireClientLocked(name string, key addressKey, keyed bool) *clientEntry {
 	if p.clients == nil {
 		return nil
 	}
 
-	lim, ok := p.secrets.Load().limitsOf(name)
+	set := p.secrets.Load()
+	if !p.trackClientIPs && !set.anyClientControl() {
+		return nil
+	}
+
+	lim, ok := set.limitsOf(name)
 	if !ok || !p.clientEntriesWanted(lim) {
 		return nil
 	}

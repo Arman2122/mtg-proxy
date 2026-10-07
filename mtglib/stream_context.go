@@ -57,6 +57,10 @@ type streamContext struct {
 	// matched, read from the same snapshot as the rest of the attribution.
 	ipLimit int
 
+	// clientConns is the user's per-address connection cap as it stood when
+	// the secret matched, read with ipLimit; zero is no cap.
+	clientConns int
+
 	// addrKey is the address this stream was counted under in its user's
 	// ledger, and addrCounted says whether it was counted at all -- so the
 	// release on the way out undoes exactly what admission did, whichever

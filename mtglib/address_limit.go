@@ -160,6 +160,17 @@ func (l *addressLedger) admit(key addressKey, limit int, now time.Time) bool {
 	return true
 }
 
+// live is how many connections from key the ledger counts here, reported
+// addresses not included: the count the per-address connection cap reads.
+// Zero on a nil ledger, which is a user with nothing counted.
+func (l *addressLedger) live(key addressKey) int {
+	if l == nil {
+		return 0
+	}
+
+	return l.local[key]
+}
+
 // release undoes one admit.
 func (l *addressLedger) release(key addressKey) {
 	if l.local[key] <= 1 {

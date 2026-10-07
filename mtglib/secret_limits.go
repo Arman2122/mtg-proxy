@@ -82,6 +82,22 @@ type SecretLimits struct {
 	// address counts as its /64. Refusal happens at admission, after the
 	// secret matched, so only a holder of the valid secret can observe it.
 	IPLimit int
+
+	// ClientConns is how many live connections one address may hold to this
+	// secret at once, client-conns: the per-address connection cap. 0 means
+	// unlimited.
+	//
+	// It is counted from the address ledger -- the same unit and the same live
+	// count IPLimit reads, so a v4-mapped address is its IPv4 address and an
+	// IPv6 address is its /64 -- and not from the per-address table, so it
+	// holds when the table is full and counts the connections that were open
+	// before it was set. A connection from an address already holding that
+	// many is refused after the handshake, as an IPLimit refusal is. An
+	// address that does not stand for one place (loopback, private and the
+	// like: behind a carrier that forwards no client address, every client) is
+	// never capped. Distinct from IPLimit, which counts places: a Telegram
+	// client opens several connections, so this is set to a few times that.
+	ClientConns int
 }
 
 // IsZero reports whether the limits impose no restriction at all, i.e. the
@@ -91,16 +107,18 @@ func (l SecretLimits) IsZero() bool {
 	return l.QuotaBytes == 0 && l.QuotaReset == QuotaResetNone &&
 		l.ExpiresAt.IsZero() && !l.Disabled && l.SpeedBytesPerSecond == 0 &&
 		l.SpeedUpBytesPerSecond == 0 && l.SpeedDownBytesPerSecond == 0 &&
-		l.IPLimit == 0
+		l.IPLimit == 0 && l.ClientConns == 0
 }
 
 // hasClientControl reports whether the limits carry a per-address control --
 // client-conns, client-speed or client-fair -- which needs the per-address
 // table to hold an entry for every address of the secret even when the proxy
-// does not track client addresses. None exists yet, so nothing does; each
-// control adds itself here as it lands.
+// does not track client addresses. It is the one place that says which limits
+// are per-address: admission, a reload's backfill and the secret set's own
+// summary all ask it. Each control adds itself here as it lands; client-conns
+// is the first.
 func (l SecretLimits) hasClientControl() bool {
-	return false
+	return l.ClientConns > 0
 }
 
 // DenyReason explains why a connection was refused by the per-user limits.

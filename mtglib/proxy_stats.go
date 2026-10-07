@@ -498,6 +498,14 @@ const (
 	// that, and their absence is indistinguishable from an idle secret.
 	FeatureClientIPs = "client-ips"
 
+	// FeatureClientLimits means the per-address controls inside one secret are
+	// honoured: [secret-limits.<name>] and the secrets API accept client-conns
+	// (client_conns on the API), a cap on the live connections one address may
+	// hold to the secret, and /stats reads it back as client_conns and counts
+	// its refusals in client_conns_refused. The API is strict, so a client
+	// must see this before it sends the field.
+	FeatureClientLimits = "client-limits"
+
 	// FeatureFakeTLS means the proxy speaks the FakeTLS (obfuscated) handshake.
 	FeatureFakeTLS = "faketls"
 
@@ -579,6 +587,7 @@ const (
 var supportedFeatures = []string{
 	FeatureClientIPActivity,
 	FeatureClientIPs,
+	FeatureClientLimits,
 	FeatureFakeTLS,
 	FeatureHandshakeBudget,
 	FeatureIPLimits,
@@ -748,6 +757,14 @@ type UserStatsJSON struct {
 	ActiveIPs      int   `json:"active_ips,omitempty"`
 	IPLimitRefused int64 `json:"ip_limit_refused,omitempty"`
 
+	// ClientConns is the per-address connection cap, read back, and
+	// ClientConnsRefused is how many connections were turned away for arriving
+	// from an address that already held that many. Scalars inside the user
+	// object, never a key under users and never an address: both are absent
+	// when zero, and neither is gated.
+	ClientConns        int   `json:"client_conns,omitempty"`
+	ClientConnsRefused int64 `json:"client_conns_refused,omitempty"`
+
 	// ConnectedIPs lists the distinct client addresses holding a live
 	// connection right now, sorted. LastIP is the address of the most recent
 	// admitted connection, which outlives that connection. ExternalIPs are
@@ -802,8 +819,9 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 			AdTagFailed:  st.adTagFailed.Load(),
 			ThrottledMillis: (st.speed.throttledNanos.Load() + st.speedUp.throttledNanos.Load() +
 				st.speedDown.throttledNanos.Load()) / int64(time.Millisecond),
-			IPLimitRefused: st.ipLimitRefused.Load(),
-			LastIP:         lastIP,
+			IPLimitRefused:     st.ipLimitRefused.Load(),
+			ClientConnsRefused: st.clientConnsRefused.Load(),
+			LastIP:             lastIP,
 		}
 	}
 	s.mu.RUnlock()
