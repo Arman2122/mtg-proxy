@@ -1,11 +1,16 @@
 package mtglib
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -81,4 +86,115 @@ func TestKickValidation(t *testing.T) {
 	rec := doAPI(t, p, "", http.MethodPost, "/secrets/alice/kick", `{"ips":["203.0.113.9"]}`)
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.JSONEq(t, `{"closed":0}`, rec.Body.String())
+}
+
+// gatedNetwork is the harness's network with a Telegram dial the test holds:
+// each dial says so on dialling and goes through only once gate is closed.
+type gatedNetwork struct {
+	*fakeNetwork
+
+	dialling chan struct{}
+	gate     chan struct{}
+}
+
+func (n *gatedNetwork) Dial(network, address string) (essentials.Conn, error) {
+	n.dialling <- struct{}{}
+	<-n.gate
+
+	return n.fakeNetwork.Dial(network, address)
+}
+
+func (n *gatedNetwork) DialContext(_ context.Context, network, address string) (essentials.Conn, error) {
+	return n.Dial(network, address)
+}
+
+// A stream revoked while its Telegram dial is in flight -- here by a kick; a
+// reload or the proxy stopping does the same -- has its upstream closed by
+// setTelegram rather than kept, and must leave without relaying: there is
+// nothing to relay to. It used to reach the relay with a nil upstream and
+// panic, which the worker pool recovers in production and which ends a test
+// binary.
+func TestAStreamRevokedWhileDiallingTelegramLeaves(t *testing.T) {
+	t.Parallel()
+
+	ec := govEntryCases()[1] // dd: no server flight to sequence
+	secret := ec.secret(t)
+	h := ec.harness(t, map[string]Secret{"alice": secret}, nil)
+
+	network := &gatedNetwork{fakeNetwork: h.network, dialling: make(chan struct{}, 1), gate: make(chan struct{})}
+	h.proxy.network = network
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	require.NoError(t, err)
+
+	t.Cleanup(func() { client.Close() }) //nolint: errcheck
+
+	server, err := listener.Accept()
+	require.NoError(t, err)
+	require.NoError(t, listener.Close())
+
+	conn := policyConn{
+		Conn:   remoteAddrConn{Conn: essentials.WrapNetConn(server), addr: tcpFrom("203.0.113.9", 54001)},
+		policy: *ec.policy,
+	}
+
+	// ServeConn on a goroutine of its own that records a panic instead of
+	// ending the binary -- as far as one can be caught: a panic on a goroutine
+	// the relay starts cannot be, and still ends it.
+	var (
+		done     = make(chan struct{})
+		panicked any
+	)
+
+	go func() {
+		defer close(done)
+		defer func() { panicked = recover() }()
+
+		h.proxy.ServeConn(conn)
+	}()
+
+	ec.openEntry(t, client, secret.Key)
+
+	_, err = client.Write([]byte("bytes the relay must never carry"))
+	require.NoError(t, err)
+
+	select {
+	case <-network.dialling:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the admitted stream never dialled Telegram")
+	}
+
+	closed, err := h.proxy.Kick("alice", []netip.Addr{netip.MustParseAddr("203.0.113.9")})
+	require.NoError(t, err)
+	require.Equal(t, 1, closed, "the stream is live, admitted and dialling, and the kick finds it")
+
+	close(network.gate)
+
+	require.True(t, govAwait(done, govDenyBudget), "a stream revoked while dialling must leave, not relay")
+	require.Nil(t, panicked, "ServeConn panicked: %v", panicked)
+
+	// Telegram got the handshake the dial sends, then the socket setTelegram
+	// closed: not one byte of the client's.
+	upstream, err := h.upstream.Accept()
+	require.NoError(t, err)
+
+	t.Cleanup(func() { upstream.Close() }) //nolint: errcheck
+
+	require.NoError(t, upstream.SetReadDeadline(time.Now().Add(5*time.Second)))
+
+	var handshake [64]byte
+
+	_, err = io.ReadFull(upstream, handshake[:])
+	require.NoError(t, err)
+
+	rest, err := io.ReadAll(upstream)
+	require.NoError(t, err, "the upstream is closed, not left open")
+	assert.Empty(t, rest, "nothing was relayed")
+
+	h.proxy.liveMu.Lock()
+	assert.Empty(t, h.proxy.liveConns["alice"], "the stream left the registry")
+	h.proxy.liveMu.Unlock()
 }

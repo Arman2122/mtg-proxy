@@ -38,34 +38,6 @@ func requireOnlyEntry(t *testing.T, table *clientTable, name string, want *clien
 	require.Same(t, want, snapshot[0])
 }
 
-// awaitUpstreamRecorded waits until every live stream of name has recorded its
-// Telegram socket. The upstream has the handshake a moment before the stream
-// records the socket, and a stream revoked inside that moment reaches the relay
-// with no upstream at all -- a race of doTelegramCall's own, which a test that
-// revokes streams right after connecting them must not step into.
-func awaitUpstreamRecorded(t *testing.T, p *Proxy, name string) {
-	t.Helper()
-
-	require.Eventually(t, func() bool {
-		p.liveMu.Lock()
-
-		streams := make([]*streamContext, 0, len(p.liveConns[name]))
-		for sc := range p.liveConns[name] {
-			streams = append(streams, sc)
-		}
-
-		p.liveMu.Unlock()
-
-		for _, sc := range streams {
-			if sc.telegram() == nil {
-				return false
-			}
-		}
-
-		return len(streams) > 0
-	}, 5*time.Second, time.Millisecond, "%s's streams never recorded their Telegram socket", name)
-}
-
 // newClientTableProbe is a denyProbe with a table and a secret set of one ee
 // secret, "alice", which is everything admission, a reload and the table touch.
 func newClientTableProbe(t *testing.T, tracking bool) *denyProbe {
@@ -424,9 +396,6 @@ func TestRemovingASecretDropsItsEntriesAndARekeyKeepsThem(t *testing.T) {
 	aliceEntry := entryByKey(table, "alice", "203.0.113.1")
 	require.NotNil(t, aliceEntry)
 	require.Len(t, table.snapshot("bob"), 2, "bob's address and his rest entry")
-
-	awaitUpstreamRecorded(t, h.proxy, "alice")
-	awaitUpstreamRecorded(t, h.proxy, "bob")
 
 	require.NoError(t, h.proxy.DeleteSecret("bob"))
 

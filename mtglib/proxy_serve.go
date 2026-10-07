@@ -135,12 +135,21 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 		return
 	}
 
+	// A stream revoked while it dialled -- a reload, a kick, the proxy stopping
+	// -- has had its upstream closed by setTelegram rather than kept. There is
+	// nothing to relay to, and a relay handed no upstream would panic.
+	telegram := ctx.telegram()
+	if telegram == nil {
+		ctx.logger.Info("stream was closed while dialling telegram")
+		return
+	}
+
 	tracker := newIdleTracker(p.idleTimeout)
 
 	relay.Relay(
 		ctx,
 		ctx.logger.Named("relay"),
-		connIdleTimeout{Conn: ctx.telegram(), tracker: tracker},
+		connIdleTimeout{Conn: telegram, tracker: tracker},
 		newCountingConn(ctx.ctx, ctx.Close, connIdleTimeout{Conn: ctx.client(), tracker: tracker}, p.stats, ctx.secretName).
 			withActivity(&ctx.lastActiveUnix),
 	)
