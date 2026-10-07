@@ -3,9 +3,10 @@ package config
 import "fmt"
 
 const (
-	// TypeHandshakeBudgetModeEnforce waits a hello that no hint matched for CPU
-	// budget, then fronts it to the cover site if the budget cannot pay. It is
-	// the default.
+	// TypeHandshakeBudgetModeEnforce charges the scan of a hello that no hint
+	// matched against the CPU budget. A scan the budget can pay for within
+	// 150 ms waits for it and runs; one it cannot pay for is fronted to the
+	// cover site at once, never closed. It is the default.
 	TypeHandshakeBudgetModeEnforce = "enforce"
 
 	// TypeHandshakeBudgetModeObserve keeps the same accounting but never waits

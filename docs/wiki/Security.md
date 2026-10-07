@@ -133,9 +133,9 @@ What a prober can still measure is *when* the first byte comes back, and that
 includes whatever work the proxy did first. A hello that fails the hostname check
 is fronted before any secret is tried; one that matches nothing is fronted after
 every hosted secret was; a larger hello takes longer to try; and a hello refused
-by the [ee handshake budget](#the-ee-handshake-budget) is fronted without being
-tried at all. The bytes sent to the cover site are the same in every case. The
-delay is not, and this page does not claim it is hidden.
+by the [ee handshake budget](#the-ee-handshake-budget) is fronted without the
+scan over the secrets. The bytes sent to the cover site are the same in every
+case. The delay is not, and this page does not claim it is hidden.
 
 Five things take this exit:
 
@@ -244,10 +244,11 @@ by default. It does five things, all inside the ee door:
 - never scans a hello larger than 128 SHA-256 blocks (about 8 KiB; real clients
   send 0.5 to 2 KiB): it is fronted;
 - lets a scan wait at most 150 ms for budget, and fronts the hello to the cover
-  site, with the same bytes a no-match gets, when it would have to wait longer —
-  it never closes the connection;
-- remembers, per client address, which secrets matched, and tries those first, so
-  a returning client costs one HMAC;
+  site at once, with the same bytes a no-match gets, when it would have to wait
+  longer — it never closes the connection;
+- when `hints` is on (it follows `track-client-ips`), remembers per client
+  address which secrets matched and tries those first, so a returning client
+  costs one HMAC in the usual case (at most 16);
 - refunds the charge only when the whole handshake succeeds, so a replay, a
   disabled user, an `ip-limit`-refused user and a hello that matched nothing all
   keep it.
@@ -268,13 +269,17 @@ only there to stop a single source from spending all of it.
   attacker has to keep the process-wide bucket empty, which costs them about
   `cpu-percent` of this proxy's real CPU in scan work. Before this budget the same
   effort could starve everything, relays included. While it lasts, a client with
-  **no hint** is fronted within 150 ms and retries; hinted clients,
-  streams already established and the data path are unaffected. A legitimate user
-  behind an address whose bucket a flooder has drained is treated the same way
-  unless a hint exists. Behind a carrier that hides client addresses, the
-  per-address bucket is off by construction and only the process-wide one
-  applies. This is the accepted degradation, and `mode = "observe"` exists so you
-  can see whether it ever touches a real client before you enforce.
+  **no hint** is fronted at once and retries; hinted clients (when `hints` is on;
+  it follows `track-client-ips`), streams already established and the data path
+  are unaffected. A legitimate user behind an address whose bucket a flooder has
+  drained is treated the same way unless a hint exists. Behind a carrier that
+  connects from a loopback or private address and does not forward the client's,
+  there is no per-address bucket and only the process-wide one applies. Behind a
+  front proxy on a **public** address that sends no PROXY header, every client
+  lands in that one address's bucket (50 ms of scan CPU a second by default), so
+  set `per-ip-ms = 0` there and leave the process-wide bucket to bound the work.
+  This is the accepted degradation, and `mode = "observe"` exists so you can see
+  whether it ever touches a real client before you enforce.
 - **It does not change what an accepted client gets.** Every byte the proxy sends
   for an accepted hello is as it was, and a hint only reorders the secrets tried:
   each goes through the same verification, so a hint can never make a wrong secret
@@ -282,19 +287,28 @@ only there to stop a single source from spending all of it.
 
 **Timing.** A refused hello and a no-match hello send the cover site the same
 bytes, and that is all that is the same. A no-match is fronted after its scan; a
-refusal is decided before any hashing and fronted straight away (a scan that is
-granted but has to wait for budget waits at most 150 ms, and then runs). Scan
-time already varied with the hello's size and with the hostname check before the
-budget existed; this adds one more dependence of the same kind. What a prober
-can read from it is that a budget exists and is spent — not whether any secret is
-valid.
+refusal is decided before the scan (hinted candidates, if the address has any,
+are tried first) and fronted straight away. A scan that is granted but has to
+wait for budget waits at most 150 ms, and then runs. Scan time already varied
+with the hello's size and with the hostname check before the budget existed; this
+adds one more dependence of the same kind. What a prober can read from it is that
+a budget exists and is spent — not whether any secret is valid.
 
-**Hints are an address kept in memory.** The cache holds a client address and the
-name of a secret it matched for 30 to 60 minutes after the address last completed
-a handshake, and is never logged, exported or written to disk. That is why
-`hints` follows `track-client-ips` by default: a deployment that did not choose to
-keep addresses past a connection does not get a cache of them. See
-[[Configuration]] and *Client addresses* below.
+**Hints are an address tied to a secret name, kept in memory.** The cache holds a
+client address and the name of a secret it matched for 30 to 60 minutes after the
+address last completed a handshake, and is never logged, exported or written to
+disk. That is why `hints` follows `track-client-ips` by default: a deployment that
+did not choose to keep addresses past a connection does not get an
+address-to-secret cache.
+
+**The per-address bucket is not governed by either setting.** It holds an address
+(IPv4, or IPv6 /64) — no secret name, nothing else — in process memory for 30 to
+60 minutes after its last unhinted scan; it is never logged, exported or written
+to disk; `per-ip-ms = 0` keeps none. It is what stops one source from spending the
+whole budget, so it is on by default, and it holds a prober's address as readily
+as a client's. The obfuscated2 door's per-IP failure budget, on a `public = true`
+listener, keeps IP-keyed buckets in memory in the same way. See [[Configuration]]
+and *Client addresses* below.
 
 **Restart only, and observable.** The table is read once at start; a reload
 re-reads the secrets, not this. `GET /stats` carries the door's counters as
@@ -708,6 +722,11 @@ a proxy which does not know something cannot be made to disclose it.
   every hosted secret. It is never logged, exported or written to disk, and
   `hints = false` keeps it off while tracking stays on. See *The ee handshake
   budget* above.
+- **It does not govern the handshake budget's per-address bucket**, so
+  `track-client-ips = false` does not mean no address is ever held in memory.
+  The bucket holds an address (IPv4, or IPv6 /64) — no secret name, nothing else
+  — in process memory for 30 to 60 minutes after its last unhinted scan; it is
+  never logged, exported or written to disk; `per-ip-ms = 0` keeps none.
 - **The fields are absent, not empty, when tracking is off.** `/stats` looks
   exactly as it did before the feature existed, and an absent field is
   indistinguishable from an idle secret.

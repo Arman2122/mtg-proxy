@@ -641,15 +641,17 @@ drs = false
 # them, so uncomment it only to change something. It is read once at start. A
 # POST /reload re-reads the secrets, not this table.
 #
-# A scan that would go over budget waits up to 150 ms for it and is then
-# fronted to the cover site with the same bytes a wrong secret gets -- never
-# closed. A hello larger than 128 SHA-256 blocks (about 8 KiB; a real client
-# sends 0.5 to 2 KiB) is never scanned at all and is fronted the same way. A
-# client whose address matched a secret recently is tried against that secret
-# first and skips the scan. A legitimate client with no such hint can therefore
-# be fronted while a flood keeps the budget spent; it retries. That is the
-# accepted cost, and "observe" below is how to see whether it ever touches your
-# users. See the Security and Configuration pages of the wiki.
+# A scan the budget can pay for within 150 ms waits for it and runs; one it
+# cannot pay for is fronted at once to the cover site, with the same bytes a
+# wrong secret gets -- never closed. A hello larger than 128 SHA-256 blocks
+# (about 8 KiB; a real client sends 0.5 to 2 KiB) is never scanned at all and is
+# fronted the same way. When hints are on (see hints below: they follow
+# track-client-ips), a client whose address matched a secret recently is tried
+# against that secret first and skips the scan. A legitimate client with no such
+# hint can therefore be fronted while a flood keeps the budget spent; it
+# retries. That is the accepted cost, and "observe" below is how to see whether
+# it ever touches your users. See the Security and Configuration pages of the
+# wiki.
 #
 # [defense.handshake-budget]
 # # "enforce" (the default) acts on the budget as described above.
@@ -657,13 +659,22 @@ drs = false
 # # counts what "enforce" would have refused, and how many of those hellos then
 # # matched a real secret (over_budget_matched on GET /stats). Run it first, and
 # # switch to "enforce" once that number stays near zero.
-# # "off" has no budget and no limit on hello size.
+# # "off" has no budget and no scan cap.
 # mode = "enforce"
 #
 # # Scan CPU one client address (an IPv4 address, or an IPv6 /64) may spend per
 # # second, in milliseconds; 0 to 1000. Burst: four seconds' worth. 0 turns the
 # # per-address bucket off and leaves only the process-wide one below. Loopback
-# # and private addresses have no bucket of their own either way.
+# # and private addresses have no bucket of their own either way, so behind a
+# # front proxy that connects from one of those without sending a PROXY header,
+# # every client shares the process-wide bucket. Behind one on a PUBLIC address
+# # without PROXY protocol, every client lands in that one address's bucket:
+# # set 0 there.
+# #
+# # The per-address bucket holds an address (IPv4, or IPv6 /64) -- no secret
+# # name, nothing else -- in process memory for 30 to 60 minutes after its last
+# # unhinted scan; it is never logged, exported or written to disk, and 0 keeps
+# # none. It is not governed by track-client-ips or hints.
 # per-ip-ms = 50
 #
 # # The share of the cores (GOMAXPROCS, read at start) the whole process may

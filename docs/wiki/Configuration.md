@@ -139,7 +139,9 @@ It has one more effect: [`[defense.handshake-budget]` `hints`](#defensehandshake
 follows it. With tracking on, the FakeTLS door also keeps each client address and
 the name of a secret it matched in memory for 30 to 60 minutes, so a returning
 client skips a scan over every hosted secret. `hints = false` keeps that off, and
-nothing is written to disk either way.
+nothing is written to disk either way. `track-client-ips` does not govern the
+budget's per-address bucket, which also holds addresses in memory; see
+[`[defense.handshake-budget]`](#defensehandshake-budget).
 
 ### The bind-to listener is `ee`-only
 
@@ -584,8 +586,8 @@ It is **on by default**. A config without this table gets the values below.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `mode` | `"enforce"` \| `"observe"` \| `"off"` | `"enforce"` | What happens to a scan the budget cannot pay for. Lower case only: anything else is refused when the file is read. See below. |
-| `per-ip-ms` | integer, 0–1000 | `50` | Scan CPU one client address (an IPv4 address, or an IPv6 /64) may spend per second, in milliseconds, with a burst of four seconds' worth. **`0` turns the per-address bucket off** and leaves only the process-wide one. |
+| `mode` | `"enforce"` \| `"observe"` \| `"off"` | `"enforce"` | What happens to a scan the budget cannot pay for. Lower case only: any other word is refused when the file is read, and an empty `mode = ""` is read as unset. See below. |
+| `per-ip-ms` | integer, 0–1000 | `50` | Scan CPU one client address (an IPv4 address, or an IPv6 /64) may spend per second, in milliseconds, with a burst of four seconds' worth. **`0` turns the per-address bucket off** and leaves only the process-wide one. The bucket holds an address — no secret name, nothing else — in process memory for 30 to 60 minutes after its last unhinted scan; it is never logged, exported or written to disk, and `per-ip-ms = 0` keeps none. |
 | `cpu-percent` | integer, 1–100 | `25` | The share of the cores (`GOMAXPROCS`, read once at start) the whole process may spend scanning, with a burst of one second's worth. This is the bound that holds against many addresses and against forged ones. An explicit `0` is refused. |
 | `hints` | bool | the value of `track-client-ips` | Remember which secrets a client address matched, and try them first. `true` or `false` overrides `track-client-ips` in either direction. |
 
@@ -602,16 +604,17 @@ hints = true
 1. A hello that cannot be read, or whose hostname matches no secret, is fronted
    as it always was and costs no budget.
 2. A hello larger than 128 SHA-256 blocks per secret — about 8 KiB; a real
-   client sends 0.5 to 2 KiB — is never tried and never hinted. It is fronted.
+   client sends 0.5 to 2 KiB — is never hinted, and under `enforce` never tried:
+   it is fronted. (`observe` counts it and scans it anyway; `off` has no cap.)
 3. If hints apply to the client's address, the secrets it matched before are
-   tried first. Each is one HMAC, a hit finishes the handshake, and a hit is
-   outside the budget.
+   tried first. Each is one HMAC (at most 16), a hit finishes the handshake, and
+   a hit is outside the budget.
 4. Otherwise the budget is charged for a scan over the remaining secrets, at
    `secrets × max(blocks, 12)` blocks, where an ordinary 517-byte hello is 12
-   blocks. If both buckets can pay within 150 ms, the scan waits for them and
-   runs. If not, the hello is **fronted to the cover site with exactly the bytes
-   a hello that matched nothing gets**, neither bucket is charged, and the
-   connection is never closed.
+   blocks. If both buckets can pay within 150 ms, the scan waits for them, if it
+   has to, and runs. If not, the hello is **fronted at once to the cover site
+   with exactly the bytes a hello that matched nothing gets**, neither bucket is
+   charged, and the connection is never closed.
 5. The charge is refunded only when the whole handshake then succeeds. A hello
    that matches nothing, a replay, and a disabled, expired, throttled or
    `ip-limit`-refused user all keep it.
@@ -624,15 +627,20 @@ logged at start at info level, which `debug = true` shows. As an illustration, a
 2,000 secrets and 34 ns a block a full scan of an ordinary hello is 24,000 blocks,
 about 0.8 ms of CPU, so the defaults let one address make about 60 unhinted
 scans a second (a burst of about 240) and let the process make about 1,200 on
-four cores. A returning client with a hint costs one HMAC and none of that. Both
-bursts are floored at the full scans of four ordinary hellos, so a very large
-secret count cannot shrink the budget below a few real clients.
+four cores. A returning client with a hint costs one HMAC in the usual case (at
+most 16) and none of that. Both bursts are floored at the full scans of four
+ordinary hellos, so a very large secret count cannot shrink the budget below a
+few real clients.
 
 Loopback, private, link-local, unspecified and multicast addresses, and a
 connection with no address, do not stand for one place. They have no bucket of
 their own and no hints, and share the process-wide bucket. Behind a carrier that
-does not forward the client address every client looks like that, so on such a
-deployment only the process-wide bucket applies.
+connects from a loopback or private address and does not forward the client's,
+every client looks like that, so on such a deployment only the process-wide
+bucket applies. A front proxy on a **public** address that sends no PROXY header
+is the opposite case: every client arrives from that one address and shares one
+`per-ip-ms` bucket, so set `per-ip-ms = 0` there, and leave the process-wide
+bucket to bound the work.
 
 `mode` is what happens when the budget says no:
 
@@ -650,13 +658,14 @@ deployment only the process-wide bucket applies.
 **The accepted degradation.** Under `enforce`, a legitimate client with no hint
 can be fronted: while a flood keeps the process-wide bucket empty, or while
 someone else behind the same address has drained that address's bucket. It is
-fronted within 150 ms and retries. Clients with a hint, streams already
-established and the data path are unaffected. To keep new users out, an attacker
-has to keep the process-wide bucket empty, which costs them about `cpu-percent`
-of this proxy's real CPU in scan work; before this table existed the same effort
-could starve everything, relays included. `observe` and its counters exist so you
-can see whether this ever touches your users before you enforce. See [[Security]]
-for what the budget defends and what it cannot.
+fronted at once and retries. Clients with a hint (when `hints` is on; it follows
+`track-client-ips`), streams already established and the data path are
+unaffected. To keep new users out, an attacker has to keep the process-wide
+bucket empty, which costs them about `cpu-percent` of this proxy's real CPU in
+scan work; before this table existed the same effort could starve everything,
+relays included. `observe` and its counters exist so you can see whether this
+ever touches your users before you enforce. See [[Security]] for what the budget
+defends and what it cannot.
 
 **Hints and privacy.** The cache holds a client address and the name of a secret
 it matched (a panel's names are often emails) in process memory, for 30 to 60
@@ -670,13 +679,21 @@ so a hint can never make a wrong secret match, and a hello that matches nothing
 can neither plant one nor read one. It is written only after the whole handshake
 has succeeded.
 
-That is still an address kept past the connection, which is exactly what
+That is still an address kept past the connection, tied to a name, which is what
 `track-client-ips` is the switch for. So `hints` **defaults to the value of
-`track-client-ips`**: a standalone deployment keeps the promise that no client
-address outlives its connection, and one that has already chosen to keep
-addresses gets the cache with no further setting. Without it, a returning client
-pays the same scan as a stranger, within the budget. `hints = true` turns the
-cache on without tracking; `hints = false` keeps it off even with tracking.
+`track-client-ips`**: a deployment that has not chosen to keep client addresses
+gets no address-to-secret cache, and one that has gets it with no further
+setting. Without it, a returning client pays the same scan as a stranger, within
+the budget. `hints = true` turns the cache on without tracking; `hints = false`
+keeps it off even with tracking.
+
+**The per-address bucket is a separate thing, and neither `hints` nor
+`track-client-ips` governs it.** It holds an address (IPv4, or IPv6 /64) — no
+secret name, nothing else — in process memory for 30 to 60 minutes after its last
+unhinted scan; it is never logged, exported or written to disk; `per-ip-ms = 0`
+keeps none. It is what stops one source from spending the whole budget, so it is
+on by default, and it sees every address that is charged for an unhinted scan: a
+prober's hello as much as a client's first one.
 
 **Restart only.** The table is read once at start. `POST /reload` re-reads
 `[secrets]`, `[secret-ad-tags]` and `[secret-limits]`, not this, so a change

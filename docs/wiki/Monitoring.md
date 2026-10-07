@@ -151,7 +151,7 @@ the process started.
 
 | Field | Meaning |
 |---|---|
-| `hinted` | Hellos matched by a secret the client's address had matched before: one HMAC, outside the budget. |
+| `hinted` | Hellos matched by one of the secrets the client's address had matched before: usually one HMAC, at most 16, outside the budget. Only with `hints` on. |
 | `scanned` | Hellos matched by the scan over the hosted secrets. |
 | `unmatched` | Hellos the scan found no secret for. They were fronted to the cover site. |
 | `denied_ip` | Hellos refused because the client address's own bucket could not pay for a scan. Checked before the process-wide bucket. |

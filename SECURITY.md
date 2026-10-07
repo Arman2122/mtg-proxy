@@ -114,9 +114,10 @@ welcome as an ordinary issue.
 
 ## Known side channels on an obfuscated listener
 
-The `bind-to` port is FakeTLS only and is unaffected by everything below. A
-`[[listener]]` speaking plaintext obfuscated2 is a different door, off by
-default, and recommended on loopback behind a carrier such as tproxy-server.
+The `bind-to` port is FakeTLS only and is unaffected by everything below except
+the last paragraph. A `[[listener]]` speaking plaintext obfuscated2 is a
+different door, off by default, and recommended on loopback behind a carrier
+such as tproxy-server.
 These are the things we know about it and have chosen not to close. They are
 documented rather than hidden, because an operator putting one on a public
 address deserves to know what it gives away.
@@ -152,3 +153,9 @@ fix is a per-listener constant-work option, not a change to the default.
 **A successful handshake is followed by a dial; a failed one is not.** This is
 inherent to a proxy and is not fixable at this layer. It is the strongest
 reason to keep these listeners on loopback.
+
+**On the `bind-to` port, a refused ee hello is fronted sooner than a no-match.**
+Under `enforce`, the handshake budget fronts a hello it refuses or finds
+oversized at once, while a hello that matches no secret is fronted after its
+scan, so the time to the first fronted byte can differ even though the bytes the
+cover site receives are the same. The Security page of the wiki has the detail.
