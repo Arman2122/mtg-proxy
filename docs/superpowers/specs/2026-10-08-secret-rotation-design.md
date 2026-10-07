@@ -1,7 +1,8 @@
 # Rotation of a shared secret with an overlap period — design
 
-Date: 2026-10-08. Revision 2, after two advisor rounds and an independent adversarial review
-(1 blocker, 4 majors, 14 minors; see "Review dispositions"). Status: ready for a second review,
+Date: 2026-10-08. Revision 3. It follows two advisor rounds, an independent adversarial review
+(1 blocker, 4 majors, 14 minors) and a scoped re-review of revision 2 (0 blockers, 1 major,
+13 minors; verdict SOUND_WITH_FIXES). See "Review dispositions". Status: ready for the plan,
 under delegation. Piece R of the shared-secret program (A
 handshake at scale — done; B per-address governance — done, on `feat/client-governance`; **R
 this piece**, on `feat/secret-rotation`, stacked on B; C bounded slow-reader queue; D
@@ -115,7 +116,8 @@ therefore carries both** (D1): the CLI edits it, and the proxy reloads it.
 |---|---|---|
 | `POST /reload` of an unchanged file during the overlap | the file's (the new key) | accepted until `until`; no stream closed |
 | reload or restart after `until` | the file's | not accepted: an expired entry is inert (D11). On a reload, its live streams are closed by that swap (§4.1, the held-key predicate) |
-| the expiry sweep after `until` | unchanged | not accepted; its live streams closed within 5 s (10 s at worst, §4.2) |
+| the expiry sweep after `until` | unchanged | not accepted; its live streams closed at the next sweep tick (5 s), one tick later per collision with a reload or mutation that does not swap (§4.2) |
+| a stream racing an expiry or re-key swap between `attribute` and registration | the swap's | refused `key_revoked` at registration, or closed by the swap's walk. This holds **only because the re-check loads the set inside `liveMu`** (§4.3, L5b) |
 | restart during the overlap | the file's | accepted until `until` |
 | crash after the file write, before any reload | at restart, the file's (new) | per the file |
 | crash during the write | the old file is intact (atomic rename) | per the old file: no rotation happened |
@@ -158,9 +160,9 @@ Each is numbered and justified where it is made. The ones most worth auditing ar
   when there is no retiring key.
 - **D10** Expiry is judged by a high-water wall clock: one `mtglib.RotationClock` per process,
   handed to both the config layer's reloader and the engine (`ProxyOpts.RotationClock`).
-- **D11** Expiry is exact at admission and within one 5 s sweep for live streams (10 s at
-  worst, when the sweep's `TryLock` loses to a reload that then fails), with no extra
-  grace.
+- **D11** Expiry is exact at admission, and live streams close at the next 5 s sweep tick, or
+  in any swap before it. Each time the sweep's `TryLock` collides with a reload or mutation
+  that does not swap, the close moves one tick later. There is no extra grace.
 - **D12** A hinted name tries its primary, then its retiring keys. At most 32 hinted
   verifications per hello.
 - **D13** The budget is unchanged. Retiring candidates are charged like any other candidate.
@@ -168,7 +170,8 @@ Each is numbered and justified where it is made. The ones most worth auditing ar
   inner handshake.
 - **D15** `closeStaleConns` decides per stream, by the stream's own key. Its per-name fast path
   compares the **held-key sets** (primary plus every retiring key a set holds), with no clock.
-- **D16** Registration re-checks the key, which also closes the pre-existing re-key race.
+- **D16** Registration re-checks the key, loading the set **inside `liveMu`** before the ban
+  re-check. This also closes the pre-existing re-key race.
 - **D17** API mutations preserve retiring entries. A removal drops them, and a re-key onto a
   retiring key drops that entry. `SecretConfig.Retiring` has one meaning everywhere (nil is
   none); the HTTP PUT handler keeps entries through an unexported keep-merge.
@@ -270,17 +273,35 @@ against the pinned go-toml:
 A UTF-8 byte-order mark at the start of the file is refused by today's parser
 (`toml: invalid character at start of key`). This piece does not change that.
 
-`Config` gains `RetiringSecrets []ConfigRetiringSecret json:"retiringSecrets,omitempty"`.
-`ConfigRetiringSecret` has `Name`, `Secret` and `Until` as raw strings plus an unexported
-wrong-type mark. The values are **not** parsed during the JSON decode, because a
-`TextUnmarshaler` error would carry no index and might echo the value. `omitempty` keeps
-`Config.String()` byte-identical for every file without the table, including the panel's.
+`Config` gains the field `RetiringSecrets []ConfigRetiringSecret
+json:"retiringSecrets,omitempty"`. `ConfigRetiringSecret` has `Name`, `Secret` and `Until` as
+raw strings, plus an **unexported** wrong-type mark.
+- **The values are not parsed during the JSON decode,** because a `TextUnmarshaler` error would
+  carry no index and might echo the value.
+- **How the mark is set (m8 of the second review).** An unexported field neither crosses the
+  JSON step nor appears in `Config.String()`. So `Parse` sets the mark on
+  `conf.RetiringSecrets[i]` **after** the JSON decode, from the record its normalisation pass
+  over `tomlConf.RetiringSecrets` kept: which fields of entry `i` had the wrong TOML type.
+- `omitempty` keeps `Config.String()` byte-identical for every file without the table,
+  including the panel's.
 
-### 1.2 Reading it: `(*Config).RetiringSecrets(now) ([]mtglib.RetiringSecret, []string)`
+### 1.2 Reading it: `(*Config).GetRetiringSecrets(now) RetiringReport`
 
-This returns the usable entries (rule-4 entries included) and the lines: one per problem or
-warning, which `--check` refuses alike. It is pure (no logging, no state) and takes `now`, so a
-test injects the clock.
+The method follows the package's pattern of a field `X` with a method `GetX` (`Secrets` and
+`GetSecrets`). A method named like the field would not compile (m1 of the second review). It
+returns a small struct (m7 of the second review), so every output the callers need has a
+channel:
+
+```go
+type RetiringReport struct {
+    Usable  []mtglib.RetiringSecret // what the engine is handed (rule-4 entries included)
+    Lines   []string                // one per problem or warning; --check refuses any; logged at Warning
+    Expired int                     // rule-2 entries: the Info summary, doctor's count and the --prune hint
+    Notes   []string                // Info lines: rules 6 and 7 (inert duplicates, own-primary keys)
+}
+```
+
+It is pure (no logging, no state) and takes `now`, so a test injects the clock.
 
 Every caller uses it, and each says which clock its `now` comes from:
 - inside `run` (the start-up and the reloader): the process's one `RotationClock` (§2.3, D10);
@@ -366,22 +387,28 @@ a credential and may be echoed.
 
 ### 1.4 Wiring
 
-- **The clock.** `runProxyWith` builds the process's clock first:
-  `clock := mtglib.NewRotationClock(time.Now, onBehind)`, where `onBehind` logs the §2.3
-  Warning with the run's logger. It hands the clock to both `makeSecretsReloader(configPath,
-  logger, clock)` and `ProxyOpts.RotationClock`. The reloader is built before `NewProxy` and
-  has no handle on the proxy, so this shared value, and no package global, is how the config
-  layer and the engine read one clock.
-- `makeSecretsReloader` calls `conf.RetiringSecrets(clock.Now())`, puts `Retiring: usable` in
-  the `SecretConfig` it returns, and logs each problem or warning line at Warning in
-  `warnUnknownKeys`' wording style, on start-up and on every reload.
-- `runProxyWith` passes `ProxyOpts.RetiringSecrets` (judged on the same clock) and logs the
-  lines once.
-- `checkConfig` refuses when there are unknown keys **or** retiring lines:
+- **The clock.** `runProxyWith` gains a `now func() time.Time` parameter beside `listen`:
+  `runProxy` passes `time.Now`, and the `run_proxy_loop_test.go` harness passes a fake (m4 of
+  the second review). Right after building the logger, it builds the process's one clock,
+  `clock := mtglib.NewRotationClock(now, onBehind)`, where `onBehind` logs the §2.3 Warning with
+  the run's logger.
+  - It hands that one clock to both `makeSecretsReloader(configPath, logger, clock)` and
+    `ProxyOpts.RotationClock`.
+  - The reloader is built before `NewProxy` and has no handle on the proxy, so this shared
+    value, and no package global, is how the config layer and the engine read one clock.
+  - `runProxy` is the only production caller, for both `run` and `simple-run` (whose reloader
+    is nil), so there is no second construction site.
+- `makeSecretsReloader` calls `conf.GetRetiringSecrets(clock.Now())` and puts
+  `Retiring: report.Usable` in the `SecretConfig` it returns. On start-up and on every reload it
+  logs each of `report.Lines` at Warning, in `warnUnknownKeys`' wording style, and
+  `report.Expired` and `report.Notes` at Info.
+- `runProxyWith` passes `ProxyOpts.RetiringSecrets = report.Usable` (judged on the same clock)
+  and logs the report once.
+- `checkConfig` refuses when there are unknown keys **or** `report.Lines` is non-empty:
   `errRetiringProblems`, listing them.
-- `doctor` lists the lines and counts expired entries with the `--prune` hint. A retiring line
-  **fails the doctor's verdict**, as an unknown key does (`checkUnknownKeys`); expired entries
-  alone do not.
+- `doctor` lists `report.Lines` and shows `report.Expired` with the `--prune` hint. A retiring
+  line **fails the doctor's verdict**, as an unknown key does (`checkUnknownKeys`); expired
+  entries alone do not.
 
 ### 1.5 The `SECRET` environment override (D29)
 
@@ -499,16 +526,25 @@ type RotationClock struct {
 }
 
 func NewRotationClock(now func() time.Time, onBehind func(time.Duration)) *RotationClock
-func (c *RotationClock) Now() time.Time   // nil-safe: a nil clock is time.Now
+func (c *RotationClock) Now() time.Time   // nil pointer: time.Now; zero value: high-water on time.Now
 ```
 
-- **What `Now()` does.** It returns `max(now(), mark)` and advances `mark` by CAS.
+- **What `Now()` does.** It returns `max(source(), mark)` and advances `mark` by CAS. `source`
+  is `c.now`, or `time.Now` when `c.now` is nil.
+- **The zero value is usable (m3 of the second review).** The fields are unexported, so the
+  only value a library caller can build without `NewRotationClock` is `&RotationClock{}`. Its
+  `now` is nil, and it must not panic. It is therefore a real high-water clock on `time.Now`
+  with no `onBehind`. A nil pointer reads plain `time.Now`, with no high-water mark. E5 covers
+  both.
 - **Who holds it.** `Proxy.rotation` is `ProxyOpts.RotationClock`, or one `NewProxy` builds on
-  `time.Now` (with `onBehind` logging through the proxy's logger) when the option is nil. A
-  `Proxy{}` literal in a test has nil, which reads `time.Now`.
+  `time.Now` (with `onBehind` logging through the proxy's logger) when the option is nil.
+  `NewProxy` resolves the clock right after it builds its logger and **before** it builds the
+  initial set, because that build reads the clock (`proxy.go:182`–`185`). A `Proxy{}` literal
+  in a test has nil, which reads `time.Now`.
 - **What it governs.** In the `run` process it is the only clock for retiring expiry: the
-  reloader's `RetiringSecrets(now)` (§1.4), `buildSecretSetAt`'s `now`, the door checks, the
-  sweep, the registration re-check and the read-backs.
+  reloader's `GetRetiringSecrets(now)` (§1.4), `buildSecretSetAt`'s `now` (including
+  `NewProxy`'s initial build), the door checks, the sweep, the registration re-check, the §6.3
+  change-log classification and the read-backs.
 - **Who does not use it.** `checkLimits` keeps `time.Now()` for a user's own `ExpiresAt`, as
   today. The separate processes in §1.2 (`--check`, `doctor`, `rotate-secret`) use
   `time.Now()`.
@@ -517,8 +553,11 @@ func (c *RotationClock) Now() time.Time   // nil-safe: a nil clock is time.Now
 from the moment it starts:
 - `onBehind` fires once with the gap;
 - the config layer and the engine both judge expiry by `mark`, so an entry whose `until` lies
-  between the wall clock and `mark` is expired for both: dropped as `expired`, its streams
-  closed at the next swap or sweep;
+  between the wall clock and `mark` is expired for both;
+- a reload's config layer filters it as inert (rule 2, counted in `report.Expired`), so the
+  engine is never handed it; an entry already in the set is dropped by the next swap's build;
+- either way its streams close in that swap or at the next sweep, and the §6.3 diff logs
+  "overlap ended";
 - new handshakes on it are refused at the door;
 - when the wall clock passes `mark` again, the episode ends and `behind` resets;
 - nothing that `mark` judged expired is accepted again, because `mark` never decreases.
@@ -621,8 +660,11 @@ closed") but decides it **per stream**, and gains a `now` parameter.
 Two sets per name, kept apart on purpose:
 
 - **Held-key set:** the primary plus every retiring key a set *holds*, expired or not. It is a
-  pure function of the set and reads no clock.
-- **Accepted-key set:** the primary plus the retiring keys with `until > now`.
+  pure function of the set and reads no clock. For a name the set does not have, it is the
+  **empty set** (m9 of the second review), so a name re-added after a removal never takes the
+  fast path.
+- **Accepted-key set:** the primary plus the retiring keys with `until > now`; empty for an
+  absent name.
 
 `swapSecretConfigLocked` reads `now` once from the rotation clock and passes the same value to
 `buildSecretSetAt` and to `closeStaleConns(oldSet, newSet, now)`. For each name in
@@ -651,11 +693,18 @@ The outcomes:
 | expiry sweep, or a reload after `T` | {K2, K1} → {K2} (the build at `now ≥ T` dropped K1) | the K1 streams closed |
 | `--end-overlap` reload | {K2, K1} → {K2} | the K1 streams closed |
 
-**Equivalence without retiring keys.** Held and accepted sets are both {primary}, so this
-decides exactly what today's code decides. Every live stream of a name holds the name's current
-primary, because any re-key closed the others at its own swap, and D16 makes that true across
-the attribute-to-register race too. So a primary change closes all of the name's streams, as
-today.
+**Equivalence without retiring keys (worded exactly; m9 of the second review).** Held and
+accepted sets are both {primary}.
+- **For every stream registered before the swap,** this decides what today's code decides.
+  Every such stream holds the name's previous primary: any earlier re-key closed the others at
+  its own swap, and D16 makes that true across the attribute-to-register race. So a primary
+  change closes them all, as today.
+- **The one difference is an improvement.** A stream that registered on the **new** key in the
+  window between the swap's `Store` and its walk (it loaded the new set inside `liveMu`, §4.3)
+  is now kept. Today's code closes it needlessly, because its rule is "the key changed, close
+  every stream of the name".
+- **Measured.** The reviewer overlaid this rule into today's code, and the whole `mtglib` suite
+  passed.
 
 **The `newSet` judgment at `now` is belt and braces.** `buildSecretSetAt` has already dropped
 every entry expired at `now`, so for a set built by this swap, held and accepted are equal. The
@@ -686,8 +735,11 @@ read and parse, and an API mutation holds it too. Waiting behind one would stall
 maintenance goroutine's `closeDeniedConns`, quota rollover and usage flush. A missed tick
 retries 5 s later. If the holder swaps, it rebuilds at its own `now`, which drops the expired
 entry and closes its streams (§4.1): the reload does the sweep's work. If the holder fails
-without swapping, the close comes one tick later. Either way it is never more than one tick
-late.
+without swapping, the close moves one tick later. That repeats for as long as every tick
+collides with such a holder, for example a script POSTing `/reload` in a tight loop against a
+file that does not parse (m11 of the second review). So the delay is **one tick per collision,
+not a fixed bound**. Admission stays exact throughout, because the doors and D16 check `until`
+themselves. Only streams already open wait.
 
 - The expiry swap rebuilds from the **current** set, so API overrides survive it. The lock
   order is `reloadMu` → `liveMu` → `tableMu`, as for every swap.
@@ -696,10 +748,9 @@ late.
 - One swap happens per distinct expiry instant. At 5,000 secrets the rebuild costs about
   10,000 SHA-256 blocks of pad precomputation (about 3.4 ms on the bench box, from piece A's
   per-block figure). The benchmark measures it (§13).
-- **Precision.** New handshakes stop at `until` exactly (§3). Live streams are closed within
-  5 s. The exception is up to 10 s, when a tick finds `reloadMu` held by a reload or mutation
-  that then fails without swapping. A successful swap rebuilds at its own `now` and closes them
-  itself.
+- **Precision.** New handshakes stop at `until` exactly (§3). Live streams are closed at the
+  next tick (5 s), or by any swap before it, and one tick later per collision with a reload or
+  mutation that does not swap (above).
 - **No extra grace.** The overlap is the grace the operator chose. A second grace would make
   the real deadline something no file states.
 - **Rejected:**
@@ -710,28 +761,59 @@ late.
 
 ### 4.3 Registration re-checks the key (D16)
 
-`tryRegisterConn` gains a first step, before the ban re-check and before anything the
-rollback must undo:
+**Where the check sits is the whole of its correctness (M1′ of the second review).**
+`tryRegisterConn` resolves the client address *before* it takes `liveMu` (`ip`, `key`,
+`keyed`, `now`). The key re-check must **not** join that preamble. It runs **under `liveMu`,
+immediately after `p.liveMu.Lock()`, before the ban re-check** and before anything the rollback
+must undo. Both the set (`p.secrets.Load()`) and the stream's held key (`ctx.matchedSecretKey`,
+`ctx.retiringUntil`) are read inside the critical section:
 
 ```go
+beforeRegisterLockHook(ctx)            // test seam: a package-level func like registerStepHook; no-op in production
+p.liveMu.Lock()
+defer p.liveMu.Unlock()
+
+// The key re-check. The Load MUST stay below the Lock: a set read before it can be one a swap
+// replaced while this stream waited on liveMu -- and that swap's walk ran exactly then.
 cur := p.secrets.Load()
-if cur != ctx.attrSet || !ctx.retiringUntil.IsZero() {        // pointer compare in the common case
+if cur != ctx.attrSet || !ctx.retiringUntil.IsZero() {   // pointer compare in the common case
     if !cur.accepts(ctx.secretName, ctx.matchedSecretKey, p.rotation.Now()) {
-        return refuse(DenyKeyRevoked)
+        return refuse(DenyKeyRevoked)                    // nothing taken yet: refuse undoes nothing
     }
 }
+// ... then the ban re-check, the cap, the ledger, the table entry, the registration, as today.
 ```
 
 `accepts` does a binary search for the name, compares the primary key, then checks the name's
 `retiringOf` entries (key equal and `now < until`).
 
-A swap stores its set **before** it takes `liveMu` to walk `liveConns`. A stream is therefore
-either registered before the walk (and judged by `closeStaleConns`), or registers after it
-(and reads the new set here). This closes the new race (a retiring key that expires, or is
-removed, between `attribute` and registration). It **also closes the existing race** for a
-plain re-key described under "Where things stand", which is a behaviour change. It can only
-refuse a connection whose key the set no longer accepts. It is tested with
-`registerStepHook`-style seams, never by hammering.
+**Why it has to be inside.** A swap stores its set **before** it takes `liveMu` to walk
+`liveConns`. If the stream loads the set under `liveMu`, it is either registered before the
+walk (and judged by `closeStaleConns`), or it takes the lock after the walk and loads the set
+the swap stored, which no longer accepts the key. Loaded before the lock, it could hold a set
+the swap has since replaced. Its `Lock()` would then return right after the walk it waited on,
+and it would register a just-expired or just-removed key. That stream would live until its
+client hangs up: no later sweep looks at a name whose set holds no retiring entry, and later
+swaps skip the name.
+
+This closes the new race (a retiring key that expires, or is removed, between `attribute` and
+registration). It **also closes the existing race** for a plain re-key described under "Where
+things stand", which is a behaviour change. It can only refuse a connection whose key the set
+no longer accepts.
+
+**Tested with seams, never by hammering.**
+- **L5:** `afterAttributeHook` runs a swap before registration starts.
+- **L5b:** the new `beforeRegisterLockHook`, called immediately before `p.liveMu.Lock()`, runs
+  a **complete** swap at the one point where the two placements differ. A Load above the Lock
+  passes L5 and fails L5b.
+
+**Order against piece B's contract.** The ban re-check stops being the first step:
+- the key re-check now precedes it, so a revoked key arriving from a banned place is refused
+  and logged as `key_revoked`, not `banned`;
+- the ban re-check still precedes the cap, the address limit and the ledger, which is what
+  `TestTheReCheckIsTheFirstStep` asserts;
+- that test is renamed (`TestTheBanReCheckPrecedesTheLimits`) with its assertions unchanged,
+  and the comment at `proxy_serve.go:490` is updated (task 0).
 
 `ctx.attrSet` is cleared once registration passes, so a long-lived stream does not pin a whole
 old set (candidates and pad states) for hours. `matchedSecretKey` still points into the key
@@ -744,7 +826,19 @@ it takes `denyObfuscated`.
 
 **Alternative rejected:** re-checking only streams on a retiring key. That leaves the existing
 re-key race open. The cost of covering everyone is one atomic load and one pointer compare per
-admission.
+admission, inside `liveMu`.
+
+**The cost to the existing tests (m2 of the second review, measured by the reviewer).** With
+this check in place, **37 existing `mtglib` tests fail**, and some subtests pass only
+vacuously.
+- **Why they fail.** Their helpers register hand-built streams without `attribute()`:
+  `registerFakeStream`, `denyProbe.stream`, the ban and cap probes, and others. So `attrSet`
+  and `matchedSecretKey` are nil and the check refuses them.
+- **Which pass vacuously.** In `TestProxyReloadSecrets`, "added secret … disturbs nothing" and
+  the alice half of "removed secret …" pass only because `registerFakeStream` ignores the
+  result of `tryRegisterConn`, so the stream is never registered.
+- **The fix is task 0 (§15).** It comes before every engine task: the helpers attribute
+  through the stored set and register for real.
 
 ### 4.4 What else applies to both keys
 
@@ -786,6 +880,10 @@ calls `swapSecretConfigLocked`.
 Revision 1 instead overloaded `cfg.Retiring == nil` to mean "keep" inside the exported
 `ReplaceSecrets` and "none" in `ReloadSecrets`. Every library caller that built
 `SecretConfig{Secrets: …}` would then have kept entries without knowing.
+
+**For embedders, said once.** A library `ReplaceSecrets` with a nil `Retiring` ends every
+overlap until the next reload of the file grants them again. That is a kill-then-revive, but
+within the operator's own grant, so it is no R0 breach. The field's doc comment says so.
 
 The merge happens under `reloadMu`, against the set as it is at that moment. A PUT therefore
 cannot re-add an entry that a reload or the expiry sweep removed after the handler read the
@@ -861,6 +959,19 @@ The config path parses `secret` itself (§1.1) with value-free messages and neve
 and HTTP body during a scripted rotation and asserts that neither the hex nor the base64
 spelling of the retiring value, nor its key, appears anywhere.
 
+**The parser's error, printed safely (m13 of the second review, verified by overlay).**
+- go-toml's `DecodeError.Error()` (`"toml: " + message`) never contained the document's bytes
+  in the reviewer's tests: the scalar shape holding an `ee…` value, a duplicate `secret` key,
+  an unterminated string. Neither did `config.Parse`'s `%w`-wrapped error.
+- `DecodeError.String()`, the human form with the offending line as context (`errors.go:76`),
+  **contained the value every time**.
+- So wherever this piece prints "the parser's own error" (`run --check`, `rotate-secret` step 1,
+  the `/reload` failure log), it prints the error's `Error()` text and never calls `String()` on
+  a `*toml.DecodeError`. Formatting the error value with `%v`, `%s` or `%w` uses `Error()`,
+  which is safe; only an explicit `String()`, or an `errors.As` into the type followed by its
+  human form, is not. Nothing in `internal/` calls `String()` today. R7 and C8 pin it with a
+  refused scalar-shape file whose refused line holds a secret value.
+
 ### 6.2 Logs
 
 All lines carry `secret_name` and times; none carries a key.
@@ -868,7 +979,7 @@ All lines carry `secret_name` and times; none carries a key.
 | When | Level | Message | Fields |
 |---|---|---|---|
 | start and every swap, per entry that is new in this set | Info | `secret accepts a previous key until its overlap ends` | `secret_name`, `until` |
-| an entry leaves the set because it expired (sweep, or a reload or swap after `until`; engine reason `expired`) | Info | `previous key of the secret is no longer accepted: overlap ended` | `secret_name`, `until`, `closed` |
+| an entry leaves the set because it expired: the sweep, or any reload or swap after `until`. Classified by the §6.3 diff, not by an engine drop reason | Info | `previous key of the secret is no longer accepted: overlap ended` | `secret_name`, `until`, `closed` |
 | an entry leaves the set otherwise (file edit, removal) | Info | `previous key of the secret is no longer accepted` | `secret_name`, `reason`, `closed` |
 | a config problem or warning | Warning | (§1.3 line) | |
 | an engine drop that is not an expiry | Warning (`same_as_primary` and `duplicate`: Info) | `a retiring key was ignored` | `secret_name`, `reason` (`dangling`, `same_as_primary`, `duplicate`, `key_of_other_secret`, `over_cap`) |
@@ -887,6 +998,20 @@ the race it closes (m11 of the review).
 `swapSecretConfigLocked` diffs `oldSet.retiring` with `newSet.retiring`, matching entries by
 (name, key) and never logging the key, to choose the lines above. A swap that changes nothing
 about rotation logs nothing about it.
+
+**How the diff classifies an expiry (m6 of the second review).** An entry of `oldSet` that is
+absent from `newSet` is logged **"overlap ended"** when its `until` ≤ the swap's `now`. That is
+the same single `now` the build and `closeStaleConns` use (§4.1). Otherwise it is logged
+"no longer accepted" with `reason` (`removed` from the file or by the API).
+
+The engine's `expired` drop reason does not reach this line. On a reload after `until`, the
+config layer has already filtered the entry as inert (rule 2), so the engine is never handed it
+and logs no drop. The diff is the only place that sees the entry leave. The `expired` engine
+reason (§2.1) covers only an entry that expires between the reloader's read and the build. It is
+logged at Info as the drop it is, and the diff then logs the same entry's "overlap ended" line
+with its `closed` count.
+
+L2b's reload-only variant asserts the line and its count.
 
 ## 7. The operator surface: `mtg-proxy rotate-secret` (D22–D26, D32)
 
@@ -967,10 +1092,11 @@ original bytes. The repo pins v2.4.3.
 - A same-line trailing comment is not in the AST, which is harmless to a byte splice.
 
 1. **Read and check.** Read the file. `config.Parse` the raw bytes; it must parse, and `Validate`
-   must pass. A file today's parser refuses is refused here with the parser's own error: the
-   scalar shape of §1.1, or a UTF-8 BOM (`toml: invalid character at start of key`). Compute
-   `RetiringSecrets(now)` with one fixed `now` for the whole run. Existing problems are warned
-   about but do not block an urgent rotation; new ones do (step 5).
+   must pass. A file today's parser refuses is refused here with the parser's own error, in its
+   `Error()` form only (§6.1): the scalar shape of §1.1, or a UTF-8 BOM (`toml: invalid
+   character at start of key`). Compute `GetRetiringSecrets(now)` with one fixed `now` for the
+   whole run. Existing problems are warned about but do not block an urgent rotation; new ones
+   do (step 5).
 2. **The new primary.** Find the string node of the name's value. The full key path is the
    current table's path plus the key, so `[secrets] shared = …`, `secrets.shared = …`,
    `[secrets] "shared" = …` and `secrets = { shared = … }` all resolve. For `"default"` (only
@@ -989,20 +1115,20 @@ original bytes. The repo pins v2.4.3.
 4. **Removing a block** (`--prune`, `--end-overlap`). A block is introduced by either header
    kind: `[[retiring-secret]]`, or the single-table typo `[retiring-secret]`, which the parser
    reads as one entry (§1.1). Removed: from the start of the block's header line up to the start
-   of the next header line, or to the end of the file. That end
-   point is first walked back over the comment and blank lines directly above the next header,
-   so a comment that heads the next table survives. A comment a person wrote inside a removed
+   of the next header line, or to the end of the file. That end point is first walked back over
+   the comment and blank lines directly above the next header, so a comment that heads the next
+   table survives. A comment a person wrote inside a removed
    block goes with it (documented).
 5. **Verify by re-parse (the safety net).** `config.Parse` the new bytes. Not
    `utils.ParseConfig`: its environment overlay and validation would hide or fail the diff. The
    result must equal the old parse in **every** field (`reflect.DeepEqual` on `Config`,
    `UnknownKeys` included) except two:
    - the name's primary, which must equal the generated secret;
-   - `RetiringSecrets`, which must equal the old list minus the removed entries plus the new
-     one, compared as raw (name, secret, until) triples.
+   - the `RetiringSecrets` field, which must equal the old list minus the removed entries plus
+     the new one, compared as raw (name, secret, until) triples.
 
-   `Validate` must still pass, and `RetiringSecrets(now)` must report no problem or warning the
-   old file did not have. Any difference means nothing is written: `internal error: the edit
+   `Validate` must still pass, and `GetRetiringSecrets(now).Lines` must hold no problem or
+   warning the old file did not have. Any difference means nothing is written: `internal error: the edit
    changed more than it meant to; nothing was written`. This catches every layout the splice
    mishandles, including a user appended after the block that would otherwise fall inside it
    (`UnknownKeys` would differ).
@@ -1075,37 +1201,47 @@ the subtle bugs will be.
 - **Address.** It reads `api-bind-to` and `api-token` from the file. A host of `0.0.0.0` or
   `::` is reached at `127.0.0.1` or `::1`. A missing `api-bind-to` is a refusal before anything
   is written.
-- **Before writing:** `GET /stats`, and for a rotation or `--end-overlap` also
-  `GET /secrets/{name}`, which records the `before` primary.
+- **Before writing:** `GET /stats` only, for reachability and features. Revision 2's pre-write
+  `GET /secrets/{name}` is dropped: nothing needs it now that every check compares with the
+  written file (m5 of the second review).
   - An unreachable API is a refusal (the operator asked for a reload; writing without one would
     half-apply).
   - If `features` lacks `secret-rotation` (an older running binary, which would ignore the block
     and kill the old key at the reload), it refuses unless `--force`.
-- **After writing:** `POST /reload`, then `GET /secrets/{name}`. Each check that fails is named,
-  with its own likely causes:
-  1. **Primary.** The `secret` field (base64) must **parse to the same key, mode and host** as
-     the generated value, which the file may hold as hex: compare the parsed `Secret`s, not the
-     strings. `--end-overlap` requires the primary to be unchanged from `before`. Likely causes
-     of a mismatch: a `SECRET` environment variable overriding `[secrets]`; a single-file bind
-     mount that still shows the old file (mount the directory); another process that rewrote
-     the file.
+- **After writing:** `POST /reload`, which must answer 200. Then, for each name the run touched
+  (the rotated or ended name, and every pruned name still configured), `GET /secrets/{name}`.
+  **Every expected value comes from one source: the bytes just written**, parsed with
+  `config.Parse` and judged with `GetRetiringSecrets(now)`, `now` read just before the GETs.
+  Each check that fails is named, with its own likely causes:
+  1. **Primary** (every form that names a name: rotation, `--overlap 0`, `--end-overlap`). The
+     `secret` field (base64) must **parse to the same key, mode and host** as the name's
+     primary **parsed from the written bytes**, which may hold hex: compare the parsed
+     `Secret`s, not the strings. For a rotation that is the generated value. For
+     `--end-overlap` it is whatever the file holds, so an earlier rotation written without
+     `--reload`, or an API re-key since, is not a false failure. Likely causes of a mismatch:
+     - a `SECRET` environment variable overriding `[secrets]`;
+     - a single-file bind mount that still shows the old file (mount the directory);
+     - another process that rewrote the file.
   2. **Retiring count.** `retiring_keys` (absent means 0) must equal the number of the name's
-     usable entries in the **written file**, as `RetiringSecrets(now)` on the written bytes
-     judges them, with `now` read just before the GET. This is the review's "before + 1",
-     restated so that `--prune`, `--end-overlap` and an entry expiring in the meantime are all
-     counted from one source. Likely causes: the proxy's clock is ahead of this machine's (its
+     usable entries in the written file. This is the review's "before + 1", restated so that
+     `--prune`, `--end-overlap` and an entry expiring in the meantime are all counted from one
+     source. Likely causes of a mismatch: the proxy's clock is ahead of this machine's (its
      high-water mark judged an entry expired), or the proxy logged a problem with the block.
-  3. **Retiring end.** With a new block, `retiring_until` must be **≥ the written `until`**,
-     never equal. It is the latest `until` among the name's entries, so an earlier, longer
-     overlap legitimately reports a later time (M1 of the review). Likely cause of a failure:
+  3. **Retiring end.** With a new block, `retiring_until` must be **≥ the written `until`**; it
+     is not required to be equal. It is the latest `until` among the name's entries, so an
+     earlier, longer overlap legitimately reports a later time (M1 of the review). Likely cause of a failure:
      the same as 2.
+
+  **`--prune` alone** names no single name. It requires the 200, then check 2 for each pruned
+  name that is still configured. A pruned name that is no longer configured has nothing to read
+  back.
 
   The message is `the file is rotated but the proxy does not serve it: <check> differs
   (<expected> vs <reported>); likely: <causes for that check>`. It never prints a secret.
 - **A failed reload:** exit non-zero with the same "the file is rotated" wording, and print
   **only the HTTP status line** of the failed `POST /reload`, never its body (m14 of the
-  review). The body is the proxy's error text, which can quote parser output this spec could not
-  verify is free of document bytes. The file is never rolled back: it is the truth, and a
+  review). The body is the proxy's error text. The proxy itself logs only `Error()` forms
+  (§6.1), but the CLI does not depend on that. The file is never rolled back: it is the truth, and a
   rollback would revive the leaked key at the next restart.
 - It does not reload other processes that share the file. The documentation says to reload each
   one.
@@ -1292,9 +1428,11 @@ to delete it. No backup copy exists (M3 of the review).
 Test seams:
 - `RotationClock`'s `now` is injected (`NewRotationClock(fake, onBehind)`), and the same
   instance is handed to the reloader and to `ProxyOpts.RotationClock`;
+- `runProxyWith`'s new `now` parameter, driven by the `run_proxy_loop_test.go` harness (m4′);
 - the maintenance sweep interval (`startMaintenanceEvery`);
-- `registerStepHook`, plus a new `afterAttributeHook` between `attribute` and `admit`, which is
-  a no-op in production;
+- `registerStepHook`, plus two new seams, both no-ops in production:
+  - `afterAttributeHook`, between `attribute` and `admit`;
+  - `beforeRegisterLockHook`, immediately before `tryRegisterConn` takes `liveMu` (M1′);
 - address-controlled connections (`dialProxyFrom`) for hinted cases.
 
 No wall-clock sleeps decide an outcome.
@@ -1303,17 +1441,22 @@ No wall-clock sleeps decide an outcome.
 - E1. `buildSecretSetAt` covers rules 2, 3, 5, 6, 7 and 8 at engine level, with the order and
   determinism of `retiring`, `cands` order (primaries first), `retiringCands`, `retiringNext`,
   and hosts in `hostnames` and `coverHosts`, but not `frontHost`.
-- E2. With no retiring entries every new field is nil or zero, and the set is `DeepEqual` to
-  `buildSecretSet`'s.
+- E2. With no retiring entries every new field is nil or zero. The set equals what **today's**
+  builder makes, checked against a frozen copy of today's `buildSecretSet` kept in a test file
+  (m10 of the second review). Comparing the new wrapper with itself would be vacuous. The fields
+  compared are names, secrets, hostnames, `cands` order, `candIdx`, `candByName`, `hosted`,
+  `frontHost`, ad tags and limits, over the existing candidate fixtures.
 - E3. `toConfig` → `buildSecretSetAt` round-trips retiring entries.
 - E4. `forget` drops them.
-- E5. `RotationClock`: backwards steps never lower `Now()`, `onBehind` fires once per episode
-  and again after the episode ends and a new one starts, and a nil clock reads `time.Now`.
-- E6. **One clock across the layers (M2 of the review):** during a behind-clock episode, a
-  reload through the real reloader on the shared clock neither passes nor accepts an entry the
-  mark has passed. The config layer's expired count includes it. A sabotage that gives the
-  reloader `time.Now` makes the engine log an `expired` drop and the counts disagree, so the
-  test fails.
+- E5. `RotationClock`: backwards steps never lower `Now()`, and `onBehind` fires once per
+  episode and again after the episode ends and a new one starts. A nil pointer reads
+  `time.Now`. **The zero value `&RotationClock{}`** neither panics nor runs backwards (m3′).
+- E6. **One clock across the layers (M2; reached through `runProxyWith`, m4′):** the
+  `run_proxy_loop_test.go` harness drives `runProxyWith` with a fake `now` and `POST`s
+  `/reload` during an injected behind-clock episode. The reload neither passes nor accepts an
+  entry the mark has passed, the config layer's expired count includes it, and the engine logs
+  no `expired` drop for it. A sabotage that builds a second clock for the reloader inside
+  `runProxyWith` makes the engine log that drop and the counts disagree, so the test fails.
 
 **Doors (D)**
 - D1. An ee client on a retiring key completes a real handshake. Its server flight is
@@ -1347,19 +1490,32 @@ No wall-clock sleeps decide an outcome.
     sweep on the next tick.
 
   In every variant no K1 stream survives, and after the close the name's later swaps never
-  touch the K2 streams.
+  touch the K2 streams. The reload-only variant also asserts the "overlap ended" log line, with
+  the closed count, from the §6.3 diff (m6′).
 - L3. An `--end-overlap` reload closes them at once.
-- L4. A re-key with no overlap closes every stream of the name (today's behaviour, unchanged).
+- L4. A re-key with no overlap closes every stream registered **before** the swap (today's
+  behaviour). A stream registered on the new key between the swap's `Store` and its walk is
+  kept (m9′; the improvement is pinned at the same seam as L5b).
 - L5. `afterAttributeHook` swaps in a set without the key, and registration refuses with
   `key_revoked`, both for a retiring key and **for a plain re-key** (the existing race,
   fixed).
+- L5b. **(M1′ of the second review)** `beforeRegisterLockHook` runs a **complete** swap, from
+  `Store` to the end of its walk, at the instant just before `tryRegisterConn` takes `liveMu`.
+  There are two variants:
+  - the swap expires the stream's retiring key (an injected clock past `until`);
+  - the swap re-keys the stream's name with no overlap.
+
+  Either way the registration must be refused `key_revoked`, and the stream must not appear in
+  `liveConns`. A Load placed above the Lock passes L5 but fails L5b: that is the test's
+  purpose.
 - L6. A swap that does not change the name's **held** keys takes the fast path (counted by a
   test-only counter), and a swap that changes them never does, even when both sets accept the
-  same keys at `now`.
+  same keys at `now`. A name absent from the old set (held = ∅) never takes it.
+- L7. Ban and kick apply to both keys. A revoked key arriving from a banned place is refused as
+  `key_revoked` (the key re-check comes first).
+- L8. Quota is shared by both keys.
 - L9. The expiry sweep uses `TryLock`: with `reloadMu` held by the test, the sweep returns at
   once, and the maintenance loop's `closeDeniedConns` still runs on that tick.
-- L7. Ban and kick apply to both keys.
-- L8. Quota is shared by both keys.
 
 **API (A)**
 - A1. `PUT /secrets` keeps the entries of names it keeps and drops those of names it removes.
@@ -1386,7 +1542,9 @@ No wall-clock sleeps decide an outcome.
 - C6. The env `SECRET` clears them.
 - C7. `Config.String()` redacts them and is byte-identical without the table.
 - C8. **Leak sweep:** a scripted rotation (CLI, reload, API reads, a refused reload, problem
-  lines, `/reload` 500 bodies, debug logs) never shows the retiring value in any spelling.
+  lines, `/reload` 500 bodies, debug logs) never shows the retiring value in any spelling. It
+  includes a refused scalar-shape file whose refused line holds a secret value, run through
+  `run --check`, a `POST /reload` and `rotate-secret` (m13′).
 - C9. **P1:** a seeded generator of files and times asserts that `--check` accepted at *t*
   implies accepted at *t′ > t*.
 - C10. The panel-emitted config yields no unknown keys and no problems.
@@ -1435,7 +1593,9 @@ No wall-clock sleeps decide an outcome.
   - the lock refusal and the hash-mismatch abort;
   - every `--reload` error, which prints only the HTTP status line of a failed `POST /reload`
     and never its body (m14 of the review; tested with a proxy whose 500 body contains the old
-    value).
+    value);
+  - the step-1 refusal of a scalar-shape file whose refused line holds a secret value, which
+    prints the parser error's `Error()` form only (m13′).
 - R8. `--dry-run` writes nothing and generates no key.
 - R9. `--overlap` is required; the 720 h bound holds; the 5th entry is refused; `--host` with dd
   is refused; `default` while `[secrets]` is present is refused.
@@ -1445,6 +1605,10 @@ No wall-clock sleeps decide an outcome.
   - **a second rotation inside a longer earlier overlap passes** (`retiring_until` is later
     than the written `until`, and `retiring_keys` is 2) (M1 of the review);
   - `--overlap 0` and `--end-overlap` count correctly;
+  - **`--end-overlap` after an earlier rotation written without `--reload`** passes check 1,
+    because the expected primary comes from the written file (m5′);
+  - **`--prune` alone** passes on the 200 and check 2 for each pruned name still configured
+    (m5′);
   - the unreachable-API refusal before writing.
 - R11. The panel-path heuristic refuses, and `--force` passes it.
 
@@ -1467,7 +1631,15 @@ No wall-clock sleeps decide an outcome.
 - judge the fast path's sets at `now` instead of by what they hold (L2b and L2 fail);
 - close expired-key streams in `expireRetiring` itself and leave `closeStaleConns` clock-judged
   (L2b's reload-only variant fails);
-- give the reloader `time.Now` instead of the shared clock (E6 fails);
+- build a second clock for the reloader in `runProxyWith` (E6 fails);
+- load the set in `tryRegisterConn` before taking `liveMu` (L5b fails);
+- leave a test helper registering a stream without a key, or ignoring `tryRegisterConn`'s
+  result (task 0's enumeration command lists it again);
+- print the parser's human form (`DecodeError.String()`) anywhere (C8 and R7 fail);
+- classify "overlap ended" by an engine drop reason instead of the §6.3 diff (L2b's
+  reload-only variant fails);
+- compare `buildSecretSet` with itself instead of with today's frozen copy (E2 becomes
+  vacuous; the review's own sabotage of the no-retiring set then survives);
 - have the sweep `Lock` instead of `TryLock` (L9 fails);
 - skip a name's retiring positions when its primary has no FakeTLS candidate (D4b fails);
 - require `retiring_until` to equal the written `until` in the read-back (R10's second-rotation
@@ -1534,24 +1706,58 @@ anything else is changed.
 
 | # | Task | Depends on | Review focus |
 |---|---|---|---|
-| # | Task | Depends on | Review focus |
-|---|---|---|---|
-| 1 | **Set building**: `RetiringSecret`, constants, `SecretConfig.Retiring` (one meaning of nil, documented on the field), `ProxyOpts.RetiringSecrets`, `buildSecretSetAt` (rules incl. the `expired` drop reason, order, candidates, hosts, cover hosts, `retiringNext`), held-key and accepted-key helpers on the set, `toConfig`/`forget` | — | nil-when-none; determinism; primary always wins; `frontHost` and `SecretsCanFront` untouched |
-| 2 | **Rotation clock**: exported `RotationClock` (`NewRotationClock`, `Now`, `onBehind`), `ProxyOpts.RotationClock`, `NewProxy` building its own when nil; the plumbing in `runProxyWith` that hands one instance to `makeSecretsReloader` and the proxy | — (1 for the option field) | monotonicity; one instance per process; no package global; no wall-clock decisions elsewhere |
-| 3 | **FakeTLS door**: split scan loop, lazy expiry, hinted positions with retiring (added whether or not the primary is a candidate) and the cap of 32, `matchAt`, `attribute`/`completeFakeTLS` carrying the key, `ctx.attrSet`/`retiringUntil` | 1, 2 | byte-identical loop 1; budget arithmetic; golden server flight; ee → dd hinted |
+| 0 | **The registration re-check, primary form (D16), and the test helpers it breaks.** `streamContext.attrSet`, set by `attribute`; `DenyKeyRevoked`; the check **under `liveMu`, right after the Lock, before the ban re-check** (§4.3); the seams `beforeRegisterLockHook` and `afterAttributeHook`; L5 and L5b (plain re-key variants). The helpers and the B contract are adapted as described under task 0 below the table | — | **the Load is inside `liveMu`** (L5b); **no test weakened**; the per-helper diff; the enumeration before and after |
+| 1 | **Set building**: `RetiringSecret`, constants, `SecretConfig.Retiring` (one meaning of nil, documented on the field), `ProxyOpts.RetiringSecrets`, `buildSecretSetAt` (rules incl. the `expired` drop reason, order, candidates, hosts, cover hosts, `retiringNext`), held-key and accepted-key helpers on the set (held = ∅ for an absent name), `toConfig`/`forget`, E2 against a frozen copy of today's builder | 0 | nil-when-none; determinism; primary always wins; `frontHost` and `SecretsCanFront` untouched |
+| 2 | **Rotation clock**: exported `RotationClock` (`NewRotationClock`, `Now`, `onBehind`, usable zero value), `ProxyOpts.RotationClock`, `NewProxy` resolving it before the initial build; `runProxyWith`'s `now` parameter and the plumbing that hands one instance to `makeSecretsReloader` and the proxy; E5 | 0 | monotonicity; one instance per process; no package global; zero value |
+| 3 | **FakeTLS door**: split scan loop, lazy expiry, hinted positions with retiring (added whether or not the primary is a candidate) and the cap of 32, `matchAt`, `attribute`/`completeFakeTLS` carrying the matched key and `ctx.retiringUntil` | 1, 2 | byte-identical loop 1; budget arithmetic; golden server flight; ee → dd hinted |
 | 4 | **Obfuscated door**: key list and index mapping, expiry | 1, 2 | allocation unchanged when none; off-by-one |
-| 5 | **Lifecycle**: `closeStaleConns` with the **held-key fast path** and per-stream judgment against the new accepted set at `now`; registration re-check + `DenyKeyRevoked`; `expireRetiring` with `TryLock` in the sweep; change logging | 3, 4 | B1: L2b in its three variants; lock order; the race seams; the plain re-key race fix |
+| 5 | **Lifecycle**: `closeStaleConns` with the **held-key fast path** and per-stream judgment against the new accepted set at the swap's one `now`; the re-check extended to retiring keys (`retiringUntil`, L5b expiry variant); `expireRetiring` with `TryLock` in the sweep; the §6.3 change log classified by `until ≤ now` | 3, 4 | B1: L2b in its three variants with the log line; lock order; **the Load still inside `liveMu`** |
 | 6 | **API mutations**: the unexported PUT keep-merge under `reloadMu`; `ReplaceSecrets`, `PutSecret`, `DeleteSecret` and adtag paths with one meaning of nil | 1, 5 | no revival through a PUT; panel re-key immediate; the revert row |
 | 7 | **Read-backs**: four fields in `/stats` and `SecretInfo`, read-time `retiring_connections`, `retiring_last_seen`, feature string | 5 | shapes unchanged without rotation; nothing under `users` |
-| 8 | **Config**: tomlConfig `any` fields + normalisation, `Config.RetiringSecrets(now)`, problems/warnings, `--check`, doctor (lines fail the verdict), env clear, `String()` redaction, the reloader on the shared clock, the shape facts (C15) | 1, 2 | value-free messages; P1 and P2; `Validate` untouched |
+| 8 | **Config**: tomlConfig `any` fields + normalisation (the wrong-type mark set after the JSON decode), `Config.GetRetiringSecrets(now) RetiringReport`, problems/warnings, `--check`, doctor (lines fail the verdict), env clear, `String()` redaction, the reloader on the shared clock and E6 through the `runProxyWith` harness, the shape facts (C15), `Error()`-only parser messages | 1, 2 | value-free messages; P1 and P2; `Validate` untouched; no field/method clash; E6 sees `runProxyWith`'s wiring |
 | 9a | **CLI edit, pure**: unstable-parser locator (header from the key node's range), splice rules for both header kinds, re-parse verification, the corpus and golden files, the dry-run summary | 8 | the corpus; verification cannot be bypassed; no filesystem in this task |
-| 9b | **CLI I/O**: lock (with remedy), hash check, atomic write, permissions and owner, symlinks, the mount-point refusal, panel heuristic, `default` and `--mode` refusals, flags and output | 9a | never prints the old value; never leaves a copy of the old file |
-| 10 | **CLI `--reload`**: feature pre-check, before/after reads, reload, the three read-back checks, status-line-only errors | 7, 9b | refusal before writing; never rolls the file back; M1's second-rotation case |
+| 9b | **CLI I/O**: lock (with remedy), hash check, atomic write, permissions and owner, symlinks, the mount-point refusal, panel heuristic, the `default` refusal, flags and output | 9a | never prints the old value; never leaves a copy of the old file |
+| 10 | **CLI `--reload`**: the `GET /stats` pre-check, the reload, the after-reads for every touched name, the three checks against the written file, `--prune` alone, status-line-only errors | 7, 9b | refusal before writing; never rolls the file back; M1's second-rotation case; m5's two cases |
 | 11 | **WEB relay**: retired capabilities in tier two, registry and reload compare, the 8,192 bound | 8 | constant-time scan; never `Lookup` |
-| 12 | **Docs and benchmarks**: example config, wiki (Configuration, Multi-User-and-API, Security, Monitoring, WEB-Proxy-Setup, FAQ, Home table), README, release notes; bench rows and the box A/B | all | every claim matches the code; the bar met |
+| 12 | **Docs and benchmarks**: example config, wiki (Configuration, Multi-User-and-API, Security, Monitoring, WEB-Proxy-Setup, Installation, FAQ, Home table), README, release notes; bench rows and the box A/B | all | every claim matches the code; the bar met |
 
-Tasks 1 and 2 can run in parallel; then 3 and 4 in parallel; 8 can start after 1 and 2; 9a
-after 8, and 9b after 9a.
+**Order.** Task 0 comes first, alone. Then:
+- Tasks 1 and 2 can run in parallel. They touch the same `ProxyOpts` struct, but different
+  fields; whichever lands second rebases.
+- Tasks 3 and 4 can run in parallel after 1 and 2.
+- Task 8 can start after 1 and 2.
+- Task 9a follows 8, and 9b follows 9a.
+
+**Task 0 in detail (m2 of the second review; the reviewer measured the breakage).**
+- **Why first.** The D16 check refuses every stream that registers without a key. With the
+  check in place and today's helpers, **37 existing `mtglib` tests fail**, and some subtests
+  pass only vacuously. Every later task's red/green signal depends on the suite being honest
+  first.
+- **Enumerate, before changing any helper.** Add the check with the helpers untouched, then
+  run `go test ./mtglib/ -count=1 -json`. Write the output to the task's directory under
+  `.superpowers/` and list every event with `"Action":"fail"` and a `"Test"` field. Record
+  that list, about 37 names, in the task report.
+  - The reviewer's examples: `TestProxyReloadSecrets`, `TestTheReCheckIsTheFirstStep`,
+    `TestCloseDeniedConns`, `TestExpiryEndsALiveSessionOnTheClock`,
+    `TestMaintenanceRunsWithoutAUsageFile`, and most of the client-table, ban and client-conns
+    tests.
+  - The same command is the task's exit check: after the helper changes it lists nothing, and
+    `go test -race ./...` is green.
+- **Adapt the helpers, never the assertions.**
+  - `registerFakeStream`, `denyProbe.stream`, `capStream`, the ban probes and every other
+    helper that hand-builds a stream attribute it through the stored set: `matchedSecretKey`
+    is the set's key for the name, and `attrSet` is `p.secrets.Load()`.
+  - `registerFakeStream` stops ignoring `tryRegisterConn`'s result and requires `DenyNone`.
+- **No test may be weakened.**
+  - No assertion is removed or loosened. No subtest is deleted, skipped or made conditional.
+    No expected `DenyReason` changes.
+  - The subtests that passed vacuously (in `TestProxyReloadSecrets`, "added secret … disturbs
+    nothing" and the alice half of "removed secret …") must now register for real and pass. If
+    one fails once it is honest, that is a finding, reported, never patched over.
+  - The one rename is `TestTheReCheckIsTheFirstStep` → `TestTheBanReCheckPrecedesTheLimits`,
+    with its assertions byte-identical. The key re-check now precedes the ban re-check; the ban
+    re-check still precedes the cap and the limit, which is what the test asserts. The comment
+    at `proxy_serve.go:490` is updated to match.
 
 ## Docs to update
 
@@ -1634,11 +1840,14 @@ after 8, and 9b after 9a.
   that `rename` onto a bind-mount target fails with `EBUSY` or `EXDEV`. This is from general
   knowledge of Linux bind mounts, and the review did not try it either. Since revision 2 it
   only shapes a message and a piece of documentation (no `--in-place`).
-- **Now verified by the review:** go-toml v2.4.3's `unstable.Parser` gives exact `Raw` ranges
-  for every string form and key node, but **not** for table headers (m1, handled in §7.3); a
-  single `[retiring-secret]` table decodes as one entry; a BOM is refused.
-- That go-toml's `DecodeError.Error()` never quotes document text. It is relevant to the
-  `/reload` 500 body, which the CLI therefore never prints (m14).
+- **Now verified by the reviews**, so no longer open:
+  - go-toml v2.4.3's `unstable.Parser` gives exact `Raw` ranges for every string form and key
+    node, but **not** for table headers (m1, handled in §7.3);
+  - a single `[retiring-secret]` table decodes as one entry, and a BOM is refused;
+  - `DecodeError.Error()` did not quote document text in three refused documents carrying a
+    secret value, while `DecodeError.String()` did every time. §6.1 therefore prints only
+    `Error()`, and the CLI still never prints a `/reload` body (m13′; first review m14);
+  - D16 as specified breaks 37 existing tests through their helpers (task 0).
 - Whether a per-secret ad tag issued by @MTProxybot stays valid after a key change. That is
   unchanged by this piece; it is the same question as any re-key today.
 - The bench-box figures cited (about 4 µs a candidate, about 340 ns a block) come from piece A's
@@ -1657,7 +1866,9 @@ after 8, and 9b after 9a.
 4. Retiring candidates come after all primaries (D9). Cost: an old-link client pays a full scan
    after a restart (empty hints) and is the last scanned in a flood.
 5. The registration re-check covers every stream and fixes the pre-existing re-key race (D16),
-   a deliberate behaviour change.
+   a deliberate behaviour change. It reads the set **inside `liveMu`**, which is the condition
+   its correctness rests on (second review M1′, L5b). It also moves ahead of piece B's ban
+   re-check, and it costs about 37 test helpers an honest key (task 0, first).
 6. Retiring ee hosts join the SNI gate and cover hosts (D7), enabling host-changing rotations.
 7. A high-water rotation clock (D10), with its poisoning trade-off, made an exported
    `RotationClock` shared through `ProxyOpts`, so the config layer and the engine read one clock
@@ -1675,15 +1886,47 @@ after 8, and 9b after 9a.
 12. WEB: no overlap; retiring capabilities are tier two (D28).
 13. The surgical text edit with re-parse verification, rather than a TOML re-marshal (D23).
 14. The four read-back scalars; `retiring_connections` is computed at read time (D19, D20).
-15. Expiry closes live streams within 5 s (10 s at worst), with no extra grace (D11). The close
-    goes through `closeStaleConns`'s held-key fast path, not through a close in the sweep
-    (review B1). The sweep takes `reloadMu` with `TryLock` (review m3).
+15. Expiry closes live streams at the next 5 s tick, one tick later per collision with a
+    non-swapping reload, with no extra grace (D11). The close goes through `closeStaleConns`'
+    **held-key predicate** (the per-stream branch it reaches because the held sets differ), not
+    through a close in the sweep (review B1). The sweep takes `reloadMu` with `TryLock`
+    (review m3).
 16. No SIGHUP for `run` (D27): a SIGHUP ends the process today, and changing that is not
     additive.
 17. No `--in-place` write mode and no backup copy (review M3). A single-file bind-mount user
     mounts the directory instead.
 
 ## Revision notes
+
+- **Revision 3 (2026-10-08, after the scoped re-review of revision 2: 0 blockers, 1 major,
+  13 minors; verdict SOUND_WITH_FIXES).** The re-review confirmed every revision-2 disposition
+  and found no failing state-table cell, given one condition. The changes:
+  - **M1′, the major.** §4.3 and D16 now state that the key re-check loads the set and the
+    stream's held key **inside `liveMu`**, right after the Lock and before the ban re-check,
+    and never in `tryRegisterConn`'s pre-lock preamble. A new seam, `beforeRegisterLockHook`,
+    and test L5b run a complete swap at the one point where the two placements differ, with a
+    sabotage to match.
+  - **The measured cost of D16 on today's suite** (37 failing tests, some vacuous passes) is
+    recorded, and a new **task 0**, first in the decomposition, lands the primary form of the
+    re-check together with the helper changes. It carries an enumeration command and the rule
+    that no test is weakened. Piece B's ban re-check is no longer the first step; its test is
+    renamed with its assertions unchanged.
+  - **Minors (all 13), as listed in the dispositions:**
+    - `GetRetiringSecrets(now)`, returning a `RetiringReport` (m1′, m7′);
+    - the wrong-type mark set after the JSON decode (m8′);
+    - a usable `RotationClock` zero value, and `NewProxy` resolving the clock before its initial
+      build (m3′);
+    - `runProxyWith`'s `now` parameter and E6 through the harness (m4′);
+    - the `--reload` checks all from the written file, and `--prune` alone (m5′);
+    - "overlap ended" classified by the §6.3 diff (m6′);
+    - held = ∅ for an absent name, and the exact equivalence wording (m9′);
+    - E2 against a frozen copy of today's builder (m10′);
+    - "one tick per collision" instead of "10 s at worst" (m11′);
+    - the editorial fixes (m12′);
+    - the `DecodeError.String()` risk pinned and the go-toml item closed (m13′).
+
+    An embedder note on `ReplaceSecrets` with a nil `Retiring` was added (re-review §6).
+  - **Decision count:** still 32. D11 and D16 were re-worded.
 
 - **Revision 2 (2026-10-08, after the independent adversarial review: 1 blocker, 4 majors,
   14 minors).** Every finding is listed under "Review dispositions" below. What changed:
@@ -1721,8 +1964,9 @@ after 8, and 9b after 9a.
     - persisting the mark noted as the one fix for the restart gap (m12);
     - the 8,192 bound (m13, W5);
     - status-line-only reload errors (m14, R7).
-  - **Decision count:** still 32. D4, D10, D15, D17, D22 and D24 were re-worded; no decision was
-    added or removed.
+  - **Decision count:** still 32. D4, D10, D11, D15, D17, D22 and D24 were re-worded; no
+    decision was added or removed.
+  - Revision 3 later dropped M1's pre-write `GET /secrets/{name}` (second review m5).
 
 - **Revision 1.1 (2026-10-08, the same day, a second advisor round).** It found that
   revision 1 broke R0 in two §1.3 rows. Revision 1 proved only P1 (`--check` is monotone); R0
@@ -1754,6 +1998,8 @@ after 8, and 9b after 9a.
 
 ## Review dispositions
 
+### First review (revision 1.1)
+
 The review is `.superpowers/sdd/2026-10-08-secret-rotation/spec-review.md` (verdict: BLOCKED
 by B1, otherwise SOUND_WITH_FIXES). Every finding is listed with what was done and where.
 Totals over the 19 findings (M4's two parts, a and b, share one count): 15 accepted, 4
@@ -1762,7 +2008,7 @@ modified, 0 declined.
 | ID | Finding | Disposition | Where it landed |
 |---|---|---|---|
 | B1 | The fast path judged at `now` skips the expiry close | **accepted** (the review's held-key predicate, verbatim in substance) | §4.1 (held vs accepted sets, outcomes table), §4.2 pseudocode note, invariant table, §10, D15, tests L2/L2b/L6, sabotage list, task 5 |
-| M1 | The read-back fails a second rotation inside a longer overlap | **modified**: before and after reads, a primary check and `retiring_until ≥ written`, as asked. The count is checked against the number of the name's usable entries in the written file (at the read-back's `now`) instead of `before + 1`, so `--prune`, `--end-overlap` and an expiry in between count from one source. Error text is per check | §7.5, R10, task 10, sabotage list |
+| M1 | The read-back fails a second rotation inside a longer overlap | **modified**: before and after reads (revision 3 dropped the pre-write read again, m5′), a primary check and `retiring_until ≥ written`, as asked. The count is checked against the number of the name's usable entries in the written file (at the read-back's `now`) instead of `before + 1`, so `--prune`, `--end-overlap` and an expiry in between count from one source. Error text is per check | §7.5, R10, task 10, sabotage list |
 | M2 | "One clock" cannot be wired as written | **accepted**, the review's second option: an exported `RotationClock` shared through `ProxyOpts.RotationClock` and handed to the reloader by `runProxyWith`. Engine drops also gain `expired`; the behind-clock behaviour is stated | D10, §1.2, §1.4, §2.1, §2.3, §6.2, invariant table, §10, E5/E6, task 2, task 8 |
 | M3 | `--in-place` leaves a copy of the leaked key; `O_TRUNC` window | **accepted**: dropped, with the backup | D24, §7.1, §7.4 step 6 (with the rejection), §10, §11 (now true), R6, Risks, Not in this piece, task 9b |
 | M4a | A UTF-8 BOM is refused by today's parser | **accepted** | §1.1, §7.3 steps 1 and 3, R1, Configuration docs |
@@ -1785,3 +2031,30 @@ modified, 0 declined.
 The review's state table was compared with the spec's. The two live-stream rows it marked
 (B1) are now in the invariant table and §10. Its "revert by POST" row was added to the
 invariant table, to §5.1 and to the Multi-User-and-API docs.
+
+### Second review (scoped re-review of revision 2)
+
+The re-review is `.superpowers/sdd/2026-10-08-secret-rotation/spec-rereview.md` (verdict:
+SOUND_WITH_FIXES; 0 blockers, 1 major, 13 minors). Its IDs restart at m1, so they are listed
+here as M1′ and m1′ to m13′, apart from the first review's IDs. Totals over these 14 findings:
+**13 accepted, 1 modified, 0 declined.**
+
+| ID | Finding | Disposition | Where it landed |
+|---|---|---|---|
+| M1′ | The D16 re-check must read the set inside `liveMu`; a pre-lock Load reopens the race, and no test caught it | **accepted** | §4.3 (placement, pseudocode with the Lock, why), D16, the new seam `beforeRegisterLockHook`, L5b, sabotage list, tasks 0 and 5, audit item 5 |
+| m1′ | `Config.RetiringSecrets` is both a field and a method | **accepted**: the method is `GetRetiringSecrets(now)` | §1.2, §1.4, §2.3, §7.3 steps 1 and 5, §7.5, task 8 |
+| m2′ | D16 makes 37 existing tests fail; some pass vacuously; B's "ban re-check first" contract moves | **modified**: adopted in full, but in a **new task 0**, first in the decomposition (the coordinator's placement), not inside task 5. The primary form of the re-check lands with it, with an enumeration command and the no-weakening rule. B's test is renamed with its assertions unchanged | §4.3 ("The cost to the existing tests", "Order against piece B's contract"), §15 task 0 and its detail, L7, sabotage list, Could not verify |
+| m3′ | `RotationClock`'s zero value panics | **accepted** (a usable zero value; `NewProxy` resolves the clock before its initial build) | §2.3, E5, task 2 |
+| m4′ | E6 cannot see `runProxyWith`'s wiring | **accepted** (`runProxyWith` gains `now`; E6 runs through the loop harness; the sabotage is restated) | §1.4, §12 seams, E6, sabotage list, tasks 2 and 8 |
+| m5′ | `--reload` check 1 for `--end-overlap` uses the stale "before"; `--prune` alone undefined | **accepted** (every expected value comes from the written file; pre-write `GET /secrets/{name}` dropped; `--prune` alone defined) | §7.5, R10, task 10, revision 2 note |
+| m6′ | "Overlap ended" cannot come from the engine's `expired` reason on the reload path | **accepted** (classified by the §6.3 diff with the swap's `now`) | §6.2 table, §6.3, L2b, sabotage list, task 5 |
+| m7′ | `GetRetiringSecrets`' signature has no channel for the Info outputs | **accepted** (`RetiringReport{Usable, Lines, Expired, Notes}`) | §1.2, §1.4, §7.3, task 8 |
+| m8′ | The unexported wrong-type mark cannot cross the JSON step | **accepted** (set after the decode, from the normalisation pass) | §1.1, task 8 |
+| m9′ | The equivalence paragraph overstates; held(old) undefined for an absent name | **accepted** | §4.1 (held = ∅; worded equivalence), L4, L6 |
+| m10′ | E2 is vacuous once `buildSecretSet` wraps the new builder | **accepted** (a frozen copy of today's builder) | E2, sabotage list, task 1 |
+| m11′ | "10 s at worst" is not a bound | **accepted** ("one tick per collision") | D11, invariant table, §4.2, audit item 15 |
+| m12′ | Editorial leftovers | **accepted**: duplicate §15 header removed; `--mode` gone from 9b; the parallelism note says what 1 and 2 share; L9 placed after L8; D11 named in the revision-2 note; audit item 15 says "held-key predicate" | §15, §12, Revision notes, audit list |
+| m13′ | Close the go-toml item, and pin the `DecodeError.String()` risk | **accepted** | §6.1, C8, R7, sabotage list, Could not verify |
+
+The re-review's §6 observation (a library `ReplaceSecrets` with a nil `Retiring` ends overlaps
+until the next reload) is stated for embedders in §5.1. It was not a numbered finding.
