@@ -58,6 +58,11 @@ type SecretInfo struct {
 	// speed is read back as speed_limit; absent for unlimited.
 	ClientSpeedLimit int64 `json:"client_speed_limit,omitempty"`
 
+	// ClientFair is whether the secret's speed limits are divided among its
+	// addresses, client_fair; absent when they are not. A switch, not an
+	// address.
+	ClientFair bool `json:"client_fair,omitempty"`
+
 	// Mode is the wire form this secret serialises to: "ee", "dd" or "plain".
 	Mode string `json:"mode"`
 
@@ -183,6 +188,7 @@ func fillLimitInfo(info *SecretInfo, lim SecretLimits, used int64) {
 	info.IPLimit = lim.IPLimit
 	info.ClientConns = lim.ClientConns
 	info.ClientSpeedLimit = lim.ClientSpeedBytesPerSecond
+	info.ClientFair = lim.ClientFair
 }
 
 // ReplaceSecrets swaps the entire secret configuration (secrets + advertising
@@ -548,6 +554,7 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		user.IPLimit = lim.IPLimit
 		user.ClientConns = lim.ClientConns
 		user.ClientSpeedLimit = lim.ClientSpeedBytesPerSecond
+		user.ClientFair = lim.ClientFair
 
 		resp.Users[name] = user
 	}
@@ -685,8 +692,9 @@ func (p *Proxy) hasSecret(name string) bool {
 // accepts RFC3339 or YYYY-MM-DD, quota_reset is "none" or "monthly", and speed
 // accepts a rate ("5mbit", "1MB/s") -- the same spellings the config file
 // takes, from the same parsers -- ip_limit is a count of addresses,
-// client_conns a count of one address's live connections, and client_speed one
-// address's ceiling, spelled as speed is.
+// client_conns a count of one address's live connections, client_speed one
+// address's ceiling, spelled as speed is, and client_fair the switch that
+// divides the secret's speed among its addresses.
 type limitFields struct {
 	Quota       string `json:"quota,omitempty"`
 	QuotaReset  string `json:"quota_reset,omitempty"`
@@ -698,6 +706,7 @@ type limitFields struct {
 	IPLimit     int    `json:"ip_limit,omitempty"`
 	ClientConns int    `json:"client_conns,omitempty"`
 	ClientSpeed string `json:"client_speed,omitempty"`
+	ClientFair  bool   `json:"client_fair,omitempty"`
 }
 
 // parse turns the raw string fields into a SecretLimits, returning an error for
@@ -758,7 +767,28 @@ func (l limitFields) parse() (SecretLimits, error) {
 		IPLimit:                   l.IPLimit,
 		ClientConns:               l.ClientConns,
 		ClientSpeedBytesPerSecond: clientSpeed,
+		ClientFair:                l.ClientFair,
 	}, nil
+}
+
+// limits is parse, and then what no one field can say on its own: client_fair
+// divides the secret's speed, so it needs speed, speed_up or speed_down in the
+// same request. A POST replaces every limit of its secret and a PUT every
+// secret, so a speed set before the request is gone by the time it applies.
+// The per-address ceiling is not a speed fair share divides. Both handlers
+// that take limits read them through here.
+func (l limitFields) limits() (SecretLimits, error) {
+	lim, err := l.parse()
+	if err != nil {
+		return SecretLimits{}, err
+	}
+
+	if lim.ClientFair && lim.fairTotals() == (fairTotals{}) {
+		return SecretLimits{}, fmt.Errorf(
+			"%w: client_fair divides the secret's speed and needs speed, speed_up or speed_down", ErrSecretInvalid)
+	}
+
+	return lim, nil
 }
 
 type secretEntry struct {
@@ -805,7 +835,7 @@ func (p *Proxy) handlePutSecrets(w http.ResponseWriter, r *http.Request) {
 			cfg.SecretAdTags[name] = *tag
 		}
 
-		limits, err := entry.parse()
+		limits, err := entry.limits()
 		if err != nil {
 			httpError(w, http.StatusBadRequest, fmt.Errorf("invalid limits for %q: %w", name, err))
 
@@ -867,7 +897,7 @@ func (p *Proxy) handlePostSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limits, err := req.parse()
+	limits, err := req.limits()
 	if err != nil {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("invalid limits: %w", err))
 

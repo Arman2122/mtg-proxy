@@ -518,11 +518,13 @@ const (
 	// FeatureClientLimits means the per-address controls inside one secret are
 	// honoured: [secret-limits.<name>] and the secrets API accept client-conns
 	// (client_conns on the API), a cap on the live connections one address may
-	// hold to the secret, and client-speed (client_speed), a ceiling on how
-	// fast one address may move bytes. /stats reads them back as client_conns
-	// and client_speed_limit and counts the cap's refusals in
+	// hold to the secret; client-speed (client_speed), a ceiling on how fast
+	// one address may move bytes; and client-fair (client_fair), which divides
+	// the secret's speed, speed-up and speed-down among its addresses and is
+	// refused without one of them. /stats reads them back as client_conns,
+	// client_speed_limit and client_fair and counts the cap's refusals in
 	// client_conns_refused. The API is strict, so a client must see this before
-	// it sends either field.
+	// it sends any of these fields.
 	FeatureClientLimits = "client-limits"
 
 	// FeatureClientStats means GET /secrets/{name}/clients is served: each
@@ -798,6 +800,11 @@ type UserStatsJSON struct {
 	// back as SpeedLimit is, and absent for unlimited. Time an address spent
 	// held to it is in ThrottledMillis.
 	ClientSpeedLimit int64 `json:"client_speed_limit,omitempty"`
+
+	// ClientFair is whether the user's speed limits are divided among the
+	// addresses they connect from, read back, and absent when they are not.
+	// Time an address spent held to its share is in ThrottledMillis.
+	ClientFair bool `json:"client_fair,omitempty"`
 
 	// Clients is how many source addresses the per-address table holds an
 	// entry for, the shared rest entry not counted, and ClientsOverflow how

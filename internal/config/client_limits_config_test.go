@@ -88,8 +88,9 @@ func TestSecretLimitClientConns(t *testing.T) {
 }
 
 // secretLimitSamples is one valid [secret-limits.<name>] line per field of
-// ConfigSecretLimit, by the field's JSON name. A field with no line here fails
-// the test below rather than skipping.
+// ConfigSecretLimit, by the field's JSON name -- with the line a field cannot
+// be valid without, where there is one. A field with no line here fails the
+// test below rather than skipping.
 var secretLimitSamples = map[string]string{
 	"quota":       `quota = "1MB"`,
 	"quotaReset":  `quota-reset = "monthly"`,
@@ -101,13 +102,16 @@ var secretLimitSamples = map[string]string{
 	"ipLimit":     `ip-limit = 2`,
 	"clientConns": `client-conns = 3`,
 	"clientSpeed": `client-speed = "1mbit"`,
+
+	// Fair share divides a speed of the secret's, so it needs one.
+	"clientFair": "client-fair = true\nspeed-down = \"1mbit\"",
 }
 
 // Every engine-level limit can be written in the config file: each field of
-// [secret-limits.<name>], written alone, is a key this binary knows and reaches
-// the engine as a limit, and between them they reach every field of
-// mtglib.SecretLimits. A field added to SecretLimits without its key, its TOML
-// mirror or its line in GetSecretLimits fails here.
+// [secret-limits.<name>], written alone or beside what it needs, is a key this
+// binary knows and reaches the engine as a limit, and between them they reach
+// every field of mtglib.SecretLimits. A field added to SecretLimits without
+// its key, its TOML mirror or its line in GetSecretLimits fails here.
 func TestEveryLimitFieldHasAConfigKey(t *testing.T) {
 	t.Parallel()
 
@@ -192,6 +196,100 @@ func TestClientConnsLeavesConfigStringAloneUntilUsed(t *testing.T) {
 	assert.NotContains(t, limitKeys(t, speed), "clientConns", "and only what it uses")
 	assert.Contains(t, speed.String(), `"clientSpeed":"62500B/s"`,
 		"in a form the key accepts back, as speed renders")
+}
+
+// client-fair is a key of [secret-limits.<name>] this binary reads: a switch
+// that divides the secret's own speed limits among its addresses, so a table
+// that turns it on needs speed, speed-up or speed-down beside it -- any one --
+// and one without is refused by name, the per-address ceiling not counting:
+// that is not a speed fair share divides. Off is no limit at all, a value that
+// is not a boolean is refused when the file is parsed, and Config.String()
+// shows the key only for a table that turns it on.
+func TestSecretLimitClientFair(t *testing.T) {
+	t.Parallel()
+
+	t.Run("reaches the engine beside the speed it divides and is no unknown key", func(t *testing.T) {
+		t.Parallel()
+
+		conf, err := config.Parse([]byte(clientLimitsConfig(t, "speed-down = \"8mbit\"\nclient-fair = true")))
+		require.NoError(t, err)
+		require.NoError(t, conf.Validate())
+
+		assert.Empty(t, conf.UnknownKeys, "run --check accepts it")
+
+		alice := conf.GetSecretLimits()["alice"]
+		assert.True(t, alice.ClientFair)
+		assert.EqualValues(t, 1_000_000, alice.SpeedDownBytesPerSecond)
+	})
+
+	for _, speed := range []string{"speed", "speed-up", "speed-down"} {
+		t.Run("divides "+speed+" alone", func(t *testing.T) {
+			t.Parallel()
+
+			conf, err := config.Parse([]byte(clientLimitsConfig(t, speed+" = \"8mbit\"\nclient-fair = true")))
+			require.NoError(t, err)
+			require.NoError(t, conf.Validate())
+			assert.True(t, conf.GetSecretLimits()["alice"].ClientFair)
+		})
+	}
+
+	for name, lines := range map[string]string{
+		"alone":                 "client-fair = true",
+		"beside the ceiling":    "client-fair = true\nclient-speed = \"1mbit\"",
+		"beside another limit":  "client-fair = true\nquota = \"1GB\"\nip-limit = 2",
+		"beside a cap per conn": "client-fair = true\nclient-conns = 4",
+	} {
+		t.Run("without a speed it is refused by name: "+name, func(t *testing.T) {
+			t.Parallel()
+
+			conf, err := config.Parse([]byte(clientLimitsConfig(t, lines)))
+			require.NoError(t, err, "the file parses; the table is what is wrong")
+
+			err = conf.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "client-fair")
+			assert.Contains(t, err.Error(), "alice")
+		})
+	}
+
+	t.Run("off is no limit", func(t *testing.T) {
+		t.Parallel()
+
+		conf, err := config.Parse([]byte(clientLimitsConfig(t, "client-fair = false")))
+		require.NoError(t, err)
+		require.NoError(t, conf.Validate())
+
+		assert.Empty(t, conf.UnknownKeys)
+		assert.Nil(t, conf.GetSecretLimits())
+	})
+
+	for _, value := range []string{`"yes"`, `1`} {
+		t.Run("not a boolean is refused: "+value, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := config.Parse([]byte(clientLimitsConfig(t, "speed = \"8mbit\"\nclient-fair = "+value)))
+			require.Error(t, err)
+		})
+	}
+
+	t.Run("Config.String shows it only when it is on", func(t *testing.T) {
+		t.Parallel()
+
+		for lines, shown := range map[string]bool{
+			"speed = \"8mbit\"":                      false,
+			"speed = \"8mbit\"\nclient-fair = false": false,
+			"speed = \"8mbit\"\nclient-fair = true":  true,
+		} {
+			conf, err := config.Parse([]byte(clientLimitsConfig(t, lines)))
+			require.NoError(t, err)
+
+			if shown {
+				assert.Contains(t, conf.String(), `"clientFair":true`, lines)
+			} else {
+				assert.NotContains(t, conf.String(), "clientFair", lines)
+			}
+		}
+	})
 }
 
 // client-speed is a key of [secret-limits.<name>] this binary reads: a speed

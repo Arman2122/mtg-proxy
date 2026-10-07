@@ -1371,12 +1371,15 @@ func TestNilClientTableHasNoFairShare(t *testing.T) {
 // table's lock alone, like the sweep, and so does the ticker that drives it.
 // This holds reloadMu and liveMu and requires two ticks of the table -- a
 // baseline and a decision -- to finish anyway, and then a pass of the proxy's
-// ticker, running in its own goroutine as it does in production.
+// ticker, running in its own goroutine as it does in production, that ticks
+// the fair secret with its live entry.
 func TestTheFairTickNeverWaitsForLiveMu(t *testing.T) {
 	t.Parallel()
 
 	probe := newClientTableProbe(t, true)
 	p := probe.proxy
+	p.secrets.Store(buildSecretSet(map[string]Secret{"alice": GenerateSecret("alice.example.com")}, nil, nil,
+		map[string]SecretLimits{"alice": {SpeedBytesPerSecond: 1 << 20, ClientFair: true}}))
 
 	require.Equal(t, DenyNone, p.tryRegisterConn(probe.stream(t, tcpFrom("203.0.113.9", 50001), 0)))
 	require.Len(t, p.clients.snapshot("alice"), 1)
@@ -1403,10 +1406,12 @@ func TestTheFairTickNeverWaitsForLiveMu(t *testing.T) {
 	}()
 
 	finished := govAwait(done, 2*time.Second)
+	ticked := fairLastTick(p.clients, "alice")
 
 	p.startFairShare(ctx, 5*time.Millisecond)
 
 	passed := awaitFairPass(passes, 2*time.Second)
+	reached := fairLastTick(p.clients, "alice") != ticked
 
 	p.liveMu.Unlock()
 	p.reloadMu.Unlock()
@@ -1414,6 +1419,7 @@ func TestTheFairTickNeverWaitsForLiveMu(t *testing.T) {
 
 	require.True(t, finished, "the fair-share tick must not wait for liveMu")
 	require.True(t, passed, "the fair-share ticker must not wait for liveMu or reloadMu")
+	require.True(t, reached, "and its pass ticked the fair secret while they were held")
 }
 
 // ---- applyFair: the fair limiters follow the secret's totals ----------------

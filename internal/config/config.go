@@ -17,9 +17,10 @@ type Optional struct {
 
 // ConfigSecretLimit is the typed form of a single [secret-limits.<name>] table:
 // an optional data quota (with reset policy), a speed limit, an expiry
-// deadline, a disabled flag, an address limit, a per-address connection cap and
-// a per-address speed ceiling. All fields are optional; the zero value leaves
-// the secret unrestricted.
+// deadline, a disabled flag, an address limit, a per-address connection cap, a
+// per-address speed ceiling and the switch that divides the speed limits among
+// the secret's addresses. All fields are optional; the zero value leaves the
+// secret unrestricted.
 type ConfigSecretLimit struct {
 	Quota      TypeBytes      `json:"quota"`
 	QuotaReset TypeQuotaReset `json:"quotaReset"`
@@ -35,6 +36,7 @@ type ConfigSecretLimit struct {
 	// as it did before they existed.
 	ClientConns TypeClientConns `json:"clientConns,omitzero"`
 	ClientSpeed TypeClientSpeed `json:"clientSpeed,omitzero"`
+	ClientFair  TypeBool        `json:"clientFair,omitzero"`
 }
 
 // ConfigListener is one [[listener]] block: an extra socket serving the
@@ -383,8 +385,10 @@ func (c *Config) UnknownKeyWarnings() []string {
 }
 
 // validateSecretLimits ensures every [secret-limits] entry names a secret that
-// actually exists. Field values are already validated at parse time by their
-// Type* setters, so here we only guard against typos in the secret name.
+// actually exists, and that a table turning client-fair on has a speed for it
+// to divide. Field values are already validated at parse time by their Type*
+// setters; what is left is the secret name, and the one rule that spans two
+// keys of a table.
 func (c *Config) validateSecretLimits() error {
 	if len(c.SecretLimits) == 0 {
 		return nil
@@ -399,9 +403,17 @@ func (c *Config) validateSecretLimits() error {
 		known["default"] = struct{}{}
 	}
 
-	for name := range c.SecretLimits {
+	for name, l := range c.SecretLimits {
 		if _, ok := known[name]; !ok {
 			return fmt.Errorf("secret-limits refers to unknown secret %q", name)
+		}
+
+		// client-speed is not a speed fair share divides: it holds one
+		// address, and fair share divides what the secret as a whole may move.
+		if l.ClientFair.Get(false) && l.Speed.Get(0) == 0 && l.SpeedUp.Get(0) == 0 && l.SpeedDown.Get(0) == 0 {
+			return fmt.Errorf(
+				"secret-limits.%s: client-fair divides the secret's speed among its addresses "+
+					"and needs speed, speed-up or speed-down beside it", name)
 		}
 	}
 
@@ -461,6 +473,7 @@ func (c *Config) GetSecretLimits() map[string]mtglib.SecretLimits {
 			IPLimit:                   l.IPLimit.Get(0),
 			ClientConns:               l.ClientConns.Get(0),
 			ClientSpeedBytesPerSecond: l.ClientSpeed.Get(0),
+			ClientFair:                l.ClientFair.Get(false),
 		}
 
 		if l.QuotaReset.Get("none") == mtglib.QuotaResetMonthly.String() {

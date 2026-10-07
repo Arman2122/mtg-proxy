@@ -51,6 +51,23 @@ func TestRunCheck(t *testing.T) {
 		require.NoError(t, r.Run(nil, "test"))
 	})
 
+	t.Run("accepts fair share beside a speed", func(t *testing.T) {
+		t.Parallel()
+
+		r := &Run{
+			ConfigPath: writeConfig(t, doctorConfig("\n[secret-limits.default]\nspeed = \"8mbit\"\nclient-fair = true\n")),
+			Check:      true,
+		}
+		require.NoError(t, r.Run(nil, "test"))
+	})
+
+	t.Run("refuses fair share with no speed to divide", func(t *testing.T) {
+		t.Parallel()
+
+		r := &Run{ConfigPath: writeConfig(t, doctorConfig("\n[secret-limits.default]\nclient-fair = true\n")), Check: true}
+		require.ErrorContains(t, r.Run(nil, "test"), "client-fair")
+	})
+
 	t.Run("refuses what run refuses", func(t *testing.T) {
 		t.Parallel()
 

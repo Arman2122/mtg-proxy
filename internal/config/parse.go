@@ -31,6 +31,7 @@ type tomlConfig struct {
 
 		ClientConns int    `toml:"client-conns" json:"clientConns,omitempty"`
 		ClientSpeed string `toml:"client-speed" json:"clientSpeed,omitempty"`
+		ClientFair  bool   `toml:"client-fair" json:"clientFair,omitempty"`
 	} `toml:"secret-limits" json:"secretLimits,omitempty"`
 	UsageStateFile string `toml:"usage-state-file" json:"usageStateFile,omitempty"`
 	APIToken       string `toml:"api-token" json:"apiToken,omitempty"`

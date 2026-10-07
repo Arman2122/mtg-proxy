@@ -112,6 +112,17 @@ type SecretLimits struct {
 	// rest entry, which has no ceiling: it stands for many clients at once, and
 	// one address's ceiling would hold all of them together.
 	ClientSpeedBytesPerSecond int64
+
+	// ClientFair, client-fair, divides the secret's own speed limits among the
+	// addresses using it: a work-conserving share, worked out again every
+	// second, in which an address that wants less than an even split keeps
+	// what it wants and the others share the rest equally, however many
+	// connections each holds. Each of SpeedBytesPerSecond,
+	// SpeedUpBytesPerSecond and SpeedDownBytesPerSecond that is set is divided
+	// on its own, so it needs at least one of them; the config and the API
+	// refuse it without. The rest entry -- every address that does not stand
+	// for one place -- holds one share between them.
+	ClientFair bool
 }
 
 // IsZero reports whether the limits impose no restriction at all, i.e. the
@@ -121,7 +132,8 @@ func (l SecretLimits) IsZero() bool {
 	return l.QuotaBytes == 0 && l.QuotaReset == QuotaResetNone &&
 		l.ExpiresAt.IsZero() && !l.Disabled && l.SpeedBytesPerSecond == 0 &&
 		l.SpeedUpBytesPerSecond == 0 && l.SpeedDownBytesPerSecond == 0 &&
-		l.IPLimit == 0 && l.ClientConns == 0 && l.ClientSpeedBytesPerSecond == 0
+		l.IPLimit == 0 && l.ClientConns == 0 && l.ClientSpeedBytesPerSecond == 0 &&
+		!l.ClientFair
 }
 
 // hasClientControl reports whether the limits carry a per-address control --
@@ -131,15 +143,23 @@ func (l SecretLimits) IsZero() bool {
 // are per-address: admission, a reload's backfill and the secret set's own
 // summary all ask it. Each control adds itself here as it lands.
 func (l SecretLimits) hasClientControl() bool {
-	return l.ClientConns > 0 || l.ClientSpeedBytesPerSecond > 0
+	return l.ClientConns > 0 || l.ClientSpeedBytesPerSecond > 0 || l.ClientFair
 }
 
-// fairTotals is what fair share divides among the secret's addresses: none
-// yet. client-fair is the switch, and it divides the secret's speed limits
-// once it lands; until then every secret's fair limiters stay off, and the
-// ticker has no secret to tick.
+// fairTotals is what client-fair divides among the secret's addresses: each of
+// its speed limits that is set, on its own, or nothing when fair share is off.
+// The per-address ceiling is not among them: it holds one address, and fair
+// share divides what the secret as a whole may move.
 func (l SecretLimits) fairTotals() fairTotals {
-	return fairTotals{}
+	if !l.ClientFair {
+		return fairTotals{}
+	}
+
+	return fairTotals{
+		Speed: l.SpeedBytesPerSecond,
+		Up:    l.SpeedUpBytesPerSecond,
+		Down:  l.SpeedDownBytesPerSecond,
+	}
 }
 
 // DenyReason explains why a connection was refused by the per-user limits.

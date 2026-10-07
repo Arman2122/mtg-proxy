@@ -106,7 +106,7 @@ type pathStage struct {
 }
 
 type pathSim struct {
-	t *testing.T
+	t testing.TB
 
 	now   time.Time
 	seq   uint64
@@ -145,8 +145,8 @@ func pathAsking(demand float64) []pathStream {
 }
 
 // newPathSim is the secret "alice" with total in bucket b, fair share on, and
-// its first tick due now.
-func newPathSim(t *testing.T, b fairBucket, total int64) *pathSim {
+// its first tick due now. A benchmark drives it too (fair_share_bench_test.go).
+func newPathSim(t testing.TB, b fairBucket, total int64) *pathSim {
 	t.Helper()
 
 	s := &pathSim{t: t, now: fakeAddrClockBase, bucket: b, fairOn: true, bracketUser: true}
