@@ -419,6 +419,20 @@ func TestABanLapsesAtItsTTL(t *testing.T) {
 	_, text = listBans(t, p, "alice")
 	assert.JSONEq(t, `{"total":0,"tracking":true,"bans":[]}`, text)
 	assert.Zero(t, bansHeld(t, p), "a lapsed ban is not held")
+
+	// Without tracking the answer is a count, and a lapsed ban is not in it. The
+	// list is asked first: a check of the place would prune the ban itself.
+	untracked, untrackedClock := banProbe(t, false)
+
+	mustBan(t, untracked.proxy, "alice", `{"ips":["203.0.113.9"]}`)
+
+	_, text = listBans(t, untracked.proxy, "alice")
+	assert.JSONEq(t, `{"total":1,"tracking":false}`, text)
+
+	untrackedClock.advance(DefaultBanTTL)
+
+	_, text = listBans(t, untracked.proxy, "alice")
+	assert.JSONEq(t, `{"total":0,"tracking":false}`, text, "a lapsed ban is not counted")
 }
 
 // The list holds 4,096 bans across every secret and refuses the request that
@@ -482,6 +496,7 @@ func TestTheBanListHoldsAtMost4096(t *testing.T) {
 // A ban is lifted by the address it names or by the /64 form the listing
 // shows, or by any other spelling of the same place -- another host of the
 // /64, the v4-mapped form of an IPv4 address -- and lifting needs no force.
+// It lifts the named secret's ban and no other secret's at the same place.
 // Lifting a ban that is not there is not an error, as a kick of zero is not:
 // it says it removed nothing. Anything else is 400, and an unknown secret 404.
 func TestABanIsLiftedByAddressOrByPrefix(t *testing.T) {
@@ -519,12 +534,22 @@ func TestABanIsLiftedByAddressOrByPrefix(t *testing.T) {
 
 	assert.Zero(t, bansHeld(t, p))
 
+	mustBan(t, p, "alice", `{"ips":["203.0.113.9"]}`)
+	mustBan(t, p, "bob", `{"ips":["203.0.113.9"]}`)
+	assert.JSONEq(t, `{"removed":1}`, lift("203.0.113.9"))
+	assert.False(t, isBanned(p, "alice", "203.0.113.9"))
+	assert.True(t, isBanned(p, "bob", "203.0.113.9"), "lifting alice's ban leaves bob's at the same place")
+
+	code, _ := liftBan(t, p, "bob", "203.0.113.9")
+	require.Equal(t, http.StatusOK, code)
+	assert.Zero(t, bansHeld(t, p))
+
 	for _, bad := range []string{"not-an-ip", "203.0.113.0/24", "2001:db8::/48"} {
 		code, _ := liftBan(t, p, "alice", bad)
 		assert.Equal(t, http.StatusBadRequest, code, bad)
 	}
 
-	code, _ := liftBan(t, p, "nobody", "203.0.113.9")
+	code, _ = liftBan(t, p, "nobody", "203.0.113.9")
 	assert.Equal(t, http.StatusNotFound, code)
 }
 
@@ -1038,11 +1063,40 @@ func TestTheReCheckIsTheFirstStep(t *testing.T) {
 	assert.Equal(t, before, probe.ledgerCounts(), "none of the refusals touched the ledger")
 }
 
+// obfsTokens is what the obfuscated door's failure limiter holds for ip's
+// place, read under its lock and without a refill, and false when it holds no
+// bucket for the place.
+func obfsTokens(t *testing.T, l *obfuscatedLimiter, ip string) (float64, bool) {
+	t.Helper()
+
+	key, ok := limiterKey(net.ParseIP(ip))
+	require.True(t, ok)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	bucket, ok := l.current[key]
+	if !ok {
+		bucket, ok = l.previous[key]
+	}
+
+	if !ok {
+		return 0, false
+	}
+
+	return bucket.tokens, true
+}
+
 // On the obfuscated door a banned client is charged to the per-address failure
 // limiter as a frame that matched nothing is, so one that keeps reconnecting is
 // soon refused before the trial loop instead of costing a trial decryption
 // every time. It is not counted as a miss: its frame did match. A place that is
 // not banned is charged nothing for getting in.
+//
+// The charge is read off the bucket, exactly, rather than through Allow, so no
+// wall time enters the test: Allow makes no bucket, Fail makes one full and
+// spends a token from it at the same instant, and nothing refills it until the
+// next Allow or Fail for the place.
 func TestABannedObfuscatedClientIsChargedLikeAMiss(t *testing.T) {
 	t.Parallel()
 
@@ -1061,24 +1115,24 @@ func TestABannedObfuscatedClientIsChargedLikeAMiss(t *testing.T) {
 	limiter, stats := h.proxy.obfsLimiter, &h.proxy.obfsStats
 
 	connectFrom(t, h, ec, tcpFrom("198.51.100.7", 52001), "alice", secret.Key)
-	assert.True(t, limiter.Allow(*ec.policy, net.ParseIP("198.51.100.7")), "getting in costs nothing")
+
+	_, charged := obfsTokens(t, limiter, "198.51.100.7")
+	assert.False(t, charged, "getting in costs nothing: the limiter holds no bucket for the place")
 
 	mustBan(t, h.proxy, "alice", `{"ips":["`+place+`"]}`)
-	require.True(t, limiter.Allow(*ec.policy, net.ParseIP(place)))
 
-	// A budget of one a second with a burst of two: two refusals spend it.
+	_, charged = obfsTokens(t, limiter, place)
+	require.False(t, charged)
+
 	refuseFrom(t, ec, h, secret.Key, tcpFrom(place, 52002))
-	refuseFrom(t, ec, h, secret.Key, tcpFrom(place, 52003))
 
-	assert.False(t, limiter.Allow(*ec.policy, net.ParseIP(place)), "each banned attempt was charged")
+	tokens, charged := obfsTokens(t, limiter, place)
+	require.True(t, charged, "the banned attempt was charged")
+	assert.InDelta(t, float64(ec.policy.HandshakesPerIP)*handshakeBurstFactor-1, tokens, 0,
+		"one token, out of a full bucket")
 	assert.Zero(t, stats.misses.Load(), "a banned frame matched; it is not a miss")
-	assert.EqualValues(t, 3, stats.trials.Load())
-	assert.EqualValues(t, 2, stats.denied.Load())
-
-	refuseFrom(t, ec, h, secret.Key, tcpFrom(place, 52004))
-
-	assert.EqualValues(t, 1, stats.rateLimited.Load(), "the next is refused before the trial loop")
-	assert.EqualValues(t, 3, stats.trials.Load())
+	assert.EqualValues(t, 2, stats.trials.Load())
+	assert.EqualValues(t, 1, stats.denied.Load())
 }
 
 // A banned place gets no hinted verification. The ban forgets the hint, so the
@@ -1086,12 +1140,15 @@ func TestABannedObfuscatedClientIsChargedLikeAMiss(t *testing.T) {
 // the banned hello writes no hint of its own. And a hint the ban could not
 // forget -- one written by a stream admitted a moment before the ban, after it
 // -- is skipped all the same: a banned place is never verified against the
-// secret it is banned from on the strength of a hint.
+// secret it is banned from on the strength of a hint. The skip is of that
+// secret at that place and nothing wider: the place's hint for another secret,
+// and the secret's hint at another place, are tried first as before.
 func TestABannedPlaceIsScannedNotHinted(t *testing.T) {
 	t.Parallel()
 
 	const (
 		place = "203.0.113.30"
+		other = "203.0.113.31"
 		cost  = 2 * 12 // two candidates, the short hello
 	)
 
@@ -1125,4 +1182,13 @@ func TestABannedPlaceIsScannedNotHinted(t *testing.T) {
 	assert.Equal(t, doorTally{verifications: 1, scanned: 1}, refusedFrom(t, h, tcpFrom(place, 53004), alice.Key),
 		"a hint written after the ban is not tried")
 	assert.Equal(t, 2, h.events.frontings())
+
+	connectFrom(t, h, ec, tcpFrom(place, 53005), "bob", bob.Key)
+	require.Equal(t, []string{"bob", "alice"}, recall())
+	assert.Equal(t, doorTally{verifications: 1, hinted: 1}, connectFrom(t, h, ec, tcpFrom(place, 53006), "bob", bob.Key),
+		"bob's hint at the banned place is tried first, alice's beside it is not")
+
+	connectFrom(t, h, ec, tcpFrom(other, 53007), "alice", alice.Key)
+	assert.Equal(t, doorTally{verifications: 1, hinted: 1},
+		connectFrom(t, h, ec, tcpFrom(other, 53008), "alice", alice.Key), "alice's hint at another place")
 }
