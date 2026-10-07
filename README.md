@@ -343,8 +343,9 @@ while the middle-proxy config loads — see
 `faketls_handshake` appears once the FakeTLS door has counted something, and it is
 a top-level object, never under `users`. `hinted` and `scanned` are hellos matched
 to a secret (by an address's earlier match, or by the scan), `unmatched` matched
-none, and `denied_ip`, `denied_global` and `oversized` were turned away by the
-handshake budget, whose `[defense.handshake-budget]` table is on by default.
+none, and, under `enforce`, `denied_ip`, `denied_global` and `oversized` were
+turned away by the handshake budget, whose `[defense.handshake-budget]` table is
+on by default (under `observe` they count what would have been).
 `enforced` says whether a refusal is acted on, `over_budget_matched` is the
 number to watch while running it in `observe` mode, and `ns_per_block` is what
 the budget believes one SHA-256 block costs on this machine.
@@ -380,7 +381,10 @@ server. `connected_ips` adds no retention — those addresses are already held f
 the life of the connection — but `last_ip` outlives the connection it came from,
 so a deployment that never asks for either never accumulates one. Neither is
 written to disk in any form; `usage-state-file` persists quota counters alone, so
-no address survives a restart.
+no address survives a restart. (That is about these two fields: the ee handshake
+budget keeps a separate anonymous per-address bucket in memory whatever
+`track-client-ips` says, as the wiki's Security page explains under *Client
+addresses*.)
 
 Behind a front proxy, both report what the PROXY header carried — the client's
 real address — which is what makes them useful for a WEB deployment. See

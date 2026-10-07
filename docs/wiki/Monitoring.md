@@ -280,7 +280,9 @@ by compromise, or by a backup that went somewhere it should not have.
 `connected_ips` adds no retention, because those addresses are already held for
 the life of the connection and vanish with it. `last_ip` does add retention,
 because it survives the connection it came from. A deployment that never asks
-for either never accumulates one.
+for either never accumulates one. (That is about these two fields. The ee
+handshake budget keeps a separate anonymous per-address bucket in memory whatever
+`track-client-ips` says; see *Client addresses* in [[Security]].)
 
 Neither field is written to disk in any form. `usage-state-file` persists quota
 counters alone, so no address survives a restart.
@@ -573,7 +575,10 @@ Lines worth knowing, all at warn level unless noted:
 - `ee hello refused by the scan budget` with `reason` — info, so debug only, and
   one per refused hello, so verbose under a flood. `reason` is `denied_ip`,
   `denied_global` or `oversized`. The `/stats` counters of the same names are the
-  way to watch it at the default level.
+  way to watch it at the default level. The line carries the stream's `stream-id`
+  and `client-ip` like every stream line (the `Stream has been started` line
+  already logs the address of every connection at that level). The per-address
+  bucket is never logged; the stream logger is separate from it.
 - `web relay reload: ...` — one line per refused reload, each saying which
   profiles were kept, with `trigger=file` or `trigger=signal` for where it came
   from.

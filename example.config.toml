@@ -649,9 +649,19 @@ drs = false
 # below: they follow track-client-ips), a client whose address matched a secret
 # recently is tried against that secret first and skips the scan. A legitimate
 # client with no such hint can therefore be fronted while a flood keeps the
-# budget spent; it retries. That is the accepted cost, and "observe" below is
-# how to see whether it ever touches your users. See the Security and
-# Configuration pages of the wiki.
+# budget spent; it retries.
+#
+# The budget bounds the proxy's CPU; it does not make an attack expensive. To
+# keep the process-wide bucket empty an attacker needs about
+# (cpu-percent/100 x GOMAXPROCS x 1e9 / ns_per_block) / (secrets x 12) unmatched
+# hellos a second: about 60 a second on 2 cores at 340 ns a block with 2,000
+# secrets, where saturating the CPU used to take about 240. So "enforce"
+# deliberately makes locking out clients WITHOUT a hint cheaper to cause than
+# CPU exhaustion was, and in exchange keeps the relays, the data path and every
+# hinted client up while an attack lasts. Hints follow track-client-ips (or set
+# hints below), and "observe" below is how to see whether any of this touches
+# your users before you enforce. See the Security and Configuration pages of the
+# wiki.
 #
 # [defense.handshake-budget]
 # # "enforce" (the default) acts on the budget as described above.
@@ -672,11 +682,12 @@ drs = false
 # # set 0 there.
 # #
 # # The per-address bucket holds an address (IPv4, or IPv6 /64) as the key to a
-# # token count and the time it was last charged -- no secret name -- in process
-# # memory for 30 to 60 minutes after the last hello from that address that
-# # reached the budget (scanned or refused); the bucket is never logged, exported
-# # or written to disk, and per-ip-ms = 0 or mode = "off" keeps none. It is not
-# # governed by track-client-ips or hints.
+# # token count and the time it was last charged -- no secret name. An address
+# # gets a bucket on its first granted scan, and it is held in process memory for
+# # 30 to 60 minutes after the last hello from it that reached the budget (a
+# # refused hello only refreshes a bucket it already has); the bucket is never
+# # logged, exported or written to disk, and per-ip-ms = 0 or mode = "off" keeps
+# # none. It is not governed by track-client-ips or hints.
 # per-ip-ms = 50
 #
 # # The share of the cores (GOMAXPROCS, read at start) the whole process may

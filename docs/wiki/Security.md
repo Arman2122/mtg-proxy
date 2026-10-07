@@ -266,21 +266,33 @@ only there to stop a single source from spending all of it.
 - **It is not a defence against volume.** Bandwidth, and the number of
   connections an attacker opens, are as they were; `concurrency` and the
   operating system are what bound those.
-- **It does not prevent lock-out; it prices it.** To keep new users out, an
-  attacker has to keep the process-wide bucket empty, which costs them about
-  `cpu-percent` of this proxy's real CPU in scan work. Before this budget the same
-  effort could starve everything, relays included. While it lasts, a client with
-  **no hint** is fronted at once and retries; hinted clients (when `hints` is on;
-  it follows `track-client-ips`), streams already established and the data path
-  are unaffected. A legitimate user behind an address whose bucket a flooder has
-  drained is treated the same way unless a hint exists. Behind a carrier that
-  connects from a loopback or private address and does not forward the client's,
-  there is no per-address bucket and only the process-wide one applies. Behind a
-  front proxy on a **public** address that sends no PROXY header, every client
-  lands in that one address's bucket (50 ms of scan CPU a second by default), so
-  set `per-ip-ms = 0` there and leave the process-wide bucket to bound the work.
-  This is the accepted degradation, and `mode = "observe"` exists so you can see
-  whether it ever touches a real client before you enforce.
+- **It does not make an attack expensive, and it does not prevent lock-out.** The
+  budget bounds the proxy's CPU; the two must not be confused. To keep the
+  process-wide bucket empty an attacker needs a hello *rate* of
+  `(cpu-percent/100 × GOMAXPROCS × 1e9 / ns_per_block) / (candidates × 12)`
+  unmatched 517-byte hellos a second (`ns_per_block` is in `/stats`; `candidates`
+  is the number of hosted `ee` secrets). On a 2-core machine without SHA
+  extensions (about 340 ns a block) with 2,000 hosted secrets that is about 60 a
+  second — roughly 30 KB/s from about ten addresses, or one where there is no
+  per-address bucket. The connections need not be held: a refused hello is
+  fronted at once and a granted one waits at most 150 ms. Before the budget the
+  same proxy needed about four times that rate, about 240 a second, to saturate
+  its CPU. So `enforce` **deliberately makes locking out unhinted clients cheaper
+  to cause than CPU exhaustion was**, and in exchange keeps the relays, the data
+  path and every hinted client up while an attack lasts. While it lasts, a client
+  with **no hint** is fronted at once and retries; hinted clients (when `hints` is
+  on; it follows `track-client-ips`), streams already established and the data
+  path are unaffected. That is why hints matter — turn on `track-client-ips` (or
+  `hints = true`) if returning clients should survive an attack — and why the
+  first deployment should run `mode = "observe"`, which shows whether the budget
+  ever touches a real client before it is enforced. A legitimate user behind an
+  address whose bucket a flooder has drained is treated the same way unless a hint
+  exists. Behind a carrier that connects from a loopback or private address and
+  does not forward the client's, there is no per-address bucket and only the
+  process-wide one applies. Behind a front proxy on a **public** address that
+  sends no PROXY header, every client lands in that one address's bucket (50 ms of
+  scan CPU a second by default), so set `per-ip-ms = 0` there and leave the
+  process-wide bucket to bound the work. This is the accepted degradation.
 - **It does not change what an accepted client gets.** Every byte the proxy sends
   for an accepted hello is as it was, and a hint only reorders the secrets tried:
   each goes through the same verification, so a hint can never make a wrong secret
@@ -305,14 +317,15 @@ address-to-secret cache.
 
 **The per-address bucket is not governed by either setting.** It holds an address
 (IPv4, or IPv6 /64) as the key to a token count and the time it was last charged
-— no secret name — in process memory for 30 to 60 minutes after the last hello
-from that address that reached the budget (scanned or refused); the bucket is
-never logged, exported or written to disk; `per-ip-ms = 0` or `mode = "off"` keeps
-none. It is what stops one source from spending the whole budget, so it is on by
-default, and it holds a prober's address as readily as a client's. The older
-obfuscated2 limiter also keeps anonymous per-address buckets in memory (10 to 20
-minutes, on a `public = true` listener). See [[Configuration]] and *Client
-addresses* below.
+— no secret name. An address gets a bucket on its first granted scan, and it is
+held in process memory for 30 to 60 minutes after the last hello from it that
+reached the budget (a refused hello only refreshes a bucket the address already
+has); the bucket is never logged, exported or written to disk; `per-ip-ms = 0` or
+`mode = "off"` keeps none. It is what stops one source from spending the whole
+budget, so it is on by default, and it holds a prober's address as readily as a
+client's. The older obfuscated2 limiter also keeps anonymous per-address buckets
+in memory (10 to 20 minutes, on a `public = true` listener). See [[Configuration]]
+and *Client addresses* below.
 
 **Restart only, and observable.** The table is read once at start; a reload
 re-reads the secrets, not this. `GET /stats` carries the door's counters as
@@ -729,10 +742,11 @@ a proxy which does not know something cannot be made to disclose it.
 - **It does not govern the handshake budget's per-address bucket**, so
   `track-client-ips = false` does not mean no address is ever held in memory.
   The bucket holds an address (IPv4, or IPv6 /64) as the key to a token count and
-  the time it was last charged — no secret name — in process memory for 30 to 60
-  minutes after the last hello from that address that reached the budget (scanned
-  or refused); the bucket is never logged, exported or written to disk;
-  `per-ip-ms = 0` or `mode = "off"` keeps none.
+  the time it was last charged — no secret name. An address gets a bucket on its
+  first granted scan, and it is held in process memory for 30 to 60 minutes after
+  the last hello from it that reached the budget (a refused hello only refreshes
+  a bucket the address already has); the bucket is never logged, exported or
+  written to disk; `per-ip-ms = 0` or `mode = "off"` keeps none.
 - **The fields are absent, not empty, when tracking is off.** `/stats` looks
   exactly as it did before the feature existed, and an absent field is
   indistinguishable from an idle secret.

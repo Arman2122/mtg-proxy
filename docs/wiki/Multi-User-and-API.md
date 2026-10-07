@@ -292,7 +292,9 @@ also the answer available to whoever ends up with the server — by seizure,
 compromise or subpoena. `connected_ips` adds no retention on its own, since
 those addresses are already held for the life of the connection. `last_ip` does:
 it survives the connection it came from, so a deployment that never asks for
-either never accumulates one.
+either never accumulates one. (That is about these two fields: the ee handshake
+budget keeps a separate anonymous per-address bucket in memory whatever
+`track-client-ips` says; see *Client addresses* in [[Security]].)
 
 Nothing here is written to disk in any form. `usage-state-file` persists quota
 counters only, so no address survives a restart. Turn this on for a specific,
