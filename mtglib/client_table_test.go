@@ -47,7 +47,7 @@ func fillClients(t *testing.T, table *clientTable, name string, n int) []*client
 	entries := make([]*clientEntry, n)
 
 	for i := range n {
-		entries[i] = table.acquire(name, syntheticClientKey(i), true, 0, entryInit{})
+		entries[i] = table.acquire(name, syntheticClientKey(i), true, entryInit{})
 		require.False(t, entries[i].rest, "entry %d of %d must have room", i, n)
 	}
 
@@ -62,7 +62,7 @@ func TestClientTableHoldsOneEntryPerAddress(t *testing.T) {
 
 	table, _ := newTestClientTable(t)
 
-	first := table.acquire("alice", "203.0.113.5", true, 0, entryInit{})
+	first := table.acquire("alice", "203.0.113.5", true, entryInit{})
 	require.NotNil(t, first)
 
 	assert.False(t, first.rest)
@@ -70,14 +70,14 @@ func TestClientTableHoldsOneEntryPerAddress(t *testing.T) {
 	assert.Equal(t, "alice", first.name)
 	assert.Equal(t, 1, clientRefs(table, first))
 
-	assert.Same(t, first, table.acquire("alice", "203.0.113.5", true, 0, entryInit{}),
+	assert.Same(t, first, table.acquire("alice", "203.0.113.5", true, entryInit{}),
 		"a second connection from the same place is the same entry")
 	assert.Equal(t, 2, clientRefs(table, first))
 
-	other := table.acquire("alice", "203.0.113.6", true, 0, entryInit{})
+	other := table.acquire("alice", "203.0.113.6", true, entryInit{})
 	assert.NotSame(t, first, other)
 
-	bobs := table.acquire("bob", "203.0.113.5", true, 0, entryInit{})
+	bobs := table.acquire("bob", "203.0.113.5", true, entryInit{})
 	assert.NotSame(t, first, bobs, "an entry belongs to an address AND a secret")
 
 	assert.Equal(t, 2, table.clients("alice"))
@@ -95,7 +95,7 @@ func TestClientTableHoldsOneEntryPerAddress(t *testing.T) {
 	table.release(nil)
 
 	assert.Equal(t, 2, table.clients("alice"), "an entry outlives its last connection")
-	assert.Same(t, first, table.acquire("alice", "203.0.113.5", true, 0, entryInit{}),
+	assert.Same(t, first, table.acquire("alice", "203.0.113.5", true, entryInit{}),
 		"and the address finds it again when it comes back")
 }
 
@@ -114,7 +114,7 @@ func TestClientTableInitialisesLimitersOnlyWhenItCreates(t *testing.T) {
 		FairTotals:  fairTotals{Speed: 8 << 20, Up: 2 << 20, Down: 4 << 20},
 	}
 
-	entry := table.acquire("alice", "203.0.113.5", true, 0, init)
+	entry := table.acquire("alice", "203.0.113.5", true, init)
 
 	ceiling := installedLimiter(t, &entry.ceiling)
 	assert.InDelta(t, float64(1<<20), float64(ceiling.Limit()), 0)
@@ -141,7 +141,7 @@ func TestClientTableInitialisesLimitersOnlyWhenItCreates(t *testing.T) {
 
 	table.release(entry)
 
-	again := table.acquire("alice", "203.0.113.5", true, 0, entryInit{CeilingRate: 4 << 20})
+	again := table.acquire("alice", "203.0.113.5", true, entryInit{CeilingRate: 4 << 20})
 	require.Same(t, entry, again)
 
 	assert.Same(t, ceiling, installedLimiter(t, &again.ceiling),
@@ -151,7 +151,7 @@ func TestClientTableInitialisesLimitersOnlyWhenItCreates(t *testing.T) {
 	assert.EqualValues(t, 1000, again.bytesIn.Load())
 	assert.EqualValues(t, 2000, again.bytesOut.Load())
 
-	rest := table.acquire("alice", "", false, 0, init)
+	rest := table.acquire("alice", "", false, init)
 	require.NotNil(t, rest)
 	require.True(t, rest.rest)
 
@@ -161,7 +161,7 @@ func TestClientTableInitialisesLimitersOnlyWhenItCreates(t *testing.T) {
 	assert.EqualValues(t, 2<<20, rest.fairUp.bytesPerSecond())
 	assert.EqualValues(t, 4<<20, rest.fairDown.bytesPerSecond())
 
-	plain := table.acquire("alice", "203.0.113.6", true, 0, entryInit{})
+	plain := table.acquire("alice", "203.0.113.6", true, entryInit{})
 	for _, l := range []*addrLimiter{&plain.ceiling, &plain.fairSpeed, &plain.fairUp, &plain.fairDown} {
 		assert.Nil(t, l.limiter.Load(), "no limit asked for is no limiter: the data path pays one load")
 	}
@@ -175,18 +175,18 @@ func TestClientTableUnkeyedPeersJoinTheRestEntry(t *testing.T) {
 
 	table, _ := newTestClientTable(t)
 
-	rest := table.acquire("alice", "", false, 0, entryInit{})
+	rest := table.acquire("alice", "", false, entryInit{})
 	require.NotNil(t, rest)
 
 	assert.True(t, rest.rest)
 	assert.Empty(t, rest.key)
 	assert.Equal(t, "alice", rest.name)
 
-	assert.Same(t, rest, table.acquire("alice", "127.0.0.1", false, 0, entryInit{}),
+	assert.Same(t, rest, table.acquire("alice", "127.0.0.1", false, entryInit{}),
 		"whatever key an unkeyed peer has, it is the rest entry")
 	assert.Equal(t, 2, clientRefs(table, rest))
 
-	assert.NotSame(t, rest, table.acquire("bob", "", false, 0, entryInit{}), "one rest entry per secret")
+	assert.NotSame(t, rest, table.acquire("bob", "", false, entryInit{}), "one rest entry per secret")
 
 	assert.Zero(t, table.clients("alice"), "the rest entry is not a client")
 	assert.Zero(t, table.overflow("alice"), "and an unkeyed peer is not an overflow")
@@ -203,7 +203,7 @@ func TestClientTablePerSecretCapDropsNewNeverEvicts(t *testing.T) {
 
 	table, clock := newTestClientTable(t)
 
-	first := table.acquire("alice", syntheticClientKey(0), true, 0, entryInit{CeilingRate: 1 << 20})
+	first := table.acquire("alice", syntheticClientKey(0), true, entryInit{CeilingRate: 1 << 20})
 	drainAddrLimiter(t, &first.ceiling)
 	first.bytesIn.Add(4242)
 
@@ -215,14 +215,14 @@ func TestClientTablePerSecretCapDropsNewNeverEvicts(t *testing.T) {
 
 	newcomer := addressKey("203.0.113.200")
 
-	rest := table.acquire("alice", newcomer, true, 0, entryInit{})
+	rest := table.acquire("alice", newcomer, true, entryInit{})
 	assert.True(t, rest.rest, "a new address past the cap joins the rest entry")
 	assert.EqualValues(t, 1, table.overflow("alice"))
 
-	assert.Same(t, rest, table.acquire("alice", newcomer, true, 0, entryInit{}))
+	assert.Same(t, rest, table.acquire("alice", newcomer, true, entryInit{}))
 	assert.EqualValues(t, 2, table.overflow("alice"), "overflow counts connections, not addresses")
 
-	assert.Same(t, first, table.acquire("alice", syntheticClientKey(0), true, 0, entryInit{}),
+	assert.Same(t, first, table.acquire("alice", syntheticClientKey(0), true, entryInit{}),
 		"an address already held keeps getting its own entry at the cap")
 	assert.EqualValues(t, 2, table.overflow("alice"), "and that is not an overflow")
 
@@ -249,36 +249,8 @@ func TestClientTablePerSecretCapDropsNewNeverEvicts(t *testing.T) {
 
 	require.Equal(t, 1, table.sweep(clock.read(), clientSweepChunk))
 
-	assert.False(t, table.acquire("alice", newcomer, true, 0, entryInit{}).rest)
+	assert.False(t, table.acquire("alice", newcomer, true, entryInit{}).rest)
 	assert.EqualValues(t, 2, table.overflow("alice"))
-}
-
-// With an ip-limit the per-secret cap is the smaller of the two: there is no
-// point holding more places for a secret than it may be in at once.
-func TestClientTablePerSecretCapFollowsIPLimit(t *testing.T) {
-	t.Parallel()
-
-	for ipLimit, want := range map[int]int{
-		-1:   maxClientsPerSecret,
-		0:    maxClientsPerSecret,
-		1:    1,
-		2:    2,
-		4096: maxClientsPerSecret,
-		5000: maxClientsPerSecret,
-	} {
-		assert.Equal(t, want, clientCap(ipLimit), "ip-limit %d", ipLimit)
-	}
-
-	table, _ := newTestClientTable(t)
-
-	a := table.acquire("alice", "203.0.113.1", true, 2, entryInit{})
-	b := table.acquire("alice", "203.0.113.2", true, 2, entryInit{})
-	c := table.acquire("alice", "203.0.113.3", true, 2, entryInit{})
-
-	assert.False(t, a.rest)
-	assert.False(t, b.rest)
-	assert.True(t, c.rest, "an ip-limit of two holds two places")
-	assert.EqualValues(t, 1, table.overflow("alice"))
 }
 
 // The table as a whole is bounded too: when every secret together holds the
@@ -303,23 +275,23 @@ func TestClientTableGlobalCapDropsNewNeverEvicts(t *testing.T) {
 
 	first.bytesOut.Add(77)
 
-	late := table.acquire("latecomer", "203.0.113.9", true, 0, entryInit{})
+	late := table.acquire("latecomer", "203.0.113.9", true, entryInit{})
 	assert.True(t, late.rest, "a secret with room of its own still has none when the table is full")
 	assert.EqualValues(t, 1, table.overflow("latecomer"))
 	assert.Zero(t, table.clients("latecomer"))
 
-	assert.Same(t, first, table.acquire("user0", syntheticClientKey(0), true, 0, entryInit{}))
+	assert.Same(t, first, table.acquire("user0", syntheticClientKey(0), true, entryInit{}))
 	assert.EqualValues(t, 77, first.bytesOut.Load(), "nothing was evicted to make room")
 
 	// One entry swept anywhere is one slot free everywhere. Every other entry
 	// is still held by the stream that made it, so only this one goes.
-	victim := table.acquire("user3", syntheticClientKey(7), true, 0, entryInit{})
+	victim := table.acquire("user3", syntheticClientKey(7), true, entryInit{})
 	table.release(victim)
 	table.release(victim)
 	clock.advance(clientIdleRetention)
 
 	require.Equal(t, 1, table.sweep(clock.read(), clientSweepChunk))
-	assert.False(t, table.acquire("latecomer", "203.0.113.9", true, 0, entryInit{}).rest)
+	assert.False(t, table.acquire("latecomer", "203.0.113.9", true, entryInit{}).rest)
 }
 
 // Review Focus 2: an IPv4 address and its v4-mapped IPv6 spelling are one
@@ -357,16 +329,16 @@ func TestClientKeysShareOneEntryPerPlace(t *testing.T) {
 
 	table, _ := newTestClientTable(t)
 
-	four := table.acquire("alice", plain4, true, 0, entryInit{})
-	assert.Same(t, four, table.acquire("alice", plainBytes, true, 0, entryInit{}),
+	four := table.acquire("alice", plain4, true, entryInit{})
+	assert.Same(t, four, table.acquire("alice", plainBytes, true, entryInit{}),
 		"a 4-byte and a 16-byte IPv4 are one place")
-	assert.Same(t, four, table.acquire("alice", mapped, true, 0, entryInit{}),
+	assert.Same(t, four, table.acquire("alice", mapped, true, entryInit{}),
 		"a v4-mapped address is its IPv4 address")
 	assert.Equal(t, 3, clientRefs(table, four))
 
-	six := table.acquire("alice", sameNet1, true, 0, entryInit{})
-	assert.Same(t, six, table.acquire("alice", sameNet2, true, 0, entryInit{}), "one /64 is one place")
-	assert.NotSame(t, six, table.acquire("alice", otherNet, true, 0, entryInit{}), "the next /64 is another")
+	six := table.acquire("alice", sameNet1, true, entryInit{})
+	assert.Same(t, six, table.acquire("alice", sameNet2, true, entryInit{}), "one /64 is one place")
+	assert.NotSame(t, six, table.acquire("alice", otherNet, true, entryInit{}), "the next /64 is another")
 
 	assert.Equal(t, 3, table.clients("alice"))
 
@@ -392,20 +364,20 @@ func TestClientTableSweepKeepsLiveAndRecentlyIdleEntries(t *testing.T) {
 
 	table, clock := newTestClientTable(t)
 
-	live := table.acquire("alice", "203.0.113.1", true, 0, entryInit{})
+	live := table.acquire("alice", "203.0.113.1", true, entryInit{})
 
-	idle := table.acquire("alice", "203.0.113.2", true, 0, entryInit{})
+	idle := table.acquire("alice", "203.0.113.2", true, entryInit{})
 	table.release(idle)
 
-	returning := table.acquire("alice", "203.0.113.3", true, 0, entryInit{})
+	returning := table.acquire("alice", "203.0.113.3", true, entryInit{})
 	table.release(returning)
 
-	rest := table.acquire("alice", "", false, 0, entryInit{})
+	rest := table.acquire("alice", "", false, entryInit{})
 	table.release(rest)
 
 	clock.advance(9 * time.Minute)
 
-	table.acquire("alice", "203.0.113.3", true, 0, entryInit{})
+	table.acquire("alice", "203.0.113.3", true, entryInit{})
 	table.release(returning)
 
 	clock.advance(time.Minute - time.Second)
@@ -427,11 +399,11 @@ func TestClientTableSweepKeepsLiveAndRecentlyIdleEntries(t *testing.T) {
 	assert.Len(t, table.all, 2)
 	table.mu.Unlock()
 
-	again := table.acquire("alice", "203.0.113.2", true, 0, entryInit{})
+	again := table.acquire("alice", "203.0.113.2", true, entryInit{})
 	assert.NotSame(t, idle, again, "a swept address starts afresh")
 	assert.Zero(t, again.bytesIn.Load())
 
-	assert.NotSame(t, rest, table.acquire("alice", "", false, 0, entryInit{}), "and so does a swept rest entry")
+	assert.NotSame(t, rest, table.acquire("alice", "", false, entryInit{}), "and so does a swept rest entry")
 }
 
 // The sweep never walks more than its chunk under one hold of the lock, and lets
@@ -467,7 +439,7 @@ func TestClientTableSweepWorksInChunks(t *testing.T) {
 		released = append(released, free)
 
 		if arrival == nil {
-			arrival = table.acquire("alice", "203.0.113.77", true, 0, entryInit{})
+			arrival = table.acquire("alice", "203.0.113.77", true, entryInit{})
 		}
 	}
 
@@ -494,10 +466,10 @@ func TestClientTableDropSecretForgetsEverything(t *testing.T) {
 
 	table, _ := newTestClientTable(t)
 
-	held := table.acquire("alice", "203.0.113.1", true, 1, entryInit{})
-	table.acquire("alice", "203.0.113.2", true, 1, entryInit{})
-	rest := table.acquire("alice", "", false, 1, entryInit{})
-	bobs := table.acquire("bob", "203.0.113.1", true, 0, entryInit{})
+	held := fillClients(t, table, "alice", maxClientsPerSecret)[0]
+	require.True(t, table.acquire("alice", "203.0.113.2", true, entryInit{}).rest)
+	rest := table.acquire("alice", "", false, entryInit{})
+	bobs := table.acquire("bob", "203.0.113.1", true, entryInit{})
 
 	require.EqualValues(t, 1, table.overflow("alice"))
 
@@ -517,7 +489,7 @@ func TestClientTableDropSecretForgetsEverything(t *testing.T) {
 	table.release(held)
 	table.release(rest)
 
-	again := table.acquire("alice", "203.0.113.1", true, 0, entryInit{})
+	again := table.acquire("alice", held.key, true, entryInit{})
 	assert.NotSame(t, held, again, "the name coming back starts afresh")
 	assert.Equal(t, 1, table.clients("alice"))
 	assert.Equal(t, 1, clientRefs(table, again))
@@ -532,8 +504,8 @@ func TestClientTableSnapshotIsACopy(t *testing.T) {
 
 	table, _ := newTestClientTable(t)
 
-	keyed := table.acquire("alice", "203.0.113.1", true, 0, entryInit{})
-	rest := table.acquire("alice", "", false, 0, entryInit{})
+	keyed := table.acquire("alice", "203.0.113.1", true, entryInit{})
+	rest := table.acquire("alice", "", false, entryInit{})
 
 	snapshot := table.snapshot("alice")
 	assert.ElementsMatch(t, []*clientEntry{keyed, rest}, snapshot)
@@ -551,8 +523,8 @@ func TestNilClientTableIsOff(t *testing.T) {
 
 	var table *clientTable
 
-	assert.Nil(t, table.acquire("alice", "203.0.113.1", true, 0, entryInit{}))
-	assert.Nil(t, table.acquire("alice", "", false, 0, entryInit{}))
+	assert.Nil(t, table.acquire("alice", "203.0.113.1", true, entryInit{}))
+	assert.Nil(t, table.acquire("alice", "", false, entryInit{}))
 	assert.Zero(t, table.sweep(time.Now(), clientSweepChunk))
 	assert.Nil(t, table.snapshot("alice"))
 	assert.Zero(t, table.clients("alice"))

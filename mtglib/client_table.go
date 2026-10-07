@@ -40,7 +40,12 @@ import (
 
 const (
 	// maxClientsPerSecret is how many addresses one secret holds an entry for,
-	// or its ip-limit if that is smaller.
+	// whatever its ip-limit says. The address ledger already holds a secret's
+	// live addresses to its ip-limit -- it refuses a new address first -- so a
+	// cap at the ip-limit would only ever bite on idle entries: a phone that
+	// left Wi-Fi a minute ago would push its own new LTE address to the rest
+	// entry, which has no ceiling, for the life of the connection. This bounds
+	// the memory idle entries hold, and nothing else.
 	maxClientsPerSecret = 4096
 
 	// maxClients is how many address entries the table holds across every
@@ -187,18 +192,6 @@ func clientKeyed(ip net.IP) bool {
 	return ok
 }
 
-// clientCap is the per-secret cap for a secret with the given ip-limit: the
-// table's own bound, or the ip-limit when that is smaller. A secret cannot be
-// in more places at once than its ip-limit, so holding more for it would only
-// help someone cycle through addresses to fill the table.
-func clientCap(ipLimit int) int {
-	if ipLimit > 0 {
-		return min(ipLimit, maxClientsPerSecret)
-	}
-
-	return maxClientsPerSecret
-}
-
 // acquire finds or makes the entry a new stream of the named secret is
 // governed by, and holds it for the stream: the address's own entry when key is
 // keyed and the table has room for it, and the secret's rest entry otherwise.
@@ -208,9 +201,8 @@ func clientCap(ipLimit int) int {
 // An entry that already exists is returned as it is: its bucket, bytes and
 // limiters are what its address left, whatever init says now. A new one has its
 // limiters made from init before it is published -- a rest entry without the
-// ceiling -- so nobody ever sees it without them. ipLimit is the secret's
-// ip-limit, from the same snapshot as init, for the per-secret cap.
-func (t *clientTable) acquire(name string, key addressKey, keyed bool, ipLimit int, init entryInit) *clientEntry {
+// ceiling -- so nobody ever sees it without them.
+func (t *clientTable) acquire(name string, key addressKey, keyed bool, init entryInit) *clientEntry {
 	if t == nil {
 		return nil
 	}
@@ -231,7 +223,7 @@ func (t *clientTable) acquire(name string, key addressKey, keyed bool, ipLimit i
 
 		switch {
 		case entry != nil:
-		case len(sc.entries) < clientCap(ipLimit) && t.keyed < maxClients:
+		case len(sc.entries) < maxClientsPerSecret && t.keyed < maxClients:
 			entry = t.makeLocked(name, key, false, init, now)
 			sc.entries[key] = entry
 			t.keyed++

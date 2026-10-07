@@ -246,6 +246,44 @@ func TestAReloadBackfillsStreamsAlreadyOpen(t *testing.T) {
 	assert.Equal(t, 0, clientRefs(table, rest))
 }
 
+// The per-secret entry cap is 4,096 whatever ip-limit says. The ledger holds a
+// secret's LIVE addresses to its ip-limit; the table's idle entries -- kept ten
+// minutes after their last stream -- must not push a roaming client's new
+// address to the rest entry, which has no ceiling, for the life of its
+// connection.
+func TestThePerSecretCapDoesNotFollowIPLimit(t *testing.T) {
+	t.Parallel()
+
+	probe := newClientTableProbe(t, true)
+	probe.proxy.secrets.Store(buildSecretSet(
+		map[string]Secret{"alice": GenerateSecret("alice.example.com")}, nil, nil,
+		map[string]SecretLimits{"alice": {IPLimit: 2}}))
+
+	table := probe.proxy.clients
+
+	// The phone on Wi-Fi and the laptop: both gone now, both still held idle.
+	for i, from := range []string{"203.0.113.1", "203.0.113.2"} {
+		sc := probe.stream(t, tcpFrom(from, 50001+i), 2)
+
+		require.Equal(t, DenyNone, probe.proxy.tryRegisterConn(sc))
+		probe.proxy.unregisterConn(sc)
+	}
+
+	require.Equal(t, 2, table.clients("alice"))
+
+	// The phone again, now on LTE. No address is live, so the ledger admits it.
+	roaming := probe.stream(t, tcpFrom("198.51.100.3", 50003), 2)
+
+	require.Equal(t, DenyNone, probe.proxy.tryRegisterConn(roaming))
+
+	entry := roaming.addrEntry.Load()
+	require.NotNil(t, entry)
+
+	assert.False(t, entry.rest, "a new address gets its own entry, not the rest entry, whatever ip-limit says")
+	assert.Equal(t, 3, table.clients("alice"))
+	assert.Zero(t, table.overflow("alice"), "no cap turned it away")
+}
+
 // Review Focus 5: removing a secret drops its entries and its rest entry at
 // once, and the streams it closes let go of entries the table no longer holds
 // without disturbing anything; a re-key closes the old key's streams but keeps
@@ -428,8 +466,8 @@ func TestMaintenanceSweepsTheClientTable(t *testing.T) {
 	p := newLimitTestProxy(map[string]Secret{"alice": GenerateSecret("alice.example.com")}, nil)
 	p.clients = newClientTable(clock.clock())
 
-	p.clients.release(p.clients.acquire("alice", "203.0.113.9", true, 0, entryInit{}))
-	live := p.clients.acquire("alice", "203.0.113.10", true, 0, entryInit{})
+	p.clients.release(p.clients.acquire("alice", "203.0.113.9", true, entryInit{}))
+	live := p.clients.acquire("alice", "203.0.113.10", true, entryInit{})
 
 	clock.advance(clientIdleRetention)
 

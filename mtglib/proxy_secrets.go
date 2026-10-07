@@ -419,7 +419,7 @@ func (p *Proxy) backfillClients(set *secretSet) {
 				continue
 			}
 
-			sc.addrEntry.Store(p.clients.acquire(name, sc.addrKey, sc.addrKeyed, lim.IPLimit, entryInitOf(lim)))
+			sc.addrEntry.Store(p.clients.acquire(name, sc.addrKey, sc.addrKeyed, entryInitOf(lim)))
 		}
 	}
 }

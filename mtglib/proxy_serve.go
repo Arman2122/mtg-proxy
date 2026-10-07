@@ -546,7 +546,7 @@ func (p *Proxy) acquireClientLocked(name string, key addressKey, keyed bool) *cl
 		return nil
 	}
 
-	return p.clients.acquire(name, key, keyed, lim.IPLimit, entryInitOf(lim))
+	return p.clients.acquire(name, key, keyed, entryInitOf(lim))
 }
 
 // connectedIPs snapshots the distinct client addresses holding a live
