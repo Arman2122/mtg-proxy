@@ -148,6 +148,21 @@ func TestHandshakeBudgetInvalidValuesAreRefusedByKey(t *testing.T) {
 	}
 }
 
+// An empty mode is not a fifth word: it is read as unset, like an absent key, and
+// enforce is what that means. Today that holds because the TOML mirror drops an
+// empty string (omitempty) before the mode type ever sees it; this pins the
+// behaviour the documentation states, so a change to the mirror cannot turn
+// `mode = ""` into a startup error without a test saying so.
+func TestAnEmptyModeIsUnset(t *testing.T) {
+	t.Parallel()
+
+	conf := parseHandshakeBudget(t, "\n[defense.handshake-budget]\nmode = \"\"\n")
+
+	assert.Empty(t, conf.GetHandshakeBudgetMode(), "an empty mode is unset, which mtglib reads as enforce")
+	assert.Empty(t, conf.UnknownKeys, "mode is still a known key")
+	assert.NoError(t, conf.Validate())
+}
+
 // The edges of the ranges are valid. An explicit per-ip-ms of 0 is the way to
 // switch the per-address bucket off; cpu-percent has no such spelling.
 func TestHandshakeBudgetBoundariesAreValid(t *testing.T) {

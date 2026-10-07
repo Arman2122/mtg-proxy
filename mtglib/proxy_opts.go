@@ -305,9 +305,10 @@ type ProxyOpts struct {
 	//
 	// The budget is in real CPU: the cost of a SHA-256 block on this machine is
 	// measured once per process. Under enforce a legitimate client with no hint
-	// can be fronted while a flood keeps the budget spent; it retries. A client
-	// whose address matched a secret recently is verified against that hint
-	// first and is exempt.
+	// can be fronted while a flood keeps the budget spent; it retries. With
+	// hints on (HandshakeHints), a client whose address matched a secret
+	// recently has its hinted candidates tried before, and outside, the budget;
+	// a hint miss falls through to a scan that is charged like any other.
 	//
 	// The zero values of this and the next two settings are the defaults:
 	// enforce, 50 ms per address, 25% of the cores.
@@ -323,8 +324,10 @@ type ProxyOpts struct {
 	//
 	// nil is 50. 0 disables the per-address bucket, leaving only the
 	// process-wide one -- which is what peers behind a carrier that does not
-	// forward client addresses get anyway, since they all arrive from
-	// loopback. Above 1000 is invalid.
+	// forward client addresses get anyway, since they all arrive from a loopback
+	// or private address. A front proxy on a public address that sends no PROXY
+	// header is the opposite case: every client arrives from that one address
+	// and shares one bucket, so 0 is what it wants. Above 1000 is invalid.
 	//
 	// This is an optional setting.
 	HandshakeBudgetPerIPMillis *uint

@@ -156,7 +156,7 @@ the process started.
 | `unmatched` | Hellos the scan found no secret for. They were fronted to the cover site. |
 | `denied_ip` | Hellos refused because the client address's own bucket could not pay for a scan. Checked before the process-wide bucket. |
 | `denied_global` | Hellos refused because the process-wide bucket could not pay. |
-| `oversized` | Hellos above the scan cap of 128 SHA-256 blocks (about 8 KiB), which are never scanned. |
+| `oversized` | Hellos above the scan cap of 128 SHA-256 blocks (about 8 KiB). Under `enforce` they are never scanned; `observe` counts them and scans them anyway. Always `0` under `off`, which has no cap. |
 | `over_budget_matched` | `observe` mode only: hellos the budget would have refused that then matched a real secret. Always `0` under `enforce`. |
 | `enforced` | Whether the budget acts on a refusal. `true` in `enforce` mode, `false` in `observe` and `off`. |
 | `ns_per_block` | What the budget believes one SHA-256 block costs on this machine, in nanoseconds: the reading taken once at start, which every cost in the budget is divided by. About 30 on a CPU with SHA extensions, several hundred on one without. |

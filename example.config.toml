@@ -644,14 +644,14 @@ drs = false
 # A scan the budget can pay for within 150 ms waits for it and runs; one it
 # cannot pay for is fronted at once to the cover site, with the same bytes a
 # wrong secret gets -- never closed. A hello larger than 128 SHA-256 blocks
-# (about 8 KiB; a real client sends 0.5 to 2 KiB) is never scanned at all and is
-# fronted the same way. When hints are on (see hints below: they follow
-# track-client-ips), a client whose address matched a secret recently is tried
-# against that secret first and skips the scan. A legitimate client with no such
-# hint can therefore be fronted while a flood keeps the budget spent; it
-# retries. That is the accepted cost, and "observe" below is how to see whether
-# it ever touches your users. See the Security and Configuration pages of the
-# wiki.
+# (about 8 KiB; a real client sends 0.5 to 2 KiB) is, in "enforce" mode, never
+# scanned at all and is fronted the same way. When hints are on (see hints
+# below: they follow track-client-ips), a client whose address matched a secret
+# recently is tried against that secret first and skips the scan. A legitimate
+# client with no such hint can therefore be fronted while a flood keeps the
+# budget spent; it retries. That is the accepted cost, and "observe" below is
+# how to see whether it ever touches your users. See the Security and
+# Configuration pages of the wiki.
 #
 # [defense.handshake-budget]
 # # "enforce" (the default) acts on the budget as described above.
@@ -671,10 +671,12 @@ drs = false
 # # without PROXY protocol, every client lands in that one address's bucket:
 # # set 0 there.
 # #
-# # The per-address bucket holds an address (IPv4, or IPv6 /64) -- no secret
-# # name, nothing else -- in process memory for 30 to 60 minutes after its last
-# # unhinted scan; it is never logged, exported or written to disk, and 0 keeps
-# # none. It is not governed by track-client-ips or hints.
+# # The per-address bucket holds an address (IPv4, or IPv6 /64) as the key to a
+# # token count and the time it was last charged -- no secret name -- in process
+# # memory for 30 to 60 minutes after the last hello from that address that
+# # reached the budget (scanned or refused); the bucket is never logged, exported
+# # or written to disk, and per-ip-ms = 0 or mode = "off" keeps none. It is not
+# # governed by track-client-ips or hints.
 # per-ip-ms = 50
 #
 # # The share of the cores (GOMAXPROCS, read at start) the whole process may

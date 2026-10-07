@@ -587,7 +587,7 @@ It is **on by default**. A config without this table gets the values below.
 | key | type | default | meaning |
 |---|---|---|---|
 | `mode` | `"enforce"` \| `"observe"` \| `"off"` | `"enforce"` | What happens to a scan the budget cannot pay for. Lower case only: any other word is refused when the file is read, and an empty `mode = ""` is read as unset. See below. |
-| `per-ip-ms` | integer, 0–1000 | `50` | Scan CPU one client address (an IPv4 address, or an IPv6 /64) may spend per second, in milliseconds, with a burst of four seconds' worth. **`0` turns the per-address bucket off** and leaves only the process-wide one. The bucket holds an address — no secret name, nothing else — in process memory for 30 to 60 minutes after its last unhinted scan; it is never logged, exported or written to disk, and `per-ip-ms = 0` keeps none. |
+| `per-ip-ms` | integer, 0–1000 | `50` | Scan CPU one client address (an IPv4 address, or an IPv6 /64) may spend per second, in milliseconds, with a burst of four seconds' worth. **`0` turns the per-address bucket off** and leaves only the process-wide one. The bucket holds an address as the key to a token count and the time it was last charged — no secret name — in process memory for 30 to 60 minutes after the last hello from that address that reached the budget (scanned or refused); the bucket is never logged, exported or written to disk, and `per-ip-ms = 0` or `mode = "off"` keeps none. |
 | `cpu-percent` | integer, 1–100 | `25` | The share of the cores (`GOMAXPROCS`, read once at start) the whole process may spend scanning, with a burst of one second's worth. This is the bound that holds against many addresses and against forged ones. An explicit `0` is refused. |
 | `hints` | bool | the value of `track-client-ips` | Remember which secrets a client address matched, and try them first. `true` or `false` overrides `track-client-ips` in either direction. |
 
@@ -607,8 +607,8 @@ hints = true
    client sends 0.5 to 2 KiB — is never hinted, and under `enforce` never tried:
    it is fronted. (`observe` counts it and scans it anyway; `off` has no cap.)
 3. If hints apply to the client's address, the secrets it matched before are
-   tried first. Each is one HMAC (at most 16), a hit finishes the handshake, and
-   a hit is outside the budget.
+   tried first: one HMAC each, at most 16. A hit finishes the handshake and is
+   outside the budget.
 4. Otherwise the budget is charged for a scan over the remaining secrets, at
    `secrets × max(blocks, 12)` blocks, where an ordinary 517-byte hello is 12
    blocks. If both buckets can pay within 150 ms, the scan waits for them, if it
@@ -688,12 +688,14 @@ the budget. `hints = true` turns the cache on without tracking; `hints = false`
 keeps it off even with tracking.
 
 **The per-address bucket is a separate thing, and neither `hints` nor
-`track-client-ips` governs it.** It holds an address (IPv4, or IPv6 /64) — no
-secret name, nothing else — in process memory for 30 to 60 minutes after its last
-unhinted scan; it is never logged, exported or written to disk; `per-ip-ms = 0`
-keeps none. It is what stops one source from spending the whole budget, so it is
-on by default, and it sees every address that is charged for an unhinted scan: a
-prober's hello as much as a client's first one.
+`track-client-ips` governs it.** It holds an address (IPv4, or IPv6 /64) as the
+key to a token count and the time it was last charged — no secret name — in
+process memory for 30 to 60 minutes after the last hello from that address that
+reached the budget (scanned or refused); the bucket is never logged, exported or
+written to disk; `per-ip-ms = 0` or `mode = "off"` keeps none. It is what stops
+one source from spending the whole budget, so it is on by default. Every unhinted
+hello that reaches the scan touches it — with hints off, which is the default,
+every client hello — a prober's as much as a client's.
 
 **Restart only.** The table is read once at start. `POST /reload` re-reads
 `[secrets]`, `[secret-ad-tags]` and `[secret-limits]`, not this, so a change
