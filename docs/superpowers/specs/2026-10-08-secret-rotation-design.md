@@ -135,10 +135,15 @@ Each is numbered and justified where it is made. The ones most worth auditing ar
 - **D3** `until` is an absolute RFC 3339 instant with an explicit offset.
 - **D4** A problem in a retiring entry never blocks a load. `run` and reload drop the entry with
   a warning, which kills that old key. `run --check` refuses the file.
-- **D5** Problems and inert conditions are separated, and the time-dependent checks look only
-  at unexpired entries. A file `run --check` accepts at time *t* is therefore accepted at every
-  later time.
-- **D6** Caps: 4 per name, 4,096 in all, and `until` no more than 720 h after the load.
+- **D5** Problems, warnings and inert conditions are separated, and two properties hold for an
+  unchanged file:
+  - **P1:** what `run --check` accepts at *t* it accepts later;
+  - **P2:** what `run` does not accept at *t* it never accepts later (R0).
+
+  The cross-name collision is therefore judged against every entry, expired or not, and
+  too-far `until` is a warning, not a drop.
+- **D6** Caps: 4 per name and 4,096 in all (drops). `until` more than 720 h after the load is a
+  warning under `run`, a refusal under `--check`, and never written by the CLI.
 - **D7** A retiring value may have any mode and any host. Door behaviour follows the value's own
   mode.
 - **D8** Key uniqueness: the primary always wins. A cross-name collision is a problem.
@@ -239,7 +244,8 @@ wrong-type mark. The values are **not** parsed during the JSON decode, because a
 
 ### 1.2 Reading it: `(*Config).RetiringSecrets(now) ([]mtglib.RetiringSecret, []string)`
 
-This returns the usable entries and the problems. It is pure (no logging, no state) and takes
+This returns the usable entries (rule-4 entries included) and the lines: one per problem or
+warning, which `--check` refuses alike. It is pure (no logging, no state) and takes
 `now`, so a test injects the clock. Every caller uses it: the `run` start-up, the reloader,
 `run --check`, `doctor` and `rotate-secret`. `Validate()` does **not** call it (D4), so
 `web-relay`, `access` and `doctor` never fail because of a retiring entry.
@@ -253,8 +259,8 @@ Each entry is classified in this order.
 | 1 | `name` empty or wrong type; `secret` wrong type, unparseable, or an all-zero key; `until` missing, wrong type, without an offset, or not RFC 3339 | problem (does not depend on time) | entry dropped, warning | refused |
 | 2 | `until` ≤ now | **inert** (expired) | ignored; one Info summary line naming the count and suggesting `--prune` | accepted |
 | 3 | `name` not a configured secret | problem | dropped, warning | refused |
-| 4 | `until` > now + 720 h (`mtglib.MaxRetiringOverlap`) | problem | dropped, warning | refused |
-| 5 | the key equals another name's primary key, or another name's unexpired retiring key | problem | dropped, warning (both colliding retiring entries are dropped; a primary is never touched) | refused |
+| 4 | `until` > now + 720 h (`mtglib.MaxRetiringOverlap`) | **warned** (an over-long grant, still bounded by its own `until`) | **kept**, warning at every load | refused |
+| 5 | the key equals any other name's primary key, or the key of **any** syntactically valid entry of another name, **expired or not** (a pure function of the file's text, so it does not depend on time) | problem | dropped, warning (both colliding retiring entries are dropped; a primary is never touched) | refused |
 | 6 | the key equals its own name's primary key | inert (the primary already accepts it) | ignored, Info | accepted |
 | 7 | two unexpired entries of one name with the same key | inert duplicate | collapsed to one with the later `until`, Info | accepted |
 | 8 | more than 4 unexpired entries for one name (`mtglib.MaxRetiringPerSecret`), or more than 4,096 in all (`mtglib.MaxRetiringSecrets`) | problem | keep the 4 latest `until` per name, then the 4,096 latest overall (ties broken by name, then key bytes); drop the rest, warning | refused |
@@ -269,23 +275,50 @@ reload), `access` and `doctor`, none of which uses these entries. Dropping fails
 early, and the warning (at the default log level) says why. This is the same split as unknown
 keys: logged by `run`, refused by `--check`.
 
-**Why acceptance is monotone in time.**
-- Rule 1 does not depend on time.
-- Rules 3, 4, 5 and 8 are applied to unexpired entries only.
-- Rule 4 compares `until` with `now + 720h`, and `now` only grows.
-- As time passes, entries only move into rule 2.
+**Two properties in time, both required, both tested.** In each, the file is unchanged and
+*t′ > t*.
 
-So a file `--check` accepts at *t* is accepted at every *t′ > t*. A test pins this (§12, C9).
+- **P1 (`--check` is monotone):** a file `--check` accepts at *t* is accepted at *t′* (§12,
+  C9).
+  - Rules 1 and 5 do not depend on time.
+  - Rules 3 and 8 look only at unexpired entries, a set that only shrinks.
+  - Rule 4 compares `until` with `now + 720h`, and `now` only grows.
+  - Entries only ever move into rule 2.
+- **P2 (`run` never revives, which is R0):** an entry that `run` does not accept at *t* is not
+  accepted at *t′* (§12, C12). Rule by rule:
+  - 1 is constant.
+  - 2: an expired entry stays expired. Within one process the high-water clock guarantees it;
+    across a restart, only the wall clock does (Risks).
+  - 3 depends on `[secrets]` only.
+  - 5 is a pure function of the text. This is why it compares against expired and dangling
+    entries too. Judged against unexpired entries only, the collision would disappear when the
+    other name's entry expired, and a reload would then accept a key it had dropped.
+  - 6 and 7 never drop a grant: the key is either the primary's, or kept with the latest
+    `until`.
+  - 8 drops the entries that expire first. Its order (`until` descending, then name, then key
+    bytes) is fixed, and the population it ranks only shrinks with time. So every entry ranked
+    above a dropped one is still unexpired, and still ranked above it, for as long as the
+    dropped one is unexpired.
+  - Rule 4 is why it is a **warning, not a drop**. Any comparison with `now` that drops an
+    entry today would accept it once `now` has grown (a block 721 h away is dropped now and
+    accepted an hour later). So `run` keeps it, bounded by its own `until`, and warns at every
+    load; `--check` refuses it, and `rotate-secret` never writes one.
 
-**Messages are value-free.** The format is `retiring-secret #<n> (name "<name>"): <reason>; the
-entry is ignored and its key is not accepted`. `<n>` is the 1-based position in the file. The
+A drop caused by an API mutation (§5.1, a re-key onto a retiring key) is not covered by P2. The
+next reload returns to the file, and the file's grant is still in force: it is not a key past
+its overlap.
+
+**Messages are value-free.** The format of a problem is `retiring-secret #<n> (name "<name>"):
+<reason>; the entry is ignored and its key is not accepted`. The format of the rule-4 warning is
+`retiring-secret #<n> (name "<name>"): until is more than 720h away; it is honoured, but an
+overlap is a migration window, not a second key: shorten it (run --check refuses this file)`. `<n>` is the 1-based position in the file. The
 reason never contains the secret. `until` is not a credential and may be echoed.
 
 ### 1.4 Wiring
 
 - `makeSecretsReloader` adds `Retiring: usable` to the `SecretConfig` it returns, and logs each
-  problem line at Warning with `warnUnknownKeys`' wording style, on start-up and on every
-  reload.
+  problem or warning line at Warning in `warnUnknownKeys`' wording style, on start-up and on
+  every reload.
 - `runProxyWith` passes `ProxyOpts.RetiringSecrets` and logs the problems once.
 - `checkConfig` refuses when there are unknown keys **or** retiring problems:
   `errRetiringProblems`, listing the lines.
@@ -329,7 +362,10 @@ const (
 - The engine applies rules 2, 3, 5, 6, 7 and 8 again, defensively, for library callers and for
   states only the engine sees (a `POST /secrets` re-key onto a retiring key). At engine level
   every rule drops and logs; none is an error.
-- The engine does not apply the 720 h cap: that is a config and CLI rule.
+- The engine judges rule 5 only among the entries and primaries it is handed. The config layer
+  has already applied the time-independent form against the whole file, expired entries
+  included, before it filters out the expired ones, so P2 holds for the file path.
+- The engine does not apply the 720 h cap (a config warning and a CLI rule).
 
 ### 2.2 Building the set (D9)
 
@@ -771,8 +807,8 @@ each key's and string's byte range; the repo pins v2.4.3) and splices the origin
    - `RetiringSecrets`, which must equal the old list minus the removed entries plus the new
      one, compared as raw (name, secret, until) triples.
 
-   `Validate` must still pass, and `RetiringSecrets(now)` must report no problem the old file
-   did not have. Any difference means nothing is written: `internal error: the edit changed
+   `Validate` must still pass, and `RetiringSecrets(now)` must report no problem or warning the
+   old file did not have. Any difference means nothing is written: `internal error: the edit changed
    more than it meant to; nothing was written`. This catches every layout the splice
    mishandles, including a user appended after the block that would otherwise fall inside it
    (`UnknownKeys` would differ).
@@ -825,8 +861,10 @@ each key's and string's byte range; the repo pins v2.4.3) and splices the origin
   reload; writing without one would half-apply). If `features` lacks `secret-rotation` (an
   older running binary, which would ignore the block and kill the old key at the reload), it
   refuses unless `--force`.
-- **After writing:** `POST /reload`, then `GET /secrets/{name}`. The `secret` field must be the
-  new value. With an overlap, `retiring_until` must equal the written `until`.
+- **After writing:** `POST /reload`, then `GET /secrets/{name}`. The `secret` field (base64)
+  must **parse to the same key, mode and host** as the new value, which the file may hold as
+  hex: compare the parsed `Secret`s, not the strings. With an overlap, `retiring_until` must
+  equal the written `until`.
 - **A mismatch:** exit non-zero with `the file is rotated but the proxy does not serve it:
   <what differs>; possible causes: a SECRET environment variable overriding [secrets], a
   single-file bind mount that still shows the old file (use --in-place), a clock far ahead`.
@@ -941,7 +979,7 @@ checks `features` first.
 | Crash during the write | The rename never happened, so the old file is intact. A stale `.tmp` and the lock file remain; the next run refuses on the lock and names it. `--in-place`: the backup file remains. |
 | Two proxies share one file | Each applies the same absolute `until` on its own reload. `--reload` reloads one, and the documentation says to reload each. |
 | Time zones | `until` is an instant; the CLI writes UTC. |
-| A very long overlap | Over 720 h is a problem (dropped, `--check` refuses), and the CLI refuses it. An overlap is a migration window, not a second permanent key. |
+| A very long overlap | The CLI refuses over 720 h. A hand-written one is kept under `run`, bounded by its own `until`, with a Warning at every load, and `--check` refuses it. It is not dropped, because a drop judged against `now` would be undone by a later reload (P2). An overlap is a migration window, not a second permanent key, and the warning says so. |
 | Many retiring keys | Capped at 4 per name and 4,096 in all. CPU is in §11. |
 | A reload with a malformed block | The block is dropped with a Warning, and the rest of the file (the new primary included) is applied (D4). |
 | An operator re-keys by API during an overlap, without the file | The in-memory primary changes and the retiring entries are kept (§5.1). The next reload restores the file's primary: the documented in-memory semantics of every API mutation, unchanged by this piece. |
@@ -1072,7 +1110,7 @@ No wall-clock sleeps decide an outcome.
 - A9. The feature list is sorted and includes `secret-rotation`.
 
 **Config (C)**
-- C1. Every row of §1.3, as a problem or inert, with value-free messages.
+- C1. Every row of §1.3, as a problem, a warning or inert, with value-free messages.
 - C2. `until` as a quoted string, an offset date-time, a local date-time (problem), a date
   (problem) and an integer (problem, not a parse failure).
 - C3. A wrong-typed `secret` or `name` is a problem, not a parse failure.
@@ -1082,10 +1120,18 @@ No wall-clock sleeps decide an outcome.
 - C7. `Config.String()` redacts them and is byte-identical without the table.
 - C8. **Leak sweep:** a scripted rotation (CLI, reload, API reads, a refused reload, problem
   lines, `/reload` 500 bodies, debug logs) never shows the retiring value in any spelling.
-- C9. **Monotone acceptance:** a seeded generator of files and times asserts that accepted at
-  *t* implies accepted at *t′ > t*.
+- C9. **P1:** a seeded generator of files and times asserts that `--check` accepted at *t*
+  implies accepted at *t′ > t*.
 - C10. The panel-emitted config yields no unknown keys and no problems.
 - C11. An unknown field inside the block is an unknown key.
+- C12. **P2, the dual:** the same generator asserts that an entry `run` does not accept at *t*
+  (its key absent from the usable list) is not accepted at any *t′ > t*. A high-water clock is
+  injected, so expiry follows `now`.
+- C13. **Named sequence, rule 4:** a block with `until` 721 h away is kept with a warning now,
+  still kept an hour later, and refused by `--check` now but not an hour later.
+- C14. **Named sequence, rule 5:** alice (until T1) and bob (until T2 > T1) share a retiring
+  key. Both are dropped before T1, and bob's entry is **still dropped after T1** when the file
+  is re-read.
 
 **CLI (R)**
 - R1. Rotation on a corpus of layouts:
@@ -1144,6 +1190,9 @@ No wall-clock sleeps decide an outcome.
 - let the relay `Lookup` a retired capability;
 - make a problem refuse the load under `run`;
 - check expired entries for dangling names;
+- judge rule 5 against unexpired entries only (C14 fails);
+- drop a rule-4 entry under `run` (C12 and C13 fail);
+- break the fixed rule-8 order with a time-dependent tie-break (C12 fails);
 - ignore the per-name cap;
 - shift the obfuscated index mapping by one.
 
@@ -1285,17 +1334,38 @@ Tasks 1 and 2 can run in parallel; then 3 and 4 in parallel; 8 can start after 1
    a deliberate behaviour change.
 6. Retiring ee hosts join the SNI gate and cover hosts (D7), enabling host-changing rotations.
 7. A high-water rotation clock (D10), with its poisoning trade-off.
-8. Caps: 4 per name, 4,096 in all, 720 h; and 32 hinted verifications (D6, D12).
-9. `--overlap` is required, with no default; `--reload` is opt-in (D26, D32).
-10. The panel-path heuristic with `--force` (D25).
-11. WEB: no overlap; retiring capabilities are tier two (D28).
-12. The surgical text edit with re-parse verification, rather than a TOML re-marshal (D23).
-13. The four read-back scalars; `retiring_connections` is computed at read time (D19, D20).
-14. Expiry closes live streams within 5 s, with no extra grace (D11).
-15. No SIGHUP for `run` (D27): a SIGHUP ends the process today, and changing that is not
+8. Caps: 4 per name and 4,096 in all (drops), and 32 hinted verifications (D6, D12). A `until`
+   more than 720 h away is only a **warning** under `run` (kept, bounded by its own `until`),
+   because a drop judged against `now` would be reversed by a later reload, breaking P2/R0.
+   `--check` and the CLI refuse it.
+9. Rule 5 (cross-name key collision) is judged against every syntactically valid entry,
+   **expired and dangling included**, so a dropped entry stays dropped. Cost: an expired block
+   left in the file keeps blocking a later block that reuses its key under another name, until
+   it is pruned.
+10. `--overlap` is required, with no default; `--reload` is opt-in (D26, D32).
+11. The panel-path heuristic with `--force` (D25).
+12. WEB: no overlap; retiring capabilities are tier two (D28).
+13. The surgical text edit with re-parse verification, rather than a TOML re-marshal (D23).
+14. The four read-back scalars; `retiring_connections` is computed at read time (D19, D20).
+15. Expiry closes live streams within 5 s, with no extra grace (D11).
+16. No SIGHUP for `run` (D27): a SIGHUP ends the process today, and changing that is not
     additive.
 
 ## Revision notes
+
+- **Revision 1.1 (2026-10-08, the same day, a second advisor round).** It found that
+  revision 1 broke R0 in two §1.3 rows. Revision 1 proved only P1 (`--check` is monotone); R0
+  needs P2 for `run`: what is dropped from an unchanged file stays dropped. Both counterexamples
+  are now named tests:
+  - **Rule 4** dropped an entry whose `until` was more than 720 h away, and a reload an hour
+    later accepted it. It is now a warning (kept under `run`, refused by `--check` and the CLI).
+  - **Rule 5** judged collisions against unexpired entries only. When one colliding entry
+    expired, a reload accepted the other. It is now judged against every syntactically valid
+    entry.
+
+  Also added: the P2 argument rule by rule (including rule 8's fixed order), tests C12 to C14
+  and three sabotages. The `--reload` read-back now compares parsed keys (the API answers in
+  base64, while the file may hold hex).
 
 - **Revision 1 (2026-10-08).** Written after an advisor round that changed one decision and
   added five:
