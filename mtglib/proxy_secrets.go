@@ -419,10 +419,10 @@ func (p *Proxy) applyClientLimits(set *secretSet) {
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
 
-	p.clients.applyCeilings(func(name string) int64 {
-		lim, _ := set.limitsOf(name)
+	p.clients.applyCeilings(func(name string) (int64, bool) {
+		lim, kept := set.limitsOf(name)
 
-		return lim.ClientSpeedBytesPerSecond
+		return lim.ClientSpeedBytesPerSecond, kept
 	})
 
 	p.backfillClientsLocked(set)

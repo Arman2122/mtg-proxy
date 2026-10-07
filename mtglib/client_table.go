@@ -446,18 +446,20 @@ func (t *clientTable) forgetLocked(entry *clientEntry) {
 }
 
 // applyCeilings moves the ceiling of every address entry the table holds to
-// what ceilingOf says for the entry's secret, 0 for none: how a reload reaches
-// the entries made before it. Entries no stream holds are moved too: an
-// address that comes back finds its entry as it left it, and must not find the
-// ceiling of a reload ago. Rest entries are left alone, because they never have
-// a ceiling.
+// what rateOf says for the entry's secret, 0 for none: how a reload reaches the
+// entries made before it. Entries no stream holds are moved too: an address
+// that comes back finds its entry as it left it, and must not find the ceiling
+// of a reload ago. Rest entries are left alone, because they never have a
+// ceiling, and so is every entry of a secret rateOf does not know: the reload
+// drops those and closes their streams straight after, and lifting their
+// ceilings first would let those streams relay unheld for the moment between.
 //
 // The caller holds liveMu, the lock admission makes an entry under from the
 // secret set it reads there. A reload swaps its set in before it gets here, so
 // an admission that read the set before the swap made its entry before this
 // walk, which moves it, and one after it read the new set: no entry is ever
 // left on a ceiling a reload has replaced.
-func (t *clientTable) applyCeilings(ceilingOf func(name string) int64) {
+func (t *clientTable) applyCeilings(rateOf func(name string) (bytesPerSecond int64, kept bool)) {
 	if t == nil {
 		return
 	}
@@ -466,7 +468,10 @@ func (t *clientTable) applyCeilings(ceilingOf func(name string) int64) {
 	defer t.mu.Unlock()
 
 	for name, sc := range t.secrets {
-		bytesPerSecond := ceilingOf(name)
+		bytesPerSecond, kept := rateOf(name)
+		if !kept {
+			continue
+		}
 
 		for _, entry := range sc.entries {
 			entry.ceiling.apply(bytesPerSecond, ceilingBurst(bytesPerSecond))

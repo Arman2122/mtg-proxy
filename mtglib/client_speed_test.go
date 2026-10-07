@@ -505,6 +505,35 @@ func TestAReloadReRatesTheCeilingInPlace(t *testing.T) {
 	assert.InDelta(t, float64(8<<20), float64(fair.Limit()), 0)
 }
 
+// A reload that removes a secret leaves its addresses' ceilings as they are.
+// The walk moves the ceilings of the secrets the new set holds; the removed
+// one's entries are dropped, and its streams closed, straight after it. Taken
+// for a secret with no ceiling, they would be lifted first, and its streams
+// would relay unheld for the moment between.
+func TestARemovedSecretsCeilingsAreLeftToTheDrop(t *testing.T) {
+	t.Parallel()
+
+	probe := newClientTableProbe(t, false)
+	p := probe.proxy
+	bob := GenerateSecret("bob.example.com")
+
+	cfg := p.secrets.Load().toConfig()
+	cfg.Secrets["bob"] = bob
+	cfg.Limits = map[string]SecretLimits{"alice": {ClientSpeedBytesPerSecond: 1 << 20}}
+	require.NoError(t, p.ReplaceSecrets(cfg))
+
+	entry := admitFrom(t, probe, tcpFrom("203.0.113.48", 50001)).addrEntry.Load()
+	require.NotNil(t, entry)
+
+	bucket := installedLimiter(t, &entry.ceiling)
+
+	require.NoError(t, p.ReplaceSecrets(SecretConfig{Secrets: map[string]Secret{"bob": bob}}))
+
+	assert.Nil(t, p.clients.snapshot("alice"), "the removed secret's entries are dropped")
+	assert.Same(t, bucket, installedLimiter(t, &entry.ceiling),
+		"and the ceiling of the stream still holding one was not lifted on the way out")
+}
+
 // The stale-ceiling race of spec §1: a new entry's ceiling comes from the
 // secret set as it is when admission takes the entry, under liveMu, not from
 // the set the secret matched in. A reload that lands between the match and the
