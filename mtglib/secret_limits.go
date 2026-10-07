@@ -119,9 +119,12 @@ type SecretLimits struct {
 	// what it wants and the others share the rest equally, however many
 	// connections each holds. Each of SpeedBytesPerSecond,
 	// SpeedUpBytesPerSecond and SpeedDownBytesPerSecond that is set is divided
-	// on its own, so it needs at least one of them; the config and the API
-	// refuse it without. The rest entry -- every address that does not stand
-	// for one place -- holds one share between them.
+	// on its own, so it needs at least one of them. Without one of speed /
+	// speed-up / speed-down the engine treats it as off -- nothing is divided,
+	// though as a per-address control it still keeps the secret's addresses'
+	// entries; only the config and the HTTP API refuse it. The rest entry --
+	// every address that does not stand for one place -- holds one share
+	// between them.
 	ClientFair bool
 }
 

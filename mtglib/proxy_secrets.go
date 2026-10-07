@@ -703,14 +703,17 @@ func (p *Proxy) startFairShare(ctx context.Context, every time.Duration) {
 // ticked at all; a reload that turns it on again makes its next tick a
 // baseline.
 //
-// It reads the set without a lock and takes nothing the tick does not -- the
-// table's lock and the leaf locks after it -- so never liveMu or reloadMu: a
-// pass never holds up an admission or a reload behind it. A reload that moves
-// a secret's fair limiters while that secret's tick is measuring makes the
-// tick publish nothing (clientTable.tick). One that lands after the pass read
-// the set and before the secret's tick began costs one tick at a level worked
-// out for the old totals, which the next pass replaces; the user's own bucket
-// holds the new total meanwhile.
+// It takes nothing the tick does not -- the table's lock and the leaf locks
+// after it -- so never liveMu or reloadMu: a pass never holds up an admission
+// or a reload behind it. It reads the set without a lock, so a pass may tick a
+// secret with totals a concurrent reload is replacing, and that is harmless
+// either way. A tick with the old totals whose first hold of the table comes
+// after the reload's applyFair finds lastTick zeroed, and only takes a
+// baseline. A tick whose two holds straddle applyFair publishes nothing: the
+// epoch moved. A tick with the new totals that finishes between the set's swap
+// and applyFair publishes onto the old limiters, which applyFair then re-rates
+// or replaces, forgetting the level of every bucket whose total changed. No
+// tick leaves a level for totals that are no longer the secret's.
 func (p *Proxy) tickFairShare() {
 	if p.clients != nil {
 		if set := p.secrets.Load(); set != nil {
