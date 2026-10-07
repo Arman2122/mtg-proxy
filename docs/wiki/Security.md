@@ -690,7 +690,10 @@ What a ban touches besides the refusal:
   handshake budget's per-address bucket.
 - **Bans.** The address, the secret's name and the expiry, in memory, until the
   ban lapses (at most `720h`), is lifted, its secret is removed, or the process
-  stops. Listed only with `track-client-ips`; otherwise only their number.
+  stops. A lapsed ban is cleared lazily: the next time a connection from the
+  address matches that secret, the next time any ban is made, lifted or listed,
+  or the next time `/clients` is read with tracking on. Listed only with
+  `track-client-ips`; otherwise only their number.
 - **Logs.** The start warning names the listener and the keys, never a secret
   or a value. The API's ban and unban lines carry the secret's name and counts,
   never an address. A refused connection's `connection denied by per-user limit`
