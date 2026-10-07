@@ -232,7 +232,11 @@ say so). Each configured secret bucket is divided separately: `speed` → `fairS
 `speed-up` → `fairUp`, `speed-down` → `fairDown`.
 
 - *Participants* of a secret in a direction: its keyed entries with at least one live stream
-  that moved a byte in the last 10 s, **plus its rest entry** if it has live streams.
+  that moved a byte **or was blocked at the fair limiter or the secret-level bucket** in the
+  last 10 s, **plus its rest entry** if it has live streams. (An address blocked in one long
+  wait has moved no bytes but is asking for its share; with a tiny level — a 16 KiB piece at
+  1.4 KB/s sleeps 11 s — dropping it from the participants would hand its share to the others
+  and spread the per-address means by about 40%.)
 - Every second a ticker (under the proxy context) takes the participants of each fair secret
   (pointers copied under `tableMu`) and, per configured direction with total `T`:
   1. each participant has a **duty**: the fraction of the last second during which **at
@@ -410,7 +414,8 @@ between 0.5 and 2").
   fails if secret-level waits are not counted in the duty); a downloader that pauses releases
   the other at once (the `L/2` rule); a new arrival is set to the current `L` and the others
   shrink within two ticks; hysteresis keeps a throttled address at ∞ for three ticks; an entry
-  with a live stream but no bytes for ten seconds is still set to `L`; the rest entry
+  with a live stream but no bytes and no blocked time for ten seconds is still set to `L` (and
+  is not a participant); one blocked in a long wait stays a participant; the rest entry
   participates and has no ceiling; rates are never zero and no clamp lifts them (the floor
   only raises a computed 0 to 1);
   duty is rate-independent (the same outcome at 1 MB/s and 100 MB/s).
@@ -503,6 +508,14 @@ Prometheus labels (cardinality, PII); identifying people behind one address; the
 - **Sybil by IPv6 prefix and forged PROXY addresses** are named above and not solved here.
 - **Fair share is adaptive**: it reacts within about two seconds; the water level lets a quiet
   address use its share at once, and a burst past the secret-level bucket is bounded by it.
+  **With thousands of live addresses it settles slower**: every fair limiter starts with a full
+  fixed burst (`clamp(T/20, 64 KiB, 4 MiB)`), so the share only binds once that burst has
+  drained — roughly `n / 60` seconds at `T` in the unclamped band (3 s at 512 addresses, about
+  a minute at 4,096 and 100 MB/s; independent simulation, review of Task 12a). The secret's
+  total `T` is enforced by the secret-level bucket the whole time; only the split between
+  addresses is the user bucket's per-connection one until the bursts drain. Starting the
+  limiters nearly empty would remove the wait but would also throttle the first bytes of every
+  newcomer, so it is not done; revisit if a deployment reports it.
 - **Memory:** up to 32,768 entries × a few hundred bytes (limiters allocated only where a cap
   applies), held for ten minutes after the last connection.
 - **Hot path:** a nil-pointer load with no entry; two atomic adds with an entry and no limiter;
