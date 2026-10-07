@@ -38,6 +38,34 @@ func requireOnlyEntry(t *testing.T, table *clientTable, name string, want *clien
 	require.Same(t, want, snapshot[0])
 }
 
+// awaitUpstreamRecorded waits until every live stream of name has recorded its
+// Telegram socket. The upstream has the handshake a moment before the stream
+// records the socket, and a stream revoked inside that moment reaches the relay
+// with no upstream at all -- a race of doTelegramCall's own, which a test that
+// revokes streams right after connecting them must not step into.
+func awaitUpstreamRecorded(t *testing.T, p *Proxy, name string) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		p.liveMu.Lock()
+
+		streams := make([]*streamContext, 0, len(p.liveConns[name]))
+		for sc := range p.liveConns[name] {
+			streams = append(streams, sc)
+		}
+
+		p.liveMu.Unlock()
+
+		for _, sc := range streams {
+			if sc.telegram() == nil {
+				return false
+			}
+		}
+
+		return len(streams) > 0
+	}, 5*time.Second, time.Millisecond, "%s's streams never recorded their Telegram socket", name)
+}
+
 // newClientTableProbe is a denyProbe with a table and a secret set of one ee
 // secret, "alice", which is everything admission, a reload and the table touch.
 func newClientTableProbe(t *testing.T, tracking bool) *denyProbe {
@@ -246,6 +274,91 @@ func TestAReloadBackfillsStreamsAlreadyOpen(t *testing.T) {
 	assert.Equal(t, 0, clientRefs(table, rest))
 }
 
+// Spec §2: the entry is taken after the ledger has admitted the stream, so a
+// connection the ip-limit refuses never reaches the table. It takes no entry
+// and counts as neither a client nor an overflow; otherwise a flood of refused
+// new addresses would fill the table with orphans for ten minutes. A
+// connection with no address at all, refused because a limit cannot be
+// counted without one, takes no rest entry either.
+func TestAnAddressRefusedByIPLimitTakesNoEntry(t *testing.T) {
+	t.Parallel()
+
+	probe := newClientTableProbe(t, true)
+	table := probe.proxy.clients
+
+	require.Equal(t, DenyNone, probe.proxy.tryRegisterConn(probe.stream(t, tcpFrom("203.0.113.1", 50001), 1)))
+	require.Equal(t, DenyIPLimit, probe.proxy.tryRegisterConn(probe.stream(t, tcpFrom("203.0.113.2", 50002), 1)))
+
+	assert.Nil(t, entryByKey(table, "alice", "203.0.113.2"), "a refused address takes no entry")
+	assert.Equal(t, 1, table.clients("alice"))
+	assert.Zero(t, table.overflow("alice"))
+
+	nowhere := probe.stream(t, &net.UnixAddr{Name: "@nowhere", Net: "unix"}, 1)
+
+	require.Equal(t, DenyIPLimit, probe.proxy.tryRegisterConn(nowhere))
+	assert.Len(t, table.snapshot("alice"), 1, "nor does a connection with no address take the rest entry")
+}
+
+// A refusal gives back exactly the hold it took on the rest entry and no more:
+// an unkeyed stream already live keeps the rest entry held. A second release
+// would let the sweep forget a rest entry still in use, and the next unkeyed
+// stream would make a second one for the same secret.
+func TestARefusedUnkeyedStreamLeavesTheOtherHolders(t *testing.T) { //nolint: paralleltest // swaps a package variable
+	probe := newClientTableProbe(t, true)
+	table := probe.proxy.clients
+
+	live := probe.stream(t, tcpFrom("127.0.0.1", 50001), 0)
+	require.Equal(t, DenyNone, probe.proxy.tryRegisterConn(live))
+
+	rest := live.addrEntry.Load()
+	require.NotNil(t, rest)
+	require.True(t, rest.rest)
+
+	heldInHook := 0
+
+	installRegisterStepHook(t, func(step registerStep, _ *streamContext) DenyReason {
+		if step != stepEntryAcquired {
+			return DenyNone
+		}
+
+		heldInHook = clientRefs(table, rest)
+
+		return DenyBanned
+	})
+
+	require.Equal(t, DenyBanned, probe.proxy.tryRegisterConn(probe.stream(t, tcpFrom("127.0.0.1", 50002), 0)))
+
+	assert.Equal(t, 2, heldInHook, "the refused stream held the same rest entry")
+	assert.Equal(t, 1, clientRefs(table, rest), "and gave back its own hold, and no more")
+	assert.Same(t, rest, live.addrEntry.Load())
+}
+
+// The maintenance loop's sweep really walks in chunks of clientSweepChunk, so a
+// table of any size holds its lock for one chunk at a time.
+func TestSweepClientsWorksInChunks(t *testing.T) {
+	t.Parallel()
+
+	clock := newFakeAddrClock()
+
+	p := newLimitTestProxy(map[string]Secret{"alice": GenerateSecret("alice.example.com")}, nil)
+	p.clients = newClientTable(clock.clock())
+
+	const idle = 2500
+
+	for _, entry := range fillClients(t, p.clients, "alice", idle) {
+		p.clients.release(entry)
+	}
+
+	clock.advance(clientIdleRetention)
+
+	var holds []int
+
+	p.clients.afterHold = func(walked int) { holds = append(holds, walked) }
+
+	assert.Equal(t, idle, p.sweepClients())
+	assert.Equal(t, []int{clientSweepChunk, clientSweepChunk, idle - 2*clientSweepChunk}, holds)
+}
+
 // The per-secret entry cap is 4,096 whatever ip-limit says. The ledger holds a
 // secret's LIVE addresses to its ip-limit; the table's idle entries -- kept ten
 // minutes after their last stream -- must not push a roaming client's new
@@ -311,6 +424,9 @@ func TestRemovingASecretDropsItsEntriesAndARekeyKeepsThem(t *testing.T) {
 	aliceEntry := entryByKey(table, "alice", "203.0.113.1")
 	require.NotNil(t, aliceEntry)
 	require.Len(t, table.snapshot("bob"), 2, "bob's address and his rest entry")
+
+	awaitUpstreamRecorded(t, h.proxy, "alice")
+	awaitUpstreamRecorded(t, h.proxy, "bob")
 
 	require.NoError(t, h.proxy.DeleteSecret("bob"))
 
@@ -458,8 +574,6 @@ func TestAProxyWithoutATableHasNoEntries(t *testing.T) {
 // clock, forgetting what has been idle long enough and nothing else.
 func TestMaintenanceSweepsTheClientTable(t *testing.T) {
 	t.Parallel()
-
-	assert.Equal(t, time.Minute, clientSweepInterval, "spec §1: the sweep runs every 60 s")
 
 	clock := newFakeAddrClock()
 

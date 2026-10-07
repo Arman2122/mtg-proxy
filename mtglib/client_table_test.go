@@ -54,6 +54,69 @@ func fillClients(t *testing.T, table *clientTable, name string, n int) []*client
 	return entries
 }
 
+// requireClientTableConsistent checks the table's indexes against each other,
+// under its lock: every slot of all holds an entry that knows its own index,
+// once; the keyed count is the number of address entries; and every entry the
+// per-secret maps reach is in all, and nothing else is.
+func requireClientTableConsistent(t *testing.T, table *clientTable) {
+	t.Helper()
+
+	table.mu.Lock()
+	defer table.mu.Unlock()
+
+	inAll := make(map[*clientEntry]bool, len(table.all))
+	keyed := 0
+
+	for i, entry := range table.all {
+		require.NotNil(t, entry, "slot %d is empty", i)
+		require.Equal(t, i, entry.index, "the entry in slot %d knows another index", i)
+		require.False(t, inAll[entry], "the entry in slot %d is in all twice", i)
+		require.GreaterOrEqual(t, entry.refs, 0)
+
+		inAll[entry] = true
+
+		if !entry.rest {
+			keyed++
+		}
+	}
+
+	require.Equal(t, keyed, table.keyed, "the global count is the number of address entries")
+
+	reached := 0
+
+	for name, sc := range table.secrets {
+		for key, entry := range sc.entries {
+			require.True(t, inAll[entry], "%s's entry for %s is not in all", name, key)
+			require.Equal(t, key, entry.key)
+			require.Equal(t, name, entry.name)
+			require.False(t, entry.rest)
+
+			reached++
+		}
+
+		if sc.rest != nil {
+			require.True(t, inAll[sc.rest], "%s's rest entry is not in all", name)
+			require.True(t, sc.rest.rest)
+
+			reached++
+		}
+	}
+
+	require.Len(t, table.all, reached, "every entry in all is reachable from its secret, and no other is")
+}
+
+// Spec §1-§5 give these numbers verbatim. Every other test is written relative
+// to the constants, so this is the one that notices one of them change.
+func TestClientTableConstantsAreTheSpecs(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, 4096, maxClientsPerSecret, "entries per secret")
+	assert.Equal(t, 32768, maxClients, "entries in all")
+	assert.Equal(t, 10*time.Minute, clientIdleRetention, "idle retention after the last stream")
+	assert.Equal(t, 60*time.Second, clientSweepInterval, "how often the sweep runs")
+	assert.Equal(t, 1024, clientSweepChunk, "the most entries the sweep looks at under one hold")
+}
+
 // An entry is made once per address and secret, every stream that uses it holds
 // it, and letting go of every stream does not forget it: that is the whole point
 // of a lifetime of its own.
@@ -406,6 +469,80 @@ func TestClientTableSweepKeepsLiveAndRecentlyIdleEntries(t *testing.T) {
 	assert.NotSame(t, rest, table.acquire("alice", "", false, entryInit{}), "and so does a swept rest entry")
 }
 
+// The idle clock starts at the last close, not at the connect: an address held
+// for half an hour and then let go keeps its entry for ten minutes after. Were
+// it measured from the connect, a long stream's entry would be forgotten by the
+// first sweep after it closed, and the address would come back to a full bucket.
+func TestClientTableReleaseRestartsTheIdleClock(t *testing.T) {
+	t.Parallel()
+
+	table, clock := newTestClientTable(t)
+
+	entry := table.acquire("alice", "203.0.113.5", true, entryInit{})
+
+	clock.advance(30 * time.Minute)
+	table.release(entry)
+
+	clock.advance(time.Minute)
+
+	assert.Zero(t, table.sweep(clock.read(), clientSweepChunk), "let go a minute ago: kept")
+	requireOnlyEntry(t, table, "alice", entry)
+
+	clock.advance(clientIdleRetention - time.Minute - time.Second)
+
+	assert.Zero(t, table.sweep(clock.read(), clientSweepChunk), "a second short of ten minutes: kept")
+
+	clock.advance(time.Second)
+
+	assert.Equal(t, 1, table.sweep(clock.read(), clientSweepChunk), "ten minutes after the last close: forgotten")
+	assert.Zero(t, table.clients("alice"))
+}
+
+// A secret removed while the sweep is between two holds -- a DeleteSecret
+// during the sweep of a big table -- shrinks all under the walk. The walk must
+// go on within the shorter table and leave every index consistent: a read past
+// the end would end the process, since the sweep runs on the maintenance
+// goroutine, which nothing recovers.
+func TestClientTableSweepSurvivesARemovalBetweenHolds(t *testing.T) {
+	t.Parallel()
+
+	table, clock := newTestClientTable(t)
+
+	const each = 2000
+
+	// alice's idle entries fill the start of all, bob's held ones the end, so
+	// the first hold walks bob's and the removal pulls the end in under it.
+	for _, entry := range fillClients(t, table, "alice", each) {
+		table.release(entry)
+	}
+
+	fillClients(t, table, "bob", each)
+
+	clock.advance(clientIdleRetention + time.Minute)
+
+	removed := false
+
+	table.afterHold = func(int) {
+		if !removed {
+			removed = true
+
+			table.dropSecret("bob")
+		}
+	}
+
+	assert.Equal(t, each, table.sweep(clock.read(), clientSweepChunk), "every one of alice's idle entries")
+	require.True(t, removed)
+
+	requireClientTableConsistent(t, table)
+	assert.Empty(t, table.snapshot("alice"))
+	assert.Empty(t, table.snapshot("bob"))
+
+	table.mu.Lock()
+	assert.Empty(t, table.all)
+	assert.Zero(t, table.keyed)
+	table.mu.Unlock()
+}
+
 // The sweep never walks more than its chunk under one hold of the lock, and lets
 // go of it between chunks, so a full table costs an admission a short wait at
 // most. An address that arrives between two chunks is not swept by mistake.
@@ -455,6 +592,7 @@ func TestClientTableSweepWorksInChunks(t *testing.T) {
 	require.NotNil(t, arrival)
 	assert.Equal(t, []*clientEntry{arrival}, table.snapshot("alice"), "only the newcomer is left")
 	assert.Equal(t, 1, table.clients("alice"))
+	requireClientTableConsistent(t, table)
 }
 
 // A secret that is removed takes its entries, its rest entry and its overflow
@@ -495,6 +633,7 @@ func TestClientTableDropSecretForgetsEverything(t *testing.T) {
 	assert.Equal(t, 1, clientRefs(table, again))
 
 	table.dropSecret("nobody")
+	requireClientTableConsistent(t, table)
 }
 
 // snapshot copies the pointers, rest entry included, so a caller can walk them
