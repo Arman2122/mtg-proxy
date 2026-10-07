@@ -14,6 +14,8 @@ default.
 - [`[secrets]`](#secrets)
 - [`[secret-ad-tags]`](#secret-ad-tags)
 - [`[secret-limits.<name>]`](#secret-limitsname)
+  - [Per-address controls](#per-address-controls)
+  - [Fair share: what to expect](#fair-share-what-to-expect)
 - [`[[listener]]`](#listener)
 - [`[web]`](#-web)
 - [`[network]`](#network)
@@ -143,6 +145,14 @@ nothing is written to disk either way. `track-client-ips` does not govern the
 budget's per-address bucket, which also holds addresses in memory; see
 [`[defense.handshake-budget]`](#defensehandshake-budget).
 
+It also gives every secret entries in the per-address table. With tracking on,
+each address a secret is used from is kept in memory with the secret's name and
+what it moved, until ten minutes after its last connection closes, and
+`GET /secrets/{name}/clients` lists it for up to about eleven minutes. That
+reaches further back than `connected_ips`, which is live connections only. A
+secret with a per-address control keeps such entries even with tracking off, and
+then reports only counts. See [Per-address controls](#per-address-controls).
+
 ### The bind-to listener is `ee`-only
 
 `bind-to` accepts exactly one secret form: `ee` (FakeTLS). There is no key that
@@ -206,6 +216,10 @@ expires and is enabled.
 | `expires` | RFC3339 (`"2026-12-31T00:00:00Z"`) or `YYYY-MM-DD` | never | Validity deadline. |
 | `disabled` | bool | `false` | Reject the secret without removing it. |
 
+Three more keys, `client-conns`, `client-speed` and `client-fair`, act on each
+address inside one secret. They are described in
+[Per-address controls](#per-address-controls) below.
+
 ```toml
 usage-state-file = "/var/lib/mtg/usage.json"
 
@@ -232,6 +246,230 @@ has matched, so only a holder of the valid secret can see that refusal.
 Set `usage-state-file` if you use quotas; without it, usage counters reset on
 every restart. Limits set through the management API are in-memory only and are
 overwritten by the next `POST /reload`. See [[Limits-and-Quotas]].
+
+### Per-address controls
+
+A secret that many people share has one speed limit, one quota, one `ip-limit`
+and one set of counters. One heavy user can drain everyone's share, and nobody
+can see who is using what. Three optional keys act on each address inside one
+secret. All three are off by default.
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `client-conns` | integer, 0 or more | `0` (no cap) | How many live connections one address may hold to this secret at once. The next connection from that address is refused after the handshake, as an `ip-limit` refusal is. Lowering it never drops open connections. |
+| `client-speed` | rate, the same spelling and the same floor as `speed` (minimum `64kbit`, 8,000 bytes/s) | unset (no ceiling) | A ceiling on one address: upload and download together, across all of that address's connections to this secret. Each address has its own bucket. Leave the key out for no ceiling; an explicit `"0"` is refused, as it is for `speed`. |
+| `client-fair` | bool | `false` | Divide this secret's own `speed`, `speed-up` and `speed-down` among the addresses using it, each limit on its own. Needs at least one of the three in the same table. |
+
+```toml
+[secret-limits.family]
+speed = "50mbit"
+ip-limit = 30
+client-conns = 16
+client-speed = "10mbit"
+client-fair = true
+```
+
+**What an address is.** An IPv4 address, or an IPv6 /64: the same unit
+`ip-limit` and `kick` count. A v4-mapped IPv6 address is its IPv4 address. Some
+addresses do not stand for one place: loopback, private (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), link-local, unspecified and
+multicast, and a connection with no address at all. These are never capped by
+`client-conns` and never get a ceiling. They share one entry per secret, the
+*rest* entry, and so does every address the per-address table has no room for.
+The rest entry holds one fair share however many clients it stands for, and it
+has no ceiling: one address's ceiling would hold all of them together.
+
+**One address may be many people.** A mobile carrier's NAT (CGNAT) can put
+hundreds of users behind one IPv4 address. They get one connection budget, one
+ceiling and one fair share between them, and a ban of that address bans all of
+them. Set `client-conns` and `client-speed` generously where your users are on
+mobile networks.
+
+**The address is only as honest as the path it came by.**
+
+- Behind a carrier on loopback or a private address that sends no PROXY header,
+  every client is the rest entry. `client-conns` and `client-speed` then do
+  nothing, and fair share has one participant.
+- Behind a front on any other range that sends no PROXY header — a
+  `100.64.0.0/10` overlay such as Tailscale, or a cloud NAT — every client
+  arrives from one address that does stand for one place. `client-conns = 8`
+  would then cap the whole service at 8 connections.
+- Behind a PROXY-protocol listener (`proxy-protocol-listener` for `bind-to`, or
+  `proxy-protocol = true` on a `[[listener]]`) the address is whatever the
+  header says. There is no list of trusted senders, so anyone who can reach that
+  listener can write another member's address into the header: to use up that
+  member's connection budget or share, or to get that address banned. Use
+  per-address controls there only behind a front proxy you control.
+
+At start, the proxy logs one warning at `warn` level for each listener that
+expects PROXY headers, when any secret has one of the three keys:
+
+```text
+per-address controls are in use and this listener expects PROXY headers: the address they see is the one the PROXY header claims, and anyone who can reach this listener can forge it; use them only behind a front proxy you control
+```
+
+The line carries two fields: `listener`, the socket's address, and `keys`, the
+keys in use, sorted and comma-separated (for example
+`"client-conns, client-speed"`). It names no secret and no value, and it changes
+nothing about how connections are handled. It is logged at start only: a
+`POST /reload` or an API call that adds a per-address control later does not log
+it, operator bans do not trigger it, and `mtg-proxy doctor` does not check for
+it.
+
+**`client-conns` counts from the address ledger**, the same live count
+`ip-limit` reads. So it counts connections that were open before the cap was
+set, and it still holds when the per-address table is full. It is not
+`ip-limit`: `ip-limit` counts places, `client-conns` counts the sockets one place
+opens. A Telegram client keeps several connections open at once, one per data
+centre and more for media, so set `client-conns` to a few times that, never to
+1. A refused connection counts in `client_conns_refused` on `/stats`. There is no
+event and no Prometheus or statsd metric for it.
+
+**An address is held by whichever limit it reaches first**: its own
+`client-speed`, its fair share, or the secret's `speed`, `speed-up` and
+`speed-down`, which still hold the secret as a whole. A ceiling's bucket has a
+fixed burst of a twentieth of its rate, at least 64 KiB and at most 4 MiB. A
+reload that changes `client-speed` reaches open connections without a
+reconnect.
+
+**`client-fair` needs a speed to divide.** It divides `speed`, `speed-up` and
+`speed-down`, whichever are set, each on its own. It does not divide
+`client-speed`, which holds one address. A table that turns it on with none of
+the three is refused:
+
+```text
+secret-limits.family: client-fair divides the secret's speed among its addresses and needs speed, speed-up or speed-down beside it
+```
+
+How the share is worked out, and what to expect from it, is in
+[Fair share: what to expect](#fair-share-what-to-expect) below.
+
+**Pair `client-fair` and `client-conns` with `ip-limit`.** Whoever holds an IPv6
+/56 holds 256 /64s, and a /48 holds 65,536. Each /64 is an address with its own
+share and its own connection budget. `ip-limit` bounds how many addresses the
+secret may use at once, and with it how many shares one holder can claim.
+
+**Validation.** The keys are checked when the file is read, on `run`, on
+`POST /reload` and under `run --check`, which accepts them.
+
+| what is wrong | what happens |
+|---|---|
+| `client-conns` negative | refused when the file is parsed: `client-conns must not be negative` |
+| `client-conns` not an integer (`"4"`) | refused when the file is parsed |
+| `client-speed` below `64kbit`, zero, negative or not a rate | refused when the file is parsed, with a message that starts `client-speed:` |
+| `client-fair` not a boolean (`"yes"`, `1`) | refused when the file is parsed |
+| `client-fair = true` with no `speed`, `speed-up` or `speed-down` in the same table | refused by validation, naming the secret (above) |
+
+A binary that predates these keys logs them as unknown on `run` and ignores
+them, and refuses them under `run --check`.
+
+**Reload and the API.** The keys live in `[secret-limits]`, so `POST /reload`
+applies them to open connections, as it does `speed`. The management API sets
+them as `client_conns`, `client_speed` and `client_fair`; see
+[[Multi-User-and-API]]. Like every limit set through the API, they last until
+the next reload.
+
+**The panel does not write these keys.** It regenerates the config file, and its
+`/secrets` requests carry none of them. On a panel-managed proxy a key added to
+the file by hand is gone the next time the panel writes the file, and a panel's
+`POST` or `PUT /secrets` clears any per-address limit set through the API for
+the secrets it sends. These keys are for hand-managed configs and for API
+clients.
+
+**What is kept, and for how long.** The per-address table holds one entry per
+address per secret: the address, the secret's name, bytes in and out, when it
+was first and last seen, and its buckets. An entry is kept until ten minutes
+after the address's last connection to the secret closes; the sweep runs once a
+minute, so it goes between ten and eleven minutes after. It is in process memory
+only, never logged and never written to disk. Entries exist for a secret with a
+per-address control, and for every secret when `track-client-ips` is on. With
+tracking off they are kept all the same, because enforcement needs them, and
+only counts are reported; see *Client addresses* in [[Security]]. A secret holds
+at most 4,096 entries and the proxy 32,768 in all. A full table never evicts an
+entry, because evicting would hand a drained bucket back full: a new address that
+finds no room joins the rest entry and counts in `clients_overflow`. The caps
+count idle entries too, so `ip-limit` does not prevent this: a secret that has
+seen 4,096 addresses in the last ten minutes, or a proxy whose table holds
+32,768, sends the next new address to the rest entry. An entry that was dropped
+and made again starts its counters from zero.
+
+**What it costs.** A connection with no entry — tracking off and no per-address
+control on its secret — pays one atomic load per read and write. With an entry
+and no limiter, which is every connection of a proxy with `track-client-ips` on,
+each relay call cost about 14 ns more (106 to 120 ns, +13%), and about 75 ns more
+when two cores used one entry at once. A 1 MiB transfer is 64 relay calls, so
+the worst case is about 0.4% of bulk throughput, and the bulk-throughput
+benchmarks showed no difference above their noise. These figures are a
+same-session A/B on a shared 2-vCPU server over loopback. They do not include the
+cost of a ceiling or a fair share that is actually limiting.
+
+### Fair share: what to expect
+
+`client-fair` divides a secret's speed among the addresses using it. It is
+work-conserving: an address that wants less than an even split keeps what it
+wants, and the others share the rest equally, however many connections each
+holds. Bandwidth one address does not use goes to the others, and nothing is
+held back for an address that is quiet.
+
+How it is worked out:
+
+- Every second, for each of `speed`, `speed-up` and `speed-down` that is set, the
+  proxy works out a level `L` and sets every address with a live connection to
+  it, quiet ones included.
+- An address takes part if, in the last 10 seconds, it moved a byte in that
+  direction or waited to. The rest entry takes part whenever it has a live
+  connection, as one address.
+- An address is *held back* when, for at least a quarter of the last second, at
+  least one of its connections was waiting at its share or at the secret's own
+  bucket. A wait at its `client-speed` ceiling does not count: an address its own
+  ceiling holds is not short of its share. A held-back address asks for as much
+  as it can get; any other address asks for what it moved.
+- `L` is the level at which those demands add up to the secret's total. A
+  held-back address stays held back for three more seconds, unless it moves less
+  than half of `L`, which releases it at once: a download that pauses hands its
+  share back straight away.
+- The secret's own bucket still holds the total. The levels of all addresses may
+  add up to more than the total when quiet addresses are below `L`; the secret's
+  bucket is what keeps the sum to it.
+
+What to expect:
+
+- **About two seconds to settle**, for up to a few hundred active addresses.
+- **Slower with thousands.** Every fair bucket starts with a full burst: a
+  twentieth of the secret's total, at least 64 KiB and at most 4 MiB. The share
+  only binds once those bursts have drained, which takes roughly n/60 seconds
+  for n busy addresses: about 3 s at 512 and about a minute at 4,096, in
+  simulation at 100 MB/s. The secret's total holds the whole time; until then the
+  split between addresses is the secret bucket's own, which is per connection.
+- **A blind spot at a quarter.** An address that waits less than a quarter of the
+  time counts as getting what it asks for. When many addresses each download
+  over one connection, the secret's bucket keeps a short queue that every address
+  waits in: about the number of downloading connections × 16 KiB ÷ the secret's
+  speed, which is 42 ms with 256 of them at 100 MB/s. Traffic pushed to a client
+  only arrives that much later. A client that asks again only after each answer
+  arrives gets correspondingly less, up to a quarter under what it asks for: 82%
+  of its demand in a simulation of 1,024 addresses, 256 of them downloading, at
+  100 MB/s. It is the same with `client-fair` off. Fair share starts correcting
+  the split once some address is held back a quarter of the time.
+- **A small edge for many connections at tiny levels.** When the total divided by
+  the addresses is below about 1.6 KB/s (100 KB/s among more than 60 addresses,
+  1 MB/s among more than 600), an address with several connections keeps a small
+  edge from the 64 KiB minimum burst: about 5% more than its share over ten
+  minutes.
+- **A reload that changes a total forgets the old level.** The addresses run at
+  the new total for up to about two seconds, because the first tick after the
+  reload only measures, while the secret's bucket holds the new total. Turning
+  fair share on behaves the same way. When the new total changes the burst, the
+  buckets start full again and the settling time above applies again.
+- **A wait already under way is not shortened.** Lowering or removing a ceiling
+  or a share does not cut short a wait that started at the old rate: it finishes
+  at that rate, for at most one piece of at most one burst. For `client-speed` at
+  its floor that is 64 KiB at 8,000 bytes/s, about 8 seconds. A fair share has no
+  floor of its own, so at a tiny level one piece can take longer: 16 KiB at about
+  1.4 KB/s is about 11 seconds.
+
+The proxy's per-address usage, and how to watch fair share work, are on
+[[Monitoring]].
 
 ## `[[listener]]`
 
@@ -618,8 +856,9 @@ hints = true
    cover site with exactly the bytes a hello that matched nothing gets**, neither
    bucket is charged, and the connection is never closed.
 5. The charge is refunded only when the whole handshake then succeeds. A hello
-   that matches nothing, a replay, and a disabled, expired, throttled or
-   `ip-limit`-refused user all keep it.
+   that matches nothing, a replay, a disabled, expired, throttled or
+   `ip-limit`-refused user, a connection over `client-conns` and a banned
+   address all keep it.
 
 The cost of a block is measured once, when the first proxy in the process
 starts, on the HMAC the door actually runs. "25% of the cores" is therefore 25%
