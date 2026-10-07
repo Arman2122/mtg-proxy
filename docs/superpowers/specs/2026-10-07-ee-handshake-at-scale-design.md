@@ -116,19 +116,21 @@ names of up to 16 secrets that recently matched from it, most recent first.
   rotation drops the older generation. A valid-secret holder who controls many
   addresses can therefore keep new hints out, never evict existing ones.
 - **Privacy (budget).** Separately from hints, the per-address budget bucket
-  (§3) holds an address (IPv4, or IPv6 /64) and the time of its last scan — no secret
-  name — in process memory for 30 to 60 minutes after its last unhinted scan,
-  whatever `hints` and `track-client-ips` say; it is never logged, exported or
-  persisted. The older dd limiter keeps anonymous IP-keyed buckets the same way.
-  `per-ip-ms = 0` keeps none, at the price of per-source isolation. What
-  `track-client-ips` governs (`connected_ips`, `last_ip`, the address ledger) is
-  unchanged.
+  (§3) holds an address (IPv4, or IPv6 /64) as the key to a token count and the time
+  it was last charged — no secret name — in process memory for 30 to 60 minutes
+  after the last hello from that address that reached the budget (scanned or
+  refused), whatever `hints` and `track-client-ips` say; it is never logged,
+  exported or persisted. The older dd limiter also keeps anonymous per-address
+  buckets in memory (10 to 20 minutes). `per-ip-ms = 0` or `mode = "off"` keeps
+  none, at the price of per-source isolation. What `track-client-ips` governs
+  (`connected_ips`, `last_ip`, the address ledger) is unchanged.
 - **Privacy (hints).** The cache holds address → secret name (the panel's names are
   emails) in process memory for 30 to 60 minutes after the last use. Never logged,
   exported or persisted; gone on restart. It **follows `track-client-ips`** by
   default (on exactly when the operator has already chosen to keep client addresses
-  past a connection — the panel always does), so a standalone deployment keeps the
-  documented promise that no address outlives its connection. `hints = true|false`
+  past a connection — the panel always does), so a standalone deployment never keeps
+  an address-to-secret-name association past a connection (the budget's anonymous
+  address buckets are separate: see "Privacy (budget)"). `hints = true|false`
   overrides it either way.
 - **What it cannot do.** It never makes a wrong secret verify: every hinted
   candidate passes through the same `Verify`. A prober never matches, so it can
