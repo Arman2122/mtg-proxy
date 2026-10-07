@@ -13,6 +13,7 @@ Sections on this page:
 - The ee handshake budget
 - The obfuscated2 door
 - The WEB relay
+- Per-address controls and bans
 - IP blocklists and allowlists
 - The management API
 - What gets written down
@@ -137,7 +138,7 @@ by the [ee handshake budget](#the-ee-handshake-budget) is fronted without the
 scan over the secrets. The bytes sent to the cover site are the same in every
 case. The delay is not, and this page does not claim it is hidden.
 
-Five things take this exit:
+Six things take this exit:
 
 - an unreadable or non-matching ClientHello (wrong secret, wrong SNI, or a
   timestamp outside `tolerate-time-skewness`, default `3s`);
@@ -149,6 +150,9 @@ Five things take this exit:
   [[Limits-and-Quotas]]) — the outcome is deliberately identical to a wrong
   secret, so a prober cannot tell "you got the secret right but that account is
   off" from "you got the secret wrong";
+- an address an operator has banned from that secret (see
+  [Per-address controls and bans](#per-address-controls-and-bans)), turned away
+  the same way;
 - a `[[listener]]`-less deployment with nothing else to do with the connection.
 
 The target is the hostname baked into the `ee` secret. When nothing matched at
@@ -403,8 +407,9 @@ Every refusal on this listener takes the same exit. The 64-byte frame is read,
   neither answers nor hangs up is less distinctive than a prompt reset.
 
 An unknown secret, an unhonoured transport tag, a replayed frame, a throttled
-user and a disabled, expired or over-quota one all take that exit, so none is
-distinguishable from the others.
+user, a disabled, expired or over-quota one, an address over its
+`client-conns`, and an address banned from the secret all take that exit, so
+none is distinguishable from the others.
 
 This listener **never** domain-fronts. It does not speak TLS, so relaying a
 probe to an HTTPS cover site would pipe that site's TLS alert back out of a
@@ -581,6 +586,131 @@ The same reasoning applies to the `[[listener]]` the relay dials: set
 reach the proxy. Telegram's own `tproxy-server` sends no header, so leave it
 false if that is your carrier.
 
+## Per-address controls and bans
+
+`client-conns`, `client-speed` and `client-fair` (see *Per-address controls* on
+[[Configuration]]) share one secret out among the addresses that use it, and a
+ban refuses one address that secret for a while (see [[Multi-User-and-API]]).
+They are a fairness and abuse-handling tool among people who all hold the same
+key. They are not a defence against a determined holder of that key, and they
+are only as good as the address the proxy sees.
+
+### What an address can be
+
+An address is an IPv4 address or an IPv6 /64. In several common deployments that
+is not one person:
+
+- **A carrier's NAT (CGNAT) puts many people behind one IPv4 address.** They
+  share one connection budget, one ceiling and one fair share, and a ban of the
+  address bans all of them.
+- **Loopback, private, link-local, unspecified and multicast addresses do not
+  stand for one place.** They share one *rest* entry per secret, which is never
+  capped by `client-conns` and has no ceiling. Behind a carrier on such an
+  address that sends no PROXY header, every client is that one entry, and the
+  per-address controls do nothing.
+- **A front on any other range that sends no PROXY header makes every client one
+  address.** A `100.64.0.0/10` overlay such as Tailscale, or a cloud NAT, is not
+  private by this rule, so every client counts as the one address that front
+  connects from: `client-conns = 8` caps the whole service at 8 connections.
+- **Behind a PROXY-protocol listener the address is whatever the header says.**
+  This project has no list of trusted senders, so anyone who can reach the
+  listener can claim another member's address: to use up that member's
+  connection budget or share, or to get that address banned by an operator who
+  trusts what `/clients` shows. When a secret has a per-address control and a
+  listener expects PROXY headers, the proxy logs a warning at start, once per
+  listener:
+
+  ```text
+  per-address controls are in use and this listener expects PROXY headers: the address they see is the one the PROXY header claims, and anyone who can reach this listener can forge it; use them only behind a front proxy you control
+  ```
+
+  It is logged at start only, not when a reload or the API adds a control later,
+  and bans do not trigger it.
+- **An IPv6 holder has many /64s.** A /56 holds 256 of them and a /48 holds
+  65,536. Each /64 is an address with its own share, its own connection budget
+  and its own ban, so whoever holds such a prefix can multiply all three by
+  rotating /64s. This is not solved here. `ip-limit` bounds how many addresses
+  one secret may use at once, which bounds how far it goes, so pair the
+  per-address controls with it. A coarser IPv6 unit is not part of this release.
+
+### Bans are a refusal, not concealment
+
+To anyone without the key, a ban shows nothing. A banned address is turned away
+exactly as a wrong secret is: on FakeTLS it is fronted to the cover site before
+the server answers, and the cover site receives what it would for a wrong
+secret; on an obfuscated `[[listener]]` it takes the same exit as every other
+refusal there. So a ban is not an oracle for whether a secret is valid.
+
+To someone who holds the key, a ban is visible:
+
+- **By timing.** A banned hello is fronted after its secret matched, and a hello
+  with a wrong secret after the whole scan, so a key holder at a banned address
+  who times the two can tell that the key matched. This is the same
+  matched-then-denied difference a disabled user shows. A ban recorded in the
+  moment between a stream's secret matching and the stream registering is caught
+  by a second check after the handshake; on FakeTLS that stream is closed after
+  the server has answered, which is plainly not a wrong secret.
+- **By moving.** A ban holds one IPv4 address or one /64 of one secret. The same
+  key from another address works.
+
+So a ban is a short-term tool. For a leaked link, re-key the secret: every
+holder then needs a new link. Rotation with an overlap period, which would let
+the rightful holders move to a new key without a gap, is not part of this
+release.
+
+What a ban touches besides the refusal:
+
+- **The handshake budget.** A banned hello keeps its scan charge, as every
+  refused one does. The ban forgets that secret's hint for the address, and a
+  hint for a secret the address is banned from is skipped, so a banned client
+  pays the scan rather than one HMAC.
+- **The obfuscated door's per-IP budget.** On a `public = true` listener a
+  banned attempt is charged to the address's `handshakes-per-ip` budget like a
+  frame that matched nothing, so a banned client that keeps reconnecting is soon
+  refused before the trial decryption instead of costing one every time. That
+  budget is per address, not per secret, so the same storm also spends the
+  address's budget for its other secrets on that listener. A ban caught only by
+  the second check is not charged. A loopback listener has no such budget.
+- **The unit.** Banning `2001:db8:1:2::5` bans `2001:db8:1:2::/64`, and with
+  `track-client-ips` off the answer does not show that. Banning an address that
+  does not stand for one place needs `"force": true`: behind a carrier on
+  loopback, `127.0.0.1` is every client.
+
+### What is kept
+
+- **The per-address table.** One entry per address per secret: the address (an
+  IPv4 address or an IPv6 /64), the secret's name, bytes in and out, when it was
+  first and last seen, and its buckets. Held in process memory from the first
+  connection until ten minutes after the last one closes, and dropped between ten
+  and eleven minutes after; never logged, never written to disk. With
+  `track-client-ips` on there is an entry for every address of every secret, and
+  `GET /secrets/{name}/clients` lists them. With it off there are entries only
+  for a secret with a per-address control, because enforcement needs them, and
+  only their counts are ever reported. That is the same kind of exception as the
+  handshake budget's per-address bucket.
+- **Bans.** The address, the secret's name and the expiry, in memory, until the
+  ban lapses (at most `720h`), is lifted, its secret is removed, or the process
+  stops. Listed only with `track-client-ips`; otherwise only their number.
+- **Logs.** The start warning names the listener and the keys, never a secret
+  or a value. The API's ban and unban lines carry the secret's name and counts,
+  never an address. A refused connection's `connection denied by per-user limit`
+  line carries the stream's `client-ip`, as every stream line does, at info
+  level, which only `debug = true` shows.
+- **Disk.** Nothing new. `usage-state-file` still holds quota counters only.
+
+### What this does not change
+
+- **The wire.** Not one byte the proxy sends changes. A banned address gets the
+  existing wrong-secret path. The doppelganger is untouched: its raids of the
+  cover site still size the certificate record and never feed the pacing.
+- **The defaults.** All three keys are off, nothing is banned, and `bind-to`
+  still serves FakeTLS only.
+- **The panel's contract.** No existing field, route, config key or feature
+  name changes, and nothing new appears as a key under `users`. The panel does
+  not write these keys and its config file never carries them.
+- **Metrics.** Prometheus and statsd gain nothing, and nothing per-address is a
+  label.
+
 ## IP blocklists and allowlists 🚧
 
 Both are FireHOL-format range sets, checked in the accept loop before the
@@ -755,6 +885,17 @@ a proxy which does not know something cannot be made to disclose it.
   the last hello from it that reached the budget (a refused hello only refreshes
   a bucket the address already has); the bucket is never logged, exported or
   written to disk; `per-ip-ms = 0` or `mode = "off"` keeps none.
+- **It also lists every secret's addresses on `GET /secrets/{name}/clients`.**
+  With tracking on, the per-address table keeps each address a secret is used
+  from, with the secret's name and what the address moved, until ten minutes
+  after its last connection closes, and the list shows it for up to about eleven
+  minutes: further back than `connected_ips`. The bans of a secret are listed
+  too. See *Per-address controls and bans* above.
+- **A per-address control keeps addresses even with tracking off.** A secret
+  with `client-conns`, `client-speed` or `client-fair` holds the same entries for
+  its addresses, because enforcement needs them, and only their counts are
+  reported. Turning tracking off does not mean no address outlives its
+  connection in memory.
 - **The fields are absent, not empty, when tracking is off.** `/stats` looks
   exactly as it did before the feature existed, and an absent field is
   indistinguishable from an idle secret.
@@ -866,5 +1007,9 @@ and neither you nor they will see it happen. See [[Installation]].
 - The WEB token key is mode 0600 and was generated by `generate-web-key`.
 - `track-client-ips` is off unless you have a specific reason and have thought
   about what happens to the server.
+- `client-conns`, `client-speed` and `client-fair` are used only where the proxy
+  sees real client addresses: not behind a front that sends no PROXY header, and
+  behind a PROXY-protocol listener only when nothing but your own front can reach
+  it. The start warning says when they meet such a listener.
 - You verified the release you are running, and your automation fails closed
   when verification does.
