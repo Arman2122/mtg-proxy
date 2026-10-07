@@ -280,8 +280,14 @@ say so). Each configured secret bucket is divided separately: `speed` → `fairS
   ceiling.** It stands for every unkeyed client and every address past a cap; giving it one
   address's `client-speed` would let a holder of an IPv6 /56 fill the 4,096 entries and cap
   every later legitimate address of the secret together. It still holds one fair share, so
-  that overflow is bounded, not free. **The per-secret entry cap is `min(4,096, ip-limit)`
-  when `ip-limit` is set**, which is why the docs say to pair `client-fair` with `ip-limit`.
+  that overflow is bounded, not free. **The per-secret entry cap is 4,096, whatever
+  `ip-limit` says.** The ledger already bounds the *live* addresses of a secret to its
+  `ip-limit` (it refuses a new address first), so with `ip-limit` set no live address is ever
+  routed to the rest entry because of a cap, and that is why the docs say to pair `client-fair`
+  with `ip-limit`. An earlier revision also capped the *entries* at `ip-limit`; that term only
+  ever bit idle entries (kept ten minutes after their last stream), and it sent a roaming
+  client — Wi-Fi address A idle, LTE address C new — to the rest entry, which has no ceiling,
+  for the life of the connection. The 4,096 bounds idle memory only.
 - Properties, all tested on the pure `waterLevel(total, demands)`, where a participant's
   allocation is `a_i = min(d_i, L)`: `Σ a_i ≤ T`, with equality up to a floor remainder
   (`< n`) when some demand exceeds `L`; `L ≥ floor(T/n)`; **raising one participant's demand
