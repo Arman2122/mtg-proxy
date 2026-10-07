@@ -10,9 +10,12 @@ import (
 //
 // Every tick, for each limit the secret has -- speed, speed-up, speed-down,
 // each divided on its own -- the addresses taking part are its keyed entries
-// with a live stream that moved a byte in that limit's direction in the last
-// ten seconds, and its rest entry whenever a stream holds it: one share
-// however many clients it stands for. Each has a duty, the fraction of the
+// with a live stream that moved a byte in that limit's direction, or was
+// blocked waiting to, in the last ten seconds, and its rest entry whenever a
+// stream holds it: one share however many clients it stands for. An address
+// held in one long wait has moved nothing but is asking for its share; at a
+// small level a 16 KiB write sleeps longer than ten seconds, and dropping such
+// an address would hand its share to the others. Each has a duty, the fraction of the
 // tick during which at least one of its streams was blocked in that direction,
 // at its fair limiter or at the user's bucket the limiter divides -- never at
 // its ceiling. A duty of a quarter or more is throttled: the address wants
@@ -36,7 +39,7 @@ import (
 //
 // The decision is decideFairShare, a pure function over what the tick knows of
 // each entry. tick gathers that under the table's lock, decides outside it,
-// and publishes under it again; it never takes liveMu.
+// and publishes under it again; it never takes liveMu. One goroutine ticks.
 
 const (
 	// fairThrottleDivisor: an address blocked for at least 1/fairThrottleDivisor
@@ -50,9 +53,9 @@ const (
 	// it, while the address keeps moving at least half the level.
 	fairHoldTicks = 3
 
-	// fairActiveWindow is how recently an address must have moved a byte to
-	// take part. A connected address quiet for longer asks for nothing, and is
-	// still set to the level.
+	// fairActiveWindow is how recently an address must have moved a byte, or
+	// been blocked waiting to, to take part. A connected address quiet for
+	// longer asks for nothing, and is still set to the level.
 	fairActiveWindow = 10 * time.Second
 )
 
@@ -138,9 +141,9 @@ type fairSecret struct {
 // it out.
 type fairEntry struct {
 	// live is whether a stream holds the entry, rest whether it is the
-	// secret's rest entry, and moved whether it moved a byte in the bucket's
-	// direction in the last fairActiveWindow.
-	live, rest, moved bool
+	// secret's rest entry, and active whether it moved a byte in the bucket's
+	// direction, or was blocked waiting to, in the last fairActiveWindow.
+	live, rest, active bool
 
 	// rate is what it moved in the bucket's direction over the tick, in bytes
 	// a second.
@@ -175,8 +178,8 @@ type fairVerdict struct {
 // the order given. Every entry with a live stream is to be set to the level,
 // participant or not; the others are left as they are.
 //
-// A participant is live, and moved a byte in the last ten seconds or is the
-// rest entry. Its duty is blocked over elapsed, clamped to [0, 1]. A duty of at
+// A participant is live, and active in the last ten seconds or the rest entry.
+// Its duty is blocked over elapsed, clamped to [0, 1]. A duty of at
 // least a quarter throttles it and holds the throttle for fairHoldTicks more
 // ticks. A participant whose throttle is held from an earlier tick stays
 // throttled while it moves at least half of previous, and is released below
@@ -190,7 +193,7 @@ func decideFairShare(total, previous int64, elapsed time.Duration, entries []fai
 	for i, entry := range entries {
 		blocked := min(max(entry.blocked, 0), elapsed)
 		verdict := fairVerdict{
-			participant: entry.live && (entry.rest || entry.moved),
+			participant: entry.live && (entry.rest || entry.active),
 			duty:        float64(blocked) / float64(elapsed),
 		}
 
@@ -223,11 +226,11 @@ type fairBucketState struct {
 	// hold is how many more ticks the entry's throttle holds.
 	hold int
 
-	// moved is the last tick at which the entry had moved a byte in the
-	// bucket's direction since the tick before. It is measured from the
-	// bytes, not from lastSeen, which a connection opening or closing stamps
-	// too.
-	moved time.Time
+	// active is the last tick whose window the entry moved a byte in, in the
+	// bucket's direction, or spent time blocked waiting to. It is measured from
+	// the bytes and the blocked tracker, not from lastSeen, which a connection
+	// opening or closing stamps too.
+	active time.Time
 
 	// participant and throttled are the last decision about the entry, kept
 	// so that it can be read.
@@ -257,7 +260,9 @@ type fairSecretState struct {
 	// total. A new or returning address starts there.
 	level [fairBucketCount]int64
 
-	// lastTick is when the last tick measured, zero before the first.
+	// lastTick is when the last tick measured, zero before the first and
+	// after applyFair changes the secret's fair limiters: the tick that
+	// follows only takes a baseline.
 	lastTick time.Time
 
 	// epoch moves whenever applyFair changes the secret's fair limiters. A
@@ -293,18 +298,25 @@ type fairGathered struct {
 // divides, it measures every entry of the secret over the time since the last
 // tick, decides the level, and sets every entry with a live stream to it.
 //
-// It takes the table's lock twice and nothing else -- never liveMu. The first
-// hold copies the secret's entries, whether a stream holds each, and what fair
-// share remembers of them. Outside the lock it reads their counters and
-// snapshots their blocked trackers -- every entry's, so that a window never
-// spans more than one tick -- and decides. The second hold publishes the level
-// and the states and sets the entries a stream holds by then, so an address
-// that arrived while the tick was deciding gets the new level too. If a reload
-// moved the secret's fair limiters in between, the tick publishes nothing.
+// It takes the table's lock twice, and otherwise only the leaf locks after it
+// in the lock order -- each blocked tracker's, and each fair limiter's -- never
+// liveMu. The first hold copies the secret's entries, whether a stream holds
+// each, and what fair share remembers of them. Outside the lock it reads their
+// counters and snapshots their blocked trackers -- every entry's, so that a
+// window never spans more than one tick -- and decides. The second hold
+// publishes the level and the states and sets the entries a stream holds by
+// then, so an address that arrived while the tick was deciding gets the new
+// level too. If a reload moved the secret's fair limiters in between, the tick
+// publishes nothing.
 //
-// The first tick of a secret, and a tick whose instant is not after the last
-// one's -- a clock put back -- only take a baseline: there is no tick length
-// to measure a rate over.
+// The first tick of a secret, the first after a reload moved its fair
+// limiters, and a tick whose instant is not after the last one's -- a clock
+// put back -- only take a baseline: there is no tick length to measure a rate
+// over, or none that the limiters now in place were measured across.
+//
+// One goroutine ticks a secret. A snapshot takes a tracker's window with it,
+// so a second tick running beside the first would measure next to nothing and
+// publish levels nobody is held at.
 func (t *clientTable) tick(now time.Time, secret fairSecret) {
 	if t == nil {
 		return
@@ -424,15 +436,17 @@ func decideBucket(
 		g := &gathered[i]
 		state := &g.state.buckets[b]
 
+		// Blocked time counts as activity: a write held in one long wait moves
+		// nothing until it ends, and is asking for its share all along.
 		moved := fairBytes(b, g.in, g.out)
-		if moved > 0 {
-			state.moved = now
+		if moved > 0 || g.blocked[b] > 0 {
+			state.active = now
 		}
 
 		entries[i] = fairEntry{
 			live:    g.live,
 			rest:    g.entry.rest,
-			moved:   !state.moved.IsZero() && now.Sub(state.moved) < fairActiveWindow,
+			active:  !state.active.IsZero() && now.Sub(state.active) < fairActiveWindow,
 			rate:    fairRateOver(moved, elapsed),
 			blocked: g.blocked[b],
 			hold:    state.hold,
@@ -487,8 +501,11 @@ func (t *clientTable) setRate(entry *clientEntry, bucket fairBucket, bytesPerSec
 // for it yet; a bucket without one has its limiter removed, which is
 // unlimited. A limiter installed or installed again starts with an empty
 // tracker and no throttle: time from an earlier fair period must not start a
-// hysteresis nobody earned. A secret rateOf does not know is left to the drop
-// that follows, as applyCeilings leaves it.
+// hysteresis nobody earned. Once anything changed, the secret's next tick only
+// takes a baseline: the last tick may be long past -- fair share was off, and
+// nothing ticked -- and a tick across that gap would measure an average of it,
+// not the second the new limiters ran. A secret rateOf does not know is left to
+// the drop that follows, as applyCeilings leaves it.
 //
 // The caller holds liveMu, the lock admission makes an entry under, so no
 // entry is made from one set and missed by the walk for the next.
@@ -559,5 +576,6 @@ func (t *clientTable) applyFairLocked(sc *secretClients, totals fairTotals, now 
 
 	if changed {
 		sc.fair.epoch++
+		sc.fair.lastTick = time.Time{}
 	}
 }

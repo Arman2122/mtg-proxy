@@ -175,12 +175,12 @@ func decideOneTick(total, previous int64, entries ...fairEntry) (int64, []fairVe
 
 // fairBusy is a participant blocked for the whole tick, having moved rate.
 func fairBusy(rate int64) fairEntry {
-	return fairEntry{live: true, moved: true, rate: rate, blocked: fairTestTick}
+	return fairEntry{live: true, active: true, rate: rate, blocked: fairTestTick}
 }
 
 // fairQuiet is a participant that moved rate and was never blocked.
 func fairQuiet(rate int64) fairEntry {
-	return fairEntry{live: true, moved: true, rate: rate}
+	return fairEntry{live: true, active: true, rate: rate}
 }
 
 // Work-conserving: an address that wants less than its share keeps what it
@@ -220,7 +220,7 @@ func TestFairShareThrottlesAtAQuarterOfTheTick(t *testing.T) {
 		{2 * time.Second, 499 * time.Millisecond, false},
 	} {
 		_, verdicts := decideFairShare(fairTestTotal, fairTestTotal, tc.elapsed,
-			[]fairEntry{{live: true, moved: true, rate: 1000, blocked: tc.blocked}})
+			[]fairEntry{{live: true, active: true, rate: 1000, blocked: tc.blocked}})
 		require.Len(t, verdicts, 1)
 
 		assert.Equal(t, tc.throttled, verdicts[0].throttled, "%v blocked in a tick of %v", tc.blocked, tc.elapsed)
@@ -235,8 +235,8 @@ func TestFairShareDutyIsClampedToTheTick(t *testing.T) {
 	t.Parallel()
 
 	_, verdicts := decideOneTick(fairTestTotal, fairTestTotal,
-		fairEntry{live: true, moved: true, blocked: 1500 * time.Millisecond},
-		fairEntry{live: true, moved: true, blocked: -time.Second},
+		fairEntry{live: true, active: true, blocked: 1500 * time.Millisecond},
+		fairEntry{live: true, active: true, blocked: -time.Second},
 	)
 	require.Len(t, verdicts, 2)
 
@@ -258,7 +258,7 @@ func TestFairShareHoldsAThrottleForThreeTicks(t *testing.T) {
 	hold, previous := 0, int64(total)
 
 	for tick := range 6 {
-		busy := fairEntry{live: true, moved: true, rate: 600, hold: hold}
+		busy := fairEntry{live: true, active: true, rate: 600, hold: hold}
 		if tick == 0 {
 			busy = fairBusy(900)
 		}
@@ -292,27 +292,27 @@ func TestFairSharePauseReleasesAtOnce(t *testing.T) {
 	require.EqualValues(t, 500, level)
 	require.Equal(t, fairHoldTicks, verdicts[0].hold)
 
-	paused := fairEntry{live: true, moved: true, rate: 0, hold: verdicts[0].hold}
+	paused := fairEntry{live: true, active: true, rate: 0, hold: verdicts[0].hold}
 
 	level, verdicts = decideOneTick(1000, 500, paused, fairBusy(500))
 	assert.EqualValues(t, 1000, level, "the paused one is released, so the other gets everything at once")
 	assert.False(t, verdicts[0].throttled)
 	assert.Zero(t, verdicts[0].hold)
 
-	atHalf := fairEntry{live: true, moved: true, rate: 250, hold: fairHoldTicks}
+	atHalf := fairEntry{live: true, active: true, rate: 250, hold: fairHoldTicks}
 
 	level, verdicts = decideOneTick(1000, 500, atHalf, fairBusy(500))
 	assert.EqualValues(t, 500, level, "half the level is not below it: still held")
 	assert.True(t, verdicts[0].throttled)
 
-	belowHalf := fairEntry{live: true, moved: true, rate: 249, hold: fairHoldTicks}
+	belowHalf := fairEntry{live: true, active: true, rate: 249, hold: fairHoldTicks}
 
 	level, verdicts = decideOneTick(1000, 500, belowHalf, fairBusy(500))
 	assert.EqualValues(t, 751, level, "released: it keeps its 249 and the other gets the rest")
 	assert.False(t, verdicts[0].throttled)
 
 	// With a level of 1 the half is a half: nothing moved is below it.
-	level, verdicts = decideOneTick(1000, 1, fairEntry{live: true, moved: true, hold: fairHoldTicks}, fairBusy(1))
+	level, verdicts = decideOneTick(1000, 1, fairEntry{live: true, active: true, hold: fairHoldTicks}, fairBusy(1))
 	assert.EqualValues(t, 1000, level)
 	assert.False(t, verdicts[0].throttled)
 }
@@ -323,7 +323,7 @@ func TestFairSharePauseReleasesAtOnce(t *testing.T) {
 func TestFairShareCurrentDutyOutweighsTheRelease(t *testing.T) {
 	t.Parallel()
 
-	waiting := fairEntry{live: true, moved: true, rate: 0, blocked: fairTestTick, hold: fairHoldTicks}
+	waiting := fairEntry{live: true, active: true, rate: 0, blocked: fairTestTick, hold: fairHoldTicks}
 
 	level, verdicts := decideOneTick(1000, 500, waiting, fairBusy(500))
 	assert.EqualValues(t, 500, level)
@@ -331,10 +331,12 @@ func TestFairShareCurrentDutyOutweighsTheRelease(t *testing.T) {
 	assert.Equal(t, fairHoldTicks, verdicts[0].hold)
 }
 
-// Participants are the keyed entries with a live stream that moved a byte in
-// the last ten seconds, plus the rest entry whenever it has a live stream. Each
-// case is a busy entry beside one busy participant, so whether it takes part is
-// whether the level is halved.
+// Participants are the keyed entries with a live stream that was active --
+// moved a byte, or was blocked waiting to -- in the last ten seconds, plus the
+// rest entry whenever it has a live stream. active is the gatherer's verdict
+// over those ten seconds (TestFairShareTenQuietSecondsEndAParticipation pins
+// it); here it is an input. Each case is blocked this tick beside one busy
+// participant, so whether it takes part is whether the level is halved.
 func TestFairShareParticipants(t *testing.T) {
 	t.Parallel()
 
@@ -343,11 +345,11 @@ func TestFairShareParticipants(t *testing.T) {
 		entry       fairEntry
 		participant bool
 	}{
-		{"a keyed entry that moved", fairEntry{live: true, moved: true}, true},
-		{"a keyed entry quiet for ten seconds", fairEntry{live: true}, false},
-		{"a keyed entry with no stream", fairEntry{moved: true}, false},
+		{"an active keyed entry", fairEntry{live: true, active: true}, true},
+		{"a keyed entry inactive for ten seconds", fairEntry{live: true}, false},
+		{"a keyed entry with no stream", fairEntry{active: true}, false},
 		{"the rest entry with a stream", fairEntry{live: true, rest: true}, true},
-		{"the rest entry with none", fairEntry{rest: true, moved: true}, false},
+		{"the rest entry with none", fairEntry{rest: true, active: true}, false},
 	} {
 		tc.entry.blocked = fairTestTick
 
@@ -855,11 +857,17 @@ func TestFairShareSetsAnIdleConnectedEntryToTheLevel(t *testing.T) {
 		"the two busy ones share the total")
 }
 
-// The ten seconds are measured from the bytes the entry moved, tick by tick,
-// and not from lastSeen, which a connection opening or closing stamps too. An
-// entry stuck in one long wait moves nothing; it takes part for ten seconds
-// after its last byte and then not, even though a stream of it connected a
-// moment ago.
+// An address takes part while it was active in the last ten seconds: it moved
+// a byte, or one of its streams was blocked waiting to. That is measured tick
+// by tick from the bytes and the blocked tracker, not from lastSeen, which a
+// connection opening or closing stamps too.
+//
+// An address stuck in one long wait -- a write held for longer than ten
+// seconds at a small level -- moves nothing, and is asking for its share all
+// along: it stays a participant, throttled. An address that moved one burst
+// and then neither moved nor waited takes part for ten seconds after it and
+// then not, even though a stream of it connected a moment before; still
+// connected, it is still set to the level.
 func TestFairShareTenQuietSecondsEndAParticipation(t *testing.T) {
 	t.Parallel()
 
@@ -869,40 +877,48 @@ func TestFairShareTenQuietSecondsEndAParticipation(t *testing.T) {
 
 	busy := table.acquire("alice", "203.0.113.1", true, init)
 	stuck := table.acquire("alice", "203.0.113.2", true, init)
+	quiet := table.acquire("alice", "203.0.113.3", true, init)
 
 	table.tick(clock.read(), secret)
 
-	// The first second: both move bytes, and stuck enters a wait that never
-	// ends.
-	start := clock.read()
+	// The first second: stuck and quiet move a little, and stuck enters a wait
+	// that does not end.
 	stuck.bytesOut.Add(1000)
-	stuck.blockedDown.enter(start)
+	stuck.blockedDown.enter(clock.read())
+	quiet.bytesOut.Add(1000)
 
-	for tick := 1; tick <= 11; tick++ {
+	for tick := 1; tick <= 13; tick++ {
 		start := clock.read()
 		busy.bytesOut.Add(fairRate(busy, fairDownBucket))
 		fairBlockTick(busy, fairDownBucket, start)
 
 		if tick == 9 {
-			// A second stream from the stuck address connects: lastSeen is now,
-			// and it has still moved nothing since the first second.
-			table.acquire("alice", stuck.key, true, init)
+			// A second stream from the quiet address connects: its lastSeen is
+			// now, and it has moved nothing and waited for nothing since the
+			// first second.
+			table.acquire("alice", quiet.key, true, init)
 		}
 
 		clock.advance(fairTestTick)
 		table.tick(clock.read(), secret)
 
-		state := fairStateOf(table, stuck, fairDownBucket)
+		stuckState := fairStateOf(table, stuck, fairDownBucket)
+		assert.True(t, stuckState.participant, "tick %d: blocked all along, so asking", tick)
+		assert.True(t, stuckState.throttled, "tick %d", tick)
+
+		if tick >= 2 {
+			assert.EqualValues(t, fairTestTotal/2, fairLevelOf(table, "alice", fairDownBucket),
+				"tick %d: the busy one and the stuck one share the total", tick)
+		}
+
+		quietState := fairStateOf(table, quiet, fairDownBucket)
 
 		if tick <= 10 {
-			assert.True(t, state.participant, "tick %d: bytes %d s ago", tick, tick-1)
-			assert.EqualValues(t, fairTestTotal/2, fairLevelOf(table, "alice", fairDownBucket), "tick %d", tick)
+			assert.True(t, quietState.participant, "tick %d: its byte %d s ago", tick, tick-1)
 		} else {
-			assert.False(t, state.participant, "tick %d: no byte for ten seconds", tick)
-			assert.EqualValues(t, fairTestTotal, fairLevelOf(table, "alice", fairDownBucket),
-				"tick %d: the busy one alone", tick)
-			assert.EqualValues(t, fairTestTotal, fairRate(stuck, fairDownBucket),
-				"tick %d: and the stuck one, still connected, is set to the level", tick)
+			assert.False(t, quietState.participant, "tick %d: neither a byte nor a wait for ten seconds", tick)
+			assert.EqualValues(t, fairTestTotal/2, fairRate(quiet, fairDownBucket),
+				"tick %d: still connected, so still set to the level", tick)
 		}
 	}
 }
@@ -1378,22 +1394,95 @@ func TestApplyFairKeepsTheLevelOnlyForTheSameTotal(t *testing.T) {
 	require.EqualValues(t, fairTestTotal/2, fairLevelOf(sim.table, "alice", fairDownBucket))
 
 	object := first.entry.fairDown.limiter.Load()
+	lastTick := func() time.Time {
+		sim.table.mu.Lock()
+		defer sim.table.mu.Unlock()
+
+		return sim.table.secrets["alice"].fair.lastTick
+	}
+	ticked := lastTick()
 
 	sim.table.applyFair(func(string) (fairTotals, bool) { return sim.secret.totals, true })
 
 	assert.Same(t, object, first.entry.fairDown.limiter.Load(), "the same limiter: no fresh bucket")
 	assert.EqualValues(t, fairTestTotal/2, fairRate(first.entry, fairDownBucket))
 	assert.EqualValues(t, fairTestTotal/2, fairLevelOf(sim.table, "alice", fairDownBucket))
+	assert.Equal(t, ticked, lastTick(), "and no baseline tick: nothing changed")
 
 	raised := fairTotals{Down: 2 * fairTestTotal}
 	sim.table.applyFair(func(string) (fairTotals, bool) { return raised, true })
 
 	assert.Zero(t, fairLevelOf(sim.table, "alice", fairDownBucket), "a new total has no level yet")
+	assert.True(t, lastTick().IsZero(), "and the next tick takes a baseline for the new limiters")
 
 	for _, e := range []*clientEntry{first.entry, second.entry} {
 		assert.EqualValues(t, 2*fairTestTotal, fairRate(e, fairDownBucket))
 		assert.Equal(t, fairBurst(2*fairTestTotal), installedLimiter(t, &e.fairDown).Burst())
 	}
+}
+
+// Fair share turned off for ten seconds and on again: nothing ticked the secret
+// in between, so the last tick is ten seconds old, and a tick measured across
+// that gap would see an eleven-second average -- every address moving half the
+// total, blocked a tenth of the time -- and hand both the whole total. The
+// first tick after the reload only takes a baseline, and the one after it
+// already divides the total by what the new limiters ran.
+func TestApplyFairStartsTheNextTickFromABaseline(t *testing.T) {
+	t.Parallel()
+
+	table, clock := newTestClientTable(t)
+	on := fairTotals{Down: fairTestTotal}
+	secret := fairSecret{name: "alice", totals: on}
+
+	first := table.acquire("alice", "203.0.113.1", true, entryInit{FairTotals: on})
+	second := table.acquire("alice", "203.0.113.2", true, entryInit{FairTotals: on})
+
+	busySecond := func(tracked bool) {
+		start := clock.read()
+
+		for _, e := range []*clientEntry{first, second} {
+			e.bytesOut.Add(fairTestTotal / 2)
+
+			if tracked {
+				fairBlockTick(e, fairDownBucket, start)
+			}
+		}
+
+		clock.advance(fairTestTick)
+	}
+
+	apply := func(totals fairTotals) {
+		table.applyFair(func(string) (fairTotals, bool) { return totals, true })
+	}
+
+	table.tick(clock.read(), secret)
+	busySecond(true)
+	table.tick(clock.read(), secret)
+	require.EqualValues(t, fairTestTotal/2, fairLevelOf(table, "alice", fairDownBucket))
+
+	// Off: nothing brackets the waits and nothing ticks, for ten seconds.
+	apply(fairTotals{})
+
+	for range 10 {
+		busySecond(false)
+	}
+
+	apply(on)
+
+	busySecond(true)
+	table.tick(clock.read(), secret)
+
+	assert.Zero(t, fairLevelOf(table, "alice", fairDownBucket), "the first tick after the reload only takes a baseline")
+	assert.False(t, fairStateOf(table, first, fairDownBucket).throttled)
+	assert.EqualValues(t, fairTestTotal, fairRate(first, fairDownBucket), "and sets nothing: the new limiter runs at the total")
+
+	busySecond(true)
+	table.tick(clock.read(), secret)
+
+	assert.EqualValues(t, fairTestTotal/2, fairLevelOf(table, "alice", fairDownBucket), "the next one divides the total")
+	assert.True(t, fairStateOf(table, first, fairDownBucket).throttled)
+	assert.True(t, fairStateOf(table, second, fairDownBucket).throttled)
+	assert.EqualValues(t, fairTestTotal/2, fairRate(second, fairDownBucket))
 }
 
 // A secret the reload drops is left alone: the drop that follows forgets it

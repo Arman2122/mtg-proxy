@@ -229,7 +229,8 @@ type clientTable struct {
 
 	// beforeFairPublish, when set, runs in a fair-share tick after it has
 	// decided and before it takes the lock again to publish, with the lock
-	// released. Only tests set it.
+	// released. Only tests set it, and it is read without the lock: a test
+	// sets it before anything that ticks is running.
 	beforeFairPublish func()
 }
 
