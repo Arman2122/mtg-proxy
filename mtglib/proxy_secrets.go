@@ -417,9 +417,15 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 		return ErrSecretInvalid
 	}
 
-	newSet := buildSecretSet(cfg.Secrets, cfg.SecretAdTags, cfg.GlobalAdTag, cfg.Limits)
+	// The one read of the clock for the whole swap: the build judges every
+	// retiring entry by it, and whatever else the swap judges against the clock
+	// must take this same instant rather than read its own.
+	now := p.rotation.Now()
+
+	newSet, drops := buildSecretSetAt(cfg.Secrets, cfg.SecretAdTags, cfg.GlobalAdTag, cfg.Limits, cfg.Retiring, now)
 	oldSet := p.secrets.Swap(newSet)
 
+	p.logRetiringDrops(drops)
 	p.doppelGanger.SetCoverHosts(p.coverHosts(newSet))
 
 	for _, name := range newSet.names {
@@ -432,6 +438,30 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	p.closeDeniedConns()
 
 	return nil
+}
+
+// logRetiringDrops writes one line for each retiring entry a build did not keep:
+// the secret's name and the reason, and nothing else. A retiring key is a
+// credential, and the line is written from a retiringDrop, which holds none.
+// Three reasons are routine and logged at Info -- the entry repeats a key the
+// name already accepts (same_as_primary, duplicate), or its overlap ended
+// between the reader and the build (expired). The rest say the entries handed in
+// are not what their author meant, and are Warnings: invalid, dangling,
+// key_of_other_secret and over_cap.
+//
+// It touches the logger only when there is a line to write: a Proxy{} literal
+// in a test has none.
+func (p *Proxy) logRetiringDrops(drops []retiringDrop) {
+	for _, drop := range drops {
+		line := p.logger.BindStr("secret_name", drop.name).BindStr("reason", drop.reason)
+
+		switch drop.reason {
+		case retiringSameAsPrimary, retiringDuplicate, retiringExpired:
+			line.Info("a retiring key was ignored")
+		default:
+			line.Warning("a retiring key was ignored")
+		}
+	}
 }
 
 // dropRemovedSecrets forgets what the proxy holds per address for every secret

@@ -486,6 +486,15 @@ type ProxyOpts struct {
 	// This is an optional setting.
 	RetiringSecrets []RetiringSecret
 
+	// RotationClock is the clock retiring keys expire by. One per process,
+	// shared by whatever reads the configuration and the proxy, so that both
+	// judge an overlap by the same instant and neither is ever handed a time
+	// earlier than one the other has seen. nil makes NewProxy build one of its
+	// own on the wall clock.
+	//
+	// This is an optional setting.
+	RotationClock *RotationClock
+
 	// UsageStateFile is the path of a JSON file where per-secret quota usage is
 	// persisted so it survives restarts. When empty, quota accounting is
 	// in-memory only and resets when the process restarts.

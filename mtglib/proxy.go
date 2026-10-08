@@ -111,6 +111,11 @@ type Proxy struct {
 	// value is an empty list, so a Proxy{} literal in a test bans nobody.
 	bans banList
 
+	// rotation is the clock retiring keys expire by: one per process, the
+	// instance ProxyOpts.RotationClock carries or one NewProxy builds. nil reads
+	// the wall clock, and a Proxy{} literal in a test has none.
+	rotation *RotationClock
+
 	network         Network
 	antiReplayCache AntiReplayCache
 	blocklist       IPBlocklist
@@ -182,7 +187,18 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	logger := opts.getLogger("proxy")
 	updatersLogger := logger.Named("telegram-updaters")
 
-	initialSet := buildSecretSet(opts.getSecrets(), opts.SecretAdTags, opts.GlobalAdTag, opts.SecretLimits)
+	// The clock comes first: the initial build reads it, and so must be handed
+	// the one the rest of the process reads, not the wall clock.
+	clock := opts.RotationClock
+	if clock == nil {
+		clock = NewRotationClock(time.Now, func(by time.Duration) {
+			logger.BindStr("behind_by", by.String()).
+				Warning("the wall clock is behind the latest time seen; rotation overlaps are judged by the latest time")
+		})
+	}
+
+	initialSet, initialDrops := buildSecretSetAt(
+		opts.getSecrets(), opts.SecretAdTags, opts.GlobalAdTag, opts.SecretLimits, opts.RetiringSecrets, clock.Now())
 
 	stats := NewProxyStats()
 	for _, name := range initialSet.names {
@@ -248,7 +264,11 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		emitTraffic:                 opts.EmitTraffic,
 		listeners:                   opts.Listeners,
 		listenerModes:               opts.ListenerModes,
+		rotation:                    clock,
 	}
+
+	// Logged only now: the lines are the proxy's, and the proxy exists.
+	proxy.logRetiringDrops(initialDrops)
 
 	// The limiter's bucket aging runs under the proxy's own context, so it stops
 	// with Shutdown.

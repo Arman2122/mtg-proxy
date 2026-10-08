@@ -579,7 +579,7 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 	// can be one a swap replaced while this stream waited on liveMu -- and that
 	// swap's walk ran exactly then.
 	cur := p.secrets.Load()
-	if cur != ctx.attrSet && !cur.accepts(ctx.secretName, ctx.matchedSecretKey, time.Now()) {
+	if cur != ctx.attrSet && !cur.accepts(ctx.secretName, ctx.matchedSecretKey, p.rotation.Now()) {
 		return refuse(DenyKeyRevoked)
 	}
 
