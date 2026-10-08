@@ -110,6 +110,20 @@ type SecretConfig struct {
 	// is swapped in atomically together with the secrets, so a reload or API
 	// mutation can change limits without a restart.
 	Limits map[string]SecretLimits
+
+	// Retiring is the COMPLETE list of retiring keys the swapped-in set is to
+	// hold: old keys of a name, each accepted until its own Until after the
+	// name was given a new primary key. nil means none, wherever a
+	// SecretConfig is consumed -- ReloadSecrets, ReplaceSecrets and every
+	// other swap -- never "keep what is there". An entry the set cannot hold
+	// (expired, for a name not in Secrets, on another name's key or its own
+	// primary's, a duplicate, past a cap) is dropped and logged, never an
+	// error.
+	//
+	// For embedders: a ReplaceSecrets with a nil Retiring ends every overlap
+	// in force. The next reload of a config file that still grants an
+	// overlap grants it again, until its Until.
+	Retiring []RetiringSecret
 }
 
 // ProxyOpts is a structure with settings to mtg proxy.
@@ -461,6 +475,16 @@ type ProxyOpts struct {
 	//
 	// This is an optional setting.
 	SecretLimits map[string]SecretLimits
+
+	// RetiringSecrets is the complete list of retiring keys the initial set
+	// holds: old keys of a secret name, each accepted until its own Until after
+	// the name was given a new primary key, with the name's quota, limits,
+	// bans and stats. nil means none. It has the meaning SecretConfig.Retiring
+	// has, and an entry the set cannot hold is dropped and logged, never an
+	// error.
+	//
+	// This is an optional setting.
+	RetiringSecrets []RetiringSecret
 
 	// UsageStateFile is the path of a JSON file where per-secret quota usage is
 	// persisted so it survives restarts. When empty, quota accounting is

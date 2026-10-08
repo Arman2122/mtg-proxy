@@ -46,12 +46,17 @@ type secretSet struct {
 	// with the set: one Candidate per hosted secret, in name order, minus any
 	// whose key an earlier hosted secret already has (the earlier one wins a
 	// match, as it always did, so a repeat could never be the first to match).
+	// After every primary candidate, from primaryEnd() on, come the kept ee
+	// retiring keys, in retiring's order.
 	// candIdx[i] is the index into secrets, names, limits and adTags of the secret
-	// cands[i] stands for -- the match position is NOT an index into secrets.
-	// candByName maps names[candIdx[i]] to i; a name that is not a candidate (a
-	// hostless secret, a dropped repeat) is absent, so look it up with the
-	// two-value form: a missing name reads as 0, which is a position. All three
-	// are nil on a set that was not built by buildSecretSet, which has no
+	// cands[i] stands for -- the match position is NOT an index into secrets. For
+	// a retiring position it is the index of the entry's name: the name is what
+	// the match bills. matchAt turns a position into what was matched.
+	// candByName maps names[candIdx[i]] to i for the PRIMARY candidates only; a
+	// name that is not a candidate (a hostless secret, a dropped repeat) is
+	// absent, so look it up with the two-value form: a missing name reads as 0,
+	// which is a position. A name's retiring positions are in retiringCands. All
+	// three are nil on a set that was not built by buildSecretSet, which has no
 	// candidates.
 	cands      []*fake.Candidate
 	candIdx    []int
@@ -60,7 +65,9 @@ type secretSet struct {
 	// frontHost is the domain-fronting fallback: the first non-empty Host in
 	// name order, or "" when no ee secret is configured. It replaces
 	// secrets[0].Host, which under a management panel was whichever client name
-	// sorted first -- operator-uncontrolled, and now possibly hostless.
+	// sorted first -- operator-uncontrolled, and now possibly hostless. It is
+	// the primaries' alone: a retiring key's host never fronts, so a set whose
+	// only ee key is retiring has none, as SecretsCanFront says.
 	frontHost string
 
 	// clientControl says whether any secret in the set has a per-address
@@ -69,6 +76,29 @@ type secretSet struct {
 	// in the per-address table, and admission knows that without looking the
 	// secret up.
 	clientControl bool
+
+	// The retiring keys the set keeps: old keys of a name, still accepted
+	// until their own until after the name was given a new primary key
+	// (RetiringSecret). EVERY ONE of these fields is nil or zero when the set
+	// keeps no retiring entry, and the set is then field for field the set
+	// buildSecretSet made before rotation existed.
+	//
+	// retiring is sorted by (nameIdx, until descending, key bytes); no two
+	// entries share a key, and none has a primary's key. retiringOf maps a
+	// name's index to its entries' indices in retiring, in that order.
+	// primaryCands is how many of cands are primaries when there are retiring
+	// entries, and 0 otherwise -- so it is never a bound on its own:
+	// primaryEnd() is the boundary. candRetiring[pos-primaryEnd()] is the
+	// index into retiring of the retiring candidate at pos, and
+	// retiringCands[name] the name's retiring candidate positions, in
+	// retiring's order, whether or not its primary is a candidate.
+	// retiringNext is the earliest until in retiring.
+	retiring      []retiringEntry  // {nameIdx int; secret Secret; until time.Time}, sorted by (nameIdx, until desc, key bytes)
+	retiringOf    map[int][]int    // nameIdx -> indices into retiring
+	primaryCands  int              // cands[:primaryCands] are primaries; the rest are retiring ee keys
+	candRetiring  []int            // candRetiring[pos-primaryCands] = index into retiring
+	retiringCands map[string][]int // name -> its retiring candidate positions, same order
+	retiringNext  time.Time        // earliest until in retiring; zero when none
 }
 
 // anyClientControl reports whether any secret in the set has a per-address
@@ -109,13 +139,15 @@ func (s *secretSet) limitsOf(name string) (SecretLimits, bool) {
 }
 
 // accepts says whether the set lets a stream of the named secret go on with
-// key, the key the stream matched: true when key is the name's key in this set.
-// False on a nil set, which holds nothing, for a name the set does not hold,
-// and for any other key, a nil or partial one included. now is when the
-// question is asked; a name's own key is accepted at any time. Registration
-// asks it of the set in force (tryRegisterConn), so a stream that matched a key
-// a swap has since taken away is refused rather than registered. names is
-// sorted, so this is a binary search and not a walk of every secret.
+// key, the key the stream matched: true when key is the name's key in this set,
+// or the key of one of the name's retiring entries while now is before its
+// until. False on a nil set, which holds nothing, for a name the set does not
+// hold, and for any other key, a nil or partial one included. now is when the
+// question is asked; a name's own key is accepted at any time, and a retiring
+// key is refused from its until on. Registration asks it of the set in force
+// (tryRegisterConn), so a stream that matched a key a swap has since taken
+// away is refused rather than registered. names is sorted, so this is a binary
+// search and not a walk of every secret.
 func (s *secretSet) accepts(name string, key []byte, now time.Time) bool {
 	if s == nil {
 		return false
@@ -126,12 +158,23 @@ func (s *secretSet) accepts(name string, key []byte, now time.Time) bool {
 		return false
 	}
 
-	return bytes.Equal(s.secrets[i].Key[:], key)
+	if bytes.Equal(s.secrets[i].Key[:], key) {
+		return true
+	}
+
+	for _, r := range s.retiringOf[i] {
+		if entry := &s.retiring[r]; now.Before(entry.until) && bytes.Equal(entry.secret.Key[:], key) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // toConfig reconstructs a mutable SecretConfig from the immutable snapshot. It
 // is the copy-on-write starting point for the management-API mutators, which
-// apply a delta and swap the result back in.
+// apply a delta and swap the result back in. Retiring is every entry the set
+// keeps, in its order, and nil when it keeps none.
 func (s *secretSet) toConfig() SecretConfig {
 	secrets := make(map[string]Secret, len(s.names))
 
@@ -159,7 +202,23 @@ func (s *secretSet) toConfig() SecretConfig {
 		}
 	}
 
-	return SecretConfig{Secrets: secrets, SecretAdTags: perSecret, GlobalAdTag: s.globalAdTag, Limits: limits}
+	var retiring []RetiringSecret
+
+	if len(s.retiring) > 0 {
+		retiring = make([]RetiringSecret, 0, len(s.retiring))
+
+		for _, entry := range s.retiring {
+			retiring = append(retiring, RetiringSecret{Name: s.names[entry.nameIdx], Secret: entry.secret, Until: entry.until})
+		}
+	}
+
+	return SecretConfig{
+		Secrets:      secrets,
+		SecretAdTags: perSecret,
+		GlobalAdTag:  s.globalAdTag,
+		Limits:       limits,
+		Retiring:     retiring,
+	}
 }
 
 // buildSecretSet turns a name->secret map into an immutable, name-sorted
@@ -167,8 +226,27 @@ func (s *secretSet) toConfig() SecretConfig {
 // matched index stable across processes for a given secret map. perSecret
 // carries optional per-name advertising tags and global is the fallback tag;
 // both may be nil. limitsMap carries optional per-name governance limits and
-// may be nil.
+// may be nil. It is buildSecretSetAt with no retiring entry, so the set it
+// makes holds none.
 func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLength]byte, global *[AdTagLength]byte, limitsMap map[string]SecretLimits) *secretSet {
+	set, _ := buildSecretSetAt(secretsMap, perSecret, global, limitsMap, nil, time.Time{})
+
+	return set
+}
+
+// buildSecretSetAt is buildSecretSet with retiring keys: the primaries are
+// built exactly as buildSecretSet always built them, and then retiring, the
+// complete list of entries the set is to hold (nil is none), is classified at
+// now by the §1.3 rules 2, 3, 5, 6, 7 and 8 (buildRetiring). The kept entries
+// come after every primary: their hosts join hostnames (the SNI gate) when
+// they are ee, their ee keys are candidates after every primary candidate, and
+// nothing else a primary decides -- hosted, frontHost, candByName -- changes.
+// The entries it does not keep are returned, in input order, for the log;
+// none is an error. A set that keeps no entry has every retiring field nil or
+// zero.
+func buildSecretSetAt(secretsMap map[string]Secret, perSecret map[string][AdTagLength]byte, global *[AdTagLength]byte,
+	limitsMap map[string]SecretLimits, retiring []RetiringSecret, now time.Time,
+) (*secretSet, []retiringDrop) {
 	names := make([]string, 0, len(secretsMap))
 	for name := range secretsMap {
 		names = append(names, name)
@@ -219,6 +297,17 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 		}
 	}
 
+	kept, drops := buildRetiring(names, secretsList, retiring, now)
+
+	// A kept ee entry's host passes the SNI gate until the entry leaves the
+	// set: a rotation that also moves the fronting domain must not cut the old
+	// link's clients at the gate. It never becomes frontHost.
+	for r := range kept {
+		if entry := &kept[r]; entry.secret.Hosted() && entry.secret.Host != "" {
+			hostnameSet[entry.secret.Host] = struct{}{}
+		}
+	}
+
 	hostnames := make([]string, 0, len(hostnameSet))
 	for h := range hostnameSet {
 		hostnames = append(hostnames, h)
@@ -228,7 +317,7 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 
 	cands, candIdx, candByName := buildCandidates(secretsList, names, hosted)
 
-	return &secretSet{
+	set := &secretSet{
 		secrets:       secretsList,
 		names:         names,
 		hostnames:     hostnames,
@@ -242,6 +331,10 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 		frontHost:     frontHost,
 		clientControl: clientControl,
 	}
+
+	set.addRetiring(kept)
+
+	return set, drops
 }
 
 // buildCandidates makes the FakeTLS candidates for the hosted secrets (indices
@@ -379,22 +472,34 @@ func (p *Proxy) dropRemovedSecrets(oldSet, newSet *secretSet) {
 
 // coverHosts lists the cover sites the set's ee secrets name, each once, in
 // name order, with the address domain fronting would dial for it -- where the
-// doppelganger measures it. A host with no fronting address is left out.
+// doppelganger measures it. A host with no fronting address is left out. The
+// hosts of the set's kept ee retiring keys follow every primary's, in the
+// set's order, so a client of an old link gets the server flight sizing it got
+// before its secret was rotated.
 func (p *Proxy) coverHosts(set *secretSet) []doppel.CoverHost {
 	seen := make(map[string]bool)
 
 	var hosts []doppel.CoverHost
 
-	for _, idx := range set.hosted {
-		host := set.secrets[idx].Host
+	add := func(host string) {
 		if host == "" || seen[host] {
-			continue
+			return
 		}
 
 		seen[host] = true
 
 		if addr := p.domainFrontingAddressForHost(host); addr != "" {
 			hosts = append(hosts, doppel.CoverHost{Host: host, Addr: addr})
+		}
+	}
+
+	for _, idx := range set.hosted {
+		add(set.secrets[idx].Host)
+	}
+
+	for r := range set.retiring {
+		if entry := &set.retiring[r]; entry.secret.Hosted() {
+			add(entry.secret.Host)
 		}
 	}
 

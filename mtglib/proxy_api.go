@@ -269,15 +269,28 @@ func (p *Proxy) DeleteSecret(name string) error {
 }
 
 // forget removes everything cfg files under name: the secret, its advertising
-// override and its limits. A set is built from the names in Secrets alone, so
-// an override or limits left behind would never be read; they go all the same,
-// so that the config handed to the swap says what the set will hold. Deleting
-// from a nil map does nothing, so a config with no overrides or no limits needs
-// no check.
+// override, its limits and its retiring entries. A set is built from the names
+// in Secrets alone, so an override or limits left behind would never be read,
+// and a retiring entry left behind would be dropped as dangling; they go all
+// the same, so that the config handed to the swap says what the set will hold.
+// Deleting from a nil map does nothing, so a config with no overrides or no
+// limits needs no check. Retiring is rebuilt rather than filtered in place, so
+// a slice the caller handed in is never rewritten under it, and it is nil when
+// no entry is left, which is what none means.
 func (c *SecretConfig) forget(name string) {
 	delete(c.Secrets, name)
 	delete(c.SecretAdTags, name)
 	delete(c.Limits, name)
+
+	var retiring []RetiringSecret
+
+	for _, entry := range c.Retiring {
+		if entry.Name != name {
+			retiring = append(retiring, entry)
+		}
+	}
+
+	c.Retiring = retiring
 }
 
 // GlobalAdTag returns the currently active global advertising tag, or nil when
