@@ -43,6 +43,14 @@ type streamContext struct {
 	adTag            *[AdTagLength]byte
 	logger           Logger
 
+	// attrSet is the secret set attribute matched this stream against, which
+	// matchedSecretKey points into. Registration compares it with the set in
+	// force: the same set still accepts the key it matched, and any other set
+	// is asked whether it does. Set to nil once the stream is registered, so a
+	// stream that lives for hours does not pin a whole old set -- candidates,
+	// pad states -- for as long; matchedSecretKey is kept.
+	attrSet *secretSet
+
 	// entry is the door this stream came in through. It decides whether the
 	// FakeTLS write framing (the doppelganger plus the obfuscated handshake read
 	// back out through it) applies -- on a plaintext listener that framing would

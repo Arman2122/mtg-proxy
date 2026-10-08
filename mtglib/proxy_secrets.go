@@ -1,6 +1,7 @@
 package mtglib
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"slices"
@@ -105,6 +106,27 @@ func (s *secretSet) limitsOf(name string) (SecretLimits, bool) {
 	}
 
 	return SecretLimits{}, true
+}
+
+// accepts says whether the set lets a stream of the named secret go on with
+// key, the key the stream matched: true when key is the name's key in this set.
+// False on a nil set, which holds nothing, for a name the set does not hold,
+// and for any other key, a nil or partial one included. now is when the
+// question is asked; a name's own key is accepted at any time. Registration
+// asks it of the set in force (tryRegisterConn), so a stream that matched a key
+// a swap has since taken away is refused rather than registered. names is
+// sorted, so this is a binary search and not a walk of every secret.
+func (s *secretSet) accepts(name string, key []byte, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+
+	i, found := slices.BinarySearch(s.names, name)
+	if !found || i >= len(s.secrets) {
+		return false
+	}
+
+	return bytes.Equal(s.secrets[i].Key[:], key)
 }
 
 // toConfig reconstructs a mutable SecretConfig from the immutable snapshot. It

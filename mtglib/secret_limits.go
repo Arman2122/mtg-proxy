@@ -192,6 +192,11 @@ const (
 	// DenyBanned means the connection came from an address an operator banned
 	// from this secret.
 	DenyBanned
+
+	// DenyKeyRevoked means the connection matched a key its secret no longer
+	// has: the secret set was replaced between the match and the registration,
+	// and the set now in force does not accept that key for the name.
+	DenyKeyRevoked
 )
 
 // String returns a short machine-friendly reason label for logs.
@@ -209,6 +214,8 @@ func (d DenyReason) String() string {
 		return "client_conns"
 	case DenyBanned:
 		return "banned"
+	case DenyKeyRevoked:
+		return "key_revoked"
 	default:
 		return "allowed"
 	}

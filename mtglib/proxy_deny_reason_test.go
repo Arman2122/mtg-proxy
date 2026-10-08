@@ -117,7 +117,9 @@ func newDenyProbe(t *testing.T) *denyProbe {
 }
 
 // stream is a stream of alice's as attribution leaves it, coming from addr with
-// the address limit the secret had when it matched.
+// the address limit the secret had when it matched. When the probe holds a
+// secret set, the stream carries alice's key in it, as a door would have
+// attributed it then (attributeFromSet); a probe with no set leaves it none.
 func (d *denyProbe) stream(t *testing.T, addr net.Addr, ipLimit int) *streamContext {
 	t.Helper()
 
@@ -130,7 +132,7 @@ func (d *denyProbe) stream(t *testing.T, addr net.Addr, ipLimit int) *streamCont
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	return &streamContext{
+	sc := &streamContext{
 		ctx:          ctx,
 		ctxCancel:    cancel,
 		clientSocket: remoteAddrConn{Conn: essentials.WrapNetConn(server), addr: addr},
@@ -139,6 +141,10 @@ func (d *denyProbe) stream(t *testing.T, addr net.Addr, ipLimit int) *streamCont
 		ipLimit:      ipLimit,
 		logger:       denyProbeLogger{record: d.log}.BindStr("secret_name", "alice"),
 	}
+
+	attributeFromSet(t, d.proxy, sc)
+
+	return sc
 }
 
 // ledgerCounts is alice's live connections per address as the ledger holds

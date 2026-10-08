@@ -70,6 +70,8 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 		return
 	}
 
+	afterAttributeHook(ctx)
+
 	// Phase 2: admission. The same code in the same order as today, now reached
 	// with a real secret name whichever door the client came in.
 	if !p.admit(ctx) {
@@ -190,6 +192,7 @@ func (p *Proxy) doEntry(ctx *streamContext, policy ListenerPolicy) bool {
 // banned only by an operator who said force, and then it is to be refused.
 func (p *Proxy) attribute(ctx *streamContext, set *secretSet, i int) DenyReason {
 	ctx.matchedSecretKey = set.secrets[i].Key[:]
+	ctx.attrSet = set
 	ctx.secretName = set.names[i]
 	ctx.adTag = set.effectiveAdTag(i)
 	ctx.ipLimit = set.limits[i].IPLimit
@@ -273,9 +276,10 @@ func (p *Proxy) bannedAt(name string, key addressKey) bool {
 // event. The connection cap has a counter of its own and no event: a new event
 // type reaches the observer interface and every metric backend, and the counter
 // is what an operator reads. A ban is an operator's decision and not a limit
-// being felt, so it is logged and nothing more. Whatever the reason, the log
-// line adds it; the stream logger's own fields, client-ip among them, come with
-// it, as on every other refusal.
+// being felt, so it is logged and nothing more; so is a key the secret no
+// longer has, which a reload or a mutation took away and no limit was felt in.
+// Whatever the reason, the log line adds it; the stream logger's own fields,
+// client-ip among them, come with it, as on every other refusal.
 //
 // A reason with no rule here is still a refusal -- admit has already said no --
 // and only goes uncounted: an unknown reason must never be let through.
@@ -289,6 +293,7 @@ func (p *Proxy) countAdmissionRefusal(ctx *streamContext, reason DenyReason) {
 	case DenyClientConns:
 		p.stats.OnClientConnsRefused(ctx.secretName)
 	case DenyBanned: // the operator's own decision: logged above, not counted
+	case DenyKeyRevoked: // a key the set took away: logged above, not counted
 	default: // a reason nothing produces yet: logged above, not counted
 	}
 }
@@ -473,6 +478,18 @@ const (
 // must not run in parallel, and the hook must not take liveMu.
 var registerStepHook = func(registerStep, *streamContext) DenyReason { return DenyNone }
 
+// beforeRegisterLockHook runs in tryRegisterConn immediately before it takes
+// liveMu, and afterAttributeHook in ServeConn once the entry has attributed the
+// stream and before admission. Both are no-ops in production. A test uses them
+// to run a whole secret swap at those two instants: the one just before the
+// lock is the only point at which loading the set before liveMu and loading it
+// under liveMu give different answers. Variables so they can be replaced; a
+// test that does must restore them and must not run in parallel.
+var (
+	beforeRegisterLockHook = func(*streamContext) {}
+	afterAttributeHook     = func(*streamContext) {}
+)
+
 // tryRegisterConn admits a stream into the live registry and into its user's
 // address ledger in one critical section, or refuses it and says why: DenyNone
 // is admitted. The address is resolved before the lock is taken: ClientIP takes
@@ -480,21 +497,35 @@ var registerStepHook = func(registerStep, *streamContext) DenyReason { return De
 // every stream.
 //
 // The steps run in a fixed order, and a refusal at any of them leaves the
-// ledger, and the per-address table, exactly as it was found: the ban
-// re-check, then the per-address connection cap, then the address limit (the
-// ledger's admit), then the per-address table entry, then the registration.
-// Every refusal comes before the table is asked for an entry, so a refused
-// address never holds one, and a step that refuses does so through refuse,
-// which gives back what the steps before it took.
+// ledger, and the per-address table, exactly as it was found: the key
+// re-check, then the ban re-check, then the per-address connection cap, then
+// the address limit (the ledger's admit), then the per-address table entry,
+// then the registration. Every refusal comes before the table is asked for an
+// entry, so a refused address never holds one, and a step that refuses does so
+// through refuse, which gives back what the steps before it took.
 //
-// The ban re-check is first because it is the one that closes a race:
-// attribute checked the ban without liveMu, and a ban is recorded, and the
-// streams it ends are found, under liveMu. A stream that passed attribute
-// before a ban was recorded is either registered before the ban takes the lock,
-// and closed by it, or meets the ban here. On the FakeTLS door the server's
-// flight has gone out by now, so a refusal here is a close after the
-// handshake, as an address-limit refusal is; it takes a ban recorded in the
-// moments between the two checks.
+// The key re-check is first, and it loads the secret set under liveMu, never
+// before it: that placement is the whole of its correctness. A swap stores its
+// set before it takes liveMu to walk the live streams and close those whose key
+// it took away. A stream that loads the set under the lock is either
+// registered before the walk, and judged by it, or takes the lock after the
+// walk and reads the set the swap stored. A set loaded before the lock could be
+// one a swap replaced while this stream waited on liveMu -- the wait being that
+// very walk -- and the stream would then register a key nothing will ever look
+// at again. The common case costs one load and one pointer compare: the set
+// the stream was attributed from is the set in force, and it accepts the key
+// it matched. Nothing has been taken yet, so the refusal gives back nothing.
+//
+// The ban re-check comes next, before the cap and the limit, because it closes
+// a race of its own: attribute checked the ban without liveMu, and a ban is
+// recorded, and the streams it ends are found, under liveMu. A stream that
+// passed attribute before a ban was recorded is either registered before the
+// ban takes the lock, and closed by it, or meets the ban here. A key the set no
+// longer accepts is refused as such even from a banned place: the key is the
+// first thing that no longer holds. On the FakeTLS door the server's flight has
+// gone out by now, so a refusal at either re-check is a close after the
+// handshake, as an address-limit refusal is; they take a swap, or a ban,
+// recorded in the moments between attribution and registration.
 //
 // The cap reads the ledger's count of the address's live connections, which
 // the ledger keeps for every stream whatever else is configured, so it counts
@@ -512,6 +543,8 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 	key, hasKey := addressKeyOf(ip)
 	keyed := hasKey && clientKeyed(ip)
 	now := time.Now()
+
+	beforeRegisterLockHook(ctx)
 
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
@@ -537,6 +570,14 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 		}
 
 		return reason
+	}
+
+	// The key re-check. The Load MUST stay below the Lock: a set read before it
+	// can be one a swap replaced while this stream waited on liveMu -- and that
+	// swap's walk ran exactly then.
+	cur := p.secrets.Load()
+	if cur != ctx.attrSet && !cur.accepts(ctx.secretName, ctx.matchedSecretKey, time.Now()) {
+		return refuse(DenyKeyRevoked)
 	}
 
 	if hasKey && p.bans.banned(ctx.secretName, key) {
@@ -585,6 +626,10 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 	if entry != nil {
 		ctx.addrEntry.Store(entry)
 	}
+
+	// Registered: the set it was attributed from has been judged, and a stream
+	// that lives for hours must not hold it. The key it matched is kept.
+	ctx.attrSet = nil
 
 	return DenyNone
 }
