@@ -313,6 +313,7 @@ func TestDenyReasonLabels(t *testing.T) {
 		DenyIPLimit:     "ip_limit",
 		DenyClientConns: "client_conns",
 		DenyBanned:      "banned",
+		DenyKeyRevoked:  "key_revoked",
 	}
 
 	seen := make(map[string]DenyReason, len(labels))
@@ -524,6 +525,7 @@ func TestAdmitMapsEveryReasonToItsOwnAccounting(t *testing.T) { //nolint: parall
 		{DenyIPLimit, 1, 0, 1},
 		{DenyClientConns, 0, 1, 0},
 		{DenyBanned, 0, 0, 0},
+		{DenyKeyRevoked, 0, 0, 0},
 		{DenyQuota, 0, 0, 0},
 	}
 

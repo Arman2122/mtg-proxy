@@ -481,10 +481,13 @@ var registerStepHook = func(registerStep, *streamContext) DenyReason { return De
 // beforeRegisterLockHook runs in tryRegisterConn immediately before it takes
 // liveMu, and afterAttributeHook in ServeConn once the entry has attributed the
 // stream and before admission. Both are no-ops in production. A test uses them
-// to run a whole secret swap at those two instants: the one just before the
-// lock is the only point at which loading the set before liveMu and loading it
-// under liveMu give different answers. Variables so they can be replaced; a
-// test that does must restore them and must not run in parallel.
+// to run a whole secret swap at those two instants. A swap run just before the
+// lock tells a set loaded above the hook from one loaded under liveMu, and no
+// more: a load between the hook and the lock reads the hook's new set too. The
+// two placements differ for as long as the stream waits on liveMu, which a test
+// shows by swapping while a registration is parked on the lock
+// (TestARekeyWhileRegistrationWaitsOnLiveMuIsRefused). Variables so they can be
+// replaced; a test that does must restore them and must not run in parallel.
 var (
 	beforeRegisterLockHook = func(*streamContext) {}
 	afterAttributeHook     = func(*streamContext) {}

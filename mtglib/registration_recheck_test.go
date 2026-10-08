@@ -1,9 +1,11 @@
 package mtglib
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
+	"runtime"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -110,10 +112,13 @@ func TestARekeyAfterAttributionIsRefusedAtRegistration(t *testing.T) { //nolint:
 }
 
 // L5b, the plain re-key variant (M1′ of the second review): a complete swap,
-// from its Store to the end of its walk, runs at the one instant where loading
-// the set before taking liveMu and loading it after differ -- just before the
-// lock. Loaded before, the stream would hold the set the swap replaced and
-// register after the walk it waited on. Loaded under the lock, it is refused.
+// from its Store to the end of its walk, runs just before the registration
+// takes liveMu. A set loaded above that point is the one the swap replaced, and
+// the stream would register after the walk with a key nothing looks at again.
+// Loaded under the lock, it is refused. This tells a load above the hook from
+// one under the lock, and nothing finer: a load placed between the hook and the
+// lock reads the hook's new set and passes here. The registration parked on
+// liveMu below is what catches that one.
 func TestARekeyJustBeforeTheRegistrationLockIsRefused(t *testing.T) { //nolint: paralleltest // swaps a package variable
 	probe := newClientTableProbe(t, false)
 	p := probe.proxy
@@ -158,6 +163,185 @@ func TestARekeyJustBeforeTheRegistrationLockIsRefused(t *testing.T) { //nolint: 
 	assert.False(t, sc.addrCounted)
 	assert.Nil(t, sc.addrEntry.Load())
 	assert.Equal(t, before, probe.ledgerCounts(), "the ledger is as it was")
+}
+
+// L5b, the removal variant: the complete swap just before the registration lock
+// removes the stream's secret altogether. The set in force has no such name, so
+// it accepts no key for it, and the stream is refused as key_revoked rather
+// than registered under a name nothing will look at again -- closeDeniedConns
+// skips names the set does not hold, and the removal's own walk has run.
+//
+// bob holds the very key alice had, and stays. The set in force still has the
+// stream's key, under another name, and that must not let it in: the question
+// is asked of the stream's name, and a name the set does not hold accepts
+// nothing. bob sorts right after alice, so a lookup that judged an absent name
+// by the secret beside it would find his key and admit the stream.
+func TestARemovalJustBeforeTheRegistrationLockIsRefused(t *testing.T) { //nolint: paralleltest // swaps a package variable
+	probe := newClientTableProbe(t, false)
+	p := probe.proxy
+
+	shared := p.secrets.Load().toConfig()
+	shared.Secrets["bob"] = Secret{Key: shared.Secrets["alice"].Key, Host: "bob.example.com"}
+	require.NoError(t, p.ReplaceSecrets(shared))
+
+	set := p.secrets.Load()
+	alice := slices.Index(set.names, "alice")
+	require.Equal(t, []string{"alice", "bob"}, set.names)
+	require.Equal(t, set.secrets[0].Key, set.secrets[1].Key, "bob holds alice's key")
+
+	held := probe.stream(t, tcpFrom("198.51.100.7", 50001), 0)
+	require.Equal(t, DenyNone, p.attribute(held, set, alice))
+	require.Equal(t, DenyNone, p.tryRegisterConn(held))
+
+	cfg := set.toConfig()
+	cfg.forget("alice")
+
+	sc := probe.stream(t, tcpFrom("203.0.113.9", 50002), 0)
+	require.Equal(t, DenyNone, p.attribute(sc, set, alice))
+
+	before := probe.ledgerCounts()
+	require.Equal(t, map[addressKey]int{"198.51.100.7": 1}, before)
+
+	swapped := false
+
+	installBeforeRegisterLockHook(t, func(hooked *streamContext) {
+		if hooked != sc || swapped {
+			return
+		}
+
+		swapped = true
+
+		require.NoError(t, p.ReplaceSecrets(cfg))
+	})
+
+	assert.Equal(t, DenyKeyRevoked, p.tryRegisterConn(sc))
+
+	require.True(t, swapped, "the removal ran just before the registration lock")
+
+	_, kept := p.secrets.Load().limitsOf("alice")
+	require.False(t, kept, "and took alice out of the set")
+	require.Equal(t, []string{"bob"}, p.secrets.Load().names, "and bob, with alice's old key, stayed")
+
+	assert.ErrorIs(t, held.Err(), context.Canceled, "the removal's walk had run by then")
+	assert.False(t, streamRegistered(p, sc), "the refused stream is not in liveConns")
+	assert.Equal(t, 1, probe.registered(), "only the stream registered before the removal is")
+	assert.False(t, sc.addrCounted)
+	assert.Nil(t, sc.addrEntry.Load())
+	assert.Equal(t, before, probe.ledgerCounts(), "the ledger is as it was")
+}
+
+// currentGoroutineID is the calling goroutine's id, read from its own stack
+// header ("goroutine 123 [running]:").
+func currentGoroutineID() string {
+	buf := make([]byte, 64)
+	buf = buf[:runtime.Stack(buf, false)]
+
+	return string(bytes.Fields(buf)[1])
+}
+
+// allGoroutineStacks is every goroutine's stack, whole: the buffer grows until
+// the dump fits, because runtime.Stack truncates silently.
+func allGoroutineStacks() []byte {
+	buf := make([]byte, 1<<20)
+
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return buf[:n]
+		}
+
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
+// parkedInRegisterLock says whether goroutine id is parked on a mutex inside
+// tryRegisterConn. Its own lookups take no lock anyone holds in the test below,
+// so the one mutex it can be parked on there is liveMu.
+func parkedInRegisterLock(id string) bool {
+	for block := range bytes.SplitSeq(allGoroutineStacks(), []byte("\n\n")) {
+		if !bytes.HasPrefix(block, []byte("goroutine "+id+" [")) {
+			continue
+		}
+
+		header, _, _ := bytes.Cut(block, []byte("\n"))
+
+		return bytes.Contains(header, []byte("Mutex")) && bytes.Contains(block, []byte("(*Proxy).tryRegisterConn"))
+	}
+
+	return false
+}
+
+// The placement itself, at its finest: a complete re-key swap whose Store lands
+// while the registering stream is parked on liveMu -- after any set load placed
+// before the lock, above the hook or below it -- and whose walk needs the lock
+// the stream is waiting for. Only a load under the lock reads the swap's set.
+// Whichever of the two gets liveMu first, the stream must be refused: if the
+// walk goes first it cannot see an unregistered stream, and if the stream goes
+// first it has to see the new set.
+//
+// The test finds the parked registration by reading the goroutine dump. If that
+// text ever changes shape, the poll runs out its deadline and the test fails;
+// it cannot pass without the stream really parked on the lock. Not parallel: a
+// dump of every goroutine is cheapest, and the poll quickest, while no parallel
+// test is running.
+func TestARekeyWhileRegistrationWaitsOnLiveMuIsRefused(t *testing.T) { //nolint: paralleltest // reads every goroutine's stack
+	probe := newClientTableProbe(t, false)
+	p := probe.proxy
+	set := p.secrets.Load()
+
+	sc := probe.stream(t, tcpFrom("203.0.113.9", 50001), 0)
+	require.Equal(t, DenyNone, p.attribute(sc, set, slices.Index(set.names, "alice")))
+
+	cfg := set.toConfig()
+	cfg.Secrets["alice"] = GenerateSecret("alice.example.com")
+
+	p.liveMu.Lock()
+
+	ids := make(chan string, 1)
+	result := make(chan DenyReason, 1)
+
+	go func() {
+		ids <- currentGoroutineID()
+		result <- p.tryRegisterConn(sc)
+	}()
+
+	id := <-ids
+
+	deadline := time.Now().Add(10 * time.Second)
+	for !parkedInRegisterLock(id) {
+		if time.Now().After(deadline) {
+			p.liveMu.Unlock()
+			t.Fatal("the registration never parked on liveMu")
+		}
+
+		// Paces the dumps; it decides nothing.
+		time.Sleep(time.Millisecond)
+	}
+
+	swapped := make(chan error, 1)
+
+	go func() { swapped <- p.ReplaceSecrets(cfg) }()
+
+	// The swap's Store lands now; its walk needs liveMu and waits for it. A
+	// swap that returns before storing has failed.
+	for p.secrets.Load() == set {
+		select {
+		case err := <-swapped:
+			p.liveMu.Unlock()
+			t.Fatalf("the swap returned without storing its set: %v", err)
+		default:
+		}
+
+		runtime.Gosched()
+	}
+
+	p.liveMu.Unlock()
+
+	reason := <-result
+
+	require.NoError(t, <-swapped)
+	assert.Equal(t, DenyKeyRevoked, reason)
+	assert.False(t, streamRegistered(p, sc), "the stream is not in liveConns")
 }
 
 // L7, its second half: the key re-check precedes the ban re-check. A stream
@@ -284,14 +468,16 @@ func TestRegistrationReleasesTheAttributedSet(t *testing.T) {
 
 	sc := probe.stream(t, tcpFrom("198.51.100.7", 50001), 0)
 	require.Equal(t, DenyNone, p.attribute(sc, set, alice))
-	require.Same(t, set, sc.attrSet, "attribute records the set it matched against")
+	// Compared as pointers, not with Same or Nil: on failure those print the
+	// whole set, keys and pad states, which is noise and nothing more.
+	require.True(t, sc.attrSet == set, "attribute records the set it matched against")
 
 	key := sc.matchedSecretKey
 	require.Equal(t, set.secrets[alice].Key[:], key)
 
 	require.True(t, p.admit(sc))
 
-	assert.Nil(t, sc.attrSet, "a registered stream does not pin the set it was attributed from")
+	assert.True(t, sc.attrSet == nil, "a registered stream does not pin the set it was attributed from")
 	require.Len(t, sc.matchedSecretKey, len(key), "its key is kept")
 	assert.Same(t, &key[0], &sc.matchedSecretKey[0], "the very key attribute bound")
 	assert.Equal(t, set.secrets[alice].Key[:], sc.matchedSecretKey)
@@ -314,6 +500,7 @@ func TestAcceptsPrimaryForm(t *testing.T) {
 
 	assert.False(t, none.accepts("alice", alice.Key[:], now), "a nil set holds nothing")
 	assert.False(t, set.accepts("carol", alice.Key[:], now), "a name the set does not hold")
+	assert.False(t, set.accepts("aaron", alice.Key[:], now), "an absent name, with the key of the name beside it")
 	assert.False(t, set.accepts("alice", bob.Key[:], now), "another name's key")
 	assert.False(t, set.accepts("alice", rekeyed.Key[:], now), "another key")
 	assert.False(t, set.accepts("alice", alice.Key[:8], now), "part of the key")
