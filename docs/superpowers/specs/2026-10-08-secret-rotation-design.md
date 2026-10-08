@@ -475,8 +475,11 @@ func buildSecretSetAt(secrets map[string]Secret, perSecret map[string][AdTagLeng
 ```
 
 `retiringDrop` is `{name string; until time.Time; reason string}`, for logging, with reason one
-of `expired`, `dangling`, `same_as_primary`, `duplicate`, `key_of_other_secret` or `over_cap`.
-It never holds a key. New `secretSet` fields, **all nil or zero when no retiring entry survives**:
+of `expired`, `dangling`, `same_as_primary`, `duplicate`, `key_of_other_secret`, `over_cap` or
+`invalid` (revision 4, Task 1's review: a handed entry whose `Secret` fails `Secret.Valid()`, such as an
+all-zero key from a library caller that forgot it, is dropped first of all rather than becoming a
+candidate; the config layer's rule 1 still refuses such a block earlier under `--check`, and the
+engine never refuses a swap for it). It never holds a key. New `secretSet` fields, **all nil or zero when no retiring entry survives**:
 
 ```go
 retiring       []retiringEntry   // {nameIdx int; secret Secret; until time.Time},
@@ -982,7 +985,7 @@ All lines carry `secret_name` and times; none carries a key.
 | an entry leaves the set because it expired: the sweep, or any reload or swap after `until`. Classified by the §6.3 diff, not by an engine drop reason | Info | `previous key of the secret is no longer accepted: overlap ended` | `secret_name`, `until`, `closed` |
 | an entry leaves the set otherwise (file edit, removal) | Info | `previous key of the secret is no longer accepted` | `secret_name`, `reason`, `closed` |
 | a config problem or warning | Warning | (§1.3 line) | |
-| an engine drop that is not an expiry | Warning (`same_as_primary` and `duplicate`: Info) | `a retiring key was ignored` | `secret_name`, `reason` (`dangling`, `same_as_primary`, `duplicate`, `key_of_other_secret`, `over_cap`) |
+| an engine drop that is not an expiry | Warning (`same_as_primary` and `duplicate`: Info) | `a retiring key was ignored` | `secret_name`, `reason` (`invalid`, `dangling`, `same_as_primary`, `duplicate`, `key_of_other_secret`, `over_cap`) |
 | the wall clock is behind | Warning | §2.3 | `behind_by` |
 | a refused registration | Info | `connection denied by per-user limit` | `deny_reason=key_revoked` |
 
