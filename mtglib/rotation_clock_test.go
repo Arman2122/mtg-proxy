@@ -1,7 +1,9 @@
 package mtglib
 
 import (
+	"math"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,9 +34,8 @@ func (s *steppedClock) now() time.Time { return time.Unix(0, s.at.Load()).UTC() 
 
 // TestRotationClockNeverRunsBackwards: whatever the source says, Now() is the
 // latest time the clock has seen. Times are compared with Equal, never with
-// assert.Equal: the clock may hand back the source's own value or one it built
-// from its mark, and the two differ in zone and monotonic reading, not in the
-// instant.
+// assert.Equal: the clock may hand back the source's own reading or one it built
+// from its mark, and the two can differ in zone, not in the instant.
 func TestRotationClockNeverRunsBackwards(t *testing.T) {
 	t.Parallel()
 
@@ -110,6 +111,177 @@ func TestRotationClockNeverRunsBackwards(t *testing.T) {
 		final := clock.Now()
 		for r, seen := range top {
 			assert.False(t, final.Before(seen), "reader %d saw a time the clock has since gone back on", r)
+		}
+	})
+
+	// The subtest above sends almost every read down the behind path: its source
+	// stays inside one minute, so the mark is at the top of that window after a
+	// few reads. A mark that lost an update to a racing writer would hide there.
+	// This one advances on every call, so most reads are ahead of the mark and
+	// race to move it by CAS, and it is judged by what a linearizable clock owes:
+	// a call never returns less than any call that had finished before it began.
+	t.Run("a source that advances on every call, under a real-time floor", func(t *testing.T) {
+		t.Parallel()
+
+		const (
+			readers = 32
+			reads   = 5000
+		)
+
+		var (
+			baseAt    atomic.Int64 // the source's drifting base, unix nanos
+			completed atomic.Int64 // the largest value any finished call returned
+			sourceMax atomic.Int64 // the largest value the source ever produced
+			frozen    atomic.Bool  // the source stops advancing and falls hours behind
+		)
+
+		baseAt.Store(rotationNow.UnixNano())
+		completed.Store(math.MinInt64)
+		sourceMax.Store(math.MinInt64)
+
+		casMax := func(a *atomic.Int64, v int64) {
+			for {
+				cur := a.Load()
+				if v <= cur || a.CompareAndSwap(cur, v) {
+					return
+				}
+			}
+		}
+
+		clock := NewRotationClock(func() time.Time {
+			if frozen.Load() {
+				return time.Unix(0, sourceMax.Load()-int64(10*time.Hour)).UTC()
+			}
+
+			// A few microseconds ahead of the last call, with up to 50 more of
+			// jitter, so reads land close together and in no fixed order; one in
+			// twenty steps back by hours, as a wall clock does when it is corrected.
+			base := baseAt.Add(int64(time.Microsecond))
+			ns := base + rand.Int64N(50)*int64(time.Microsecond)
+
+			if rand.IntN(100) < 5 {
+				ns = base - (rand.Int64N(5)+1)*int64(time.Hour)
+			}
+
+			casMax(&sourceMax, ns)
+
+			return time.Unix(0, ns).UTC()
+		}, nil)
+
+		var (
+			wg         sync.WaitGroup
+			regressed  atomic.Int64 // a reader saw its own results go down
+			belowFloor atomic.Int64 // a call returned less than a call that had finished before it began
+			overshot   atomic.Int64 // a call returned more than the source ever produced
+		)
+
+		for range readers {
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+
+				last := int64(math.MinInt64)
+
+				for range reads {
+					floor := completed.Load()
+					got := clock.Now().UnixNano()
+
+					if got < last {
+						regressed.Add(1)
+					}
+
+					if got < floor {
+						belowFloor.Add(1)
+					}
+
+					if got > sourceMax.Load() {
+						overshot.Add(1)
+					}
+
+					last = got
+
+					casMax(&completed, got)
+				}
+			}()
+		}
+
+		wg.Wait()
+
+		assert.Zero(t, regressed.Load(), "no reader ever saw the clock go back")
+		assert.Zero(t, belowFloor.Load(), "no call returned less than a call that finished before it began")
+		assert.Zero(t, overshot.Load(), "no call returned a time the source never produced")
+
+		frozen.Store(true)
+
+		assert.Equal(t, sourceMax.Load(), clock.Now().UnixNano(),
+			"with the source hours behind, the clock holds the largest time any read ever saw, exactly")
+	})
+}
+
+// TestRotationClockReturnsWallTimeOnEveryPath: every result is a wall time with
+// no monotonic reading, the one a read from a file has. A library caller's
+// Until built from time.Now().Add(...) carries a monotonic reading, and a
+// comparison between two times that both carry one is made on that reading and
+// not on the wall clock; so a result that carried one on some paths and not on
+// others would judge the same Until by the monotonic clock in one case and by
+// the wall clock in the other, and a wall step forward and back could accept a
+// key again that the mark had judged expired.
+//
+// The source is derived from one time.Now() reading and so carries a monotonic
+// reading on every call. The sequence is the one that scenario takes: the wall
+// steps two hours ahead, is corrected back, and steps ahead again.
+func TestRotationClockReturnsWallTimeOnEveryPath(t *testing.T) {
+	t.Parallel()
+
+	// carriesMonotonic says whether a time carries a monotonic reading: its
+	// string form then ends in "m=+...".
+	carriesMonotonic := func(at time.Time) bool { return strings.Contains(at.String(), "m=") }
+
+	base := time.Now()
+	require.True(t, carriesMonotonic(base), "the base reading carries a monotonic reading, or this test proves nothing")
+
+	// A library caller's Until: it carries one too.
+	until := base.Add(time.Hour)
+	require.True(t, carriesMonotonic(until))
+
+	var offset atomic.Int64
+
+	source := func() time.Time { return base.Add(time.Duration(offset.Load())) }
+
+	clock := NewRotationClock(source, nil)
+
+	high := time.Duration(0)
+
+	for _, step := range []struct {
+		name    string
+		offset  time.Duration
+		expired bool
+	}{
+		{"ten minutes in", 10 * time.Minute, false},
+		{"the wall steps two hours ahead", 2 * time.Hour, true},
+		{"and is corrected back", 10 * time.Minute, true},
+		{"and steps ahead again", 2 * time.Hour, true},
+		{"and a little further", 2*time.Hour + time.Minute, true},
+	} {
+		offset.Store(int64(step.offset))
+
+		high = max(high, step.offset)
+
+		got := clock.Now()
+
+		assert.False(t, carriesMonotonic(got), "%s: the result is a wall time: %v", step.name, got)
+		assert.True(t, got.Equal(base.Round(0).Add(high)), "%s: and the latest time seen", step.name)
+		assert.Equal(t, step.expired, !got.Before(until), "%s: judged against a library caller's Until", step.name)
+	}
+
+	t.Run("the zero value on the wall clock", func(t *testing.T) {
+		t.Parallel()
+
+		clock := &RotationClock{}
+
+		for range 100 {
+			assert.False(t, carriesMonotonic(clock.Now()))
 		}
 	})
 }

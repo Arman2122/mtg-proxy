@@ -21,6 +21,15 @@ const behindThreshold = time.Second
 // a second behind that mark, the clock reports the episode once, through the
 // callback given to NewRotationClock, and judges by the mark all the same.
 //
+// Every time a clock returns is a wall time with no monotonic reading, whichever
+// way it was reached, so that it compares with an Until read from a file, and
+// with one built from time.Now().Add(...), by the wall clock alone. (A nil
+// *RotationClock is not a clock but time.Now, and returns it as it is.)
+//
+// The mark is kept in unix nanoseconds, so the source must return times within
+// that range, the years 1678 to 2262; time.Now always does. Outside it the
+// reading wraps, and the clock would hold a mark that means nothing.
+//
 // The zero value is usable: it is a high-water clock on time.Now that reports
 // nothing. A nil *RotationClock reads time.Now with no mark at all. A
 // RotationClock must not be copied after first use.
@@ -34,6 +43,14 @@ type RotationClock struct {
 // NewRotationClock builds a clock on the given time source (nil is time.Now).
 // onBehind, if not nil, is called with how far the source was behind the clock's
 // mark, once for each episode of the source being more than a second behind it.
+//
+// The source must return times within the unix-nanosecond range, the years 1678
+// to 2262.
+//
+// onBehind is called synchronously, from inside Now, by whichever caller meets
+// the episode first. The proxy calls Now while it holds its reload lock, and
+// while a stream registers under its registry lock, so onBehind must be quick:
+// log and return. It must not block and must not call back into the proxy.
 func NewRotationClock(now func() time.Time, onBehind func(time.Duration)) *RotationClock {
 	return &RotationClock{now: now, onBehind: onBehind}
 }
@@ -41,6 +58,9 @@ func NewRotationClock(now func() time.Time, onBehind func(time.Duration)) *Rotat
 // Now is the time to judge an expiry by: the larger of the source's time and the
 // latest time this clock has returned, which it then holds. A nil receiver reads
 // time.Now. It is safe for concurrent use.
+//
+// The result of a non-nil clock is a wall time with no monotonic reading, on
+// every path: the source's reading with it stripped, or the mark.
 //
 // A source at or past the mark moves the mark and ends a behind episode. A
 // source more than a second behind the mark starts one, and onBehind is called
@@ -74,7 +94,7 @@ func (c *RotationClock) Now() time.Time {
 				c.behind.Store(false)
 			}
 
-			return at
+			return at.Round(0)
 		}
 	}
 }
