@@ -191,8 +191,25 @@ func (p *Proxy) doEntry(ctx *streamContext, policy ListenerPolicy) bool {
 // can be banned, whether or not it stands for one place: an unkeyed address is
 // banned only by an operator who said force, and then it is to be refused.
 func (p *Proxy) attribute(ctx *streamContext, set *secretSet, i int) DenyReason {
-	ctx.matchedSecretKey = set.secrets[i].Key[:]
+	return p.attributeMatch(ctx, set, set.primaryMatch(i))
+}
+
+// attributeMatch is attribute for what a door matched, which may be one of the
+// name's retiring keys: the stream holds the key it matched (a slice into the
+// set's own arrays), the set, and the entry's until -- zero for the name's
+// primary. Everything else -- name, ad tag, limits, ip-limit and client-conns --
+// is the name's, read by m.idx: an old key's traffic is its name's.
+func (p *Proxy) attributeMatch(ctx *streamContext, set *secretSet, m secretMatch) DenyReason {
+	i := m.idx
+
+	ctx.matchedSecretKey = m.key[:]
 	ctx.attrSet = set
+	ctx.retiringUntil = time.Time{}
+
+	if m.retiring >= 0 {
+		ctx.retiringUntil = set.retiring[m.retiring].until
+	}
+
 	ctx.secretName = set.names[i]
 	ctx.adTag = set.effectiveAdTag(i)
 	ctx.ipLimit = set.limits[i].IPLimit

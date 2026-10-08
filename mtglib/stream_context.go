@@ -51,6 +51,11 @@ type streamContext struct {
 	// pad states -- for as long; matchedSecretKey is kept.
 	attrSet *secretSet
 
+	// retiringUntil is the until of the retiring entry whose key this stream
+	// matched, and zero when it matched its name's primary key. Set with
+	// matchedSecretKey, by attributeMatch.
+	retiringUntil time.Time
+
 	// entry is the door this stream came in through. It decides whether the
 	// FakeTLS write framing (the doppelganger plus the obfuscated handshake read
 	// back out through it) applies -- on a plaintext listener that framing would
