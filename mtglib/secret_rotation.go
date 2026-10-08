@@ -60,9 +60,18 @@ type retiringDrop struct {
 	reason string
 }
 
-// The reasons a retiringDrop gives: the §1.3 rules the engine applies again,
-// in the order it applies them.
+// The seven reasons a retiringDrop gives, in the order the engine applies
+// them: first whether the value is one at all (Secret.Valid()), then the §1.3
+// rules 2, 3, 5, 6, 7 and 8.
 const (
+	// retiringInvalid is a value Secret.Valid() refuses: an all-zero key, in
+	// any mode, or an ee value with no host -- a library caller that forgot
+	// the Secret, say. It is no key a client could hold, and an all-zero key
+	// kept as a candidate would let anyone in as the name. It is the config
+	// layer's rule 1 at engine level; the engine drops it, never refuses the
+	// swap for it.
+	retiringInvalid = "invalid"
+
 	// retiringExpired is rule 2: Until is not after now.
 	retiringExpired = "expired"
 
@@ -247,16 +256,18 @@ type keyOwner struct {
 
 // buildRetiring is the retiring half of buildSecretSetAt. It classifies each
 // handed entry against the set's primaries (names sorted, secrets aligned with
-// them) at now by the §1.3 rules 2, 3, 5, 6, 7 and 8, in that order, the
-// first that applies deciding. It returns the kept entries in the set's order
-// (name, then until descending, then key bytes) and the drops in input order.
-// Both are nil when nothing is handed, and the kept ones are nil when every
-// entry is dropped.
+// them) at now: first whether its value is valid at all (Secret.Valid()),
+// then by the §1.3 rules 2, 3, 5, 6, 7 and 8, in that order, the first that
+// applies deciding -- seven reasons in all. It returns the kept entries in the
+// set's order (name, then until descending, then key bytes) and the drops in
+// input order. Both are nil when nothing is handed, and the kept ones are nil
+// when every entry is dropped.
 //
-// Rule 5 is judged against every handed entry, expired and dangling ones
+// Rule 5 is judged against every valid handed entry, expired and dangling ones
 // included, and every primary: a collision that went away when the other
-// entry expired would accept again a key it once dropped. The engine does not
-// apply rule 1, which the config layer owns, nor rule 4 (MaxRetiringOverlap).
+// entry expired would accept again a key it once dropped. The engine applies
+// of rule 1 only what Secret.Valid() checks (the rest is the config layer's,
+// which parses the value), and not rule 4 (MaxRetiringOverlap).
 func buildRetiring(names []string, secrets []Secret, handed []RetiringSecret, now time.Time) ([]retiringEntry, []retiringDrop) {
 	if len(handed) == 0 {
 		return nil, nil
@@ -280,8 +291,17 @@ func buildRetiring(names []string, secrets []Secret, handed []RetiringSecret, no
 		claim(names[i], secrets[i].Key)
 	}
 
+	// An invalid value claims no key. It is no key a client could present (the
+	// config layer counts only syntactically valid entries in rule 5 for the
+	// same reason), and as a claimant it would drop a valid entry of another
+	// name that happens to share its bytes, an ee value with no host, say. It
+	// is dropped as invalid below whatever else it is, so leaving it out
+	// changes no answer about it, and it is a pure function of the input, so
+	// no later now can bring a dropped entry back.
 	for j := range handed {
-		claim(handed[j].Name, handed[j].Secret.Key)
+		if handed[j].Secret.Valid() {
+			claim(handed[j].Name, handed[j].Secret.Key)
+		}
 	}
 
 	reasons := make([]string, len(handed))
@@ -294,6 +314,8 @@ func buildRetiring(names []string, secrets []Secret, handed []RetiringSecret, no
 		i, found := slices.BinarySearch(names, entry.Name)
 
 		switch {
+		case !entry.Secret.Valid():
+			reasons[j] = retiringInvalid
 		case !now.Before(entry.Until):
 			reasons[j] = retiringExpired
 		case !found:

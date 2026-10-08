@@ -83,8 +83,10 @@ func adTagFilled(b byte) [AdTagLength]byte {
 	return tag
 }
 
-// TestTheEngineAppliesTheRetiringRules is E1: the §1.3 rules 2, 3, 5, 6, 7 and
-// 8 at engine level, in that order, one row per reason and per precedence.
+// TestTheEngineAppliesTheRetiringRules is E1: the seven drop reasons at engine
+// level -- invalid (Secret.Valid() fails), then the §1.3 rules 2, 3, 5, 6, 7
+// and 8, in that order -- one row per reason, per invalid shape and per
+// precedence.
 func TestTheEngineAppliesTheRetiringRules(t *testing.T) {
 	t.Parallel()
 
@@ -217,6 +219,72 @@ func TestTheEngineAppliesTheRetiringRules(t *testing.T) {
 			drops:    []retiringDrop{dropOf("alice", hours(-1), retiringExpired)},
 		},
 		{
+			name:     "invalid: the zero Secret, a caller that forgot it",
+			retiring: []RetiringSecret{retire("alice", Secret{}, hours(1))},
+			drops:    []retiringDrop{dropOf("alice", hours(1), retiringInvalid)},
+		},
+		{
+			name:     "invalid: an all-zero key on an ee value with a host",
+			retiring: []RetiringSecret{retire("alice", eeSecretOf([SecretKeyLength]byte{}, candidatesCover), hours(1))},
+			drops:    []retiringDrop{dropOf("alice", hours(1), retiringInvalid)},
+		},
+		{
+			name:     "invalid: an all-zero key on a dd value",
+			retiring: []RetiringSecret{retire("bob", ddSecretOf([SecretKeyLength]byte{}), hours(1))},
+			drops:    []retiringDrop{dropOf("bob", hours(1), retiringInvalid)},
+		},
+		{
+			name:     "invalid: an all-zero key on a plain value",
+			retiring: []RetiringSecret{retire("carol", plainSecretOf([SecretKeyLength]byte{}), hours(1))},
+			drops:    []retiringDrop{dropOf("carol", hours(1), retiringInvalid)},
+		},
+		{
+			name:     "invalid: an ee value with no host",
+			retiring: []RetiringSecret{retire("alice", eeSecretOf(k(100), ""), hours(1))},
+			drops:    []retiringDrop{dropOf("alice", hours(1), retiringInvalid)},
+		},
+		{
+			name:     "invalid comes before expired",
+			retiring: []RetiringSecret{retire("alice", Secret{}, hours(-1))},
+			drops:    []retiringDrop{dropOf("alice", hours(-1), retiringInvalid)},
+		},
+		{
+			name:     "invalid comes before dangling",
+			retiring: []RetiringSecret{retire("ghost", eeSecretOf(k(100), ""), hours(1))},
+			drops:    []retiringDrop{dropOf("ghost", hours(1), retiringInvalid)},
+		},
+		{
+			name:     "invalid comes before its own primary's key",
+			retiring: []RetiringSecret{retire("alice", eeSecretOf(k(10), ""), hours(1))},
+			drops:    []retiringDrop{dropOf("alice", hours(1), retiringInvalid)},
+		},
+		{
+			name: "an invalid entry is no duplicate of a valid one with its key",
+			retiring: []RetiringSecret{
+				retire("alice", eeSecretOf(k(100), ""), hours(3)),
+				retire("alice", ee(100), hours(1)),
+			},
+			kept:  []RetiringSecret{retire("alice", ee(100), hours(1))},
+			drops: []retiringDrop{dropOf("alice", hours(3), retiringInvalid)},
+		},
+		{
+			name: "an invalid entry takes no part in rule 5",
+			retiring: []RetiringSecret{
+				retire("carol", eeSecretOf(k(100), ""), hours(1)),
+				retire("alice", ee(100), hours(1)),
+				retire("ghost", eeSecretOf(k(101), ""), hours(-1)),
+				retire("bob", dd(101), hours(2)),
+			},
+			kept: []RetiringSecret{
+				retire("alice", ee(100), hours(1)),
+				retire("bob", dd(101), hours(2)),
+			},
+			drops: []retiringDrop{
+				dropOf("carol", hours(1), retiringInvalid),
+				dropOf("ghost", hours(-1), retiringInvalid),
+			},
+		},
+		{
 			name: "drops come in input order, the kept in the set's",
 			retiring: []RetiringSecret{
 				retire("carol", ee(110), hours(1)),
@@ -241,10 +309,14 @@ func TestTheEngineAppliesTheRetiringRules(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			set, drops := buildSecretSetAt(rotationPrimaries(), nil, nil, nil, tc.retiring, rotationNow)
+			handed := tc.retiring
+			before := slices.Clone(handed)
+
+			set, drops := buildSecretSetAt(rotationPrimaries(), nil, nil, nil, handed, rotationNow)
 
 			assert.Equal(t, tc.kept, keptEntries(set), "the entries kept, in the set's order")
 			assert.Equal(t, tc.drops, drops, "the drops, in input order")
+			assert.Equal(t, before, handed, "the caller's slice is not rewritten by the build")
 
 			// A primary is never touched, whatever its entries do.
 			today := frozenBuildSecretSet(rotationPrimaries(), nil, nil, nil)
@@ -416,24 +488,35 @@ func TestRetiringHostsJoinTheGateAndTheCoverHostsButNeverFront(t *testing.T) {
 			"bob":   ddSecretOf(k(40)),
 		}
 
-		set, _ := buildSecretSetAt(primaries, nil, nil, nil, []RetiringSecret{
+		// A dd value that carries a host: only a library caller can make one,
+		// and it is valid, so it is kept. It is no ee value, so its host is in
+		// neither the gate nor the cover hosts.
+		ddCarrying := ddSecretOf(k(106))
+		ddCarrying.Host = hostD
+
+		set, drops := buildSecretSetAt(primaries, nil, nil, nil, []RetiringSecret{
 			retire("bob", eeSecretOf(k(100), hostA), hours(1)),
 			retire("alice", eeSecretOf(k(101), hostB), hours(1)),
 			retire("bob", eeSecretOf(k(102), hostC), hours(2)),    // alice's host again
 			retire("bob", ddSecretOf(k(103)), hours(1)),           // no host
 			retire("alice", eeSecretOf(k(104), hostD), hours(-1)), // expired: its host stays out
 			retire("ghost", eeSecretOf(k(105), hostE), hours(1)),  // dangling: so does its
+			retire("bob", ddCarrying, hours(1)),                   // kept, and its host stays out
 		}, rotationNow)
+		require.Len(t, drops, 2, "the expired and the dangling one")
+		require.Contains(t, keptEntries(set), retire("bob", ddCarrying, hours(1)))
 
 		today := frozenBuildSecretSet(primaries, nil, nil, nil)
 
 		assert.Equal(t, []string{hostA, hostB, hostC}, set.hostnames, "sorted, each once, the kept ee entries' hosts with the primaries'")
+		assert.NotContains(t, set.hostnames, hostD, "a kept dd value's host is not an SNI the gate passes")
 		assert.Equal(t, hostC, set.frontHost, "the primaries' front host, as without the entries")
 		assert.Equal(t, today.hosted, set.hosted, "hosted is the primaries'")
 
 		// The primaries' hosts in name order, then the entries' in the set's
-		// order (alice 101; bob 102, 100, 103), each once.
+		// order (alice 101; bob 102, 100, 103, 106), each once, ee ones only.
 		assert.Equal(t, []doppel.CoverHost{cover(hostC), cover(hostB), cover(hostA)}, p.coverHosts(set))
+		assert.NotContains(t, p.coverHosts(set), cover(hostD), "nor a cover site the doppelganger measures")
 	})
 
 	t.Run("a set whose only ee key is retiring", func(t *testing.T) {
@@ -783,22 +866,29 @@ func TestToConfigRoundTripsRetiringEntries(t *testing.T) {
 	perSecret := map[string][AdTagLength]byte{"bob": adTagFilled(0x11)}
 	limits := map[string]SecretLimits{"carol": {QuotaBytes: 1 << 30, ClientConns: 2}}
 
-	set, drops := buildSecretSetAt(rotationPrimaries(), perSecret, &global, limits, []RetiringSecret{
+	handed := []RetiringSecret{
 		retire("carol", plainSecretOf(k(100)), rotationAt(time.Hour)),
 		retire("alice", eeSecretOf(k(101), "old.example.org"), rotationAt(2*time.Hour)),
 		retire("bob", ddSecretOf(k(102)), rotationAt(3*time.Hour)),
 		retire("alice", ddSecretOf(k(103)), rotationAt(MaxRetiringOverlap+time.Hour)),
 		retire("ghost", ddSecretOf(k(104)), rotationAt(time.Hour)),
-	}, rotationNow)
+	}
+	before := slices.Clone(handed)
+
+	set, drops := buildSecretSetAt(rotationPrimaries(), perSecret, &global, limits, handed, rotationNow)
 	require.Len(t, drops, 1, "the dangling one")
+	assert.Equal(t, before, handed, "the caller's slice is not rewritten by the build")
 
 	cfg := set.toConfig()
 
 	assert.Equal(t, keptEntries(set), cfg.Retiring, "every kept entry, in the set's order")
 
+	beforeAgain := slices.Clone(cfg.Retiring)
+
 	again, drops := buildSecretSetAt(cfg.Secrets, cfg.SecretAdTags, cfg.GlobalAdTag, cfg.Limits, cfg.Retiring, rotationNow)
 	assert.Empty(t, drops, "a set's own entries are all kept again")
 	assert.Equal(t, set, again, "and make the same set")
+	assert.Equal(t, beforeAgain, cfg.Retiring, "nor is toConfig's")
 
 	assert.Nil(t, buildSecretSet(rotationPrimaries(), nil, nil, nil).toConfig().Retiring, "nil when there are none")
 }

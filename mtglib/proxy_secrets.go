@@ -83,8 +83,9 @@ type secretSet struct {
 	// keeps no retiring entry, and the set is then field for field the set
 	// buildSecretSet made before rotation existed.
 	//
-	// retiring is sorted by (nameIdx, until descending, key bytes); no two
-	// entries share a key, and none has a primary's key. retiringOf maps a
+	// retiring is sorted by (nameIdx, until descending, key bytes); every
+	// value in it is Valid(), no two entries share a key, and none has a
+	// primary's key. retiringOf maps a
 	// name's index to its entries' indices in retiring, in that order.
 	// primaryCands is how many of cands are primaries when there are retiring
 	// entries, and 0 otherwise -- so it is never a bound on its own:
@@ -96,7 +97,7 @@ type secretSet struct {
 	retiring      []retiringEntry  // {nameIdx int; secret Secret; until time.Time}, sorted by (nameIdx, until desc, key bytes)
 	retiringOf    map[int][]int    // nameIdx -> indices into retiring
 	primaryCands  int              // cands[:primaryCands] are primaries; the rest are retiring ee keys
-	candRetiring  []int            // candRetiring[pos-primaryCands] = index into retiring
+	candRetiring  []int            // candRetiring[pos-primaryEnd()] = index into retiring
 	retiringCands map[string][]int // name -> its retiring candidate positions, same order
 	retiringNext  time.Time        // earliest until in retiring; zero when none
 }
@@ -237,7 +238,8 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 // buildSecretSetAt is buildSecretSet with retiring keys: the primaries are
 // built exactly as buildSecretSet always built them, and then retiring, the
 // complete list of entries the set is to hold (nil is none), is classified at
-// now by the §1.3 rules 2, 3, 5, 6, 7 and 8 (buildRetiring). The kept entries
+// now: an invalid value (Secret.Valid()) first, then the §1.3 rules 2, 3, 5,
+// 6, 7 and 8 (buildRetiring). The caller's slice is only read. The kept entries
 // come after every primary: their hosts join hostnames (the SNI gate) when
 // they are ee, their ee keys are candidates after every primary candidate, and
 // nothing else a primary decides -- hosted, frontHost, candByName -- changes.

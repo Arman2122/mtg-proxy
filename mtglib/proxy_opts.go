@@ -116,9 +116,9 @@ type SecretConfig struct {
 	// name was given a new primary key. nil means none, wherever a
 	// SecretConfig is consumed -- ReloadSecrets, ReplaceSecrets and every
 	// other swap -- never "keep what is there". An entry the set cannot hold
-	// (expired, for a name not in Secrets, on another name's key or its own
-	// primary's, a duplicate, past a cap) is dropped and logged, never an
-	// error.
+	// (a value Secret.Valid() refuses, expired, for a name not in Secrets, on
+	// another name's key or its own primary's, a duplicate, past a cap) is
+	// dropped and logged, never an error.
 	//
 	// For embedders: a ReplaceSecrets with a nil Retiring ends every overlap
 	// in force. The next reload of a config file that still grants an
