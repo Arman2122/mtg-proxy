@@ -437,7 +437,10 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 
 	p.applyLimits(newSet)
 	p.dropRemovedSecrets(oldSet, newSet)
-	p.closeStaleConns(oldSet, newSet, now)
+
+	closed := p.closeStaleConns(oldSet, newSet, now)
+	p.logRetiringChanges(oldSet, newSet, now, closed)
+
 	p.closeDeniedConns()
 
 	return nil
@@ -516,6 +519,102 @@ func (p *Proxy) logRetiringDrops(drops []retiringDrop) {
 		default:
 			line.Warning("a retiring key was ignored")
 		}
+	}
+}
+
+// The rotation change log's lines (spec §6.2) and the one reason a departure
+// other than an overlap's end gives.
+const (
+	retiringAddedLine     = "secret accepts a previous key until its overlap ends"
+	retiringEndedLine     = "previous key of the secret is no longer accepted: overlap ended"
+	retiringRemovedLine   = "previous key of the secret is no longer accepted"
+	retiringRemovedReason = "removed"
+)
+
+// retiringID is a retiring entry as the change log matches it across two sets:
+// its name and its key. It is a map key and nothing else; it is never written
+// anywhere.
+type retiringID struct {
+	name string
+	key  [SecretKeyLength]byte
+}
+
+// retiringIDs is every entry set keeps, by name and key, and nil for a set
+// that keeps none, a nil set included.
+func retiringIDs(set *secretSet) map[retiringID]struct{} {
+	if set == nil || len(set.retiring) == 0 {
+		return nil
+	}
+
+	ids := make(map[retiringID]struct{}, len(set.retiring))
+
+	for r := range set.retiring {
+		entry := &set.retiring[r]
+		ids[retiringID{name: set.names[entry.nameIdx], key: entry.secret.Key}] = struct{}{}
+	}
+
+	return ids
+}
+
+// logUntil is how a change line writes an until: UTC, to the second, as
+// rotate-secret writes it into the file.
+func logUntil(until time.Time) string {
+	return until.UTC().Format(time.RFC3339)
+}
+
+// logRetiringChanges is the rotation change log of one swap (spec §6.3): it
+// diffs oldSet's retiring entries with newSet's, matching them by name and key,
+// and writes a line for each difference, naming the secret and never the key.
+//   - An entry of oldSet that newSet lacks left: "overlap ended", with its until,
+//     when its until is not after now -- the swap's own instant, the one its
+//     build and closeStaleConns judged by -- and "no longer accepted" with
+//     reason=removed otherwise. Both carry closed, the streams of the name the
+//     swap closed (closeStaleConns' count). The engine's own expired drop plays
+//     no part: on a reload after until the config layer has already left the
+//     entry out, and only this diff sees it go.
+//   - An entry of newSet that oldSet lacks is new: "accepts a previous key",
+//     with its until.
+//
+// Departures come first, each list in its set's order. A swap that changes
+// nothing about rotation writes nothing; nor does one whose only change is an
+// entry's until. NewProxy calls it with a nil oldSet once the proxy exists, so
+// the start writes a line for each entry the first set keeps. Like
+// logRetiringDrops it touches the logger only when it has a line to write: a
+// Proxy{} literal in a test has none.
+func (p *Proxy) logRetiringChanges(oldSet, newSet *secretSet, now time.Time, closed map[string]int) {
+	before, after := retiringIDs(oldSet), retiringIDs(newSet)
+	if before == nil && after == nil {
+		return
+	}
+
+	if before != nil {
+		for r := range oldSet.retiring {
+			entry := &oldSet.retiring[r]
+			name := oldSet.names[entry.nameIdx]
+
+			if _, kept := after[retiringID{name: name, key: entry.secret.Key}]; kept {
+				continue
+			}
+
+			line := p.logger.BindStr("secret_name", name)
+
+			if now.Before(entry.until) {
+				line.BindStr("reason", retiringRemovedReason).BindInt("closed", closed[name]).Info(retiringRemovedLine)
+			} else {
+				line.BindStr("until", logUntil(entry.until)).BindInt("closed", closed[name]).Info(retiringEndedLine)
+			}
+		}
+	}
+
+	for r := range newSet.retiring {
+		entry := &newSet.retiring[r]
+		name := newSet.names[entry.nameIdx]
+
+		if _, held := before[retiringID{name: name, key: entry.secret.Key}]; held {
+			continue
+		}
+
+		p.logger.BindStr("secret_name", name).BindStr("until", logUntil(entry.until)).Info(retiringAddedLine)
 	}
 }
 

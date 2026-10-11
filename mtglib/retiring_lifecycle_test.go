@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net/netip"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -77,6 +80,62 @@ func registerOnKey(t testing.TB, p *Proxy, name string, key [SecretKeyLength]byt
 // never the entries: a failed assertion on them would print their keys.
 func heldRetiring(p *Proxy) int {
 	return len(p.secrets.Load().retiring)
+}
+
+// The rotation change log's three lines (spec §6.2).
+const (
+	retiringAddedMessage   = "secret accepts a previous key until its overlap ends"
+	retiringEndedMessage   = "previous key of the secret is no longer accepted: overlap ended"
+	retiringRemovedMessage = "previous key of the secret is no longer accepted"
+)
+
+// changeLines is the rotation change log in the order it was written, each
+// line as "level|message|field=value ..." with its fields in name order.
+func changeLines(r *rotationLog) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var out []string
+
+	for _, line := range r.lines {
+		switch line.msg {
+		case retiringAddedMessage, retiringEndedMessage, retiringRemovedMessage:
+		default:
+			continue
+		}
+
+		fields := make([]string, 0, len(line.fields))
+		for _, name := range slices.Sorted(maps.Keys(line.fields)) {
+			fields = append(fields, name+"="+line.fields[name])
+		}
+
+		out = append(out, line.level+"|"+line.msg+"|"+strings.Join(fields, " "))
+	}
+
+	return out
+}
+
+// changeUntil is how a change line is expected to write an until: UTC, to the
+// second. Spelled out here, not borrowed from the code under test.
+func changeUntil(until time.Time) string {
+	return until.UTC().Format(time.RFC3339)
+}
+
+// addedLine is the line for an entry new in a set.
+func addedLine(name string, until time.Time) string {
+	return "info|" + retiringAddedMessage + "|secret_name=" + name + " until=" + changeUntil(until)
+}
+
+// endedLine is the line for an entry that left a set with its until reached.
+func endedLine(name string, until time.Time, closed int) string {
+	return "info|" + retiringEndedMessage + "|closed=" + strconv.Itoa(closed) +
+		" secret_name=" + name + " until=" + changeUntil(until)
+}
+
+// removedLine is the line for an entry that left a set before its until.
+func removedLine(name string, closed int) string {
+	return "info|" + retiringRemovedMessage + "|closed=" + strconv.Itoa(closed) +
+		" reason=removed secret_name=" + name
 }
 
 // installAfterSecretStoreHook replaces the seam a swap calls right after it
@@ -255,7 +314,10 @@ func TestTheExpirySweepClosesExactlyTheOldKeyStreams(t *testing.T) {
 // L2b (B1 of the review). The unchanged file reloaded after until, before any
 // sweep, closes exactly the K1 streams, and so does the sweep alone, and so
 // does the sweep after a reload that held the lock and failed. In every variant
-// no K1 stream survives, and a later unrelated swap leaves the K2 streams open.
+// no K1 stream survives, the change log says the overlap ended and how many
+// streams that closed -- judged by the §6.3 diff, so also when the config
+// layer, not the engine, left the expired block out -- and a later unrelated
+// swap leaves the K2 streams open.
 func TestAReloadAfterUntilClosesTheOldKeyStreams(t *testing.T) {
 	t.Parallel()
 
@@ -288,6 +350,11 @@ func TestAReloadAfterUntilClosesTheOldKeyStreams(t *testing.T) {
 		assert.NoError(t, s.bob.Err(), "bob's stream stays")
 		assert.Zero(t, heldRetiring(l.p), "K1 left the set")
 
+		// The §6.3 diff saw the entry leave with its until reached, whatever
+		// the engine was handed, and counts the streams the swap closed.
+		lines := []string{addedLine("alice", l.until), endedLine("alice", l.until, len(s.olds))}
+		assert.Equal(t, lines, changeLines(l.log), "the rotation, then the overlap's end")
+
 		// A later swap that changes nothing about alice's keys.
 		cfg := l.p.secrets.Load().toConfig()
 		cfg.SecretAdTags = map[string][AdTagLength]byte{"alice": adTagFilled(7)}
@@ -295,6 +362,7 @@ func TestAReloadAfterUntilClosesTheOldKeyStreams(t *testing.T) {
 
 		assert.NoError(t, s.next.Err(), "a later unrelated swap leaves the K2 stream open")
 		assert.NoError(t, s.bob.Err())
+		assert.Equal(t, lines, changeLines(l.log), "and says nothing about rotation")
 	}
 
 	t.Run("reload only, the expired block left out by the config layer", func(t *testing.T) {
@@ -994,4 +1062,88 @@ func TestASwapStillReadsTheClockOnce(t *testing.T) {
 			assert.NoError(t, k2.Err())
 		})
 	}
+}
+
+// TestTheRotationChangeLog: the start writes a line for each entry the first
+// set keeps; a swap writes one for each entry new to its set, one for each that
+// left it -- "overlap ended" when the entry's until had been reached by the
+// swap's instant, "removed" otherwise, with the streams the swap closed for the
+// name -- and nothing at all when it changes nothing about rotation. Entries
+// are matched by name and key, and no line, at any level, carries a key in any
+// spelling.
+func TestTheRotationChangeLog(t *testing.T) {
+	t.Parallel()
+
+	aliceOld, aliceNext := GenerateSecret("alice.example.com"), GenerateSecret("alice.example.com")
+	bobOld, bobNext := GenerateSecret("bob.example.com"), GenerateSecret("bob.example.com")
+	aliceUntil, bobUntil := rotationAt(time.Hour), rotationAt(2*time.Hour)
+	clock := newSteppedClock(rotationNow)
+
+	p, record := newRotationProxy(t, func(opts *ProxyOpts) {
+		opts.Secrets = map[string]Secret{"alice": aliceNext, "bob": bobOld}
+		opts.RetiringSecrets = []RetiringSecret{retire("alice", aliceOld, aliceUntil)}
+		opts.RotationClock = NewRotationClock(clock.now, nil)
+	})
+
+	want := []string{addedLine("alice", aliceUntil)}
+	require.Equal(t, want, changeLines(record), "the start: a line for the entry the first set keeps")
+
+	started := record.named(retiringAddedMessage)
+	require.Len(t, started, 1)
+	assert.Equal(t, "2026-10-08T10:30:00Z", started[0].fields["until"], "until in UTC, to the second")
+
+	aliceOlds := []*streamContext{registerOnKey(t, p, "alice", aliceOld.Key), registerOnKey(t, p, "alice", aliceOld.Key)}
+	aliceNew := registerOnKey(t, p, "alice", aliceNext.Key)
+	bobStream := registerOnKey(t, p, "bob", bobOld.Key)
+
+	current := func() SecretConfig { return p.secrets.Load().toConfig() }
+	swap := func(cfg SecretConfig) {
+		t.Helper()
+
+		require.NoError(t, p.ReplaceSecrets(cfg))
+	}
+
+	// An unrelated swap, then the very set swapped in again: silence.
+	cfg := current()
+	cfg.SecretAdTags = map[string][AdTagLength]byte{"bob": adTagFilled(3)}
+	swap(cfg)
+	swap(current())
+
+	require.Equal(t, want, changeLines(record), "a swap that changes nothing about rotation says nothing about it")
+
+	// bob is rotated: one line, for his entry. alice's, unchanged, says nothing.
+	cfg = current()
+	cfg.Secrets["bob"] = bobNext
+	cfg.Retiring = append(cfg.Retiring, retire("bob", bobOld, bobUntil))
+	swap(cfg)
+
+	want = append(want, addedLine("bob", bobUntil))
+	require.Equal(t, want, changeLines(record), "a new entry")
+	require.NoError(t, bobStream.Err(), "bob's old-key stream rides his overlap")
+
+	// bob's overlap is ended before its until: removed, with his one stream.
+	cfg = current()
+	cfg.Retiring = slices.DeleteFunc(cfg.Retiring, func(entry RetiringSecret) bool { return entry.Name == "bob" })
+	swap(cfg)
+
+	want = append(want, removedLine("bob", 1))
+	require.Equal(t, want, changeLines(record), "an entry that left before its until")
+	assert.ErrorIs(t, bobStream.Err(), context.Canceled)
+
+	// The clock reaches alice's until, and a swap of the set as it is drops
+	// her entry: the overlap ended, with her two old-key streams.
+	clock.set(aliceUntil)
+	swap(current())
+
+	want = append(want, endedLine("alice", aliceUntil, len(aliceOlds)))
+	assert.Equal(t, want, changeLines(record), "an entry that left with its until reached")
+
+	for i, sc := range aliceOlds {
+		assert.ErrorIs(t, sc.Err(), context.Canceled, "alice's old-key stream %d", i)
+	}
+
+	assert.NoError(t, aliceNew.Err())
+
+	assert.Empty(t, leaks(record.text(), []Secret{aliceOld, aliceNext, bobOld, bobNext}),
+		"no line, at any level, carries a key in any spelling")
 }

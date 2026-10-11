@@ -347,6 +347,9 @@ func TestASwapReadsTheClockOnce(t *testing.T) {
 			var reads atomic.Int64
 
 			p := newReloadTestProxy(map[string]Secret{"alice": alice})
+			// The setup swap adds an entry, and a swap logs each entry new to
+			// its set: a proxy that swaps one in needs a logger to say so.
+			p.logger = testLogger()
 			p.rotation = NewRotationClock(func() time.Time {
 				reads.Add(1)
 

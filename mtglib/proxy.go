@@ -203,8 +203,12 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		})
 	}
 
+	// One read of it, as a swap makes one: the build and the start's change log
+	// judge by the same instant.
+	now := clock.Now()
+
 	initialSet, initialDrops := buildSecretSetAt(
-		opts.getSecrets(), opts.SecretAdTags, opts.GlobalAdTag, opts.SecretLimits, opts.RetiringSecrets, clock.Now())
+		opts.getSecrets(), opts.SecretAdTags, opts.GlobalAdTag, opts.SecretLimits, opts.RetiringSecrets, now)
 
 	stats := NewProxyStats()
 	for _, name := range initialSet.names {
@@ -273,8 +277,10 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		rotation:                    clock,
 	}
 
-	// Logged only now: the lines are the proxy's, and the proxy exists.
+	// Logged only now: the lines are the proxy's, and the proxy exists. Every
+	// entry the first set keeps is new to it.
 	proxy.logRetiringDrops(initialDrops)
+	proxy.logRetiringChanges(nil, initialSet, now, nil)
 
 	// The limiter's bucket aging runs under the proxy's own context, so it stops
 	// with Shutdown.
