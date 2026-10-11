@@ -454,6 +454,127 @@ func TestAReloadAfterUntilClosesTheOldKeyStreams(t *testing.T) {
 	})
 }
 
+// The expiry sweep ends an overlap whatever a swap's input checks would say of
+// the set it holds. Its swap rebuilds the set in force minus the expired
+// entries, so it brings in nothing those checks exist to stop, and it skips
+// them. A set they would refuse -- one a library caller handed NewProxy, which
+// checks neither that the set can front nor, past ProxyOpts.valid, anything a
+// swap checks -- still has its expired key's streams closed. A swap that brings
+// a configuration in, an API mutation or a reload, is checked as before: the
+// same set is refused there.
+func TestTheExpirySweepEndsAnOverlapWhateverTheInputChecksSay(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a set that cannot front, from NewProxy", func(t *testing.T) {
+		t.Parallel()
+
+		old, next := ddSecretOf(keyFilledFrom(0x21)), ddSecretOf(keyFilledFrom(0x22))
+		until := rotationAt(time.Hour)
+		clock := newSteppedClock(rotationNow)
+
+		p, record := newRotationProxy(t, func(opts *ProxyOpts) {
+			opts.Secrets = map[string]Secret{"alice": next}
+			opts.RetiringSecrets = []RetiringSecret{retire("alice", old, until)}
+			opts.RotationClock = NewRotationClock(clock.now, nil)
+		})
+
+		require.False(t, SecretsCanFront(map[string]Secret{"alice": next}, ""), "dd alone, no fronting host")
+		require.Equal(t, 1, heldRetiring(p), "and NewProxy took it, entry and all")
+
+		k1 := registerOnKey(t, p, "alice", old.Key)
+		k2 := registerOnKey(t, p, "alice", next.Key)
+
+		clock.set(until.Add(time.Minute))
+
+		// The proxy's own 5 s sweep may get there first; either way the overlap
+		// ends, once.
+		p.expireRetiring()
+
+		require.True(t, awaitClosed(k1, 3*time.Second), "the sweep ends the overlap and closes K1's stream")
+		assert.NoError(t, k2.Err())
+		assert.Zero(t, heldRetiring(p))
+		assert.Eventually(t, func() bool {
+			return slices.Contains(changeLines(record), endedLine("alice", until, 1))
+		}, 3*time.Second, 5*time.Millisecond, "and logs it")
+
+		assert.ErrorIs(t, p.ReplaceSecrets(p.secrets.Load().toConfig()), ErrSecretInvalid,
+			"a swap that brings the same set in is still refused")
+	})
+
+	t.Run("a set whose primary is not valid", func(t *testing.T) {
+		t.Parallel()
+
+		// NewProxy and every swap refuse such a primary, so only a set stored by
+		// hand holds one. It stands for whatever else a swap's checks refuse.
+		l := newLifecycle(t)
+		invalid := Secret{Key: l.next.Key, Mode: SecretModeFakeTLS}
+		require.False(t, invalid.Valid(), "an ee value with no host")
+
+		set, drops := buildSecretSetAt(map[string]Secret{"alice": invalid, "bob": l.bob}, nil, nil, nil,
+			[]RetiringSecret{retire("alice", l.old, l.until)}, rotationNow)
+		require.Empty(t, drops)
+		l.p.secrets.Store(set)
+
+		k1 := l.stream(t, "alice", l.old)
+
+		l.clock.set(l.until)
+		l.p.expireRetiring()
+
+		assert.ErrorIs(t, k1.Err(), context.Canceled, "the sweep ends the overlap and closes K1's stream")
+		assert.Zero(t, heldRetiring(l.p))
+		assert.Equal(t, []string{endedLine("alice", l.until, 1)}, changeLines(l.log))
+
+		assert.ErrorIs(t, l.p.ReplaceSecrets(l.p.secrets.Load().toConfig()), ErrSecretInvalid,
+			"a swap that brings the same set in is still refused")
+	})
+}
+
+// The sweep rebuilds the set in force once it holds the lock, not the one it
+// loaded to decide: a mutation that lands between the two -- alice re-keyed
+// onto K3 with no overlap -- is what it starts from, and is never reverted.
+// Rebuilding the set it loaded first would make K2, which the re-key removed,
+// alice's primary again. The rotation clock's source is the seam: the sweep
+// reads it between its first Load and its TryLock.
+func TestTheSweepRebuildsTheSetInForceOnceItHasTheLock(t *testing.T) {
+	t.Parallel()
+
+	l := newLifecycle(t)
+	l.rotate(t)
+
+	k1 := l.stream(t, "alice", l.old)
+	k3 := GenerateSecret("alice.example.com")
+
+	// K1 has expired: the sweep has a swap to make.
+	source := newSteppedClock(l.until)
+
+	var (
+		fired   bool
+		swapErr error
+	)
+
+	l.p.rotation = NewRotationClock(func() time.Time {
+		if !fired {
+			fired = true
+			swapErr = l.p.ReplaceSecrets(SecretConfig{Secrets: map[string]Secret{"alice": k3, "bob": l.bob}})
+		}
+
+		return source.now()
+	}, nil)
+
+	l.p.expireRetiring()
+
+	require.True(t, fired, "the re-key ran inside the sweep, between its Load and its TryLock")
+	require.NoError(t, swapErr)
+
+	set := l.p.secrets.Load()
+	i, ok := set.indexOf("alice")
+	require.True(t, ok)
+
+	assert.True(t, set.secrets[i].Key == k3.Key, "the re-key onto K3 stands")
+	assert.False(t, set.accepts("alice", l.next.Key[:], source.now()), "K2, which it took away, is not accepted again")
+	assert.ErrorIs(t, k1.Err(), context.Canceled)
+}
+
 // L3. A reload that ends the overlap before its until -- rotate-secret
 // --end-overlap -- closes the K1 streams at once, and only those.
 func TestAnEndOverlapReloadClosesThemAtOnce(t *testing.T) {

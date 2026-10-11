@@ -393,11 +393,11 @@ func (p *Proxy) ReloadSecrets() error {
 	return p.swapSecretConfigLocked(cfg)
 }
 
-// swapSecretConfigLocked validates cfg, builds a fresh immutable snapshot,
-// swaps it in atomically, pre-registers stats for every name, and closes stale
-// connections. It is the single mutation point shared by ReloadSecrets, the
-// management-API mutators and the expiry sweep; the caller MUST hold reloadMu,
-// taken before liveMu (and liveMu before the table's lock), never under it.
+// swapSecretConfigLocked validates cfg, then applies it
+// (applySecretConfigLocked). It is the single mutation point shared by
+// ReloadSecrets and the management-API mutators, every one of which brings a
+// configuration in; the caller MUST hold reloadMu, taken before liveMu (and
+// liveMu before the table's lock), never under it.
 func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	if len(cfg.Secrets) == 0 {
 		return ErrSecretInvalid
@@ -418,6 +418,20 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 		return ErrSecretInvalid
 	}
 
+	p.applySecretConfigLocked(cfg)
+
+	return nil
+}
+
+// applySecretConfigLocked is the swap itself, with none of
+// swapSecretConfigLocked's input checks: it builds a fresh immutable snapshot
+// from cfg, swaps it in atomically, pre-registers stats for every name, and
+// closes stale connections. It cannot fail. Only two callers reach it: the
+// checked swap, and the expiry sweep, whose cfg is the set in force rebuilt --
+// it brings in nothing the checks exist to stop, and it must end an overlap
+// whatever they would say of a set NewProxy never checked. The caller MUST hold
+// reloadMu, as for swapSecretConfigLocked.
+func (p *Proxy) applySecretConfigLocked(cfg SecretConfig) {
 	// The one read of the clock for the whole swap: the build judges every
 	// retiring entry by it, and whatever else the swap judges against the clock
 	// must take this same instant rather than read its own.
@@ -442,11 +456,9 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	p.logRetiringChanges(oldSet, newSet, now, closed)
 
 	p.closeDeniedConns()
-
-	return nil
 }
 
-// afterSecretStoreHook runs in swapSecretConfigLocked right after the new set
+// afterSecretStoreHook runs in applySecretConfigLocked right after the new set
 // is stored and before anything in the swap takes liveMu: the window in which
 // a registration already reads the new set and the swap's walk has not run. A
 // no-op in production. A test uses it to register a stream in that window
@@ -469,11 +481,15 @@ var afterSecretStoreHook = func(*secretSet) {}
 // on the next: a holder that swaps rebuilds at its own instant and does this
 // sweep's work, and one that fails leaves it to the next tick. Admission stays
 // exact meanwhile, because the doors and registration judge until themselves.
-// The swap rebuilds from the set in force, so the API's mutations survive it,
-// and it is not refused for any set a swap, or run's config check, accepted:
-// the primaries are those the set already holds, and retiring entries never
-// count toward SecretsCanFront. (A library caller's initial set that cannot
-// front refuses every swap, this one with them.)
+//
+// The swap rebuilds from the set in force as it is once the lock is held -- not
+// the set loaded to decide, which a mutation may have replaced since -- so the
+// API's mutations survive it and nothing they removed comes back. It applies
+// the rebuild without a swap's input checks (applySecretConfigLocked), so it
+// cannot be refused: its primaries are those the set already holds, it brings
+// nothing in, and a set the checks would refuse -- a library caller's initial
+// set that cannot front, which NewProxy does not check -- still has its
+// overlaps ended and their streams closed.
 func (p *Proxy) expireRetiring() {
 	set := p.secrets.Load()
 	if set.retiringNext.IsZero() {
@@ -495,7 +511,7 @@ func (p *Proxy) expireRetiring() {
 		return
 	}
 
-	_ = p.swapSecretConfigLocked(set.toConfig()) // not refused; see above
+	p.applySecretConfigLocked(set.toConfig())
 }
 
 // logRetiringDrops writes one line for each retiring entry a build did not keep:

@@ -377,6 +377,11 @@ func TestARevokedKeyFromABannedPlaceIsRefusedAsKeyRevoked(t *testing.T) {
 // between attribution and admission, and the stream is admitted as before: the
 // re-check refuses only a key the set no longer accepts, not a stream whose set
 // was replaced.
+//
+// This is the guard through the real doors. The primary guard of the
+// condition's parentheses is TestAnUnrelatedSwapStillRegistersEitherKey, which
+// fails at once without them; here a refused stream fails only at the harness's
+// upstream deadline, 20 s a subtest.
 func TestAnUnrelatedSwapBeforeRegistrationStillAdmits(t *testing.T) { //nolint: paralleltest // swaps a package variable
 	tag := [AdTagLength]byte{1, 2, 3}
 
@@ -465,6 +470,38 @@ func TestAnUnrelatedSwapBeforeRegistrationStillAdmits(t *testing.T) { //nolint: 
 			assert.True(t, until.Equal(stream.retiringUntil), "as a retiring key")
 		})
 	}
+}
+
+// The primary guard of the re-check's parentheses: streams attributed from one
+// set register after a swap that changes nothing about their keys -- an
+// advertising tag -- whether they hold their name's primary or a retiring key
+// inside its overlap. Without the parentheses && binds first, and both would be
+// refused the moment the set they were attributed from is replaced. Hand-built
+// streams, so it fails at once.
+func TestAnUnrelatedSwapStillRegistersEitherKey(t *testing.T) {
+	t.Parallel()
+
+	probe := newClientTableProbe(t, false)
+	p := probe.proxy
+	rotationClockAt(p, rotationNow)
+
+	old, next := p.secrets.Load().secrets[0], GenerateSecret("alice.example.com")
+	set := rotateTo(t, p, map[string]Secret{"alice": next}, retire("alice", old, rotationAt(time.Hour)))
+
+	onPrimary := probe.stream(t, tcpFrom("198.51.100.7", 50001), 0)
+	attributeOnKey(t, p, set, onPrimary, "alice", next.Key)
+
+	onRetiring := probe.stream(t, tcpFrom("203.0.113.9", 50002), 0)
+	attributeOnKey(t, p, set, onRetiring, "alice", old.Key)
+
+	cfg := set.toConfig()
+	cfg.SecretAdTags = map[string][AdTagLength]byte{"alice": {1, 2, 3}}
+	require.NoError(t, p.ReplaceSecrets(cfg))
+	require.True(t, p.secrets.Load() != set, "the set both streams were attributed from was replaced")
+
+	assert.Equal(t, DenyNone, p.tryRegisterConn(onPrimary), "the name's primary")
+	assert.Equal(t, DenyNone, p.tryRegisterConn(onRetiring), "a retiring key inside its overlap")
+	assert.Equal(t, 2, probe.registered())
 }
 
 // A key_revoked refusal is logged under its reason and counted nowhere: not as
