@@ -448,15 +448,23 @@ const obfuscatedDrainBytes = 8 << 10
 // retiring entry whose until the rotation clock has not reached, in the
 // entries' order. A retiring key of any mode is tried here, as every primary is;
 // only an ee one is also a FakeTLS candidate. Primaries come first, as on the
-// FakeTLS door; keys are unique across the set, so the order changes no
-// attribution, only how far the trial loop runs.
+// FakeTLS door. No retiring key equals a primary's or another entry's (the
+// build drops it), so the order of the retiring part changes no attribution,
+// only how far the trial loop runs; two primaries may share a key, as they can
+// today, and the first in the set's order wins.
 //
 // keyRetiring[j] is the index into set.retiring of the entry whose key is
 // keys[len(set.secrets)+j], and is how obfuscatedMatch maps a match back to it.
-// A set with no retiring entry costs what the inline build always cost: the one
-// list, a nil keyRetiring, and no read of the clock. The clock is read once, for
-// the whole list, and only when the set holds an entry. The door itself builds
-// the no-entry list inline (see doObfuscatedEntry) and calls this for the rest.
+// The clock is read once, for the whole list, and only when the set holds an
+// entry. A set with no retiring entry gets its primaries' list, a nil
+// keyRetiring and no clock read.
+//
+// That list is returned, so it escapes and costs one allocation at any size. The
+// list the door built inline before rotation existed costs one at two secrets
+// and up and nothing at one: it does not escape, and the compiler keeps a
+// one-secret list (24 bytes) on the stack. That is why the door still builds the
+// no-entry list itself and calls this only for a set that holds entries, and why
+// the two must stay the same list, which TestTheTwoKeyListPathsAgree pins.
 func obfuscatedKeys(set *secretSet, clock *RotationClock) (keys [][]byte, keyRetiring []int) {
 	keys = make([][]byte, len(set.secrets), len(set.secrets)+len(set.retiring))
 	for i := range set.secrets {
@@ -540,7 +548,9 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 			// escape, so a one-secret door's 24-byte list stays on the stack as it
 			// always has, which a list returned by obfuscatedKeys cannot. No entry
 			// means no clock read, no keyRetiring and no allocation of its own.
-			// TestTheObfuscatedDoorAllocatesAsBefore pins it.
+			// TestTheObfuscatedDoorAllocatesAsBefore pins the allocations, and
+			// TestTheTwoKeyListPathsAgree that this is the list obfuscatedKeys
+			// builds, primary for primary.
 			keys = make([][]byte, len(set.secrets))
 			for i := range set.secrets {
 				keys[i] = set.secrets[i].Key[:]

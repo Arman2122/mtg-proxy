@@ -525,6 +525,194 @@ func TestTheObfuscatedIndexMappingIsExact(t *testing.T) {
 		assert.Same(t, &set.retiring[r].secret.Key[0], &ctx.matchedSecretKey[0])
 		assert.True(t, e.Until.Equal(ctx.retiringUntil))
 	}
+
+	// Once every entry has expired the list is the primaries' alone, and
+	// keyRetiring is still nil, as for a set with none: nothing was made for it.
+	source.set(rotationAt(7 * time.Hour))
+
+	keys, keyRetiring = obfuscatedKeys(set, h.proxy.rotation)
+
+	assert.Nil(t, keyRetiring, "every entry has expired: no list, not an empty one")
+	assert.Len(t, keys, len(primaries))
+	assert.Equal(t, len(primaries)+len(entries), cap(keys))
+}
+
+// TestTheTwoKeyListPathsAgree: the door builds the key list of a set with no
+// retiring entry itself, inline, so that a one-secret list stays on the stack,
+// and takes obfuscatedKeys' for a set that holds an entry. The two must be the
+// same list, the primaries' keys in the set's order, or one client would be
+// tried and billed differently once a rotation put an entry in the set.
+//
+// The inline list is local to the door and cannot be read, and a seam that
+// handed it out would change the path the plan keeps as it was. So the door's
+// behaviour is the witness: the same frames go through a set with no entry
+// (the inline list) and through a set whose only entry has already expired (the
+// obfuscatedKeys path, with nothing listed past the primaries), and must match
+// the same name and the same key. That is also the oracle for the two lists
+// against each other, since it is the only thing a client sees of them.
+// obfuscatedKeys' own list is compared with the primaries element by element,
+// on both sets.
+//
+// Three rows: one secret (the case the inline list exists for), two, and forty,
+// where two names share a key, so that the order of a tie is pinned as well: on
+// both paths the first name in the set's order wins.
+func TestTheTwoKeyListPathsAgree(t *testing.T) {
+	t.Parallel()
+
+	const cover = "cover.example.com"
+
+	policy := ListenerPolicy{Modes: ModeSetOf(SecretModeDD, SecretModePlain), OnUnknownSecret: UnknownSecretClose}
+
+	for _, n := range []int{1, 2, 40} {
+		t.Run(fmt.Sprintf("%d secrets", n), func(t *testing.T) {
+			t.Parallel()
+
+			primaries := make(map[string]Secret, n)
+
+			for i := range n {
+				key := keyFilledFrom(byte(1 + 5*i))
+				secret := ddSecretOf(key)
+
+				switch i % 3 {
+				case 1:
+					secret = plainSecretOf(key)
+				case 2:
+					secret = eeSecretOf(key, cover)
+				}
+
+				primaries[fmt.Sprintf("n%02d", i)] = secret
+			}
+
+			if n > 30 {
+				primaries["n30"] = primaries["n05"]
+			}
+
+			// The set with no entry: the door builds its list inline.
+			plain := newEntryHarness(t, primaries, nil)
+			plainSet := plain.proxy.secrets.Load()
+			require.Empty(t, plainSet.retiring)
+
+			plainReads := countReads(plain.proxy)
+
+			// The set with an entry that has already expired: the door takes
+			// obfuscatedKeys' list, and one clock read for each frame says so.
+			held := newEntryHarness(t, primaries, nil)
+			source := newSteppedClock(rotationNow)
+
+			var heldReads atomic.Int64
+
+			held.proxy.rotation = NewRotationClock(func() time.Time {
+				heldReads.Add(1)
+
+				return source.now()
+			}, nil)
+
+			heldSet := rotateTo(t, held.proxy, primaries,
+				retire("n00", ddSecretOf(keyFilledFrom(250)), rotationAt(time.Hour)))
+			source.set(rotationAt(time.Hour))
+
+			for _, set := range []*secretSet{plainSet, heldSet} {
+				keys, keyRetiring := obfuscatedKeys(set, held.proxy.rotation)
+
+				require.Len(t, keys, len(set.secrets), "the primaries and nothing past them")
+				assert.Nil(t, keyRetiring)
+
+				for i := range set.secrets {
+					assert.Same(t, &set.secrets[i].Key[0], &keys[i][0], "obfuscatedKeys' list, position %d", i)
+				}
+			}
+
+			heldReads.Store(0)
+
+			first := func(key [SecretKeyLength]byte) int {
+				return slices.IndexFunc(plainSet.secrets, func(s Secret) bool { return s.Key == key })
+			}
+
+			for i := 0; i <= n; i++ {
+				stranger := i == n
+
+				key := keyFilledFrom(251)
+				if !stranger {
+					key = plainSet.secrets[i].Key
+				}
+
+				for _, side := range []struct {
+					path string
+					h    *entryHarness
+					set  *secretSet
+				}{{"the inline list", plain, plainSet}, {"obfuscatedKeys' list", held, heldSet}} {
+					ctx, ok := side.h.obfuscatedAttempt(t, key, policy)
+
+					if stranger {
+						assert.False(t, ok, "%s: a stranger", side.path)
+
+						continue
+					}
+
+					want := first(key)
+
+					require.True(t, ok, "%s: primary %d", side.path, i)
+					assert.Equal(t, plainSet.names[want], ctx.secretName, "%s: primary %d is billed to the first name with its key", side.path, i)
+					assert.Same(t, &side.set.secrets[want].Key[0], &ctx.matchedSecretKey[0], "%s: primary %d", side.path, i)
+				}
+			}
+
+			assert.Zero(t, plainReads.Load(), "the set with no entry never reads the clock")
+			assert.EqualValues(t, n+1, heldReads.Load(), "the other set read it once for each frame: it took obfuscatedKeys' list")
+		})
+	}
+}
+
+// TestAnExpiredKeyIsChargedLikeAWrongKey: on a listener that budgets failed
+// handshakes per address, an old key past its until costs its holder exactly what
+// a wrong key costs -- one token, one miss, one denial -- and an old key still
+// inside its overlap costs nothing, as any key that gets in. The expired key is
+// not in the list, so the two take the same branch; this pins that the branch
+// charges.
+func TestAnExpiredKeyIsChargedLikeAWrongKey(t *testing.T) {
+	t.Parallel()
+
+	f := newObfuscatedRotation(t, false)
+	limiter := f.h.proxy.obfsLimiter
+
+	policy := f.policy
+	policy.Public, policy.HandshakesPerIP = true, 5
+
+	const expiredPlace, wrongPlace, livePlace = "198.51.100.21", "198.51.100.22", "198.51.100.23"
+
+	f.clock.set(f.names[0].until)
+
+	attempt := func(key [SecretKeyLength]byte, place string) (bool, obfsTally) {
+		before := obfsTallyOf(f.h.proxy)
+		_, ok := f.h.obfuscatedAttemptFrom(t, obfuscatedFrame(t, key, obfuscation.TagPaddedIntermediate, 2), policy, tcpFrom(place, 41000))
+
+		return ok, obfsTallyOf(f.h.proxy).minus(before)
+	}
+
+	ok, expired := attempt(f.names[0].old.Key, expiredPlace)
+	assert.False(t, ok, "alice's old key has reached its until")
+
+	ok, wrong := attempt(keyFilledFrom(251), wrongPlace)
+	assert.False(t, ok)
+
+	assert.Equal(t, obfsTally{trials: 1, misses: 1, denied: 1}, expired)
+	assert.Equal(t, wrong, expired, "the same counters as a wrong key")
+
+	full := float64(policy.HandshakesPerIP) * handshakeBurstFactor
+
+	for _, place := range []string{expiredPlace, wrongPlace} {
+		tokens, charged := obfsTokens(t, limiter, place)
+
+		require.True(t, charged, "%s was charged", place)
+		assert.InDelta(t, full-1, tokens, 0, "%s: one token out of a full bucket", place)
+	}
+
+	ok, live := attempt(f.names[1].old.Key, livePlace)
+	require.True(t, ok, "bob's old key is inside its overlap")
+	assert.Equal(t, obfsTally{trials: 1}, live)
+
+	_, charged := obfsTokens(t, limiter, livePlace)
+	assert.False(t, charged, "getting in costs nothing")
 }
 
 // TestAModeChangingRotationServesBothDoors is D6. A name moves between wire
@@ -619,12 +807,16 @@ var (
 	sinkObfuscatedRetired []int
 )
 
-// TestTheObfuscatedKeyListAllocatesAsBefore: on a set with no retiring entry the
-// key list costs the one allocation the inline build cost before rotation
-// existed, keyRetiring is nil (a made empty slice would be non-nil, and a made
-// non-empty one an allocation), and the clock is not read. Forty names, so that
-// a slice made beside the list is past the 32 bytes the compiler keeps for a
-// small slice that does not escape.
+// TestTheObfuscatedKeyListAllocatesAsBefore measures obfuscatedKeys itself, not
+// the door: on a set with no retiring entry it returns the primaries' list in one
+// allocation (the list is returned, so it escapes and costs one at any size),
+// keyRetiring is nil (a made empty slice would be non-nil, and a made non-empty
+// one an allocation), the capacity is the primaries', and the clock is not read.
+// The door does not call it for such a set: it builds that list inline, which at
+// one secret costs nothing, so what keeps the door's allocations is
+// TestTheObfuscatedDoorAllocatesAsBefore, and that the two lists are one list is
+// TestTheTwoKeyListPathsAgree. The forty names are the door test's largest row,
+// not something this test needs.
 //
 // Not parallel: AllocsPerRun counts every allocation in the process.
 func TestTheObfuscatedKeyListAllocatesAsBefore(t *testing.T) { //nolint: paralleltest // see above
@@ -686,27 +878,32 @@ type neverReplayed struct{}
 func (neverReplayed) SeenBefore([]byte) bool { return false }
 
 // TestTheObfuscatedDoorAllocatesAsBefore: the whole door function, on a set with
-// no retiring entry, allocates exactly what it allocated before rotation
+// no retiring entry, allocates exactly what the door allocated before rotation
 // existed, for a frame that matches the last key and for one that matches none.
-// The counts are the ones measured on the unmodified door (commit 765ec21, with
-// and without -race, AllocsPerRun of 500 runs): about three allocations a key
-// the loop tries, and, from two keys on, one for the key list. A single-secret
-// door allocates no list at all: the compiler keeps the 24-byte slice the door
-// made inline on its stack, so a list the door took from a function that
-// returns it would show here at N = 1, and only here.
+// "Before" is frozenDoObfuscatedEntry, a copy of the door as it stood at 765ec21
+// (proxy_entry_obfs_frozen_test.go), run beside the live door over the same set
+// and the same frame, so that what the two share -- MatchHandshake's three or so
+// allocations a key tried, and the compiler's rules for the stack -- cancels, and
+// a toolchain bump or a cheaper MatchHandshake moves both together.
+//
+// What it sees, by row:
+//   - one secret: the frozen door's list does not escape and stays on the stack
+//     (24 bytes), so it costs nothing, while a list returned by obfuscatedKeys
+//     costs one. A door that always called it fails here, and only here;
+//   - forty: a slice made beside the list is past the 32 bytes the compiler
+//     keeps on the stack, so a keyRetiring made for a set with no entry fails
+//     here, and not at one or two secrets;
+//   - all three: a read of the clock.
+//
+// On Go 1.26.8 at 765ec21 the counts are 15 (a match) and 6 (a miss) at one
+// secret, 19 and 10 at two, 133 and 124 at forty (AllocsPerRun of 500 runs, the
+// same with and without -race); the test logs what it measures.
 //
 // Not parallel: AllocsPerRun counts every allocation in the process.
 func TestTheObfuscatedDoorAllocatesAsBefore(t *testing.T) { //nolint: paralleltest // see above
-	for _, tc := range []struct {
-		secrets     int
-		match, miss float64
-	}{
-		{1, 15, 6},
-		{2, 19, 10},
-		{40, 133, 124},
-	} {
-		secrets := make(map[string]Secret, tc.secrets)
-		for i := range tc.secrets {
+	for _, n := range []int{1, 2, 40} {
+		secrets := make(map[string]Secret, n)
+		for i := range n {
 			secrets[fmt.Sprintf("n%04d", i)] = ddSecretOf(keyFilledFrom(byte(1 + 3*i)))
 		}
 
@@ -726,32 +923,39 @@ func TestTheObfuscatedDoorAllocatesAsBefore(t *testing.T) { //nolint: parallelte
 
 		policy := ListenerPolicy{Modes: ModeSetOf(SecretModeDD), OnUnknownSecret: UnknownSecretClose}
 
-		for _, door := range []struct {
+		for _, frame := range []struct {
 			name  string
 			key   [SecretKeyLength]byte
 			match bool
-			want  float64
 		}{
-			{"a match on the last key", set.secrets[tc.secrets-1].Key, true, tc.match},
-			{"a miss", keyFilledFrom(250), false, tc.miss},
+			{"a match on the last key", set.secrets[n-1].Key, true},
+			{"a miss", keyFilledFrom(250), false},
 		} {
-			frame := obfuscatedFrame(t, door.key, obfuscation.TagPaddedIntermediate, 2)
-			conn := &frameConn{r: bytes.NewReader(frame), frame: frame, addr: tcpFrom("203.0.113.9", 41000)}
+			wire := obfuscatedFrame(t, frame.key, obfuscation.TagPaddedIntermediate, 2)
+			conn := &frameConn{r: bytes.NewReader(wire), frame: wire, addr: tcpFrom("203.0.113.9", 41000)}
 
-			run := func() bool {
-				conn.reset()
+			runner := func(door func(*streamContext, ListenerPolicy) bool) func() bool {
+				return func() bool {
+					conn.reset()
 
-				ctx := &streamContext{ctx: context.Background(), logger: h.proxy.logger, clientSocket: conn}
-
-				return h.proxy.doObfuscatedEntry(ctx, policy)
+					return door(&streamContext{ctx: context.Background(), logger: h.proxy.logger, clientSocket: conn}, policy)
+				}
 			}
 
-			require.Equal(t, door.match, run(), "the fixture does what it says")
-			assert.InDelta(t, door.want, testing.AllocsPerRun(500, func() { run() }), 0,
-				"%d secrets, %s", tc.secrets, door.name)
+			live, frozen := runner(h.proxy.doObfuscatedEntry), runner(h.proxy.frozenDoObfuscatedEntry)
+
+			require.Equal(t, frame.match, live(), "the fixture does what it says")
+			require.Equal(t, frame.match, frozen(), "and the frozen door does the same")
+
+			liveAllocs := testing.AllocsPerRun(500, func() { live() })
+			frozenAllocs := testing.AllocsPerRun(500, func() { frozen() })
+
+			t.Logf("%d secrets, %s: live %v allocations, frozen %v", n, frame.name, liveAllocs, frozenAllocs)
+			require.Positive(t, frozenAllocs, "the frozen door was measured")
+			assert.InDelta(t, frozenAllocs, liveAllocs, 0, "%d secrets, %s", n, frame.name)
 		}
 
-		assert.Zero(t, reads.Load(), "%d secrets: the door never reads the clock", tc.secrets)
+		assert.Zero(t, reads.Load(), "%d secrets: the door never reads the clock", n)
 	}
 }
 
