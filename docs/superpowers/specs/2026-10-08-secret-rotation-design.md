@@ -485,8 +485,8 @@ engine never refuses a swap for it). It never holds a key. New `secretSet` field
 retiring       []retiringEntry   // {nameIdx int; secret Secret; until time.Time},
                                  // sorted by (nameIdx, until desc, key bytes)
 retiringOf     map[int][]int     // nameIdx -> indices into retiring
-primaryCands   int               // cands[:primaryCands] are primaries; the rest are retiring ee keys
-candRetiring   []int             // candRetiring[pos-primaryCands] = index into retiring
+primaryCands   int               // cands[:primaryEnd()] are primaries (primaryCands equals primaryEnd() only when retiring entries exist, and is 0 otherwise); the rest are retiring ee keys
+candRetiring   []int             // candRetiring[pos-primaryEnd()] = index into retiring
 retiringCands  map[string][]int  // name -> its retiring candidate positions, same order
 retiringNext   time.Time         // earliest until in retiring; zero when none
 ```
@@ -595,9 +595,9 @@ hinted          := p.hintedPositions(ctx, parsed, set)      // per hinted name: 
 pos, tried      := p.verifyHinted(parsed, set, hinted)      // a retiring position whose until has
                                                             // passed is passed over, unverified
 res, …          := p.reserveScan(…, len(set.cands)-tried, …) // unchanged
-pos, scanned    := p.scanCandidates(parsed, set, skip)      // loop 1 over cands[:primaryCands] is
+pos, scanned    := p.scanCandidates(parsed, set, skip)      // loop 1 over cands[:primaryEnd()] is
                                                             // today's loop byte for byte; loop 2 over
-                                                            // cands[primaryCands:] checks until first
+                                                            // cands[primaryEnd():] checks until first
 m               := set.matchAt(pos)                         // {idx, key *[16]byte, retiring int}
 p.completeFakeTLS(ctx, rewind, set, parsed, m)              // SendServerHello(m.key)
 ```
