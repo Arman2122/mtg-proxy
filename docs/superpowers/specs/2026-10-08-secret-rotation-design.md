@@ -1010,7 +1010,8 @@ absent from `newSet` is logged **"overlap ended"** when its `until` ≤ the swap
 the same single `now` the build and `closeStaleConns` use (§4.1). Otherwise it is logged
 "no longer accepted" with `reason` (`removed` from the file or by the API) — except when the
 departing entry's key is the name's primary in `newSet` (a revert on purpose), which is logged
-as "is the primary again" at Warning: the "no longer accepted" wording would tell an operator
+as "is the primary again" at Warning — this precedes the "overlap ended" classification, so a
+reverted key is reported this way even after its `until`: the "no longer accepted" wording would tell an operator
 auditing a leak the opposite of what happened. The `closed` count is the name's, and the streams
 it counts are the replaced primary's.
 
