@@ -123,7 +123,7 @@ therefore carries both** (D1): the CLI edits it, and the proxy reloads it.
 | crash during the write | the old file is intact (atomic rename) | per the old file: no rotation happened |
 | panel rewrites its file (no `[[retiring-secret]]`) and restarts | the panel's | not accepted |
 | `PUT /secrets` (panel or operator) | the PUT's | in-memory entries of names the PUT keeps survive; none are created (D17) |
-| `POST /secrets` re-keying the name back onto its retiring key K1 ("revert") | K1, in memory | the retiring entry is dropped (rule 6); the new key's streams close. This is the one API call that makes the leaked key primary on purpose. The next reload returns to the file (§5.1) |
+| `POST /secrets` re-keying the name back onto its retiring key K1 ("revert") | K1, in memory | the retiring entry is dropped (rule 6); the new key's streams close. This is one of the API calls that make the leaked key primary on purpose: a `PUT /secrets` naming the retiring key as the name's primary does the same, and a POST or PUT that gives ANOTHER name the retiring key makes it that name's primary (drop line `key_of_other_secret`, Warning; revision 4, Task 6's review). The next reload returns to the file (§5.1) |
 | a hand edit writes `retiring-secret = "x"` (a scalar, not a table) | the previous set's, on a reload (the whole file is refused); none on a start (the process does not start) | as before the edit. The one shape that blocks a load (§1.1, M4) |
 | an older binary reads the file | the file's | not accepted: the table is an unknown key (logged; `--check` refuses) |
 | the wall clock steps back after `until`, same process | — | not accepted: the config layer and the engine both read the process's one high-water clock (D10) |
@@ -1535,7 +1535,10 @@ No wall-clock sleeps decide an outcome.
   under the now-primary key.
 - A3. `DELETE` drops them.
 - A4. `POST` for another name keeps all entries (`toConfig` carries them).
-- A5. A PUT racing the expiry sweep cannot re-add an expired entry (lock seam).
+- A5. A PUT cannot re-add an entry a concurrent reload removed (lock seam: a reload runs in
+  `beforeKeepMergeLockHook`, with `until` still ahead; the sweep alone would be masked by the
+  build's rule 2 — revision 4, Task 6's review), and the merge reads the set UNDER `reloadMu`
+  (A5b: a holder of `reloadMu` ends the overlap while the PUT waits for the lock).
 - A6. `POST /reload` replaces them with the file's.
 - A7. `/stats` and `GET /secrets/{name}` carry the four fields only when relevant, and the
   shapes stay byte-identical for a config without rotation
