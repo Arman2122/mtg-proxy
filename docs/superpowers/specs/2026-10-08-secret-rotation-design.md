@@ -709,10 +709,12 @@ accepted sets are both {primary}.
 - **Measured.** The reviewer overlaid this rule into today's code, and the whole `mtglib` suite
   passed.
 
-**The `newSet` judgment at `now` is belt and braces.** `buildSecretSetAt` has already dropped
-every entry expired at `now`, so for a set built by this swap, held and accepted are equal. The
-per-stream check against the accepted set keeps the function correct if it is ever handed a
-set built earlier.
+**The `newSet` judgment at `now` guards only names whose held keys changed.**
+`buildSecretSetAt` has already dropped every entry expired at `now`, so for a set built by this
+swap at the same `now`, held and accepted are equal. The per-stream check against the accepted
+set therefore matters for names the fast path does not skip; a name whose held keys are equal is
+skipped before it. (Revision 4, Task 5's review: the earlier wording claimed correctness for a
+set built earlier, which the fast path does not give; no caller can hand such a set.)
 
 Streams are snapshotted under `liveMu` and closed outside it, as today. The function returns
 how many it closed per name, for logging.
@@ -984,6 +986,7 @@ All lines carry `secret_name` and times; none carries a key.
 | start and every swap, per entry that is new in this set | Info | `secret accepts a previous key until its overlap ends` | `secret_name`, `until` |
 | an entry leaves the set because it expired: the sweep, or any reload or swap after `until`. Classified by the §6.3 diff, not by an engine drop reason | Info | `previous key of the secret is no longer accepted: overlap ended` | `secret_name`, `until`, `closed` |
 | an entry leaves the set otherwise (file edit, removal) | Info | `previous key of the secret is no longer accepted` | `secret_name`, `reason`, `closed` |
+| an entry leaves the set because its key is now the name's PRIMARY (the documented revert through `POST /secrets`/`PutSecret`; revision 4, Task 5's review) | Warning | `previous key of the secret is the primary again` | `secret_name`, `closed` |
 | a config problem or warning | Warning | (§1.3 line) | |
 | an engine drop that is not an expiry | Warning (`same_as_primary` and `duplicate`: Info) | `a retiring key was ignored` | `secret_name`, `reason` (`invalid`, `dangling`, `same_as_primary`, `duplicate`, `key_of_other_secret`, `over_cap`) |
 | the wall clock is behind | Warning | §2.3 | `behind_by` |
@@ -1005,7 +1008,11 @@ about rotation logs nothing about it.
 **How the diff classifies an expiry (m6 of the second review).** An entry of `oldSet` that is
 absent from `newSet` is logged **"overlap ended"** when its `until` ≤ the swap's `now`. That is
 the same single `now` the build and `closeStaleConns` use (§4.1). Otherwise it is logged
-"no longer accepted" with `reason` (`removed` from the file or by the API).
+"no longer accepted" with `reason` (`removed` from the file or by the API) — except when the
+departing entry's key is the name's primary in `newSet` (a revert on purpose), which is logged
+as "is the primary again" at Warning: the "no longer accepted" wording would tell an operator
+auditing a leak the opposite of what happened. The `closed` count is the name's, and the streams
+it counts are the replaced primary's.
 
 The engine's `expired` drop reason does not reach this line. On a reload after `until`, the
 config layer has already filtered the entry as inert (rule 2), so the engine is never handed it
