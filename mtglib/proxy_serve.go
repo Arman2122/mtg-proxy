@@ -534,7 +534,11 @@ var (
 // very walk -- and the stream would then register a key nothing will ever look
 // at again. The common case costs one load and one pointer compare: the set
 // the stream was attributed from is the set in force, and it accepts the key
-// it matched. Nothing has been taken yet, so the refusal gives back nothing.
+// it matched -- its name's primary, which it accepts at any time. A retiring
+// key is asked about whatever set is in force, at a fresh instant of the
+// rotation clock: it can expire with no swap at all, and the door judged it at
+// the hello's instant, which a wait for the handshake budget can leave stale.
+// Nothing has been taken yet, so the refusal gives back nothing.
 //
 // The ban re-check comes next, before the cap and the limit, because it closes
 // a race of its own: attribute checked the ban without liveMu, and a ban is
@@ -594,9 +598,14 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
 
 	// The key re-check. The Load MUST stay below the Lock: a set read before it
 	// can be one a swap replaced while this stream waited on liveMu -- and that
-	// swap's walk ran exactly then.
+	// swap's walk ran exactly then. A retiring key is asked about even when no
+	// swap has run since attribution: it expires on the clock alone, and the
+	// instant the door judged it by can be stale by the time it registers. The
+	// parentheses are the condition: without them && binds first, and every
+	// stream after any unrelated swap would be refused.
 	cur := p.secrets.Load()
-	if cur != ctx.attrSet && !cur.accepts(ctx.secretName, ctx.matchedSecretKey, p.rotation.Now()) {
+	if (cur != ctx.attrSet || !ctx.retiringUntil.IsZero()) &&
+		!cur.accepts(ctx.secretName, ctx.matchedSecretKey, p.rotation.Now()) {
 		return refuse(DenyKeyRevoked)
 	}
 

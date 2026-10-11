@@ -417,6 +417,54 @@ func TestAnUnrelatedSwapBeforeRegistrationStillAdmits(t *testing.T) { //nolint: 
 			assert.Equal(t, secret.Key[:], stream.matchedSecretKey, "the key the stream registered under")
 		})
 	}
+
+	// The retiring variant: a stream on alice's old key, inside its overlap,
+	// across the same kind of swap. The set in force is not the one it was
+	// attributed from and holds the key only as a retiring one, and it still
+	// accepts it: the stream registers.
+	for _, ec := range govEntryCases() {
+		t.Run("retiring/"+ec.name, func(t *testing.T) {
+			old, next := ec.secret(t), ec.secret(t)
+			until := rotationAt(time.Hour)
+
+			h := ec.harness(t, map[string]Secret{"alice": old}, nil)
+			rotationClockAt(h.proxy, rotationNow)
+			rotateTo(t, h.proxy, map[string]Secret{"alice": next}, retire("alice", old, until))
+
+			cfg := h.proxy.secrets.Load().toConfig()
+			cfg.SecretAdTags = map[string][AdTagLength]byte{"alice": tag}
+
+			var (
+				fired   atomic.Bool
+				swapErr error
+			)
+
+			installAfterAttributeHook(t, func(*streamContext) {
+				if fired.CompareAndSwap(false, true) {
+					swapErr = h.proxy.ReplaceSecrets(cfg)
+				}
+			})
+
+			client, done := dialProxyFrom(t, h, ec.policy, tcpFrom("203.0.113.9", 50001))
+			upstream := connectThrough(t, ec, h, client, "alice", old.Key)
+
+			stream := h.liveStream(t, "alice")
+			require.NotNil(t, stream)
+
+			endStream(client, upstream, done)
+
+			require.True(t, fired.Load(), "the swap ran between attribution and admission")
+			require.NoError(t, swapErr)
+
+			set := h.proxy.secrets.Load()
+			require.NotNil(t, set.adTags[0], "the swap replaced the set")
+			assert.Equal(t, tag, *set.adTags[0])
+			require.Equal(t, 1, len(set.retiring), "and kept the retiring entry")
+			assert.True(t, old.Key == set.retiring[0].secret.Key, "the very key")
+			assert.True(t, bytes.Equal(old.Key[:], stream.matchedSecretKey), "the key the stream registered under")
+			assert.True(t, until.Equal(stream.retiringUntil), "as a retiring key")
+		})
+	}
 }
 
 // A key_revoked refusal is logged under its reason and counted nowhere: not as

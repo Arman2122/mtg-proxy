@@ -395,8 +395,9 @@ func (p *Proxy) ReloadSecrets() error {
 
 // swapSecretConfigLocked validates cfg, builds a fresh immutable snapshot,
 // swaps it in atomically, pre-registers stats for every name, and closes stale
-// connections. It is the single mutation point shared by ReloadSecrets and the
-// management-API mutators; the caller MUST hold reloadMu.
+// connections. It is the single mutation point shared by ReloadSecrets, the
+// management-API mutators and the expiry sweep; the caller MUST hold reloadMu,
+// taken before liveMu (and liveMu before the table's lock), never under it.
 func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	if len(cfg.Secrets) == 0 {
 		return ErrSecretInvalid
@@ -425,6 +426,8 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	newSet, drops := buildSecretSetAt(cfg.Secrets, cfg.SecretAdTags, cfg.GlobalAdTag, cfg.Limits, cfg.Retiring, now)
 	oldSet := p.secrets.Swap(newSet)
 
+	afterSecretStoreHook(newSet)
+
 	p.logRetiringDrops(drops)
 	p.doppelGanger.SetCoverHosts(p.coverHosts(newSet))
 
@@ -434,10 +437,62 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 
 	p.applyLimits(newSet)
 	p.dropRemovedSecrets(oldSet, newSet)
-	p.closeStaleConns(oldSet, newSet)
+	p.closeStaleConns(oldSet, newSet, now)
 	p.closeDeniedConns()
 
 	return nil
+}
+
+// afterSecretStoreHook runs in swapSecretConfigLocked right after the new set
+// is stored and before anything in the swap takes liveMu: the window in which
+// a registration already reads the new set and the swap's walk has not run. A
+// no-op in production. A test uses it to register a stream in that window
+// (beforeRegisterLockHook cannot place one there: it runs a whole swap before
+// the stream locks). A variable so it can be replaced; a test that does must
+// restore it and must not run in parallel.
+var afterSecretStoreHook = func(*secretSet) {}
+
+// expireRetiring is the maintenance sweep's end of an overlap (spec §4.2):
+// once the clock reaches the earliest until the set in force holds, it swaps
+// in that same set rebuilt at the clock's instant. The build drops every entry
+// that has expired by then, the keys it held leave the set, and closeStaleConns
+// closes their streams by the held-key judgment it gives every swap. It closes
+// nothing itself. A set with no retiring entry costs one load and one compare.
+//
+// It takes reloadMu with TryLock, never Lock. A reload or an API mutation holds
+// that lock across a file read or a request, and waiting behind one would hold
+// up the rest of the maintenance tick -- closeDeniedConns, the quota rollover,
+// the usage flush -- on the same goroutine. A tick that loses the lock retries
+// on the next: a holder that swaps rebuilds at its own instant and does this
+// sweep's work, and one that fails leaves it to the next tick. Admission stays
+// exact meanwhile, because the doors and registration judge until themselves.
+// The swap rebuilds from the set in force, so the API's mutations survive it,
+// and it is not refused for any set a swap, or run's config check, accepted:
+// the primaries are those the set already holds, and retiring entries never
+// count toward SecretsCanFront. (A library caller's initial set that cannot
+// front refuses every swap, this one with them.)
+func (p *Proxy) expireRetiring() {
+	set := p.secrets.Load()
+	if set.retiringNext.IsZero() {
+		return
+	}
+
+	now := p.rotation.Now()
+	if now.Before(set.retiringNext) {
+		return
+	}
+
+	if !p.reloadMu.TryLock() {
+		return
+	}
+	defer p.reloadMu.Unlock()
+
+	set = p.secrets.Load()
+	if set.retiringNext.IsZero() || now.Before(set.retiringNext) {
+		return
+	}
+
+	_ = p.swapSecretConfigLocked(set.toConfig()) // not refused; see above
 }
 
 // logRetiringDrops writes one line for each retiring entry a build did not keep:
@@ -637,47 +692,76 @@ func (p *Proxy) backfillClientsLocked(set *secretSet) {
 	}
 }
 
-// closeStaleConns closes every live stream whose secret was dropped from the
-// new set or whose key changed since the old set (a re-key), and leaves the
-// rest connected. It compares the KEY ALONE, deliberately: a Host change
-// touches nothing on a live stream (the FakeTLS handshake is long finished and
-// the fronting host is read only on the failure path of a NEW connection) and a
-// Mode change touches nothing at all (the three modes share the key and derive
-// identical ciphers), so widening the comparison would kill every live stream
-// of every client on a hostname edit for no correctness gain. Streams are snapshotted under the lock and closed outside it,
-// so each stream's own unregister (which also takes the lock) cannot deadlock.
-func (p *Proxy) closeStaleConns(oldSet, newSet *secretSet) {
-	newKeys := make(map[string][SecretKeyLength]byte, len(newSet.names))
-	for i, name := range newSet.names {
-		newKeys[name] = newSet.secrets[i].Key
-	}
-
-	oldKeys := make(map[string][SecretKeyLength]byte)
-	if oldSet != nil {
-		for i, name := range oldSet.names {
-			oldKeys[name] = oldSet.secrets[i].Key
-		}
-	}
-
-	var stale []*streamContext
+// closeStaleConns closes every live stream whose key newSet no longer accepts
+// at now, the swap's own instant, leaves the rest connected, and returns how
+// many it closed per name (nil when it closed none). It decides stream by
+// stream (D15), for each name in the registry:
+//   - a name newSet does not have accepts no key: every stream of it is closed;
+//   - a name whose keys the two sets HOLD alike (sameHeldKeys) is skipped
+//     whole, the fast path, and staleSkipHook hears of it;
+//   - otherwise each stream is closed unless newSet accepts the key it matched
+//     (matchedSecretKey) at now.
+//
+// The fast path compares what the sets hold -- the primary and every retiring
+// key, expired or not -- and never what they accept at now. Judged at now,
+// the expiry swap's two sets accept the same keys once an overlap has ended,
+// the name would be skipped, and the old key's streams would stay open for
+// good: no later swap looks at a name whose set holds no retiring key (B1). A
+// name the old set lacks holds nothing there, so it never takes the fast path.
+// The judgment against newSet at now is belt and braces: a set this swap built
+// at now holds no key that has expired by it.
+//
+// It compares KEYS ALONE, deliberately: a Host change touches nothing on a live
+// stream (the FakeTLS handshake is long finished and the fronting host is read
+// only on the failure path of a NEW connection) and a Mode change touches
+// nothing at all (the three modes share the key and derive identical ciphers),
+// so widening the comparison would kill every live stream of every client on a
+// hostname edit for no correctness gain.
+//
+// Streams are snapshotted under liveMu and closed outside it, so each stream's
+// own unregister (which also takes the lock) cannot deadlock. staleSkipHook
+// runs under liveMu and must not take it.
+func (p *Proxy) closeStaleConns(oldSet, newSet *secretSet, now time.Time) map[string]int {
+	var (
+		stale  []*streamContext
+		closed map[string]int
+	)
 
 	p.liveMu.Lock()
+
 	for name, conns := range p.liveConns {
-		if newKey, kept := newKeys[name]; kept {
-			if oldKey, had := oldKeys[name]; had && oldKey == newKey {
-				continue
+		_, kept := newSet.indexOf(name)
+
+		if kept && sameHeldKeys(oldSet, newSet, name) {
+			if p.staleSkipHook != nil {
+				p.staleSkipHook(name)
 			}
+
+			continue
 		}
 
 		for sc := range conns {
+			if kept && newSet.accepts(name, sc.matchedSecretKey, now) {
+				continue
+			}
+
+			if closed == nil {
+				closed = make(map[string]int)
+			}
+
+			closed[name]++
+
 			stale = append(stale, sc)
 		}
 	}
+
 	p.liveMu.Unlock()
 
 	for _, sc := range stale {
 		sc.Close()
 	}
+
+	return closed
 }
 
 // checkLimits reports whether a new connection for the named secret is allowed
@@ -758,13 +842,16 @@ func (p *Proxy) rolloverAllQuotas() {
 
 // denySweepInterval is how often live streams are checked against the limits
 // the clock alone can cross: an expiry that passes, a quota period that rolls
-// over. It bounds how long a user outlives their deadline, and it is short
-// because the sweep is a walk of the live registry and nothing more.
+// over, a retiring key's until. It bounds how long a user, or an old key,
+// outlives their deadline, and it is short because the sweep is a walk of the
+// live registry and nothing more -- unless an overlap has ended, which costs
+// one swap.
 const denySweepInterval = 5 * time.Second
 
 // startMaintenance runs, until ctx is cancelled, the work that has to happen
 // on the clock rather than on an event: every sweepEvery, monthly quota
-// periods roll over and streams of users who are now denied are closed;
+// periods roll over, overlaps the clock has ended are ended (expireRetiring)
+// and streams of users who are now denied are closed;
 // every flushEvery, the usage counters are written to usageStateFile if one
 // is configured; every clientSweepInterval, the per-address table forgets the
 // addresses that have been gone long enough; and every fairTickInterval, fair
@@ -803,6 +890,7 @@ func (p *Proxy) startMaintenanceEvery(ctx context.Context, sweepEvery, flushEver
 				return
 			case <-sweep.C:
 				p.rolloverAllQuotas()
+				p.expireRetiring()
 				p.closeDeniedConns()
 			case <-clients.C:
 				p.sweepClients()

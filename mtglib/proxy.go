@@ -46,6 +46,12 @@ type Proxy struct {
 	// the ticker starts.
 	afterFairPass func()
 
+	// staleSkipHook, when set, is told each name closeStaleConns skips whole
+	// because the old and new sets hold the same keys for it. Only tests set
+	// it, before the swap or the maintenance loop it watches starts; it runs
+	// under liveMu and must not take it.
+	staleSkipHook func(name string)
+
 	allowFallbackOnUnknownDC    bool
 	trackClientIPs              bool
 	tolerateTimeSkewness        time.Duration
