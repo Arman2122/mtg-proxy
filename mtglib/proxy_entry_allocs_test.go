@@ -2,6 +2,7 @@ package mtglib
 
 import (
 	"bytes"
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
@@ -95,4 +96,44 @@ func TestTheFakeTLSDoorAllocatesAsBefore(t *testing.T) { //nolint: paralleltest 
 	} {
 		assert.InDelta(t, tc.want, testing.AllocsPerRun(runs, tc.call), 0, tc.name)
 	}
+}
+
+// TestTheFakeTLSDoorAllocatesAsBeforeAtSixteenHintedNames is the allocation
+// check at the hint cache's own bound: sixteen hinted names (maxHintNames), the
+// carrier-NAT case, on a set with no retiring entry. Two allocations, as on
+// 9634101 at any name count: the names recall clones, and the positions. A
+// slice of len(names) ints made beside positions fits the 32-byte buffer Go
+// keeps for a small non-escaping make only up to four names, so the
+// three-name fixture above cannot see one; at sixteen it is a third
+// allocation.
+//
+// Not parallel: AllocsPerRun counts every allocation in the process.
+func TestTheFakeTLSDoorAllocatesAsBeforeAtSixteenHintedNames(t *testing.T) { //nolint: paralleltest // see above
+	secrets := make(map[string]Secret, maxHintNames)
+	for i := range maxHintNames {
+		secrets[fmt.Sprintf("n%02d", i)] = eeSecretOf(keyFilledFrom(byte(1+8*i)), candidatesCover)
+	}
+
+	set := buildSecretSet(secrets, nil, nil, nil)
+	require.Empty(t, set.retiring, "a set with no retiring entry")
+
+	p := &Proxy{
+		tolerateTimeSkewness: time.Hour,
+		hints:                &matchHints{current: make(map[netip.Addr]*hintEntry)},
+		rotation:             NewRotationClock(time.Now, nil),
+	}
+
+	const place = "203.0.113.9"
+
+	for name := range secrets {
+		p.hints.remember(net.ParseIP(place), name)
+	}
+
+	ctx := &streamContext{clientSocket: remoteAddrConn{addr: tcpFrom(place, 41000)}}
+	hello := parsedHello(t, fakeTLSClientHello(t, keyFilledFrom(200), candidatesCover, bytes.Repeat([]byte{0x35}, 32)), candidatesCover)
+
+	require.Len(t, p.hintedPositions(ctx, hello, set), maxHintNames, "every name a candidate, none past the cap")
+
+	assert.InDelta(t, 2, testing.AllocsPerRun(1000, func() { p.hintedPositions(ctx, hello, set) }), 0,
+		"hintedPositions, sixteen hinted names")
 }

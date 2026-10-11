@@ -404,7 +404,9 @@ func (p *Proxy) verifyHinted(parsed *fake.Parsed, set *secretSet, positions []in
 // clock is read on the first get and that reading kept, so a hello reads it at
 // most once, and one that never reaches a retiring position never reads it.
 // doFakeTLSHandshake keeps one on its stack and hands its address to
-// verifyHinted and scanCandidates. A nil *helloNow reads time.Now.
+// verifyHinted and scanCandidates. A nil *helloNow reads time.Now on every
+// call, past the rotation clock; it is for tests only, and no production
+// caller passes one.
 type helloNow struct {
 	clock *RotationClock
 	at    time.Time

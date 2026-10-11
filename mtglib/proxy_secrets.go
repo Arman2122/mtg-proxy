@@ -96,7 +96,7 @@ type secretSet struct {
 	// retiringNext is the earliest until in retiring.
 	retiring      []retiringEntry  // {nameIdx int; secret Secret; until time.Time}, sorted by (nameIdx, until desc, key bytes)
 	retiringOf    map[int][]int    // nameIdx -> indices into retiring
-	primaryCands  int              // cands[:primaryCands] are primaries; the rest are retiring ee keys
+	primaryCands  int              // how many of cands are primaries when there are retiring entries, else 0: never a bound, use primaryEnd()
 	candRetiring  []int            // candRetiring[pos-primaryEnd()] = index into retiring
 	retiringCands map[string][]int // name -> its retiring candidate positions, same order
 	retiringNext  time.Time        // earliest until in retiring; zero when none

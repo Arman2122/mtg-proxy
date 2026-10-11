@@ -208,6 +208,44 @@ func TestAnOldLinkPastUntilIsFrontedLikeAWrongSecret(t *testing.T) {
 	assert.Len(t, set.candRetiring, 1)
 }
 
+// TestARetiringCandidateExpiresByItsOwnEntry: the door judges a retiring
+// candidate by the until of the entry it stands for. A dd retiring entry is no
+// candidate, so when one sorts before an ee one (same name, later until), the
+// candidate's offset past primaryEnd() is not its index into retiring: alice's
+// ee old key, expired at +1h, must be fronted unverified even though alice's dd
+// old key, at index 0, runs to +2h; and bob's ee old key, unexpired until +3h,
+// must still be admitted though the entry at its offset (alice's ee) has
+// expired.
+func TestARetiringCandidateExpiresByItsOwnEntry(t *testing.T) {
+	t.Parallel()
+
+	ec := fakeTLSDoor()
+	alice, bob := ec.secret(t), ec.secret(t)
+	aliceOldEE, bobOldEE := ec.secret(t), ec.secret(t)
+	aliceOldDD := ddSecretOf(keyFilledFrom(0x91))
+
+	h := newEntryHarness(t, map[string]Secret{"alice": aliceOldEE, "bob": bobOldEE}, nil)
+	clock := rotationClockAt(h.proxy, rotationNow)
+	set := rotateTo(t, h.proxy, map[string]Secret{"alice": alice, "bob": bob},
+		retire("alice", aliceOldDD, rotationAt(2*time.Hour)),
+		retire("alice", aliceOldEE, rotationAt(time.Hour)),
+		retire("bob", bobOldEE, rotationAt(3*time.Hour)))
+
+	require.Equal(t, []int{1, 2}, set.candRetiring, "alice's dd entry is retiring[0] and no candidate")
+
+	clock.set(rotationAt(time.Hour))
+
+	before := tallyOf(h.proxy)
+	_, ok := h.fakeTLSAttempt(t, freshHello(t, aliceOldEE.Key, govCoverHost))
+	assert.False(t, ok, "alice's ee old key has reached its own until")
+	assert.Equal(t, doorTally{verifications: 3, unmatched: 1}, tallyOf(h.proxy).minus(before),
+		"two primaries and bob's old key; alice's expired one is never verified")
+
+	ctx, ok := h.fakeTLSAttempt(t, freshHello(t, bobOldEE.Key, govCoverHost))
+	require.True(t, ok, "bob's old key runs to +3h")
+	assert.Equal(t, "bob", ctx.secretName)
+}
+
 // TestAPrimaryMatchCostsTheSameWithRetiringEntries is D3: retiring candidates
 // come after every primary, so a primary's hello is verified as many times with
 // retiring entries as without, and an old link after every primary.
@@ -347,6 +385,61 @@ func TestAnEeToDdRotationKeepsTheOldLinksHint(t *testing.T) {
 	assert.Equal(t, doorTally{verifications: 1, hinted: 1},
 		connectFrom(t, h, ec, tcpFrom(place, 55102), "alice", old.Key),
 		"the hint resolves to alice's retiring position alone: one verification, no scan")
+}
+
+// TestAHintedOldLinkPastUntilIsNotVerified: the hinted path passes over an
+// expired retiring candidate at primaryEnd() itself, the first retiring
+// position, as it does any later one.
+func TestAHintedOldLinkPastUntilIsNotVerified(t *testing.T) {
+	t.Parallel()
+
+	const place = "198.51.100.91"
+
+	ec := fakeTLSDoor()
+	old := ec.secret(t)
+
+	h, _ := budgetHarness(t, map[string]Secret{"alice": old, "bob": ec.secret(t)}, nil, roomyBudget())
+	h.proxy.hints = newMatchHints(h.proxy.ctx)
+
+	clock := rotationClockAt(h.proxy, rotationNow)
+	set := rotateTo(t, h.proxy, map[string]Secret{"alice": ec.secret(t), "bob": ec.secret(t)},
+		retire("alice", old, rotationAt(time.Hour)))
+
+	require.Equal(t, []int{set.primaryEnd()}, set.retiringCands["alice"], "alice's old key is the first retiring position")
+
+	h.proxy.hints.remember(net.ParseIP(place), "alice")
+	clock.set(rotationAt(time.Hour))
+
+	assert.Equal(t, doorTally{verifications: 2, unmatched: 1}, refusedFrom(t, h, tcpFrom(place, 56101), old.Key),
+		"alice's primary from the hint, bob's from the scan; the expired old key is never verified")
+}
+
+// TestABannedPlaceIsNotHintedToARetiringKey: a ban skips the hinted name
+// whole -- its primary and its retiring keys -- so a banned place holding an
+// old link is scanned (and charged), not hinted.
+func TestABannedPlaceIsNotHintedToARetiringKey(t *testing.T) {
+	t.Parallel()
+
+	const place = "203.0.113.32"
+
+	ec := fakeTLSDoor()
+	old := ec.secret(t)
+
+	h, _ := budgetHarness(t, map[string]Secret{"alice": old, "bob": ec.secret(t)}, nil, roomyBudget())
+	h.proxy.hints = newMatchHints(h.proxy.ctx)
+	rotationClockAt(h.proxy, rotationNow)
+	set := rotateTo(t, h.proxy, map[string]Secret{"alice": ec.secret(t), "bob": ec.secret(t)},
+		retire("alice", old, rotationAt(time.Hour)))
+
+	require.Len(t, set.cands, 3)
+
+	mustBan(t, h.proxy, "alice", `{"ips":["`+place+`"]}`)
+
+	// A hint the ban could not forget: written after it.
+	h.proxy.hints.remember(net.ParseIP(place), "alice")
+
+	assert.Equal(t, doorTally{verifications: 3, scanned: 1}, refusedFrom(t, h, tcpFrom(place, 53101), old.Key),
+		"scanned to the old key and refused as banned; never verified on the hint")
 }
 
 // TestHintedPositionsAreCappedAt32: sixteen hinted names, each with a primary
