@@ -304,8 +304,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	// typo that length-first parsing turns into a plain secret.
 	listenerTags := opts.ListenerModes.Tags()
 
-	for i, name := range initialSet.names {
-		secret := initialSet.secrets[i]
+	warnIfUnserved := func(name string, secret Secret) {
 		// Served means every transport a client of this form might pick is
 		// honoured, so the test is tag-set containment, not overlap: a plain
 		// listener covers a dd secret, but a dd-only listener does NOT cover a
@@ -317,6 +316,21 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 				BindStr("mode", secret.Mode.String()).
 				Warning("secret is not served by any listener; no configured listener honours this form")
 		}
+	}
+
+	for i, name := range initialSet.names {
+		warnIfUnserved(name, initialSet.secrets[i])
+	}
+
+	// A retiring dd or plain key is tried on the obfuscated door whatever its
+	// mode and is as unreachable as such a primary when no listener honours its
+	// form: one line for each entry the set kept, in the set's order, with the
+	// same words, naming the secret and the mode. An ee entry is reached on
+	// bind-to, and an entry the build dropped is not in the set.
+	for r := range initialSet.retiring {
+		entry := &initialSet.retiring[r]
+
+		warnIfUnserved(initialSet.names[entry.nameIdx], entry.secret)
 	}
 
 	// The middle-proxy manager is always available so advertising can be

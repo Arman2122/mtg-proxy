@@ -443,6 +443,60 @@ func skipPositions(positions []int) func(pos int) bool {
 // worker pool with connections that will never be served.
 const obfuscatedDrainBytes = 8 << 10
 
+// obfuscatedKeys is the key list the obfuscated door tries a frame against: every
+// primary's key, whatever its mode, in the set's order, then the key of each
+// retiring entry whose until the rotation clock has not reached, in the
+// entries' order. A retiring key of any mode is tried here, as every primary is;
+// only an ee one is also a FakeTLS candidate. Primaries come first, as on the
+// FakeTLS door; keys are unique across the set, so the order changes no
+// attribution, only how far the trial loop runs.
+//
+// keyRetiring[j] is the index into set.retiring of the entry whose key is
+// keys[len(set.secrets)+j], and is how obfuscatedMatch maps a match back to it.
+// A set with no retiring entry costs what the inline build always cost: the one
+// list, a nil keyRetiring, and no read of the clock. The clock is read once, for
+// the whole list, and only when the set holds an entry. The door itself builds
+// the no-entry list inline (see doObfuscatedEntry) and calls this for the rest.
+func obfuscatedKeys(set *secretSet, clock *RotationClock) (keys [][]byte, keyRetiring []int) {
+	keys = make([][]byte, len(set.secrets), len(set.secrets)+len(set.retiring))
+	for i := range set.secrets {
+		keys[i] = set.secrets[i].Key[:]
+	}
+
+	if len(set.retiring) == 0 {
+		return keys, nil
+	}
+
+	now := clock.Now()
+
+	for r := range set.retiring {
+		if !now.Before(set.retiring[r].until) {
+			continue
+		}
+
+		if keyRetiring == nil {
+			keyRetiring = make([]int, 0, len(set.retiring))
+		}
+
+		keys = append(keys, set.retiring[r].secret.Key[:])
+		keyRetiring = append(keyRetiring, r)
+	}
+
+	return keys, keyRetiring
+}
+
+// obfuscatedMatch is the match of the key at index in the list obfuscatedKeys
+// built with keyRetiring: an index below len(s.secrets) is that primary, and
+// index len(s.secrets)+j is the retiring entry keyRetiring[j]. keyRetiring is
+// never read for a primary, so a door that built no retiring list can pass nil.
+func (s *secretSet) obfuscatedMatch(index int, keyRetiring []int) secretMatch {
+	if index < len(s.secrets) {
+		return s.primaryMatch(index)
+	}
+
+	return s.retiringMatch(keyRetiring[index-len(s.secrets)])
+}
+
 // doObfuscatedEntry identifies a stream that arrived on a plaintext
 // obfuscated2 listener: the secret is unknown until the 64-byte frame is
 // trial-decrypted, so attribution happens here and nothing may be accounted
@@ -475,12 +529,24 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 	// index.
 	set := p.secrets.Load()
 
-	var keys [][]byte
+	var (
+		keys        [][]byte
+		keyRetiring []int
+	)
 
 	if allowed {
-		keys = make([][]byte, len(set.secrets))
-		for i := range set.secrets {
-			keys[i] = set.secrets[i].Key[:]
+		if len(set.retiring) == 0 {
+			// The build this door always had, kept in the door: the list does not
+			// escape, so a one-secret door's 24-byte list stays on the stack as it
+			// always has, which a list returned by obfuscatedKeys cannot. No entry
+			// means no clock read, no keyRetiring and no allocation of its own.
+			// TestTheObfuscatedDoorAllocatesAsBefore pins it.
+			keys = make([][]byte, len(set.secrets))
+			for i := range set.secrets {
+				keys[i] = set.secrets[i].Key[:]
+			}
+		} else {
+			keys, keyRetiring = obfuscatedKeys(set, p.rotation)
 		}
 
 		p.obfsStats.OnObfuscatedTrial()
@@ -518,7 +584,7 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 		return p.denyObfuscated(ctx, policy)
 	}
 
-	if reason := p.attribute(ctx, set, res.Index); reason != DenyNone {
+	if reason := p.attributeMatch(ctx, set, set.obfuscatedMatch(res.Index, keyRetiring)); reason != DenyNone {
 		// A banned client is charged like a frame that matched nothing, so one
 		// that keeps reconnecting is soon refused before the trial loop rather
 		// than costing a trial decryption every time. The budget is keyed by
