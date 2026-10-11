@@ -194,6 +194,14 @@ func fillLimitInfo(info *SecretInfo, lim SecretLimits, used int64) {
 // ReplaceSecrets swaps the entire secret configuration (secrets + advertising
 // tags) for cfg, going through the same validation, atomic swap and stale
 // connection close as a file reload.
+//
+// cfg.Retiring is the COMPLETE list of retiring keys the new set holds, and nil
+// is none, as for a reload: a ReplaceSecrets that leaves it nil ends every
+// overlap in force, and closes the streams on the keys that were retiring. A
+// config file that still grants an overlap grants it again at the next reload,
+// until its until. The management API's PUT /secrets is the one caller that
+// keeps the overlaps of the names it keeps, through its own step
+// (replaceSecretsKeepingRetiring), not through this method.
 func (p *Proxy) ReplaceSecrets(cfg SecretConfig) error {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
@@ -201,12 +209,64 @@ func (p *Proxy) ReplaceSecrets(cfg SecretConfig) error {
 	return p.swapSecretConfigLocked(cfg)
 }
 
+// replaceSecretsKeepingRetiring is the PUT /secrets handler's replacement of the
+// whole set: ReplaceSecrets, except that the retiring entries of every name cfg
+// keeps stay, and those of every name it removes go with it. It is the handler's
+// alone and not a second meaning of a nil cfg.Retiring, which is none wherever a
+// SecretConfig is consumed.
+//
+// The API cannot express an overlap (there is no write field, D18), so a PUT
+// built from a request body can only be silent about one. Reading that as "none"
+// would make a rotation-unaware client -- the panel, today -- end every overlap
+// the config file granted as a side effect, and the next restart would grant it
+// again: a kill and then a revival nobody asked for. Reading it as "keep" is
+// right, and the keeping is done here, under reloadMu, against the set as it is
+// then: a reload or an API call that ran after the body was read has changed the
+// entries, and a copy taken earlier would put back an entry that one of them had
+// removed, with its until still ahead. cfg.Retiring is overwritten, not added to.
+//
+// An entry whose until has passed is kept like any other and then dropped by the
+// build, which judges it by the rotation clock (rule 2), so the merge reads no
+// clock of its own. A name whose primary the PUT changes keeps its entries all
+// the same, and its old primary does not become one: the re-key is immediate. An
+// entry that repeats a key the PUT now makes a primary is dropped by the build
+// (rules 5 and 6), as in any swap.
+func (p *Proxy) replaceSecretsKeepingRetiring(cfg SecretConfig) error {
+	beforeKeepMergeLockHook()
+
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
+	var kept []RetiringSecret
+
+	for _, entry := range p.secrets.Load().toConfig().Retiring {
+		if _, ok := cfg.Secrets[entry.Name]; ok {
+			kept = append(kept, entry)
+		}
+	}
+
+	cfg.Retiring = kept
+
+	return p.swapSecretConfigLocked(cfg)
+}
+
+// beforeKeepMergeLockHook runs in replaceSecretsKeepingRetiring before it takes
+// reloadMu: the window in which a reload or another API call can change the
+// entries the merge is about to read. A no-op in production. A test uses it to
+// run a reload that removes an entry whose until is still ahead; an expiry sweep
+// there would prove nothing, because the build drops an expired entry whatever
+// the merge handed it. A variable so it can be replaced; a test that does must
+// restore it and must not run in parallel.
+var beforeKeepMergeLockHook = func() {}
+
 // PutSecret adds or updates a single secret, optionally setting its per-secret
 // advertising tag (nil clears the override) and governance limits (nil or a
 // zero value clears them). Only a key change closes that secret's live
 // connections; an adtag-only change leaves them running because closeStaleConns
 // keys on the secret key, not the tag. A disable/expiry set here takes effect
 // immediately because swapSecretConfigLocked also closes newly-denied streams.
+// The name's retiring entries are kept; a key that repeats one of them makes the
+// entry go (the primary wins), and the old primary never becomes an entry.
 func (p *Proxy) PutSecret(name string, s Secret, adTag *[AdTagLength]byte, limits *SecretLimits) error {
 	if name == "" {
 		return fmt.Errorf("%w: empty name", ErrSecretInvalid)
@@ -885,7 +945,9 @@ func (p *Proxy) handlePutSecrets(w http.ResponseWriter, r *http.Request) {
 
 	cfg.GlobalAdTag = global
 
-	if err := p.ReplaceSecrets(cfg); err != nil {
+	// The body cannot say a retiring key, so it cannot end one: the entries of
+	// the names it keeps stay.
+	if err := p.replaceSecretsKeepingRetiring(cfg); err != nil {
 		httpError(w, secretMutationStatus(err), err)
 
 		return
