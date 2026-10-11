@@ -199,8 +199,8 @@ func fillLimitInfo(info *SecretInfo, lim SecretLimits, used int64) {
 // is none, as for a reload: a ReplaceSecrets that leaves it nil ends every
 // overlap in force, and closes the streams on the keys that were retiring. A
 // config file that still grants an overlap grants it again at the next reload,
-// until its until. The management API's PUT /secrets is the one caller that
-// keeps the overlaps of the names it keeps, through its own step
+// until the entry's own until. The management API's PUT /secrets is the one
+// caller that keeps the overlaps of the names it keeps, through its own step
 // (replaceSecretsKeepingRetiring), not through this method.
 func (p *Proxy) ReplaceSecrets(cfg SecretConfig) error {
 	p.reloadMu.Lock()
@@ -265,8 +265,10 @@ var beforeKeepMergeLockHook = func() {}
 // connections; an adtag-only change leaves them running because closeStaleConns
 // keys on the secret key, not the tag. A disable/expiry set here takes effect
 // immediately because swapSecretConfigLocked also closes newly-denied streams.
-// The name's retiring entries are kept; a key that repeats one of them makes the
-// entry go (the primary wins), and the old primary never becomes an entry.
+// The name's retiring entries are kept, and the old primary never becomes one.
+// The primary wins: a key that repeats one of the name's own entries makes that
+// entry go (rule 6), and a key that is another name's retiring key makes that
+// other name's entry go (rule 5), the key being this name's primary.
 func (p *Proxy) PutSecret(name string, s Secret, adTag *[AdTagLength]byte, limits *SecretLimits) error {
 	if name == "" {
 		return fmt.Errorf("%w: empty name", ErrSecretInvalid)
@@ -308,7 +310,7 @@ func (p *Proxy) PutSecret(name string, s Secret, adTag *[AdTagLength]byte, limit
 // DeleteSecret removes a single secret, its advertising override and its
 // limits. It returns ErrSecretNotFound for an unknown name and ErrLastSecret if
 // the removal would empty the set. The removed secret's live connections are
-// closed.
+// closed, and its retiring entries go with it (forget), whatever their until.
 func (p *Proxy) DeleteSecret(name string) error {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
