@@ -538,12 +538,13 @@ func (p *Proxy) logRetiringDrops(drops []retiringDrop) {
 	}
 }
 
-// The rotation change log's lines (spec §6.2) and the one reason a departure
-// other than an overlap's end gives.
+// The rotation change log's lines (spec §6.2) and the one reason a removal
+// gives.
 const (
 	retiringAddedLine     = "secret accepts a previous key until its overlap ends"
 	retiringEndedLine     = "previous key of the secret is no longer accepted: overlap ended"
 	retiringRemovedLine   = "previous key of the secret is no longer accepted"
+	retiringReturnedLine  = "previous key of the secret is the primary again"
 	retiringRemovedReason = "removed"
 )
 
@@ -581,13 +582,18 @@ func logUntil(until time.Time) string {
 // logRetiringChanges is the rotation change log of one swap (spec §6.3): it
 // diffs oldSet's retiring entries with newSet's, matching them by name and key,
 // and writes a line for each difference, naming the secret and never the key.
-//   - An entry of oldSet that newSet lacks left: "overlap ended", with its until,
-//     when its until is not after now -- the swap's own instant, the one its
-//     build and closeStaleConns judged by -- and "no longer accepted" with
-//     reason=removed otherwise. Both carry closed, the streams of the name the
-//     swap closed (closeStaleConns' count). The engine's own expired drop plays
-//     no part: on a reload after until the config layer has already left the
-//     entry out, and only this diff sees it go.
+//   - An entry of oldSet that newSet lacks left. When its key is the name's
+//     primary in newSet it was reverted -- made the primary again, through
+//     POST /secrets for one -- and the line is "the primary again", at
+//     Warning, whatever its until: the key is still accepted, so neither
+//     other line is true of it. Otherwise the line is "overlap ended", with
+//     its until, when its until is not after now -- the swap's own instant,
+//     the one its build and closeStaleConns judged by -- and "no longer
+//     accepted" with reason=removed when it is. All three carry closed, the
+//     streams of the name the swap closed (closeStaleConns' count). The
+//     engine's own expired drop plays no part: on a reload after until the
+//     config layer has already left the entry out, and only this diff sees
+//     it go.
 //   - An entry of newSet that oldSet lacks is new: "accepts a previous key",
 //     with its until.
 //
@@ -614,9 +620,12 @@ func (p *Proxy) logRetiringChanges(oldSet, newSet *secretSet, now time.Time, clo
 
 			line := p.logger.BindStr("secret_name", name)
 
-			if now.Before(entry.until) {
+			switch i, held := newSet.indexOf(name); {
+			case held && newSet.secrets[i].Key == entry.secret.Key:
+				line.BindInt("closed", closed[name]).Warning(retiringReturnedLine)
+			case now.Before(entry.until):
 				line.BindStr("reason", retiringRemovedReason).BindInt("closed", closed[name]).Info(retiringRemovedLine)
-			} else {
+			default:
 				line.BindStr("until", logUntil(entry.until)).BindInt("closed", closed[name]).Info(retiringEndedLine)
 			}
 		}

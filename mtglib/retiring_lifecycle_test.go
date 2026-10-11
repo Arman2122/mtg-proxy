@@ -82,11 +82,12 @@ func heldRetiring(p *Proxy) int {
 	return len(p.secrets.Load().retiring)
 }
 
-// The rotation change log's three lines (spec §6.2).
+// The rotation change log's four lines (spec §6.2).
 const (
-	retiringAddedMessage   = "secret accepts a previous key until its overlap ends"
-	retiringEndedMessage   = "previous key of the secret is no longer accepted: overlap ended"
-	retiringRemovedMessage = "previous key of the secret is no longer accepted"
+	retiringAddedMessage    = "secret accepts a previous key until its overlap ends"
+	retiringEndedMessage    = "previous key of the secret is no longer accepted: overlap ended"
+	retiringRemovedMessage  = "previous key of the secret is no longer accepted"
+	retiringReturnedMessage = "previous key of the secret is the primary again"
 )
 
 // changeLines is the rotation change log in the order it was written, each
@@ -99,7 +100,7 @@ func changeLines(r *rotationLog) []string {
 
 	for _, line := range r.lines {
 		switch line.msg {
-		case retiringAddedMessage, retiringEndedMessage, retiringRemovedMessage:
+		case retiringAddedMessage, retiringEndedMessage, retiringRemovedMessage, retiringReturnedMessage:
 		default:
 			continue
 		}
@@ -136,6 +137,12 @@ func endedLine(name string, until time.Time, closed int) string {
 func removedLine(name string, closed int) string {
 	return "info|" + retiringRemovedMessage + "|closed=" + strconv.Itoa(closed) +
 		" reason=removed secret_name=" + name
+}
+
+// returnedLine is the line for an entry whose key is its name's primary in the
+// new set: a revert.
+func returnedLine(name string, closed int) string {
+	return "warning|" + retiringReturnedMessage + "|closed=" + strconv.Itoa(closed) + " secret_name=" + name
 }
 
 // installAfterSecretStoreHook replaces the seam a swap calls right after it
@@ -1267,4 +1274,49 @@ func TestTheRotationChangeLog(t *testing.T) {
 
 	assert.Empty(t, leaks(record.text(), []Secret{aliceOld, aliceNext, bobOld, bobNext}),
 		"no line, at any level, carries a key in any spelling")
+}
+
+// A revert -- POST /secrets (PutSecret) re-keying alice back onto K1, her
+// retiring key -- takes K1 out of the retiring list, but K1 is not "no longer
+// accepted": it is the primary again. The change log says so, at Warning,
+// with the streams the swap closed for the name: the three on K2, which the
+// revert took away. K1's stream stays open. The line wins over both other
+// departures, inside the overlap and after its until alike, because both would
+// say K1 is no longer accepted. No key is written.
+func TestARevertToARetiringKeyIsLoggedAsThePrimaryAgain(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		at   func(l *lifecycle) time.Time
+		drop string
+	}{
+		{"inside the overlap", func(l *lifecycle) time.Time { return l.until.Add(-time.Minute) }, "info|alice|same_as_primary"},
+		{"after its until, before any sweep", func(l *lifecycle) time.Time { return l.until.Add(time.Minute) }, "info|alice|expired"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			l := newLifecycle(t)
+			l.rotate(t)
+
+			k1 := l.stream(t, "alice", l.old)
+			k2s := []*streamContext{l.stream(t, "alice", l.next), l.stream(t, "alice", l.next), l.stream(t, "alice", l.next)}
+
+			l.clock.set(tc.at(l))
+
+			require.NoError(t, l.p.PutSecret("alice", l.old, nil, nil))
+
+			assert.NoError(t, k1.Err(), "K1 is the primary again: its stream stays")
+
+			for i, sc := range k2s {
+				assert.ErrorIs(t, sc.Err(), context.Canceled, "K2 stream %d: the revert took K2 away", i)
+			}
+
+			assert.Equal(t, []string{addedLine("alice", l.until), returnedLine("alice", len(k2s))}, changeLines(l.log))
+			assert.Equal(t, []string{tc.drop}, ignoredLines(t, l.log), "the engine's own drop line, as before")
+			assert.Empty(t, leaks(l.log.text(), []Secret{l.old, l.next, l.bob}),
+				"no line, at any level, carries a key in any spelling")
+		})
+	}
 }
