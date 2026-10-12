@@ -1268,10 +1268,26 @@ the subtle bugs will be.
      `--prune`, `--end-overlap` and an entry expiring in the meantime are all counted from one
      source. Likely causes of a mismatch: the proxy's clock is ahead of this machine's (its
      high-water mark judged an entry expired), or the proxy logged a problem with the block.
+     **Revision 4 (Task 10's review, M-1 and M-2):** the proxy judges the name when it handles
+     the GET, so `now` is read just before and just after each GET, and any count from the
+     one after to the one before passes. A count **above** that range has other causes, which
+     the message names instead: the proxy reads a file other than this one (a single-file
+     bind mount that still shows the old file; another process that rewrote the file), or
+     this machine's clock is ahead of the proxy's.
   3. **Retiring end.** With a new block, `retiring_until` must be **≥ the written `until`**; it
      is not required to be equal. It is the latest `until` among the name's entries, so an
      earlier, longer overlap legitimately reports a later time (M1 of the review). Likely cause of a failure:
-     the same as 2.
+     the same as 2. **Revision 4 (Task 10's review, M-1):** this holds while the new block is
+     still usable just after the GET; once the written file itself judges it expired (an
+     `--overlap 1s` can end before the read-back), `retiring_until` absent or ≥ the written
+     `until` passes.
+
+  **Revision 4 (Task 10's review, M-3): an older binary.** With `--force` past a missing
+  `secret-rotation`, the checks run as above, and checks 2 and 3 name first the cause "the
+  running proxy is an older binary (--force), which ignores [[retiring-secret]]". A 404 or 405
+  to `GET /secrets/{name}` from a proxy whose features lack `secret-read` is reported with the
+  cause "the running proxy does not serve GET /secrets/{name} (an older binary)" instead of
+  check 1's.
 
   **`--prune` alone** names no single name. It requires the 200, then check 2 for each pruned
   name that is still configured. A pruned name that is no longer configured has nothing to read
