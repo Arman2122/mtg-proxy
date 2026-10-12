@@ -57,8 +57,8 @@ func (p *Prepared) verify(out []byte, newPrimary mtglib.Secret) error {
 		return ErrEditVerification
 	}
 
-	if name, revived := p.revived(report, edited.GetSecrets(), newPrimary); revived {
-		return revivalError(name)
+	if label, revived := p.revived(report, edited.GetSecrets(), newPrimary); revived {
+		return revivalError(label)
 	}
 
 	if p.req.Rotate {
@@ -71,7 +71,8 @@ func (p *Prepared) verify(out []byte, newPrimary mtglib.Secret) error {
 }
 
 // revived finds a key the edit would make usable that nothing accepts now,
-// and the name it would come back under. The keys usable now are the
+// and labels the block it would come back by: its position in the file as it
+// is, and its name unless that reads as a value. The keys usable now are the
 // primaries and GetRetiringSecrets' usable entries at the run's instant;
 // after the edit they must be a subset of those, except for a rotation's new
 // primary (the old primary, which the new block holds, is a key usable now).
@@ -98,28 +99,23 @@ func (p *Prepared) revived(after config.RetiringReport, primaries map[string]mtg
 
 	for _, entry := range after.Usable {
 		if !allowed(entry.Secret.Key) {
-			return entry.Name, true
+			return p.labelFor(entry.Name, entry.Secret.Key, entry.Until), true
 		}
 	}
 
 	for _, name := range slices.Sorted(maps.Keys(primaries)) {
 		if !allowed(primaries[name].Key) {
-			return name, true
+			return "the primary key of " + shown(name), true
 		}
 	}
 
 	return "", false
 }
 
-// revivalError is ErrKeyRevived for the block of name that would come back;
-// a name that reads as a value is not shown.
-func revivalError(name string) error {
-	what := fmt.Sprintf("a block for name %q would come back", name)
-	if name == "" || readsAsAValue(name) {
-		what = "a block whose name is not shown would come back"
-	}
-
-	return fmt.Errorf("%w (%s); remove or change that block first", ErrKeyRevived, what)
+// revivalError is ErrKeyRevived for the block labelled so that would come
+// back.
+func revivalError(label string) error {
+	return fmt.Errorf("%w (%s would come back); remove or change that block first", ErrKeyRevived, label)
 }
 
 // setPrimary puts s in c as the name's primary, on a copy of the map.

@@ -412,14 +412,17 @@ func TestABadSpliceIsCaught(t *testing.T) {
 		})
 	}
 
-	// No seam: a new key that is another name's retiring key gives that
-	// entry a problem the file did not have, which only the re-parse can see.
+	// No seam: a new key that is another name's retiring key would give that
+	// entry a problem the file did not have. Apply refuses such a key before
+	// any edit (TestApplyRefusesAKeyTheFileAlreadyHolds); that the re-parse
+	// would catch the problem line too is pinned by
+	// TestTheVerificationAloneRefusesWhatTheSimulationWould.
 	t.Run("a new key that another name's block holds", func(t *testing.T) {
 		prepared, err := Prepare(spliceDoc(), req)
 		require.NoError(t, err)
 
 		out, err := prepared.Apply(mtglib.Secret{Key: mustKey(keyOld1), Host: "storage.googleapis.com"})
-		require.ErrorIs(t, err, ErrEditVerification)
+		require.ErrorIs(t, err, errKeyHeld)
 		assert.Nil(t, out)
 	})
 }
@@ -600,6 +603,108 @@ func blockOf(name, value, until string) string {
 	return "[[retiring-secret]]\nname   = " + quoted(name) + "\nsecret = " + quoted(value) + "\nuntil  = " + quoted(until) + "\n"
 }
 
+// mistypedBlock is a block whose name is a number: a problem the file
+// already has, which claims no key.
+func mistypedBlock() string {
+	return "[[retiring-secret]]\nname   = 7\nsecret = " + quoted(ee(keyOld1)) + "\nuntil  = " + quoted(at(time.Hour)) + "\n"
+}
+
+// refusal is a document and a request Prepare refuses, and a part of the
+// refusal's text.
+type refusal struct {
+	name string
+	doc  []byte
+	req  Request
+	want string
+}
+
+// holderWant is the refusal of a rotation of alice after which a block of the
+// file, the n-th, would still accept her current key until two days on.
+func holderWant(n int, holder string) string {
+	return fmt.Sprintf(`the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z `+
+		`by retiring-secret #%d (name %q); rotate-secret <config> %q --end-overlap ends every previous key of %q; `+
+		`or edit the block by hand`, n, holder, holder, holder)
+}
+
+// holderRefusals are the rotations ruling (a) refuses: a block other than
+// the new one would keep the current key accepted, beyond the until asked or
+// after an overlap of 0. The block is named by its place in the file as it is.
+func holderRefusals() []refusal {
+	rotate := Request{Name: "alice", Rotate: true, Until: testUntil, Now: testNow}
+	overlap0 := Request{Name: "alice", Rotate: true, Now: testNow}
+
+	pruning := rotate
+	pruning.Prune = true
+
+	return []refusal{
+		{
+			name: "a block of the name holding its key for longer",
+			doc:  refusalDoc(blockOf("alice", ee(keyAlice), at(48*time.Hour))),
+			req:  rotate,
+			want: holderWant(1, "alice"),
+		},
+		{
+			name: "the same, with an overlap of 0",
+			doc:  refusalDoc(blockOf("alice", ee(keyAlice), at(48*time.Hour))),
+			req:  overlap0,
+			want: holderWant(1, "alice"),
+		},
+		{
+			// #2 in the file, #1 in the edited file once the block above
+			// it is pruned.
+			name: "a block of the name holding its key, below a block the run prunes",
+			doc:  refusalDoc(blockOf("alice", ee(keyOld1), at(-time.Hour)), blockOf("alice", ee(keyAlice), at(48*time.Hour))),
+			req:  pruning,
+			want: holderWant(2, "alice"),
+		},
+		{
+			name: "another name's block holding the key, with an overlap of 0",
+			doc:  refusalDoc(blockOf("bob", ee(keyOld1), at(time.Hour)), blockOf("bob", ee(keyAlice), at(48*time.Hour))),
+			req:  overlap0,
+			want: holderWant(2, "bob"),
+		},
+	}
+}
+
+// collisionWant is the refusal of a rotation whose new block rule 5 would
+// drop, because the block labelled so holds the key being retired.
+func collisionWant(label string) string {
+	return label + " already holds the key being retired, so the new block would be ignored; " +
+		"remove that block (--prune removes it if it has expired) and rotate again"
+}
+
+// collisionRefusals are the rotations whose new block would be ignored at
+// once: another name already claims the key being retired, by a block --
+// expired or dangling ones too, rule 5 judges them all -- or as its primary.
+func collisionRefusals() []refusal {
+	rotate := Request{Name: "alice", Rotate: true, Until: testUntil, Now: testNow}
+
+	return []refusal{
+		{
+			name: "another name's block that the new one would collide with",
+			doc:  refusalDoc(blockOf("bob", ee(keyAlice), at(48*time.Hour))),
+			req:  rotate,
+			want: collisionWant(`retiring-secret #1 (name "bob")`),
+		},
+		{
+			// In the edited file the new block would be #2: the refusal
+			// names carol's real #2, not the new block.
+			name: "an expired block of a name no longer served, below a mistyped one",
+			doc:  refusalDoc(mistypedBlock(), blockOf("carol", ee(keyAlice), at(-time.Hour))),
+			req:  rotate,
+			want: collisionWant(`retiring-secret #2 (name "carol")`),
+		},
+		{
+			name: "another secret whose primary is the same key",
+			doc: lines(`bind-to = "0.0.0.0:3128"`, ``, `[secrets]`,
+				`alice = `+quoted(ee(keyAlice)), `bob = `+quoted(ee(keyAlice))),
+			req: rotate,
+			want: `the key being retired is also the primary key of "bob", so the new block would be ignored; ` +
+				`two secrets share one key: give each its own, then rotate`,
+		},
+	}
+}
+
 // The pure half of R9, and every other refusal of step 1: none of them
 // carries a value.
 func TestPrepareRefuses(t *testing.T) {
@@ -621,12 +726,7 @@ func TestPrepareRefuses(t *testing.T) {
 		blockOf("alice", ee(keyOld4), at(4*time.Hour)),
 	}
 
-	for _, tc := range []struct {
-		name string
-		doc  []byte
-		req  Request
-		want string
-	}{
+	for _, tc := range append(append([]refusal{
 		{
 			name: "a UTF-8 byte-order mark",
 			doc:  append([]byte("\xef\xbb\xbf"), refusalDoc()...),
@@ -713,40 +813,10 @@ func TestPrepareRefuses(t *testing.T) {
 			want: "is more than 720h after now",
 		},
 		{
-			name: "a block of the name holding its key for longer",
-			doc:  refusalDoc(blockOf("alice", ee(keyAlice), at(48*time.Hour))),
+			name: "a static array where the blocks belong",
+			doc:  lines(`bind-to = "0.0.0.0:3128"`, `retiring-secret = []`, ``, `[secrets]`, `alice = `+quoted(ee(keyAlice))),
 			req:  rotate,
-			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z ` +
-				`by retiring-secret #1 (name "alice"); remove that block with --end-overlap or --prune, or edit it, then rotate`,
-		},
-		{
-			name: "the same, with an overlap of 0",
-			doc:  refusalDoc(blockOf("alice", ee(keyAlice), at(48*time.Hour))),
-			req:  with(func(r *Request) { r.Until = time.Time{} }),
-			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z ` +
-				`by retiring-secret #1 (name "alice"); remove that block with --end-overlap or --prune, or edit it, then rotate`,
-		},
-		{
-			// The block is named by its place in the file as it is, not in
-			// the edited one, where the pruned block above it is gone.
-			name: "a block of the name holding its key, below a block the run prunes",
-			doc:  refusalDoc(blockOf("alice", ee(keyOld1), at(-time.Hour)), blockOf("alice", ee(keyAlice), at(48*time.Hour))),
-			req:  with(func(r *Request) { r.Prune = true }),
-			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z ` +
-				`by retiring-secret #2 (name "alice"); remove that block with --end-overlap or --prune, or edit it, then rotate`,
-		},
-		{
-			name: "another name's block holding the key, with an overlap of 0",
-			doc:  refusalDoc(blockOf("bob", ee(keyOld1), at(time.Hour)), blockOf("bob", ee(keyAlice), at(48*time.Hour))),
-			req:  with(func(r *Request) { r.Until = time.Time{} }),
-			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z ` +
-				`by retiring-secret #2 (name "bob"); remove that block with --end-overlap or --prune, or edit it, then rotate`,
-		},
-		{
-			name: "another name's block that the new one would collide with",
-			doc:  refusalDoc(blockOf("bob", ee(keyAlice), at(48*time.Hour))),
-			req:  rotate,
-			want: "retiring-secret #2 (name \"alice\"): the key is also the key of a retiring-secret entry of another name",
+			want: "not all [[retiring-secret]] blocks",
 		},
 		{
 			name: "rotate and end-overlap at once",
@@ -784,7 +854,7 @@ func TestPrepareRefuses(t *testing.T) {
 			req:  with(func(r *Request) { r.Now = time.Time{} }),
 			want: "the run's instant is not set",
 		},
-	} {
+	}, holderRefusals()...), collisionRefusals()...) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -811,6 +881,13 @@ func TestPrepareRefuses(t *testing.T) {
 	}{
 		{name: "an overlap of 0 beside four entries", doc: refusalDoc(four...), req: with(func(r *Request) { r.Until = time.Time{} })},
 		{name: "a single-table block with an overlap of 0", doc: refusalDoc(strings.Replace(blockOf("bob", ee(keyOld1), at(time.Hour)), "[[retiring-secret]]", "[retiring-secret]", 1)), req: with(func(r *Request) { r.Until = time.Time{} })},
+		{
+			// The remedy the collision refusal gives: --prune removes the
+			// expired block that held the key, and the rotation goes through.
+			name: "the rotation the collision refused, with --prune",
+			doc:  refusalDoc(mistypedBlock(), blockOf("carol", ee(keyAlice), at(-time.Hour))),
+			req:  with(func(r *Request) { r.Prune = true }),
+		},
 		{name: "--prune with nothing to prune", doc: refusalDoc(), req: Request{Prune: true, Now: testNow}, noOp: true},
 		{name: "--end-overlap for a name without blocks", doc: refusalDoc(), req: Request{Name: "bob", EndOverlap: true, Now: testNow}, noOp: true},
 	} {
@@ -1193,7 +1270,8 @@ func TestLineEndingsFollowTheFile(t *testing.T) {
 
 // --end-overlap right after a rotation gives back the file as it was, but for
 // the new value: the block's blank line goes with it, before [secrets] and at
-// the end of the file alike.
+// the end of the file alike. (Not for a file that ends in blank lines: the cut
+// at the end takes those too. None of these fixtures does.)
 func TestEndingTheOverlapUndoesTheBlock(t *testing.T) {
 	t.Parallel()
 
@@ -1264,32 +1342,35 @@ func overCapDoc() []byte {
 	return []byte(doc.String())
 }
 
-// R0 for the tool: an edit never makes a key usable that nothing accepts now.
-// Removing one block of a colliding pair (rule 5, judged against expired
-// entries too) would bring the other name's copy back, and freeing room under
-// the overall cap (rule 8) would bring back the entries it dropped; either
-// refuses, value-free, and nothing is written. A block added by a rotation can
-// only make rules stricter for the others, so a rotation revives only through
-// the blocks it prunes.
-func TestAnEditNeverMakesADeadKeyUsable(t *testing.T) {
-	t.Parallel()
+// revival is a run that would make a dead key usable again, and the label of
+// the block that would come back; a clean run has none.
+type revival struct {
+	name string
+	doc  []byte
+	req  Request
+	back string
+}
 
+// revivalWant is the refusal of a run that would bring the block labelled so
+// back.
+func revivalWant(label string) string {
+	return "removing these blocks would make a key usable again that is not accepted now " +
+		"(" + label + " would come back); remove or change that block first"
+}
+
+// revivalCases are the runs ruling (b) refuses, and clean ones it must not.
+func revivalCases() []revival {
 	collidingPair := []string{
 		blockOf("alice", ee(keyOld1), at(-time.Hour)),
 		blockOf("bob", ee(keyOld1), at(time.Hour)),
 	}
 
-	for _, tc := range []struct {
-		name  string
-		doc   []byte
-		req   Request
-		named string // the name of the block that would come back; empty for a clean case
-	}{
+	return []revival{
 		{
-			name:  "--prune of one block of a colliding pair",
-			doc:   refusalDoc(collidingPair...),
-			req:   Request{Prune: true, Now: testNow},
-			named: "bob",
+			name: "--prune of one block of a colliding pair",
+			doc:  refusalDoc(collidingPair...),
+			req:  Request{Prune: true, Now: testNow},
+			back: `retiring-secret #2 (name "bob")`,
 		},
 		{
 			// alice's live block goes and bob's dead one comes back: as many
@@ -1299,20 +1380,21 @@ func TestAnEditNeverMakesADeadKeyUsable(t *testing.T) {
 				blockOf("alice", ee(keyOld2), at(2*time.Hour)),
 				collidingPair[0], collidingPair[1],
 			),
-			req:   Request{Name: "alice", EndOverlap: true, Now: testNow},
-			named: "bob",
+			req:  Request{Name: "alice", EndOverlap: true, Now: testNow},
+			back: `retiring-secret #3 (name "bob")`,
 		},
 		{
-			name:  "a rotation whose prune would revive the other block of a pair",
-			doc:   refusalDoc(collidingPair...),
-			req:   Request{Name: "alice", Rotate: true, Until: testUntil, Prune: true, Now: testNow},
-			named: "bob",
+			name: "a rotation whose prune would revive the other block of a pair",
+			doc:  refusalDoc(collidingPair...),
+			req:  Request{Name: "alice", Rotate: true, Until: testUntil, Prune: true, Now: testNow},
+			back: `retiring-secret #2 (name "bob")`,
 		},
 		{
-			name:  "--end-overlap that frees room under the overall cap",
-			doc:   overCapDoc(),
-			req:   Request{Name: "u1024", EndOverlap: true, Now: testNow},
-			named: "u0000",
+			// u0000 has four blocks; the refusal says which comes back first.
+			name: "--end-overlap that frees room under the overall cap",
+			doc:  overCapDoc(),
+			req:  Request{Name: "u1024", EndOverlap: true, Now: testNow},
+			back: `retiring-secret #1 (name "u0000")`,
 		},
 		{
 			name: "clean: --prune where the pair still collides with a third block",
@@ -1329,13 +1411,26 @@ func TestAnEditNeverMakesADeadKeyUsable(t *testing.T) {
 			doc:  refusalDoc(blockOf("alice", ee(keyOld1), at(-time.Hour)), blockOf("bob", ee(keyOld2), at(time.Hour))),
 			req:  Request{Name: "alice", Rotate: true, Until: testUntil, Prune: true, Now: testNow},
 		},
-	} {
+	}
+}
+
+// R0 for the tool: an edit never makes a key usable that nothing accepts now.
+// Removing one block of a colliding pair (rule 5, judged against expired
+// entries too) would bring the other name's copy back, and freeing room under
+// the overall cap (rule 8) would bring back the entries it dropped; either
+// refuses, value-free, naming the block as the file is written, and nothing
+// is written. A block added by a rotation can only make rules stricter for
+// the others, so a rotation revives only through the blocks it prunes.
+func TestAnEditNeverMakesADeadKeyUsable(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range revivalCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			prepared, err := Prepare(tc.doc, tc.req)
 
-			if tc.named == "" {
+			if tc.back == "" {
 				require.NoError(t, err)
 
 				_, err = prepared.Apply(newPrimaryLike(prepared.Primary()))
@@ -1347,8 +1442,261 @@ func TestAnEditNeverMakesADeadKeyUsable(t *testing.T) {
 			require.ErrorIs(t, err, ErrKeyRevived)
 			assert.Nil(t, prepared, "nothing to write")
 			require.Empty(t, leaks(err.Error()), "the refusal carries no value")
-			assert.Equal(t, "removing these blocks would make a key usable again that is not accepted now "+
-				`(a block for name "`+tc.named+`" would come back); remove or change that block first`, err.Error())
+			assert.Equal(t, revivalWant(tc.back), err.Error())
+		})
+	}
+}
+
+// prepareWithoutSimulation is Prepare without its judgement of the planned
+// edit (simulate): what is left between a bad edit and the bytes Apply would
+// return is Apply's own verification.
+func prepareWithoutSimulation(t *testing.T, doc []byte, req Request) *Prepared {
+	t.Helper()
+
+	prepared, err := plan(doc, req)
+	require.NoError(t, err)
+
+	prepared.summary = prepared.summarise()
+
+	return prepared
+}
+
+// The verification's own halves of the guards Prepare's simulation applies
+// first: with the simulation skipped, Apply still refuses every revival
+// (ErrKeyRevived), every rotation a block would undo, every new block rule 5
+// or the cap would drop, and every new block that would push another out
+// (ErrEditVerification), and returns nothing; the clean runs still pass.
+func TestTheVerificationAloneRefusesWhatTheSimulationWould(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range revivalCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			prepared := prepareWithoutSimulation(t, tc.doc, tc.req)
+
+			out, err := prepared.Apply(newPrimaryLike(prepared.Primary()))
+			if tc.back == "" {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.ErrorIs(t, err, ErrKeyRevived)
+			assert.Nil(t, out)
+			require.Empty(t, leaks(err.Error()), "the refusal carries no value")
+			assert.Equal(t, revivalWant(tc.back), err.Error())
+		})
+	}
+
+	for _, tc := range append(append(holderRefusals(), collisionRefusals()...), newProblemRefusals()...) {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			prepared := prepareWithoutSimulation(t, tc.doc, tc.req)
+
+			out, err := prepared.Apply(newPrimaryLike(prepared.Primary()))
+			require.ErrorIs(t, err, ErrEditVerification)
+			assert.Nil(t, out)
+		})
+	}
+}
+
+// fullCapDoc is a file at the overall cap: 1,024 names with 4 unexpired
+// blocks each, 4,096 entries, the first until first+0m, each later one a
+// minute after the one before; and a user zed with none. With last, the first
+// (and earliest) block is written after [secrets], at the end of the file.
+func fullCapDoc(first time.Duration, last bool) []byte {
+	const names = 1024
+
+	var (
+		doc   strings.Builder
+		moved string
+	)
+
+	doc.WriteString("bind-to = \"0.0.0.0:3128\"\n\n")
+
+	for i := range names * mtglib.MaxRetiringPerSecret {
+		until := testNow.Add(first + time.Duration(i)*time.Minute).Format(time.RFC3339)
+		block := blockOf(fmt.Sprintf("u%04d", i/mtglib.MaxRetiringPerSecret), ee(fmt.Sprintf("%032x", i+1)), until) + "\n"
+
+		if i == 0 && last {
+			moved = block
+
+			continue
+		}
+
+		doc.WriteString(block)
+	}
+
+	doc.WriteString("[secrets]\n")
+
+	for n := range names {
+		fmt.Fprintf(&doc, "u%04d = %q\n", n, ee(fmt.Sprintf("f%031x", n+1)))
+	}
+
+	fmt.Fprintf(&doc, "zed = %q\n", ee(keyOld6))
+
+	if moved != "" {
+		doc.WriteString("\n" + moved)
+	}
+
+	return []byte(doc.String())
+}
+
+// newProblemRefusals are rotations of zed in a file at the overall cap, whose
+// new block would give a block a problem line the file does not have.
+func newProblemRefusals() []refusal {
+	const overCap = ": more than 4096 unexpired entries in all; only the 4096 with the latest until are kept" +
+		"; the entry is ignored and its key is not accepted"
+
+	rotate := Request{Name: "zed", Rotate: true, Until: testUntil, Now: testNow}
+
+	return []refusal{
+		{
+			// Every other entry ends later, so the cap drops the new one.
+			name: "the new block, which the overall cap would drop",
+			doc:  fullCapDoc(25*time.Hour, false),
+			req:  rotate,
+			want: `the new block (name "zed")` + overCap,
+		},
+		{
+			// The earliest block is the file's last, #4096; in the edited
+			// file the new block comes before it and it is #4097. The new
+			// block itself stays honoured: only the problem line tells.
+			name: "an existing block the new one would push out, after [secrets]",
+			doc:  fullCapDoc(time.Hour, true),
+			req:  rotate,
+			want: `retiring-secret #4096 (name "u0000")` + overCap,
+		},
+	}
+}
+
+// A problem the edit would add is named as the file is written: an existing
+// block by its place in the file as it is, the new block as the new block --
+// never by a place in the edited file, which may be another block's.
+func TestANewProblemIsNamedAsTheFileIsWritten(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range newProblemRefusals() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			prepared, err := Prepare(tc.doc, tc.req)
+			require.Error(t, err)
+			assert.Nil(t, prepared)
+			require.Empty(t, leaks(err.Error()), "the refusal carries no value")
+			assert.Equal(t, "the edit would add a problem the file does not have: "+tc.want, err.Error())
+		})
+	}
+}
+
+// A name asked for that reads as a value -- here a user named by alice's key
+// in hex -- is never echoed: not in the Summary, which leaves it empty (9b
+// prints its own label then), and not in any refusal.
+func TestARequestedNameThatReadsAsAValueIsNeverEchoed(t *testing.T) {
+	t.Parallel()
+
+	named := keyAlice // a user's name that is alice's key in hex
+	users := func(value string) []string {
+		return []string{`[secrets]`, `alice = ` + quoted(ee(keyAlice)), named + ` = ` + value}
+	}
+	doc := func(blocks ...string) []byte {
+		return lines(append(append([]string{`bind-to = "0.0.0.0:3128"`, ``}, blocks...), users(quoted(ee(keyBob)))...)...)
+	}
+	rotate := Request{Name: named, Rotate: true, Until: testUntil, Now: testNow}
+
+	t.Run("the Summary", func(t *testing.T) {
+		t.Parallel()
+
+		prepared, err := Prepare(doc(), rotate)
+		require.NoError(t, err)
+
+		summary := prepared.Summary()
+		require.Empty(t, leaks(fmt.Sprintf("%#v", summary)), "the summary carries no value")
+		assert.Empty(t, summary.Name, "a name that reads as a value is left out")
+
+		_, err = prepared.Apply(newPrimaryLike(prepared.Primary()))
+		require.NoError(t, err)
+	})
+
+	for _, tc := range []refusal{
+		{
+			name: "a multi-line value",
+			doc:  lines(append([]string{`bind-to = "0.0.0.0:3128"`, ``}, users(`"""`+ee(keyBob)+`"""`)...)...),
+			req:  rotate,
+			want: "is a multi-line string",
+		},
+		{
+			name: "a fifth unexpired entry",
+			doc: doc(
+				blockOf(named, ee(keyOld1), at(time.Hour)), blockOf(named, ee(keyOld2), at(2*time.Hour)),
+				blockOf(named, ee(keyOld3), at(3*time.Hour)), blockOf(named, ee(keyOld4), at(4*time.Hour)),
+			),
+			req:  rotate,
+			want: "already has 4 unexpired previous keys",
+		},
+		{
+			name: "a block holding the current key",
+			doc:  doc(blockOf(named, ee(keyBob), at(48*time.Hour))),
+			req:  rotate,
+			want: "would still be accepted until 2026-10-10T09:30:00Z by retiring-secret #1;",
+		},
+		{
+			name: "a block of that name the new one would collide with",
+			doc:  doc(blockOf(named, ee(keyAlice), at(48*time.Hour))),
+			req:  Request{Name: "alice", Rotate: true, Until: testUntil, Now: testNow},
+			want: collisionWant("retiring-secret #1"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := Prepare(tc.doc, tc.req)
+			require.Error(t, err)
+			require.Empty(t, leaks(err.Error()), "the refusal carries no value")
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// M4: Apply refuses a new key the file already holds -- any primary's, or the
+// key of any entry that parses, expired, dangling or a problem -- before any
+// edit, in words and value-free. Generation never draws one; this is the
+// guard behind it.
+func TestApplyRefusesAKeyTheFileAlreadyHolds(t *testing.T) {
+	t.Parallel()
+
+	doc := refusalDoc(
+		blockOf("carol", ee(keyOld1), at(-time.Hour)),
+		blockOf("bob", ee(keyOld2), at(time.Hour)),
+		blockOf("bob", dd(keyOld3), "tomorrow"),
+	)
+
+	for _, tc := range []struct {
+		name string
+		key  string
+	}{
+		{"another secret's primary", keyBob},
+		{"an expired block of a name no longer served", keyOld1},
+		{"an unexpired block of another name", keyOld2},
+		{"a problem block", keyOld3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			prepared, err := Prepare(doc, Request{Name: "alice", Rotate: true, Until: testUntil, Now: testNow})
+			require.NoError(t, err)
+
+			newPrimary := prepared.Primary()
+			newPrimary.Key = mustKey(tc.key)
+
+			out, err := prepared.Apply(newPrimary)
+			require.ErrorIs(t, err, errKeyHeld)
+			assert.Nil(t, out)
+			require.Empty(t, leaks(err.Error()), "the refusal carries no value")
+			assert.Equal(t, "the new key is already held by this file, as a primary or a previous key; generate another",
+				err.Error())
 		})
 	}
 }

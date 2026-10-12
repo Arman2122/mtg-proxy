@@ -52,6 +52,12 @@ type layout struct {
 	blocks       []block      // every retiring-secret block, in file order
 	secrets      int          // the index in headers of [secrets], or -1
 	target       stringValue  // the value at the path locate was asked for
+
+	// retiringKey is a key of the top level whose path starts with
+	// retiring-secret -- retiring-secret = [] or = [{…}], or a dotted
+	// retiring-secret.name = …: entries, or none, written other than as
+	// blocks, which a new block beside them would make invalid TOML.
+	retiringKey bool
 }
 
 // locate maps doc with go-toml's unstable parser, comments kept. A key's path
@@ -184,6 +190,10 @@ func (l *layout) visit(kv *unstable.Node, table, target []string, inBlock int) {
 		path = append(path, string(keys.Node().Data))
 	}
 
+	if len(table) == 0 && path[0] == retiringTable {
+		l.retiringKey = true
+	}
+
 	value := kv.Value()
 
 	if value.Kind == unstable.InlineTable {
@@ -241,6 +251,11 @@ type span struct {
 // comment go with the block. A comment above a block's own header is not the
 // block's and stays. A range that reaches the end of the document also takes
 // the blank lines above it.
+//
+// So --end-overlap right after a rotation gives the file back as it was, the
+// new value aside -- unless the file ended in blank or whitespace-only lines:
+// the block was appended after them, and the cut that removes it from the end
+// takes them too.
 func (l *layout) cuts(blocks []block) []span {
 	cuts := make([]span, 0, len(blocks))
 

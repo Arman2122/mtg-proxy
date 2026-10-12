@@ -31,9 +31,15 @@ func (p *Prepared) ValueText(s mtglib.Secret) string {
 // primary's string node between its own quotes, the removed blocks cut, and
 // the new block inserted before [secrets] -- or, without a [secrets] header,
 // appended at the end of the file, after a newline if the file lacks a final
-// one. Line endings follow the file, and a file without a final newline keeps
-// none. It reports false when two edits overlap, which a correct layout never
+// one. It reports false when two edits overlap, which a correct layout never
 // gives.
+//
+// Line endings follow the file: new text uses the ending of the file's first
+// line (CRLF when it ends so), and every kept line keeps its own, so a file of
+// mixed endings stays mixed. A file without a final newline keeps none. One
+// corner of a mixed file without a final newline: when a cut reaches the end
+// and a block is then appended, the last kept line, whose ending the cut had
+// trimmed, gets the first line's ending.
 func (p *Prepared) splice(newPrimary mtglib.Secret) ([]byte, bool) {
 	edits := slices.Clone(p.cuts)
 

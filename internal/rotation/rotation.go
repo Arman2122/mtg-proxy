@@ -1,7 +1,11 @@
 // Package rotation is the edit mtg-proxy rotate-secret makes to an
 // operator's config file (spec §7.3), as pure functions over bytes: no
 // filesystem, no network, no clock -- the run's one instant is a field of the
-// request.
+// request. Pure, that is, up to the config layer's own types: config.Parse,
+// which the verification must use, stats the file paths listed under
+// [defense.blocklist] and [defense.allowlist] (os.Stat, filepath.Abs). A list
+// file that appears or goes between the two parses makes them differ, and the
+// edit then fails closed.
 //
 // The file is edited surgically, never re-marshalled, so its comments, order,
 // quoting and line endings survive: go-toml's unstable parser locates byte
@@ -21,7 +25,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +59,10 @@ type Request struct {
 
 // Summary is what a run does, for people: never a value.
 type Summary struct {
+	// Name is the name the run was asked for -- empty for --prune alone, and
+	// also empty when the name reads as a secret value (a user named by a
+	// key's hex, say), which is never echoed: the caller then prints a label
+	// of its own, such as "the secret you named".
 	Name string
 
 	// Until is the instant the new block keeps the current key until, as
@@ -82,6 +92,9 @@ var ErrEditVerification = errors.New("internal error: the edit changed more than
 // ErrKeyRevived is an edit that would make a key usable that nothing accepts
 // now. The error returned wraps it and names the block that would come back.
 var ErrKeyRevived = errors.New("removing these blocks would make a key usable again that is not accepted now")
+
+// errKeyHeld is a new primary whose key the file already holds.
+var errKeyHeld = errors.New("the new key is already held by this file, as a primary or a previous key; generate another")
 
 // Prepared is a request judged against a document: located, checked, and
 // ready to Apply.
@@ -127,6 +140,25 @@ type Prepared struct {
 // the tool's own edits too); or the current key still accepted after the
 // rotation by a block other than the new one. Nothing is generated here.
 func Prepare(doc []byte, req Request) (*Prepared, error) {
+	p, err := plan(doc, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := p.simulate(); err != nil {
+		return nil, err
+	}
+
+	p.summary = p.summarise()
+
+	return p, nil
+}
+
+// plan is Prepare but for judging the planned edit (simulate): it reads and
+// checks the file and the request, locates, and works out the edit -- the
+// removals, the new block, the entries and unknown keys the edited file must
+// parse to.
+func plan(doc []byte, req Request) (*Prepared, error) {
 	if err := checkRequest(req); err != nil {
 		return nil, err
 	}
@@ -159,9 +191,10 @@ func Prepare(doc []byte, req Request) (*Prepared, error) {
 		return nil, err
 	}
 
-	if len(p.loc.blocks) != len(conf.RetiringSecrets) {
+	if p.loc.retiringKey || len(p.loc.blocks) != len(conf.RetiringSecrets) {
 		return nil, errors.New("the file's retiring-secret entries are not all [[retiring-secret]] blocks " +
-			"(an inline array of tables?); rotate-secret edits only blocks: rewrite them as blocks and retry")
+			"(an inline array of tables, or a retiring-secret key?); rotate-secret edits only blocks: " +
+			"rewrite them as blocks and retry")
 	}
 
 	if err := p.locatePrimary(); err != nil {
@@ -180,12 +213,6 @@ func Prepare(doc []byte, req Request) (*Prepared, error) {
 	}
 
 	p.expected, p.expectedFrom = p.expectedEntries()
-
-	if err := p.simulate(); err != nil {
-		return nil, err
-	}
-
-	p.summary = p.summarise()
 
 	return p, nil
 }
@@ -246,15 +273,27 @@ func (p *Prepared) locatePrimary() error {
 	}
 
 	if !value.found || value.notString {
-		return fmt.Errorf("the value of %q cannot be found in the file for editing; edit it by hand", p.req.Name)
+		return fmt.Errorf("the value of %s cannot be found in the file for editing; edit it by hand", shown(p.req.Name))
 	}
 
 	if raw := p.doc[value.start:value.end]; bytes.HasPrefix(raw, []byte(`"""`)) || bytes.HasPrefix(raw, []byte(`'''`)) {
-		return fmt.Errorf("the value of %q is a multi-line string, which rotate-secret does not edit: "+
-			`write it on one line, between "" or '', and retry`, p.req.Name)
+		return fmt.Errorf("the value of %s is a multi-line string, which rotate-secret does not edit: "+
+			`write it on one line, between "" or '', and retry`, shown(p.req.Name))
 	}
 
 	return nil
+}
+
+// shown is a name as a message shows it: quoted, or, when it reads as a
+// secret value (readsAsAValue: a user named by a key's hex, say), a phrase in
+// its place. The name a run was asked for goes through it wherever it is
+// echoed, as every block's name does through entryLabel.
+func shown(name string) string {
+	if readsAsAValue(name) {
+		return "the secret asked for (its name reads as a secret value and is not shown)"
+	}
+
+	return fmt.Sprintf("%q", name)
 }
 
 // isHex reports whether text decodes as hex, the first spelling
@@ -327,8 +366,8 @@ func (p *Prepared) checkNewBlock() error {
 	}
 
 	if held >= mtglib.MaxRetiringPerSecret {
-		return fmt.Errorf("%q already has %d unexpired previous keys, the most one secret can have: "+
-			"end them with --end-overlap, or wait for one to expire, and retry", p.req.Name, held)
+		return fmt.Errorf("%s already has %d unexpired previous keys, the most one secret can have: "+
+			"end them with --end-overlap, or wait for one to expire, and retry", shown(p.req.Name), held)
 	}
 
 	return nil
@@ -400,11 +439,22 @@ func (p *Prepared) simulate() error {
 	report := sim.GetRetiringSecrets(p.req.Now)
 
 	if added := newLines(p.report.Lines, report.Lines); len(added) > 0 {
-		return errors.New("the edit would add a problem the file does not have: " + strings.Join(added, "; and "))
+		if p.addBlock && p.newBlockHasLine(added) {
+			if refusal := p.collision(sim.GetSecrets()); refusal != nil {
+				return refusal
+			}
+		}
+
+		named := make([]string, 0, len(added))
+		for _, line := range added {
+			named = append(named, p.asWritten(line))
+		}
+
+		return errors.New("the edit would add a problem the file does not have: " + strings.Join(named, "; and "))
 	}
 
-	if name, revived := p.revived(report, sim.GetSecrets(), placeholder); revived {
-		return revivalError(name)
+	if label, revived := p.revived(report, sim.GetSecrets(), placeholder); revived {
+		return revivalError(label)
 	}
 
 	if !p.req.Rotate {
@@ -412,18 +462,130 @@ func (p *Prepared) simulate() error {
 	}
 
 	if holder, until, held := p.keyStillHeld(report); held {
-		return fmt.Errorf("the current key of %q would still be accepted until %s by %s; "+
-			"remove that block with --end-overlap or --prune, or edit it, then rotate",
-			p.req.Name, until.UTC().Format(time.RFC3339), p.holderLabel(holder, until))
+		return fmt.Errorf("the current key of %s would still be accepted until %s by %s; %s",
+			shown(p.req.Name), until.UTC().Format(time.RFC3339),
+			p.labelFor(holder, p.primary.Key, until), endOverlapAdvice(holder))
 	}
 
 	return nil
 }
 
-// holderLabel names, as the config layer labels its entries, the block of the
-// file that keyStillHeld found holding the current key: its position in the
-// file and, unless it reads as a value, its name.
-func (p *Prepared) holderLabel(name string, until time.Time) string {
+// endOverlapAdvice says how to remove a block of holder: --end-overlap for
+// that name, which ends every previous key of it, or an edit by hand. The
+// holder is always unexpired (keyStillHeld reads what is usable now), so
+// --prune would not remove it.
+func endOverlapAdvice(holder string) string {
+	if readsAsAValue(holder) {
+		return "rotate-secret <config> <that name> --end-overlap ends every previous key of that name; " +
+			"or edit the block by hand"
+	}
+
+	return fmt.Sprintf("rotate-secret <config> %q --end-overlap ends every previous key of %q; "+
+		"or edit the block by hand", holder, holder)
+}
+
+// newBlockHasLine reports whether one of the lines the edit would add is the
+// new block's: it carries the new block's position in the edited file.
+func (p *Prepared) newBlockHasLine(added []string) bool {
+	at := slices.Index(p.expectedFrom, -1)
+	if at < 0 {
+		return false
+	}
+
+	for _, line := range added {
+		if n, _, labelled := position(line); labelled && n == at+1 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// collision explains a new block that rule 5 would drop at once: another
+// name already claims the key being retired, by a block of the file (expired
+// and dangling ones too: rule 5 judges every entry that passes rule 1) or as
+// its primary. Nil when no such claim is found, and the caller words the
+// problem lines instead.
+func (p *Prepared) collision(primaries map[string]mtglib.Secret) error {
+	for i, entry := range p.expected {
+		from := p.expectedFrom[i]
+		if from < 0 || entry.Name == p.req.Name || !p.claimsAKey(from) {
+			continue
+		}
+
+		if secret, _ := mtglib.ParseSecret(entry.Secret); secret.Key == p.primary.Key {
+			return fmt.Errorf("%s already holds the key being retired, so the new block would be ignored; "+
+				"remove that block (--prune removes it if it has expired) and rotate again",
+				entryLabel(from+1, entry.Name))
+		}
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(primaries)) {
+		if name != p.req.Name && primaries[name].Key == p.primary.Key {
+			return fmt.Errorf("the key being retired is also the primary key of %s, so the new block would be ignored; "+
+				"two secrets share one key: give each its own, then rotate", shown(name))
+		}
+	}
+
+	return nil
+}
+
+// claimsAKey reports whether the i-th entry of the file passes rule 1 and so
+// claims its key under rule 5: a name that is a non-empty string, a valid
+// secret, and an RFC 3339 until.
+func (p *Prepared) claimsAKey(i int) bool {
+	entry := p.conf.RetiringSecrets[i]
+
+	secret, secretErr := mtglib.ParseSecret(entry.Secret)
+	_, untilErr := time.Parse(time.RFC3339Nano, entry.Until)
+
+	return p.loc.blocks[i].nameIsString && entry.Name != "" && secretErr == nil && secret.Valid() && untilErr == nil
+}
+
+// asWritten is a line of the edited file's report in the file's own terms:
+// an existing block by its position in the file as it is, the new block as
+// "the new block". The config layer numbers entries by their place in the
+// edited file, which may be another block's place in this one.
+func (p *Prepared) asWritten(line string) string {
+	n, rest, labelled := position(line)
+	if !labelled || n < 1 || n > len(p.expectedFrom) {
+		return line
+	}
+
+	if from := p.expectedFrom[n-1]; from >= 0 {
+		return fmt.Sprintf("%s #%d%s", retiringTable, from+1, rest)
+	}
+
+	return "the new block" + rest
+}
+
+// position splits a line labelled "retiring-secret #<n>" into n and what
+// follows the number.
+func position(line string) (int, string, bool) {
+	const label = retiringTable + " #"
+
+	if !strings.HasPrefix(line, label) {
+		return 0, "", false
+	}
+
+	end := len(label)
+	for end < len(line) && line[end] >= '0' && line[end] <= '9' {
+		end++
+	}
+
+	n, err := strconv.Atoi(line[len(label):end])
+	if err != nil {
+		return 0, "", false
+	}
+
+	return n, line[end:], true
+}
+
+// labelFor names, as the config layer labels its entries, the block of the
+// file that holds key for name until until -- the block a refusal is about --
+// by its position in the file as it is, and its name unless that reads as a
+// value.
+func (p *Prepared) labelFor(name string, key [mtglib.SecretKeyLength]byte, until time.Time) string {
 	for i, entry := range p.expected {
 		if p.expectedFrom[i] < 0 || entry.Name != name {
 			continue
@@ -432,7 +594,7 @@ func (p *Prepared) holderLabel(name string, until time.Time) string {
 		secret, secretErr := mtglib.ParseSecret(entry.Secret)
 		at, untilErr := time.Parse(time.RFC3339Nano, entry.Until)
 
-		if secretErr == nil && untilErr == nil && secret.Key == p.primary.Key && at.Equal(until) {
+		if secretErr == nil && untilErr == nil && secret.Key == key && at.Equal(until) {
 			return entryLabel(p.expectedFrom[i]+1, name)
 		}
 	}
@@ -456,37 +618,49 @@ func entryLabel(n int, name string) string {
 	return label
 }
 
-// placeholder is a stand-in for the new primary: the current one's mode and
-// host, and a key that no primary and no entry of the file holds.
-func (p *Prepared) placeholder() mtglib.Secret {
-	taken := map[[mtglib.SecretKeyLength]byte]bool{}
+// heldKeys are the keys the file holds: every primary's, and the key of every
+// entry whose secret parses, whatever else is wrong with it.
+func (p *Prepared) heldKeys() map[[mtglib.SecretKeyLength]byte]bool {
+	held := map[[mtglib.SecretKeyLength]byte]bool{}
 
 	for _, secret := range p.conf.GetSecrets() {
-		taken[secret.Key] = true
+		held[secret.Key] = true
 	}
 
 	for _, entry := range p.conf.RetiringSecrets {
 		if secret, err := mtglib.ParseSecret(entry.Secret); err == nil {
-			taken[secret.Key] = true
+			held[secret.Key] = true
 		}
 	}
 
+	return held
+}
+
+// placeholder is a stand-in for the new primary: the current one's mode and
+// host, and a key the file does not hold.
+func (p *Prepared) placeholder() mtglib.Secret {
+	held := p.heldKeys()
+
 	key := [mtglib.SecretKeyLength]byte{0x5a, 0xa5, 0x5a, 0xa5, 0x5a, 0xa5, 0x5a, 0xa5, 0x5a, 0xa5, 0x5a, 0xa5, 0x5a, 0xa5, 0x5a, 0xa5}
-	for taken[key] {
+	for held[key] {
 		key[len(key)-1]++
 	}
 
 	return mtglib.Secret{Key: key, Host: p.primary.Host, Mode: p.primary.Mode}
 }
 
-// summarise is the run's Summary. A removed block's name is shown only when
-// it is a string that does not read as a value, and its until only when it is
+// summarise is the run's Summary. The name asked for, and a removed block's
+// name, are shown only when they do not read as a value (a removed block's
+// only when it is a string too), and a removed block's until only when it is
 // an RFC 3339 instant, which no value is.
 func (p *Prepared) summarise() Summary {
 	summary := Summary{
-		Name:  p.req.Name,
 		Until: p.until,
 		NoOp:  !p.req.Rotate && len(p.removed) == 0,
+	}
+
+	if !readsAsAValue(p.req.Name) {
+		summary.Name = p.req.Name
 	}
 
 	for _, i := range p.removed {
@@ -536,7 +710,11 @@ func (p *Prepared) Summary() Summary {
 // the result by parsing it again. Any difference is ErrEditVerification, a key
 // usable again that nothing accepted is ErrKeyRevived, and in either case
 // nothing is returned. With Rotate false it ignores newPrimary and splices no
-// value, and the verification requires the primary unchanged.
+// value, and the verification requires the primary unchanged. A rotation
+// refuses, before any edit, a newPrimary that is not valid, is the current
+// key, or is a key the file already holds (any primary's, or any entry's that
+// parses): generation never draws one, and two secrets sharing a key is not
+// an edit this tool makes.
 func (p *Prepared) Apply(newPrimary mtglib.Secret) ([]byte, error) {
 	if p.req.Rotate {
 		switch {
@@ -544,6 +722,8 @@ func (p *Prepared) Apply(newPrimary mtglib.Secret) ([]byte, error) {
 			return nil, errors.New("the new key is not a valid secret")
 		case newPrimary.Key == p.primary.Key:
 			return nil, errors.New("the new key is the current key")
+		case p.heldKeys()[newPrimary.Key]:
+			return nil, errKeyHeld
 		}
 	}
 
