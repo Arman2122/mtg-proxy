@@ -3,6 +3,7 @@ package config_test
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -192,13 +193,19 @@ func TestEnv(t *testing.T) {
 // effect -- are cleared with the rest of the file's set. That is the kill
 // direction: a previous key is accepted only beside the file that granted it.
 // Mutates the process environment, so it does not run in parallel.
+//
+// The "default" file is the case where the clear is the only defence: the
+// file's previous key of its top-level secret is still named "default"
+// beside the environment's secret, so rule 3 would not drop it, and without
+// the clear the old key would be accepted next to the pinned one.
 func TestTheSecretEnvironmentClearsRetiringEntries(t *testing.T) {
-	text := envTestMultiSecretConfig + `
+	const block = `
 [[retiring-secret]]
-name = "alice"
+name = "%s"
 secret = "ee0f1e2d3c4b5a69788796a5b4c3d2e1f0676f6f676c652e636f6d"
 until = "2999-01-01T00:00:00Z"
 `
+
 	now := time.Date(2026, 10, 8, 9, 30, 0, 0, time.UTC)
 
 	// Neither spelling of the variable is set, whatever the test process
@@ -208,23 +215,31 @@ until = "2999-01-01T00:00:00Z"
 		require.NoError(t, os.Unsetenv(name))
 	}
 
-	conf, err := config.Parse([]byte(text))
-	require.NoError(t, err)
-	require.NoError(t, conf.ApplyEnvironment())
-	require.Len(t, conf.RetiringSecrets, 1, "without the variable the file's entry stays")
-	require.Len(t, conf.GetRetiringSecrets(now).Usable, 1)
+	for _, file := range []struct {
+		name, text string
+	}{
+		{"a [secrets] name", envTestMultiSecretConfig + fmt.Sprintf(block, "alice")},
+		{"the top-level secret, as default", "bind-to = \"0.0.0.0:3128\"\nsecret = \"" + envTestSecretBase64 + "\"\n" +
+			fmt.Sprintf(block, "default")},
+	} {
+		conf, err := config.Parse([]byte(file.text))
+		require.NoError(t, err)
+		require.NoError(t, conf.ApplyEnvironment())
+		require.Equal(t, 1, len(conf.RetiringSecrets), "%s: without the variable the file's entry stays", file.name)
+		require.Equal(t, 1, len(conf.GetRetiringSecrets(now).Usable), "%s: and is usable", file.name)
 
-	for _, name := range []string{"SECRET", "MTG_SECRET"} {
-		t.Run(name, func(t *testing.T) {
-			t.Setenv(name, envTestSecretHex)
+		for _, variable := range []string{"SECRET", "MTG_SECRET"} {
+			t.Run(file.name+"/"+variable, func(t *testing.T) {
+				t.Setenv(variable, envTestSecretHex)
 
-			conf, err := config.Parse([]byte(text))
-			require.NoError(t, err)
-			require.NoError(t, conf.ApplyEnvironment())
+				conf, err := config.Parse([]byte(file.text))
+				require.NoError(t, err)
+				require.NoError(t, conf.ApplyEnvironment())
 
-			assert.Nil(t, conf.RetiringSecrets)
-			assert.Equal(t, config.RetiringReport{}, conf.GetRetiringSecrets(now))
-			assert.NotContains(t, conf.String(), "retiringSecrets")
-		})
+				assert.True(t, conf.RetiringSecrets == nil, "%d entries survived the variable", len(conf.RetiringSecrets))
+				rotEmptyReport(t, conf.GetRetiringSecrets(now), "under the variable")
+				assert.NotContains(t, conf.String(), "retiringSecrets")
+			})
+		}
 	}
 }

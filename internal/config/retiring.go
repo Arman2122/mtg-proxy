@@ -3,6 +3,8 @@ package config
 import (
 	"bytes"
 	"cmp"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
@@ -22,11 +24,14 @@ import (
 // reason is a fixed phrase. Secret.Set's error text is discarded: it is not the
 // place that decides what a log line may carry. A line carries the entry's
 // position, its name and, for over-long entries, the fact that until is far
-// away, and never its value. A name of the wrong type is not echoed either,
-// since an array or an inline table can hold a pasted value.
+// away, and never its value. Two kinds of name are not echoed either: a name
+// of the wrong type (an array or an inline table can hold a pasted value; a
+// TOML date-time is a wrong type in name and secret), and a string name that
+// reads as a value (readsAsAValue).
 
 // The wrong-type marks of a ConfigRetiringSecret, one bit per field: the TOML
-// value was neither a string nor (for until) an offset date-time.
+// value was not a string, or, for until, neither a string nor an offset
+// date-time.
 const (
 	retiringNameWrongType uint8 = 1 << iota
 	retiringSecretWrongType
@@ -251,7 +256,9 @@ func judgeRetiringShape(n int, raw *ConfigRetiringSecret) judgedRetiring {
 		return entry
 	}
 
-	entry.label = fmt.Sprintf("retiring-secret #%d (name %q)", n, raw.Name)
+	if !readsAsAValue(raw.Name) {
+		entry.label = fmt.Sprintf("retiring-secret #%d (name %q)", n, raw.Name)
+	}
 
 	switch {
 	case raw.wrongType&retiringSecretWrongType != 0:
@@ -299,6 +306,30 @@ func judgeRetiringShape(n int, raw *ConfigRetiringSecret) judgedRetiring {
 	entry.secret, entry.until = secret, until
 
 	return entry
+}
+
+// readsAsAValue reports whether text, shown as a name or an until, could be a
+// secret value pasted into the wrong field: it decodes, as hex or as base64
+// in either alphabet, padded or not, to at least a key's 16 bytes. That covers
+// every text mtglib.ParseSecret accepts, and also the spellings no link uses
+// (standard base64, a wrong prefix, an all-zero key). Such text is at least 22
+// characters of one encoding's alphabet, so a real name -- and the help its
+// label gives with a typo -- is not affected. It is a display rule only: the
+// entry is judged by its name as written.
+func readsAsAValue(text string) bool {
+	for _, decode := range []func(string) ([]byte, error){
+		hex.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.StdEncoding.DecodeString,
+	} {
+		if raw, err := decode(text); err == nil && len(raw) >= mtglib.SecretKeyLength {
+			return true
+		}
+	}
+
+	return false
 }
 
 // danglingReason is rule 3's reason for name: "default" names the top-level

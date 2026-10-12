@@ -242,7 +242,9 @@ func Parse(rawData []byte) (*Config, error) {
 // block into a string, in place, and returns which fields of each entry had
 // the wrong TOML type, as wrong-type marks:
 //   - a string is kept;
-//   - an offset date-time (a time.Time) becomes RFC 3339 with nanoseconds;
+//   - an offset date-time (a time.Time) in until becomes RFC 3339 with
+//     nanoseconds; in name or secret it is a wrong type (§1.1 allows one for
+//     until only);
 //   - an absent field becomes "", which rule 1 reports as missing, not as a
 //     wrong type;
 //   - anything else -- a number, a boolean, an array, an inline table, a
@@ -258,14 +260,15 @@ func normaliseRetiringSecrets(conf *tomlConfig) []uint8 {
 		entry := &conf.RetiringSecrets[i]
 
 		for _, field := range []struct {
-			value *any
-			mark  uint8
+			value    *any
+			mark     uint8
+			dateTime bool // an offset date-time is this field's type
 		}{
-			{&entry.Name, retiringNameWrongType},
-			{&entry.Secret, retiringSecretWrongType},
-			{&entry.Until, retiringUntilWrongType},
+			{&entry.Name, retiringNameWrongType, false},
+			{&entry.Secret, retiringSecretWrongType, false},
+			{&entry.Until, retiringUntilWrongType, true},
 		} {
-			text, wrongType := normaliseRetiringField(*field.value)
+			text, wrongType := normaliseRetiringField(*field.value, field.dateTime)
 			*field.value = text
 
 			if wrongType {
@@ -278,15 +281,20 @@ func normaliseRetiringSecrets(conf *tomlConfig) []uint8 {
 }
 
 // normaliseRetiringField is one field of normaliseRetiringSecrets: its text,
-// and whether its TOML type was wrong.
-func normaliseRetiringField(value any) (string, bool) {
+// and whether its TOML type was wrong. dateTime says whether an offset
+// date-time is a right type for the field.
+func normaliseRetiringField(value any, dateTime bool) (string, bool) {
 	switch v := value.(type) {
 	case nil:
 		return "", false
 	case string:
 		return v, false
 	case time.Time:
-		return v.Format(time.RFC3339Nano), false
+		if dateTime {
+			return v.Format(time.RFC3339Nano), false
+		}
+
+		return fmt.Sprint(v), true
 	default:
 		return fmt.Sprint(v), true
 	}

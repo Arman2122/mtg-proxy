@@ -641,7 +641,7 @@ func (c *Config) String() string {
 	}
 
 	redactConfigCredentials(fields)
-	redactMistypedRetiringFields(fields, c.RetiringSecrets)
+	redactSuspectRetiringFields(fields, c.RetiringSecrets)
 
 	buf := &bytes.Buffer{}
 	encoder := json.NewEncoder(buf)
@@ -693,21 +693,22 @@ func redactConfigCredentials(fields map[string]any) {
 	}
 }
 
-// redactMistypedRetiringFields blanks a retiring entry's name or until when
-// its TOML value had the wrong type. Such a field holds fmt.Sprint of an
-// array or an inline table, which can carry a value pasted in the wrong
-// place; a string name or until is shown as written.
-func redactMistypedRetiringFields(fields map[string]any, entries []ConfigRetiringSecret) {
+// redactSuspectRetiringFields blanks a retiring entry's name or until when it
+// may hold a value pasted in the wrong place: its TOML value had the wrong
+// type (the field holds fmt.Sprint of an array or an inline table), or its
+// text reads as a value (readsAsAValue). Any other name or until is shown as
+// written.
+func redactSuspectRetiringFields(fields map[string]any, entries []ConfigRetiringSecret) {
 	for i, entry := range retiringEntryFields(fields) {
 		if i >= len(entries) {
 			return
 		}
 
-		if entries[i].wrongType&retiringNameWrongType != 0 {
+		if entries[i].wrongType&retiringNameWrongType != 0 || readsAsAValue(entries[i].Name) {
 			entry["name"] = redactedValue
 		}
 
-		if entries[i].wrongType&retiringUntilWrongType != 0 {
+		if entries[i].wrongType&retiringUntilWrongType != 0 || readsAsAValue(entries[i].Until) {
 			entry["until"] = redactedValue
 		}
 	}

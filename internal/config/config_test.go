@@ -1,8 +1,6 @@
 package config_test
 
 import (
-	"encoding/base64"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -258,14 +256,8 @@ until = ` + bobRetiringUntil + `
 
 	rendered := conf.String()
 
-	retiringRaw, err := hex.DecodeString(bobRetiringSecret)
-	require.NoError(t, err)
-
-	retiringKey := retiringRaw[1:17]
-
 	// The hex spelling is what a Secret marshals to, so both are checked: the
-	// input spelling and the one the encoder would actually emit. The retiring
-	// value is checked in each spelling of the value and of its key.
+	// input spelling and the one the encoder would actually emit.
 	for _, credential := range []string{
 		aliceSecret,
 		bobSecret,
@@ -274,15 +266,13 @@ until = ` + bobRetiringUntil + `
 		bobAdTag,
 		conf.Secret.String(),
 		conf.Secrets["bob"].String(),
-		bobRetiringSecret,
-		base64.RawURLEncoding.EncodeToString(retiringRaw),
-		base64.RawStdEncoding.EncodeToString(retiringRaw),
-		hex.EncodeToString(retiringKey),
-		base64.RawStdEncoding.EncodeToString(retiringKey),
-		base64.RawURLEncoding.EncodeToString(retiringKey),
 	} {
 		require.NotContains(t, rendered, credential, "a credential reached the log rendering")
 	}
+
+	// The retiring value in each spelling of the value and of its key, named
+	// by label on a failure and never printed.
+	require.Empty(t, rotLeaks(rendered, bobRetiringSecret), "a retiring value reached the log rendering")
 
 	require.Contains(t, rendered, "alice", "the secret names must survive redaction")
 	require.Contains(t, rendered, "bob")
@@ -324,6 +314,6 @@ func TestConfigStringIsUnchangedWithoutTheTable(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, string(golden), conf.String(), "Config.String() of the panel's file changed")
-	assert.Empty(t, conf.RetiringSecrets)
-	assert.Equal(t, config.RetiringReport{}, conf.GetRetiringSecrets(time.Now()))
+	assert.Equal(t, 0, len(conf.RetiringSecrets))
+	rotEmptyReport(t, conf.GetRetiringSecrets(time.Now()), "the panel's file")
 }

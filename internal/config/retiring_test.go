@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -92,6 +93,17 @@ func rotB64(valueHex string) string {
 	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
+// rotStd respells a hex value in padded standard base64, a spelling no link
+// uses but a person might paste.
+func rotStd(valueHex string) string {
+	raw, err := hex.DecodeString(valueHex)
+	if err != nil {
+		panic(err)
+	}
+
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
 // rotIn is the instant d after rotNow, spelled as rotate-secret writes it.
 func rotIn(d time.Duration) string { return rotNow.Add(d).Format(time.RFC3339) }
 
@@ -143,6 +155,18 @@ func overLongLine(n int, name string) string {
 		"but an overlap is a migration window, not a second key: shorten it (run --check refuses this file)", n, name)
 }
 
+// namelessOverLongLine is the rule-4 warning of an entry whose name is
+// withheld: it reads as a value.
+func namelessOverLongLine(n int) string {
+	return fmt.Sprintf("retiring-secret #%d: until is more than 720h away; it is honoured, "+
+		"but an overlap is a migration window, not a second key: shorten it (run --check refuses this file)", n)
+}
+
+// rotValueLikeName is a name that decodes as a 16-byte key -- 22 base64url
+// characters -- so it could be a value pasted into the name field. It is no
+// fixture value, so an assertion may print it.
+const rotValueLikeName = "abcdefghijklmnopqrstuv"
+
 func ownPrimaryNote(n int, name string) string {
 	return fmt.Sprintf("retiring-secret #%d (name %q): the key is the secret's own primary; the entry changes nothing", n, name)
 }
@@ -186,6 +210,17 @@ func rotSame(t *testing.T, want, got []string, what string) {
 	}
 
 	assert.Equal(t, want, got, what)
+}
+
+// rotEmptyReport asserts that report is RetiringReport{}. A failure says what
+// is not empty and how much of it, and never formats the report: an element
+// of Usable holds a value.
+func rotEmptyReport(t *testing.T, report config.RetiringReport, what string) {
+	t.Helper()
+
+	assert.True(t, report.Usable == nil && report.Lines == nil && report.Notes == nil && report.Expired == 0,
+		"%s: the report is not empty: %d usable, %d lines, %d notes, %d expired",
+		what, len(report.Usable), len(report.Lines), len(report.Notes), report.Expired)
 }
 
 // rotLeaks names the spellings of the given values (in hex) that text
@@ -280,6 +315,31 @@ func TestEveryRetiringRuleClassifies(t *testing.T) {
 			name:  "rule 1: a name that is not a string is not echoed",
 			text:  rotFile(rotBlock("name = 7", rotSecret(rotEE(rotKeyOld1)), rotUntil(day))),
 			lines: []string{namelessProblemLine(1, whyNameType)},
+		},
+		{
+			name: "a name that reads as a value is withheld from the line, in every spelling",
+			text: rotFile(
+				rotBlock(rotName(rotEE(rotKeyLeak)), rotSecret(rotEE(rotKeyOld1)), rotUntil(day)),
+				rotBlock(rotName(rotB64(rotEE(rotKeyLeak))), rotSecret(rotEE(rotKeyOld2)), rotUntil(day)),
+				rotBlock(rotName(rotDD(rotKeyLeak)), rotSecret(rotEE(rotKeyOld3)), rotUntil(day)),
+				rotBlock(rotName(rotKeyLeak), rotSecret(rotEE(rotKeyOld4)), rotUntil(day)),
+				rotBlock(rotName(rotStd(rotKeyLeak)), rotSecret(rotEE(rotKeyOld5)), rotUntil(day)),
+			),
+			lines: []string{
+				namelessProblemLine(1, whyDangling),
+				namelessProblemLine(2, whyDangling),
+				namelessProblemLine(3, whyDangling),
+				namelessProblemLine(4, whyDangling),
+				namelessProblemLine(5, whyDangling),
+			},
+		},
+		{
+			name: "a configured name that reads as a value is withheld from the warning",
+			text: "bind-to = \"0.0.0.0:3128\"\n\n" +
+				rotBlock(rotName(rotValueLikeName), rotSecret(rotEE(rotKeyOld1)), rotUntil(rotIn(721*time.Hour))) +
+				"[secrets]\n" + rotValueLikeName + " = \"" + rotEE(rotKeyAlice) + "\"\n",
+			usable: []string{rotUse(rotValueLikeName, "old1", "ee", rotIn(721*time.Hour))},
+			lines:  []string{namelessOverLongLine(1)},
 		},
 		{
 			name:  "rule 1: no secret",
@@ -647,16 +707,38 @@ func TestEveryRetiringRuleClassifies(t *testing.T) {
 			}
 
 			conf := rotParse(t, "bind-to = \"0.0.0.0:3128\"\n\n"+blocks.String()+"[secrets]\n"+secrets.String())
-			report := conf.GetRetiringSecrets(rotNow)
 
 			droppedName := "u1024"
 			if variant.earlyName >= 0 {
 				droppedName = fmt.Sprintf("u%04d", variant.earlyName)
 			}
 
-			assert.Len(t, report.Usable, mtglib.MaxRetiringSecrets, variant.name)
-			assert.Equal(t, []string{problemLine(dropped, droppedName, whyOverCapAll)}, report.Lines, variant.name)
-			assert.Empty(t, report.Notes, variant.name)
+			// P2 for the overall cap: the same file judged at instants of both
+			// parities of a 30-minute step, all before the earliest until,
+			// drops the same entry and keeps the same 4,096 at every one. A
+			// tie-break that reads now -- the time, its parity, its order --
+			// changes which entry is cut at one of them, and the entry cut
+			// there would be accepted again at another.
+			var first map[string]bool
+
+			for _, step := range []time.Duration{0, 30 * time.Minute, time.Hour, 90 * time.Minute, 6 * time.Hour} {
+				at := rotNow.Add(step)
+				report := conf.GetRetiringSecrets(at)
+				kept := rotPairs(report)
+
+				assert.Equal(t, mtglib.MaxRetiringSecrets, len(report.Usable), "%s, at +%s", variant.name, step)
+				assert.Equal(t, []string{problemLine(dropped, droppedName, whyOverCapAll)}, report.Lines,
+					"%s, at +%s", variant.name, step)
+				assert.Empty(t, report.Notes, "%s, at +%s", variant.name, step)
+
+				if first == nil {
+					first = kept
+
+					continue
+				}
+
+				assert.True(t, maps.Equal(first, kept), "%s, at +%s: the kept entries are not the ones kept at +0", variant.name, step)
+			}
 		}
 	})
 }
@@ -702,13 +784,13 @@ func TestUntilSpellings(t *testing.T) {
 			report := conf.GetRetiringSecrets(rotNow)
 
 			if !tc.ok {
-				assert.Empty(t, report.Usable)
+				assert.Empty(t, rotUsable(report))
 				assert.Equal(t, []string{problemLine(1, "alice", whyUntilInvalid)}, report.Lines)
 
 				return
 			}
 
-			require.Len(t, report.Usable, 1)
+			require.Equal(t, 1, len(report.Usable))
 			assert.True(t, report.Usable[0].Until.Equal(tc.at), "until is the same instant whatever its spelling")
 			assert.Empty(t, report.Lines)
 		})
@@ -748,7 +830,7 @@ func TestWrongTypesAreProblemsNotParseFailures(t *testing.T) {
 
 	require.Empty(t, conf.UnknownKeys, "a wrong type is not an unknown key")
 	require.NoError(t, conf.Validate())
-	require.Len(t, conf.RetiringSecrets, 11)
+	require.Equal(t, 11, len(conf.RetiringSecrets))
 
 	report := conf.GetRetiringSecrets(rotNow)
 
@@ -767,6 +849,34 @@ func TestWrongTypesAreProblemsNotParseFailures(t *testing.T) {
 	assert.Equal(t, []string{rotUse("alice", "old4", "ee", day)}, rotUsable(report),
 		"one bad block never takes its neighbour with it")
 	assert.Empty(t, rotLeaks(strings.Join(report.Lines, "\n"), rotAllValues...))
+
+	// A TOML offset date-time is the right type for until only (§1.1). In
+	// name or secret it is a wrong type like any other: a rule-1 problem, so
+	// not a rule-5 claimant, never counted as expired, and never a name that
+	// a [secrets] user spelt the same way could resolve.
+	t.Run("a TOML date-time is a string only in until", func(t *testing.T) {
+		t.Parallel()
+
+		conf := rotParse(t, "bind-to = \"0.0.0.0:3128\"\n\n"+
+			rotBlock("name = 2026-10-09T09:30:00Z", rotSecret(rotEE(rotKeyOld1)), until)+
+			rotBlock("name = 2026-10-07T09:30:00Z", rotSecret(rotEE(rotKeyOld2)), rotUntil(rotIn(-time.Hour)))+
+			rotBlock(rotName("alice"), rotSecret(rotB64(rotEE(rotKeyOld1))), until)+
+			rotBlock(rotName("alice"), "secret = 2026-10-09T09:30:00Z", until)+
+			"[secrets]\nalice = \""+rotEE(rotKeyAlice)+"\"\n\"2026-10-09T09:30:00Z\" = \""+rotEE(rotKeyOld3)+"\"\n")
+		require.Empty(t, conf.UnknownKeys)
+
+		report := conf.GetRetiringSecrets(rotNow)
+
+		assert.Equal(t, []string{
+			namelessProblemLine(1, whyNameType),
+			namelessProblemLine(2, whyNameType),
+			problemLine(4, "alice", whySecretType),
+		}, report.Lines)
+		assert.Equal(t, []string{rotUse("alice", "old1", "ee", day)}, rotUsable(report),
+			"a date-time name claims no key, so alice's entry with the same key is not a collision")
+		assert.Equal(t, 0, report.Expired, "a rule-1 problem is never counted as expired")
+		assert.Empty(t, report.Notes)
+	})
 }
 
 // C4: Validate never looks at the table. web-relay, access and doctor run it,
@@ -841,7 +951,7 @@ func TestAnOverLongUntilIsWarnedNotDropped(t *testing.T) {
 	assert.Empty(t, later.Lines, "720h away is not over-long: run --check accepts")
 
 	after := rotParse(t, text).GetRetiringSecrets(rotNow.Add(721 * time.Hour))
-	assert.Empty(t, after.Usable, "bounded by its own until")
+	assert.Empty(t, rotUsable(after), "bounded by its own until")
 	assert.Equal(t, 1, after.Expired)
 	assert.Empty(t, after.Lines)
 }
@@ -875,7 +985,7 @@ func TestACrossNameCollisionStaysDroppedAfterOneExpires(t *testing.T) {
 	} {
 		report := rotParse(t, text).GetRetiringSecrets(step.now)
 
-		assert.Empty(t, report.Usable, "%s: neither entry is ever usable", step.name)
+		assert.Empty(t, rotUsable(report), "%s: neither entry is ever usable", step.name)
 		rotSame(t, step.lines, report.Lines, step.name)
 		assert.Equal(t, step.expired, report.Expired, step.name)
 	}
@@ -927,6 +1037,16 @@ func TestConfigLinesNeverCarryTheValue(t *testing.T) {
 		rotFile(alice("ff"+leak[2:], day)),
 		rotFile(alice(zero, day)),
 		rotFile(rotBlock(rotName("alice"), fmt.Sprintf("secrte = %q", leak), rotUntil(day))),
+		// The value pasted into a string name, in each spelling, and into a
+		// string until: withheld from every line, redacted in String().
+		rotFile(rotBlock(rotName(leak), rotSecret(rotEE(rotKeyOld1)), rotUntil(day))),
+		rotFile(rotBlock(rotName(rotB64(leak)), rotSecret(rotEE(rotKeyOld1)), rotUntil(rotIn(721*time.Hour)))),
+		rotFile(rotBlock(rotName(rotDD(rotKeyLeak)), rotSecret(rotEE(rotKeyOld1)), rotUntil(day))),
+		rotFile(rotBlock(rotName(rotKeyLeak), rotSecret(rotEE(rotKeyOld1)), rotUntil(day))),
+		rotFile(rotBlock(rotName(rotStd(rotKeyLeak)), rotSecret(rotEE(rotKeyOld1)), rotUntil(day))),
+		rotFile(rotBlock(rotName(rotStd(leak)), rotSecret(rotEE(rotKeyOld1)), rotUntil(day))),
+		rotFile(rotBlock(rotName("alice"), rotSecret(rotEE(rotKeyOld1)), rotUntil(leak))),
+		rotFile(rotBlock(rotName("alice"), rotSecret(rotEE(rotKeyOld1)), rotUntil(rotB64(leak)))),
 	}
 
 	for i, text := range parsed {

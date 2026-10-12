@@ -169,11 +169,13 @@ func rotGenerate(rng *rand.Rand, keys []string) rotGenFile {
 }
 
 // rotJudgeAll parses the file and judges it at every instant of rotGenTimes.
+// No failure message prints the file: it holds values. A failure names the
+// file's index, and the seeded generator writes the same file again.
 func rotJudgeAll(t *testing.T, file rotGenFile) (*config.Config, []time.Time, []config.RetiringReport) {
 	t.Helper()
 
 	conf, err := config.Parse([]byte(file.text))
-	require.NoError(t, err, file.text)
+	require.NoError(t, err, "a generated file must load")
 
 	times := make([]time.Time, len(rotGenTimes))
 	reports := make([]config.RetiringReport, len(rotGenTimes))
@@ -227,7 +229,7 @@ func TestCheckAcceptanceIsMonotoneInTime(t *testing.T) {
 				}
 
 				require.True(t, accepted(reports[j]),
-					"file %d: accepted at %s, refused at %s with %q\n%s", f, times[i], times[j], reports[j].Lines, file.text)
+					"file %d: accepted at %s, refused at %s with %q", f, times[i], times[j], reports[j].Lines)
 
 				if len(reports[i].Usable) > 0 {
 					acceptedNonEmpty++
@@ -286,8 +288,8 @@ func TestRunNeverAcceptsAKeyItDropped(t *testing.T) {
 
 					if !pairs[i][pair] {
 						require.False(t, pairs[j][pair],
-							"file %d: %s/key %s dropped at %s, accepted at %s\n%s",
-							f, entry.name, rotGenLabel(keys, entry.key), times[i], times[j], file.text)
+							"file %d: %s/key %s dropped at %s, accepted at %s",
+							f, entry.name, rotGenLabel(keys, entry.key), times[i], times[j])
 
 						if entry.until.After(times[j]) {
 							droppedLive++
