@@ -91,8 +91,10 @@ type secretStats struct {
 
 	// retiringLastSeen is the unix-nano time of the last admission made under one
 	// of the secret's retiring keys, 0 for none yet (admit stamps it). Runtime
-	// state like lastSeen: never persisted, and only ever reported while the
-	// secret still has a retiring key (see retiringViews).
+	// state like lastSeen: never persisted, only ever reported while the secret
+	// still has a retiring key (see retiringViews), and cleared when a swap gives
+	// the secret its first unexpired retiring entry, so that it is about the
+	// current overlap's old link (see resetRetiringSeen).
 	retiringLastSeen atomic.Int64
 }
 

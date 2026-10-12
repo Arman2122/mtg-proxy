@@ -438,6 +438,13 @@ func (p *Proxy) applySecretConfigLocked(cfg SecretConfig) {
 	now := p.rotation.Now()
 
 	newSet, drops := buildSecretSetAt(cfg.Secrets, cfg.SecretAdTags, cfg.GlobalAdTag, cfg.Limits, cfg.Retiring, now)
+
+	// BEFORE the Swap, not after it: once the new set is stored a stream on a new
+	// old link can register and stamp retiring_last_seen, and a reset that ran
+	// then would wipe it. reloadMu is held, so the set in force is the one being
+	// replaced.
+	p.resetRetiringSeen(p.secrets.Load(), newSet, now)
+
 	oldSet := p.secrets.Swap(newSet)
 
 	afterSecretStoreHook(newSet)

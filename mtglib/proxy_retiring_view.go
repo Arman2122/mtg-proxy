@@ -149,11 +149,76 @@ func (v retiringView) times() (*time.Time, *time.Time) {
 	return &until, &lastSeen
 }
 
+// hasUnexpiredRetiring says whether the set keeps a retiring entry of the named
+// secret that accepts its key at now. False for a nil set and for a name the set
+// does not hold. It reads no clock of its own.
+func (s *secretSet) hasUnexpiredRetiring(name string, now time.Time) bool {
+	i, ok := s.indexOf(name)
+	if !ok {
+		return false
+	}
+
+	for _, r := range s.retiringOf[i] {
+		if now.Before(s.retiring[r].until) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// resetRetiringSeen clears retiring_last_seen of every name that newSet gives
+// its FIRST unexpired retiring entry: the name has some in newSet and had none
+// in oldSet, judged at the swap's now (D31, revision 4). The stamp answers "has
+// anyone used THIS old link lately", and the previous overlap's last admission
+// is about another key; left in place it would read, right after a second
+// rotation, as an old link that has been quiet for days when its key was the
+// primary a minute ago, and invite an early --end-overlap. A name that already
+// had an unexpired entry keeps its stamp, so an unrelated swap, or another
+// rotation inside a running overlap, changes nothing. Nothing else is reset.
+//
+// It runs between the build and the Swap of the new set, with reloadMu held (the
+// set in force cannot change before the Swap), and never after it: from the
+// Swap on a stream on the new old link registers and stamps, and a reset then
+// would wipe a real first admission and report "absent" while someone did come
+// in. Before the Swap every stamp written belongs to the new overlap. An
+// old-overlap stream that registered just before the reset can still stamp
+// after it; that plants a stamp from the swap's own moment at worst, and is not
+// worth a lock.
+//
+// Only the buckets that exist are touched, and none is created: a name with no
+// bucket has never been stamped.
+func (p *Proxy) resetRetiringSeen(oldSet, newSet *secretSet, now time.Time) {
+	if newSet == nil {
+		return
+	}
+
+	for i := range newSet.retiringOf {
+		name := newSet.names[i]
+
+		if !oldSet.hasUnexpiredRetiring(name, now) {
+			p.stats.clearRetiringSeen(name)
+		}
+	}
+}
+
 // markRetiringSeen records an admission made under one of the name's retiring
 // keys at at. A timestamp for the operator, not a decision: it is not read by the
 // rotation clock and nothing acts on it.
 func (s *ProxyStats) markRetiringSeen(name string, at time.Time) {
 	s.getOrCreate(name).retiringLastSeen.Store(at.UnixNano())
+}
+
+// clearRetiringSeen forgets the last admission under a retiring key of the name.
+// It never creates a bucket: a name without one has nothing to forget.
+func (s *ProxyStats) clearRetiringSeen(name string) {
+	s.mu.RLock()
+	st, ok := s.users[name]
+	s.mu.RUnlock()
+
+	if ok {
+		st.retiringLastSeen.Store(0)
+	}
 }
 
 // retiringSeenAt is when the last admission under a retiring key of the name was

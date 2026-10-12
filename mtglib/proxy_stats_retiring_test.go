@@ -473,10 +473,65 @@ func TestRetiringConnectionsCountsLiveOldLinkStreams(t *testing.T) {
 	}
 }
 
+const (
+	// viewLockHold is how long the lock test waits to see that retiringViews has
+	// NOT returned while the registry lock is held. A wait that is too short can
+	// only make a missing lock go unnoticed, never a present one fail.
+	viewLockHold = 200 * time.Millisecond
+
+	// viewLockBound is how long it waits for retiringViews to return once the lock
+	// is let go. Generous, and only ever spent when the code under test is wrong.
+	viewLockBound = 5 * time.Second
+)
+
 // retiringViews takes liveMu to walk the streams of the names that have an
-// overlap, because admission and release write that registry under it. A walk
-// without the lock is a map read against a map write; the race detector, or the
-// runtime's own check, finds it here.
+// overlap, because admission and release write that registry under it. This is
+// the deterministic proof: with the registry lock held here, the walk cannot
+// return, and it returns once the lock is let go. A walk without the lock
+// returns at once and fails the first wait.
+func TestRetiringConnectionsWaitForTheRegistryLock(t *testing.T) {
+	t.Parallel()
+
+	r := newViewRig(t)
+	set := r.rotate(t)
+
+	r.p.liveMu.Lock()
+
+	held := true
+	defer func() {
+		if held {
+			r.p.liveMu.Unlock()
+		}
+	}()
+
+	done := make(chan map[string]retiringView, 1)
+
+	go func() { done <- r.p.retiringViews(set, rotationNow) }()
+
+	select {
+	case <-done:
+		t.Fatal("retiringViews returned while the registry lock was held: it walks the streams without it")
+	case <-time.After(viewLockHold):
+	}
+
+	r.p.liveMu.Unlock()
+
+	held = false
+
+	select {
+	case views := <-done:
+		assert.Equal(t, 2, views["alice"].keys, "and once the lock is let go it answers")
+	case <-time.After(viewLockBound):
+		t.Fatal("retiringViews did not return after the registry lock was let go")
+	}
+}
+
+// The same lock, proven by a race instead of by waiting: registration and
+// release churn against repeated walks. A walk without the lock is a map read
+// against a map write. This proves the lock ONLY under -race, where the detector
+// reports the two accesses; without it the runtime's own concurrent-map check
+// may or may not trip, so TestRetiringConnectionsWaitForTheRegistryLock above is
+// the one that holds on any run.
 func TestRetiringConnectionsAreCountedUnderTheRegistryLock(t *testing.T) {
 	t.Parallel()
 
@@ -567,6 +622,19 @@ func TestRetiringLastSeenFollowsRetiringAdmissions(t *testing.T) {
 	assert.True(t, strings.HasSuffix(text, "Z"), "UTC, not an offset: %s", text)
 	assertSurfacesAgree(t, r.p, "alice")
 
+	// The wire text ends in Z on any host whose local zone is UTC, whatever the
+	// code did, so the zone is pinned on the Go value as well: the one location
+	// time.UTC, which time.Local is not even when it has no offset.
+	views := r.p.retiringViews(r.p.secrets.Load(), r.p.rotation.Now())
+	assert.Same(t, time.UTC, views["alice"].lastSeen.Location(), "the stamp is in UTC on every host")
+	assert.Same(t, time.UTC, views["alice"].until.Location(), "and so is the until")
+
+	info := secretInfoFor(t, r.p, "alice")
+	require.NotNil(t, info.RetiringLastSeen)
+	require.NotNil(t, info.RetiringUntil)
+	assert.Same(t, time.UTC, info.RetiringLastSeen.Location(), "GET /secrets says it in UTC")
+	assert.Same(t, time.UTC, info.RetiringUntil.Location())
+
 	// It is alice's: bob, whose old key nobody used, has none.
 	assertRetiring(t, r.p, "bob", overlap(1, bobUntil))
 	assert.Zero(t, stamp("bob"))
@@ -591,6 +659,201 @@ func TestRetiringLastSeenFollowsRetiringAdmissions(t *testing.T) {
 	assert.NotZero(t, stamp("alice"), "the stamp itself is kept")
 	assertRetiring(t, r.p, "alice", none)
 	assertRetiring(t, r.p, "bob", none)
+}
+
+// stampOf is the raw retiring_last_seen stamp of name: what was recorded, not
+// what is reported. 0 is never.
+func (r *viewRig) stampOf(name string) int64 {
+	return r.p.stats.users[name].retiringLastSeen.Load()
+}
+
+// admitAndRelease admits a stream of name on secret's key, so that admission
+// stamps what it stamps, and lets the stream go again: the stamp is what a test
+// wants, not a live stream counted as an old link.
+func (r *viewRig) admitAndRelease(t *testing.T, name string, secret Secret) {
+	t.Helper()
+
+	r.p.release(r.admit(t, name, secret))
+}
+
+// hasLastSeen says whether name's object in GET /stats carries
+// retiring_last_seen.
+func hasLastSeen(t *testing.T, p *Proxy, name string) bool {
+	t.Helper()
+
+	_, has := statsUser(t, p, name)["retiring_last_seen"]
+
+	return has
+}
+
+// D31, revision 4. retiring_last_seen answers "has anyone used THIS old link
+// lately", so it is cleared when a name gets its first unexpired retiring entry
+// in a new set -- it had none in the set being replaced. A second rotation never
+// shows the previous overlap's last admission, which would read as "the old link
+// has been quiet for nine days" about a key that was the primary a minute ago and
+// invite an early --end-overlap. Reported "absent" means nobody has come in on
+// the old link since this overlap began, which is also what the first rotation
+// says.
+func TestASecondRotationDoesNotShowTheFirstOverlapsLastSeen(t *testing.T) {
+	t.Parallel()
+
+	for _, variant := range []struct {
+		name string
+		// between ends the first overlap, or puts the name outside the set, before
+		// the second rotation.
+		between func(*testing.T, *viewRig)
+	}{
+		{"after the sweep ended the first overlap", func(t *testing.T, r *viewRig) {
+			r.clock.set(rotationAt(4 * time.Hour))
+			r.p.expireRetiring()
+			require.Zero(t, heldRetiring(r.p), "the sweep ended the overlaps")
+		}},
+		{"on a swap after the until that never saw the sweep", func(t *testing.T, r *viewRig) {
+			r.clock.set(rotationAt(4 * time.Hour))
+			require.Equal(t, 3, heldRetiring(r.p), "the sweep has not run: the set still holds the entries")
+		}},
+		{"for a name that left the set and came back", func(t *testing.T, r *viewRig) {
+			require.NoError(t, r.p.ReplaceSecrets(SecretConfig{Secrets: map[string]Secret{"bob": r.bobNew, "carol": r.carol}}))
+			require.Zero(t, heldRetiring(r.p))
+		}},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := newViewRig(t)
+			r.rotate(t)
+
+			r.admitAndRelease(t, "alice", r.k1)
+			require.NotZero(t, r.stampOf("alice"))
+			require.True(t, hasLastSeen(t, r.p, "alice"), "the first overlap reports it")
+
+			variant.between(t, r)
+
+			// alice is rotated again: K3 is the primary and K2, until now the primary,
+			// retires. K2 has not been used since it stopped being the primary.
+			k3, until := GenerateSecret("alice.example.com"), rotationAt(24*time.Hour)
+			rotateTo(t, r.p, map[string]Secret{"alice": k3, "bob": r.bobNew, "carol": r.carol},
+				retire("alice", r.k2, until))
+
+			assertRetiring(t, r.p, "alice", overlap(1, until))
+			assert.Zero(t, r.stampOf("alice"), "the stamp was cleared, not merely hidden")
+
+			// And the new old link's first admission is reported.
+			r.admit(t, "alice", r.k2)
+			assert.NotZero(t, r.stampOf("alice"))
+			assert.True(t, hasLastSeen(t, r.p, "alice"))
+			assertSurfacesAgree(t, r.p, "alice")
+		})
+	}
+}
+
+// An admission through the new set's entry that arrives right after the swap
+// stored the set is not wiped: the reset runs between the build and the Swap, not
+// after it. afterSecretStoreHook runs in exactly that window, so a reset placed
+// after the Swap wipes what the hook's stream stamped. A package seam, so this
+// test is not parallel.
+func TestAnAdmissionRightAfterTheSwapIsNotWiped(t *testing.T) {
+	r := newViewRig(t)
+
+	admitted := false
+
+	installAfterSecretStoreHook(t, func(*secretSet) {
+		if admitted {
+			return
+		}
+
+		admitted = true
+
+		r.admit(t, "alice", r.k1)
+	})
+
+	r.rotate(t)
+
+	require.True(t, admitted, "the stream was admitted in the window after the new set was stored")
+	assert.NotZero(t, r.stampOf("alice"), "its stamp survives the swap")
+	assert.True(t, hasLastSeen(t, r.p, "alice"))
+	assertSurfacesAgree(t, r.p, "alice")
+}
+
+// A swap that leaves the name's overlap in force does not reset it: an unrelated
+// one (another secret's ad tag), and another rotation of the same name while its
+// first overlap is still running, where the earlier admission is still about a
+// working old link.
+func TestASwapInsideALiveOverlapKeepsTheLastSeen(t *testing.T) {
+	t.Parallel()
+
+	t.Run("an unrelated swap", func(t *testing.T) {
+		t.Parallel()
+
+		r := newViewRig(t)
+		r.rotate(t)
+		r.admitAndRelease(t, "alice", r.k1)
+
+		stamp := r.stampOf("alice")
+		require.NotZero(t, stamp)
+
+		cfg := r.p.secrets.Load().toConfig()
+		cfg.SecretAdTags = map[string][AdTagLength]byte{"carol": {1, 2, 3}}
+		require.NoError(t, r.p.ReplaceSecrets(cfg))
+
+		assert.Equal(t, stamp, r.stampOf("alice"), "an unrelated swap does not reset it")
+		assert.True(t, hasLastSeen(t, r.p, "alice"))
+	})
+
+	t.Run("another rotation of the name inside its overlap", func(t *testing.T) {
+		t.Parallel()
+
+		r := newViewRig(t)
+		r.rotate(t)
+		r.admitAndRelease(t, "alice", r.k1)
+
+		stamp := r.stampOf("alice")
+		require.NotZero(t, stamp)
+
+		k3 := GenerateSecret("alice.example.com")
+		cfg := r.p.secrets.Load().toConfig()
+		cfg.Secrets["alice"] = k3
+		cfg.Retiring = append(cfg.Retiring, retire("alice", r.k2, rotationAt(5*time.Hour)))
+		require.NoError(t, r.p.ReplaceSecrets(cfg))
+
+		assert.Len(t, r.p.secrets.Load().retiring, 4, "alice now has three previous keys, bob one")
+		assert.Equal(t, stamp, r.stampOf("alice"), "the name already had a previous key: no reset")
+		assert.True(t, hasLastSeen(t, r.p, "alice"))
+	})
+}
+
+// The reset is for the names that got their first entry, and only those: a name
+// whose overlap ended and who was not rotated again keeps its stamp (unreported,
+// since it has no previous key), and another name's reset does not touch it.
+func TestTheResetTouchesOnlyTheNameThatGotItsFirstEntry(t *testing.T) {
+	t.Parallel()
+
+	r := newViewRig(t)
+	carolNew, carolThird := GenerateSecret("carol.example.com"), GenerateSecret("carol.example.com")
+
+	rotateTo(t, r.p, map[string]Secret{"alice": r.k2, "bob": r.bobNew, "carol": carolNew},
+		retire("alice", r.k1, aliceEarly), retire("bob", r.bobOld, bobUntil), retire("carol", r.carol, bobUntil))
+
+	r.admitAndRelease(t, "alice", r.k1)
+	r.admitAndRelease(t, "bob", r.bobOld)
+	r.admitAndRelease(t, "carol", r.carol)
+
+	alice, bob := r.stampOf("alice"), r.stampOf("bob")
+	require.NotZero(t, alice)
+	require.NotZero(t, bob)
+	require.NotZero(t, r.stampOf("carol"))
+
+	r.clock.set(rotationAt(4 * time.Hour))
+	r.p.expireRetiring()
+	require.Zero(t, heldRetiring(r.p), "every overlap is over")
+
+	// Only carol is rotated again.
+	rotateTo(t, r.p, map[string]Secret{"alice": r.k2, "bob": r.bobNew, "carol": carolThird},
+		retire("carol", carolNew, rotationAt(5*time.Hour)))
+
+	assert.Zero(t, r.stampOf("carol"), "carol got a first entry in this set")
+	assert.Equal(t, alice, r.stampOf("alice"), "alice is not in this rotation")
+	assert.Equal(t, bob, r.stampOf("bob"), "nor is bob")
 }
 
 // Nothing about an overlap costs anything when there is none: the three
