@@ -71,7 +71,8 @@ const retiringShapeAdvice = "[[retiring-secret]] blocks go in their own table, a
 	"one per old key, each with name, secret and until: not a scalar (retiring-secret = ...), " +
 	"not an inline table (retiring-secret = { ... }), not a key of that name under another table such as [secrets]"
 
-// retiringReloadKept is what a reload refused at such a key adds: the file is
+// retiringReloadKept is what a reload refused at such a key (or refused because
+// a [secrets] holds only the reserved retiring-secret user) adds: the file is
 // refused whole, so the set in force stays, and a re-key in the same edit -- the
 // usual company of a rotation, in [secrets] or the top-level secret -- is not
 // applied either. The reloader cannot tell whether the edit re-keyed anything,

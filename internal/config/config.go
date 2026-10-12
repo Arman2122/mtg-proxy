@@ -291,7 +291,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid secret %s", c.Secret.String())
 		}
 	case len(served) == 0:
-		return errOnlyMisplacedRetiringUser
+		return ErrOnlyMisplacedRetiringUser
 	default:
 		for name, s := range served {
 			if !s.Valid() {
@@ -483,13 +483,14 @@ func (c *Config) GetSecrets() map[string]mtglib.Secret {
 // is dropped -- the kill direction R0 asks for -- and GetRetiringSecrets reports
 // it as a problem: run warns, run --check and doctor refuse. The load is not
 // refused for it while [secrets] has another user to serve; a [secrets] holding
-// it alone serves nothing and is refused (errOnlyMisplacedRetiringUser).
+// it alone serves nothing and is refused (ErrOnlyMisplacedRetiringUser).
 const misplacedRetiringUser = "retiring-secret"
 
-// errOnlyMisplacedRetiringUser is Validate's refusal of a [secrets] whose only
+// ErrOnlyMisplacedRetiringUser is Validate's refusal of a [secrets] whose only
 // user is misplacedRetiringUser. It says why nothing is served and how the file
-// is written, and names no value.
-var errOnlyMisplacedRetiringUser = errors.New(`[secrets] holds only the reserved name "retiring-secret", ` +
+// is written, and names no value. It is exported so that the reloader can add
+// what a refusal keeps in force (errors.Is sees through the wrapping).
+var ErrOnlyMisplacedRetiringUser = errors.New(`[secrets] holds only the reserved name "retiring-secret", ` +
 	"which is never served, and the top-level secret is not served while [secrets] is present, " +
 	"so the file serves no secret: name the users to serve in [secrets], " +
 	"and write an old key as a [[retiring-secret]] block above [secrets]")

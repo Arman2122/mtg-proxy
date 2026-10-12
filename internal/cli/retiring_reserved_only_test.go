@@ -83,7 +83,8 @@ func TestAFileWhoseSecretsHoldOnlyTheReservedNameIsRefused(t *testing.T) {
 		err := proxy.ReloadSecrets()
 		require.Empty(t, retiringLeaks(errText(err), append(everyValue, alice)...), "the reload's error carries a key")
 		require.Error(t, err, "the reload serves a file that serves nothing")
-		assert.Equal(t, "cannot reload secrets: invalid config: "+onlyReservedRefusal, err.Error())
+		assert.Equal(t, "cannot reload secrets: invalid config: "+onlyReservedRefusal+"; "+retiringReloadKept, err.Error(),
+			"the refusal says that the set in force, and so the old key, is kept")
 
 		served := proxy.SnapshotSecrets()
 		require.Equal(t, 1, len(served), "alice, and no other secret")

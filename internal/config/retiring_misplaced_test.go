@@ -63,7 +63,9 @@ func servedNames(conf *config.Config, keyHex string) ([]string, bool) {
 // forever, as a primary. So that user is never served -- not by run, not by a
 // reload, not by the relay or access, which all read GetSecrets -- and the
 // report carries a line for it, which run logs at Warning and run --check and
-// doctor refuse. The load itself is never refused for it.
+// doctor refuse. The load itself is not refused for it while [secrets] has
+// another user to serve; a [secrets] holding it alone serves nothing and is
+// refused (final review B, I-1).
 func TestASecretsUserNamedRetiringSecretIsNotServed(t *testing.T) {
 	t.Parallel()
 

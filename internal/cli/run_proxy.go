@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -412,8 +413,9 @@ func usableRetiringSecrets(
 // too: the reloader judges the [[retiring-secret]] table by it, so during a
 // behind-clock episode it filters out an entry the proxy would judge expired,
 // rather than hand it over on a clock of its own. A problem in an entry drops
-// that entry and never fails the reload; only a file that does not parse does,
-// and the proxy then keeps the set in force.
+// that entry and never fails the reload; only a file that does not parse, or
+// does not validate (a [secrets] holding nothing but the reserved retiring-secret
+// user serves nothing), does, and the proxy then keeps the set in force.
 func makeSecretsReloader(
 	configPath string, logger mtglib.Logger, clock *mtglib.RotationClock,
 ) func() (mtglib.SecretConfig, error) {
@@ -429,6 +431,13 @@ func makeSecretsReloader(
 			// retiring-secret, it also says what the refusal keeps in force.
 			if advice, ok := retiringParseAdvice(err); ok {
 				return mtglib.SecretConfig{}, fmt.Errorf("%s: %w; %s", advice, err, retiringReloadKept)
+			}
+
+			// A [secrets] that serves nothing but the reserved user is the same
+			// mis-edit (the old value written as a user), and the one in which the
+			// old key certainly stays the primary: say so.
+			if errors.Is(err, config.ErrOnlyMisplacedRetiringUser) {
+				return mtglib.SecretConfig{}, fmt.Errorf("%w; %s", err, retiringReloadKept)
 			}
 
 			return mtglib.SecretConfig{}, err

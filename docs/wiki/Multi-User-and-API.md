@@ -880,7 +880,8 @@ links: mtg-proxy access /etc/mtg-proxy/config.toml
 
 On stdout, exactly one line: the new value, spelled as the old one was (hex if
 the file had hex, base64url otherwise). It is printed once, right after the
-file is replaced, before the lines on stderr and before any reload, so
+file is replaced, before the lines above (the report of the rotation) and before
+any reload, so
 redirect it if a script needs it.
 With `[web] enabled = true` stderr also says `WEB links of "alice" change now;
 the WEB transport has no overlap (see WEB-Proxy-Setup)`.

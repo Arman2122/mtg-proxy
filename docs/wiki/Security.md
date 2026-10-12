@@ -959,7 +959,7 @@ no WEB link for a host the config refuses.
 
 The known limits, which need a value pasted where it does not belong, most of
 them written in a deliberately odd way too: a key or a value spelled with TOML
-escapes (`A` for one of its characters, say), or split by a line-ending
+escapes (`A` for the letter A, say), or split by a line-ending
 backslash in a multi-line string, or a float written with digit underscores,
 can still be quoted by a parse error or a typed field's refusal — such as
 `client-speed: incorrect speed unit in "…"` — in its decoded form, which is not

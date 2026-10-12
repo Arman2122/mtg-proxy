@@ -576,9 +576,12 @@ a [secrets] user named "retiring-secret" is ignored: [[retiring-secret]] blocks 
 ```
 
 A `[secrets]` that holds nothing but that user would serve no secret at all —
-the top-level `secret` is not served while `[secrets]` is present — so `run`,
+the top-level `secret` is not served while `[secrets]` has any entry (an empty
+`[secrets]` header has none, and serves the top-level `secret`) — so `run`,
 `run --check`, `doctor`, `access` and `rotate-secret` refuse that file, and a
-reload refuses it and keeps the secret set in force. `run --check` says:
+reload refuses it and keeps the secret set in force; if the edit renamed a
+client to retire its key, that key stays the primary until the file is fixed
+and reloaded, and the reload's error says so. `run --check` says:
 
 ```text
 cannot init config: invalid config: [secrets] holds only the reserved name "retiring-secret", which is never served, and the top-level secret is not served while [secrets] is present, so the file serves no secret: name the users to serve in [secrets], and write an old key as a [[retiring-secret]] block above [secrets]
