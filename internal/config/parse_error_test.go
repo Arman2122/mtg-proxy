@@ -86,13 +86,15 @@ func TestAParseErrorCarriesNoValueOfTheFile(t *testing.T) {
 			_, err := config.Parse([]byte(tc.doc))
 			require.Error(t, err, "the file parses")
 
-			// First, so that no failing assertion below prints a key.
-			require.Empty(t, rotLeaks(err.Error(), tc.value), "the error carries the value")
+			// First, so that no failing assertion below prints a key: the value
+			// out of place, or alice's primary.
+			require.Empty(t, rotLeaks(err.Error(), tc.value, rotEE(rotKeyAlice)), "the error carries a value")
 
 			var parseErr *config.ParseError
 			require.ErrorAs(t, err, &parseErr, "the parser's error is a ParseError")
 
-			require.Empty(t, rotLeaks(strings.Join(parseErr.Key(), "."), tc.value), "the key carries the value")
+			require.Empty(t, rotLeaks(strings.Join(parseErr.Key(), "."), tc.value, rotEE(rotKeyAlice)),
+				"the key carries a value")
 
 			line, column := parseErr.Position()
 			assert.Equal(t, tc.line, line, "the line")
@@ -114,7 +116,7 @@ func TestAParseErrorCarriesNoValueOfTheFile(t *testing.T) {
 
 		_, err := config.Parse([]byte(parseDoc("[domain-fronting]\nhost = \"" + old + " x\"\n\n")))
 		require.Error(t, err)
-		require.Empty(t, rotLeaks(err.Error(), old), "the error carries the value")
+		require.Empty(t, rotLeaks(err.Error(), old, rotEE(rotKeyAlice)), "the error carries a value")
 
 		assert.Equal(t, `cannot parse a config: incorrect host "`+parseNotShown+` x"`, err.Error())
 	})
@@ -172,7 +174,7 @@ func TestAParseErrorOfAnOrdinaryFileIsUnchanged(t *testing.T) {
 
 			_, err := config.Parse([]byte(tc.doc))
 			require.Error(t, err)
-			require.Empty(t, rotLeaks(err.Error(), rotEE(rotKeyLeak)), "the error carries a value")
+			require.Empty(t, rotLeaks(err.Error(), rotEE(rotKeyLeak), rotEE(rotKeyAlice)), "the error carries a value")
 
 			assert.Equal(t, tc.text, err.Error())
 
@@ -223,11 +225,11 @@ func TestAnUnknownKeyThatReadsAsAValueIsNotShown(t *testing.T) {
 			t.Parallel()
 
 			conf, err := config.Parse([]byte(doc))
-			require.Empty(t, rotLeaks(rotErrText(err), old), "the error carries the value")
+			require.Empty(t, rotLeaks(rotErrText(err), old, rotEE(rotKeyAlice)), "the error carries a value")
 			require.NoError(t, err, "the file parses")
 
 			text := strings.Join(conf.UnknownKeys, "\n") + "\n" + strings.Join(conf.UnknownKeyWarnings(), "\n")
-			require.Empty(t, rotLeaks(text, old), "an unknown key carries the value")
+			require.Empty(t, rotLeaks(text, old, rotEE(rotKeyAlice)), "an unknown key carries a value")
 
 			require.Len(t, conf.UnknownKeys, 1)
 			assert.True(t, strings.HasPrefix(conf.UnknownKeys[0], "retiring-secret."), "the path around the value is kept")

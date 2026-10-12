@@ -185,10 +185,10 @@ func TestRotateSecretReloadsTheProxy(t *testing.T) {
 
 		res := runRotate(t, RotateSecret{ConfigPath: run.path, Name: "alice", Overlap: "24h", Reload: true, now: clock})
 		requireQuiet(t, res, alice, bob)
-		require.NoError(t, res.err)
 
 		renewed := newValue(t, res)
 		requireQuiet(t, res, renewed)
+		require.NoError(t, res.err)
 
 		info := secretOn(t, run.api, "alice")
 		assert.True(t, info.Secret == renewed.Base64(), "the proxy serves the new key")
@@ -251,7 +251,7 @@ func TestRotateSecretReloadsTheProxy(t *testing.T) {
 		// The file is the truth, and stays as written.
 		conf := readSecrets(t, run.path)
 		assert.True(t, conf.Secrets["alice"] == renewed, "the file was rolled back")
-		require.Len(t, conf.RetiringSecrets, 1, "the file was rolled back")
+		require.Equal(t, 1, len(conf.RetiringSecrets), "the file was rolled back")
 		assert.True(t, conf.RetiringSecrets[0].Secret == alice.Hex(), "the file was rolled back")
 	})
 
@@ -282,9 +282,11 @@ func TestRotateSecretReloadsTheProxy(t *testing.T) {
 
 		res := runRotate(t, RotateSecret{ConfigPath: run.path, Name: "alice", Overlap: "24h", Reload: true, now: clock})
 		requireQuiet(t, res, alice, bob, older)
-		require.NoError(t, res.err)
 
 		renewed := newValue(t, res)
+		requireQuiet(t, res, renewed)
+		require.NoError(t, res.err)
+
 		info := secretOn(t, run.api, "alice")
 		assert.True(t, info.Secret == renewed.Base64())
 		assert.Equal(t, 2, info.RetiringKeys)
@@ -297,9 +299,11 @@ func TestRotateSecretReloadsTheProxy(t *testing.T) {
 
 		res := runRotate(t, RotateSecret{ConfigPath: run.path, Name: "alice", Overlap: "0", Reload: true, now: clock})
 		requireQuiet(t, res, alice, bob, older)
-		require.NoError(t, res.err)
 
 		renewed := newValue(t, res)
+		requireQuiet(t, res, renewed)
+		require.NoError(t, res.err)
+
 		info := secretOn(t, run.api, "alice")
 		assert.True(t, info.Secret == renewed.Base64())
 		assert.Equal(t, 1, info.RetiringKeys, "the earlier block, and nothing for the key just retired")
@@ -312,7 +316,7 @@ func TestRotateSecretReloadsTheProxy(t *testing.T) {
 		res := runRotate(t, RotateSecret{ConfigPath: run.path, Name: "alice", EndOverlap: true, Reload: true, now: clock})
 		requireQuiet(t, res, alice, bob, older)
 		require.NoError(t, res.err)
-		assert.Empty(t, res.stdout)
+		assert.True(t, res.stdout == "", "stdout carries something")
 
 		info := secretOn(t, run.api, "alice")
 		assert.True(t, info.Secret == alice.Base64())
@@ -327,9 +331,10 @@ func TestRotateSecretReloadsTheProxy(t *testing.T) {
 
 		first := runRotate(t, RotateSecret{ConfigPath: run.path, Name: "alice", Overlap: "24h", now: clock})
 		requireQuiet(t, first, alice, bob)
-		require.NoError(t, first.err)
 
 		renewed := newValue(t, first)
+		requireQuiet(t, first, renewed)
+		require.NoError(t, first.err)
 		assert.True(t, secretOn(t, run.api, "alice").Secret == alice.Base64(), "the proxy was reloaded without --reload")
 
 		res := runRotate(t, RotateSecret{ConfigPath: run.path, Name: "alice", EndOverlap: true, Reload: true, now: clock})
@@ -355,7 +360,7 @@ func TestRotateSecretReloadsTheProxy(t *testing.T) {
 		res := runRotate(t, RotateSecret{ConfigPath: run.path, Prune: true, Reload: true, now: clock})
 		requireQuiet(t, res, alice, bob, older, gone, bobsOld)
 		require.NoError(t, res.err)
-		assert.Empty(t, res.stdout)
+		assert.True(t, res.stdout == "", "stdout carries something")
 
 		assert.Zero(t, secretOn(t, run.api, "alice").RetiringKeys)
 		assert.Equal(t, 1, secretOn(t, run.api, "bob").RetiringKeys)
@@ -422,6 +427,9 @@ func TestAReadBackNeverPrintsANameThatReadsAsAValue(t *testing.T) {
 
 			res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: valueLike, Overlap: "24h", Reload: true})
 			requireQuiet(t, res, files.old()...)
+
+			renewed := newValue(t, res)
+			requireQuiet(t, res, renewed)
 			require.NotContains(t, res.printed(), valueLike, "the name that reads as a value is printed")
 			require.Error(t, res.err)
 
@@ -537,7 +545,7 @@ func TestTheReloadPreCheckRefusesBeforeWriting(t *testing.T) {
 
 		assert.Contains(t, res.err.Error(), want)
 		assert.True(t, strings.HasSuffix(res.err.Error(), "nothing was written"), res.err.Error())
-		assert.Empty(t, res.stdout)
+		assert.True(t, res.stdout == "", "stdout carries something")
 		assert.Empty(t, generated.modes, "a refused run generated a key")
 		assert.Equal(t, before, listing(t, files.dir), "a refused run changed the directory")
 	}
@@ -676,7 +684,7 @@ func TestAFailedReloadPrintsOnlyTheStatusLine(t *testing.T) {
 
 	conf := readSecrets(t, files.path)
 	assert.True(t, conf.Secrets["alice"] == renewed, "the file was rolled back")
-	require.Len(t, conf.RetiringSecrets, 1, "the file was rolled back")
+	require.Equal(t, 1, len(conf.RetiringSecrets), "the file was rolled back")
 	assert.True(t, conf.RetiringSecrets[0].Secret == files.alice.Hex(), "the previous key's block is gone")
 	assert.Equal(t, []string{"config.toml"}, names(listing(t, files.dir)), "a file besides the config is left")
 }
@@ -801,7 +809,7 @@ func TestAnInterruptEndsAStalledReload(t *testing.T) {
 		require.Error(t, res.err)
 
 		assert.Equal(t, "interrupted; nothing was written", res.err.Error())
-		assert.Empty(t, res.stdout)
+		assert.True(t, res.stdout == "", "stdout carries something")
 		assert.Empty(t, generated.modes)
 		assert.Equal(t, before, listing(t, files.dir))
 	})

@@ -181,9 +181,11 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 	sweep.add("rotate-secret --reload: stdout", res.stdout, true)
 	sweep.add("rotate-secret --reload: stderr and error", res.printed(), false)
 	require.Empty(t, sweep.leaks([]mtglib.Secret{alice}, []mtglib.Secret{bob}), "the rotation printed a key")
-	require.NoError(t, res.err)
 
 	renewed := newValue(t, res)
+	require.Empty(t, retiringLeaks(res.printed(), renewed), "the new value is printed beyond stdout")
+	require.NoError(t, res.err)
+
 	retiring := []mtglib.Secret{alice, floating}
 	primaries := []mtglib.Secret{renewed, bob}
 
@@ -299,6 +301,7 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 	surfaces("no primary", noPrimary, false)
 
 	invalid := errText((&Run{ConfigPath: writeConfig(t, noPrimary), Check: true}).Run(nil, "test"))
+	sweep.add("no primary: Validate's refusal", invalid, false)
 
 	// The proxy back on the rotated file, and its whole log.
 	status, _ = reload("the rotated file again", rotated)
@@ -338,16 +341,19 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 	require.Empty(t, sweep.leaks(retiring, primaries), "a channel carries a key")
 
 	// What makes the sweep mean something: each channel said what it says.
+	// Each is asserted without printing the channel, which can hold a primary
+	// (access does by design).
 	require.NoError(t, accessErr)
-	assert.Contains(t, accessOut, renewed.Hex(), "access did not run over the rotated file")
-	assert.Contains(t, proxyLog, `"message":"configuration"`, "the proxy's Debug lines were not collected")
-	assert.Contains(t, proxyLog, "unknown config key is ignored", "a reload's unknown keys were not logged")
-	assert.Contains(t, proxyLog, "secret reload failed", "a refused reload was not logged")
-	assert.Contains(t, invalid, "invalid secret ", "Validate's refusal was not reached")
+	assert.True(t, strings.Contains(accessOut, renewed.Hex()), "access did not run over the rotated file")
+	assert.True(t, strings.Contains(proxyLog, `"message":"configuration"`), "the proxy's Debug lines were not collected")
+	assert.True(t, strings.Contains(proxyLog, "unknown config key is ignored"), "a reload's unknown keys were not logged")
+	assert.True(t, strings.Contains(proxyLog, "secret reload failed"), "a refused reload was not logged")
+	assert.True(t, strings.Contains(invalid, "invalid secret "), "Validate's refusal was not reached")
 
 	for _, log := range shapeLogs {
-		assert.Contains(t, log, "unknown config key is ignored", "a start did not log its unknown keys")
+		assert.True(t, strings.Contains(log, "unknown config key is ignored"), "a start did not log its unknown keys")
 	}
 
-	assert.Contains(t, res.stderr, "reloaded the proxy through its management API at "+run.api)
+	assert.True(t, strings.Contains(res.stderr, "reloaded the proxy through its management API at "+run.api),
+		"the rotation did not say it reloaded the proxy")
 }
