@@ -429,7 +429,10 @@ func TestTheTablesShapes(t *testing.T) {
 
 			if tc.where != "" {
 				assert.Contains(t, reloadErr.Error(), retiringShapeAdvice)
-				assert.Contains(t, reloadErr.Error(), retiringReloadKept, "the refused reload does not say what stays in force")
+				assert.True(t, strings.HasSuffix(reloadErr.Error(), "; the secret set in force is kept: "+
+					"nothing in this edit is applied; if it re-keyed [secrets] or secret, "+
+					"the old key stays the primary until the file is fixed and reloaded"),
+					"the refused reload does not say what stays in force")
 			} else {
 				assert.NotContains(t, reloadErr.Error(), retiringReloadKept)
 			}

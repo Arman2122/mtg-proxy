@@ -350,7 +350,10 @@ func TestASecretsUserNamedRetiringSecretIsNeverServed(t *testing.T) {
 		err := (&Run{ConfigPath: writeConfig(t, misEdit), Check: true}).Run(nil, "test")
 		require.Empty(t, retiringLeaks(errText(err), everyValue...), "the refusal carries a key")
 		require.ErrorIs(t, err, errRetiringProblems)
-		assert.Contains(t, err.Error(), misplacedUserLine)
+
+		// The heading speaks of settings, which a [secrets] key is as much as a
+		// block is; the line follows it.
+		assert.Equal(t, "retiring-secret settings that run ignores or warns about:\n  "+misplacedUserLine, err.Error())
 	})
 
 	t.Run("the reloader drops it, with a Warning, and applies the rest", func(t *testing.T) {

@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"encoding/hex"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -138,6 +139,78 @@ func TestASecretsUserNamedRetiringSecretIsNotServed(t *testing.T) {
 
 		assert.Equal(t, []string{misplacedLine, problemLine(1, "retiring-secret", whyDangling)},
 			conf.GetRetiringSecrets(rotNow).Lines)
+	})
+
+	// The name is reserved exactly. A user whose name merely looks like it is
+	// an ordinary user, served with its own key and named in no line: dropping
+	// one would cut a real client under a Warning about somebody else.
+	t.Run("only the exact name is dropped", func(t *testing.T) {
+		t.Parallel()
+
+		lookalikes := map[string]string{
+			"Retiring-Secret":    rotKeyOld1,
+			"retiring-secret2":   rotKeyOld2,
+			"my-retiring-secret": rotKeyOld3,
+			"retiring_secret":    rotKeyOld4,
+			"retiring-secrets":   rotKeyOld5,
+		}
+
+		var users strings.Builder
+
+		for name, key := range lookalikes {
+			fmt.Fprintf(&users, "%q = %q\n", name, rotEE(key))
+		}
+
+		conf := rotParse(t, rotFile()+users.String()+rotMisplaced(leaked))
+		require.NoError(t, conf.Validate())
+
+		names, holds := servedNames(conf, rotKeyLeak)
+		assert.False(t, holds, "the leaked key is served")
+		assert.Equal(t, []string{
+			"Retiring-Secret", "alice", "bob", "my-retiring-secret", "retiring-secret2", "retiring-secrets", "retiring_secret",
+		}, names)
+
+		served := conf.GetSecrets()
+
+		for name, key := range lookalikes {
+			secret := served[name]
+			assert.True(t, key == hex.EncodeToString(secret.Key[:]), "%s is served with its own key", name)
+		}
+
+		assert.Equal(t, []string{misplacedLine}, conf.GetRetiringSecrets(rotNow).Lines,
+			"one line, for the exact name only")
+	})
+
+	t.Run("only the exact name is dropped, without the name itself", func(t *testing.T) {
+		t.Parallel()
+
+		conf := rotParse(t, rotFile()+fmt.Sprintf("%q = %q\n", "Retiring-Secret", rotEE(rotKeyOld1))+
+			fmt.Sprintf("%q = %q\n", "retiring-secret2", rotEE(rotKeyOld2)))
+
+		names, _ := servedNames(conf, rotKeyLeak)
+		assert.Equal(t, []string{"Retiring-Secret", "alice", "bob", "retiring-secret2"}, names)
+		rotEmptyReport(t, conf.GetRetiringSecrets(rotNow), "look-alike names only")
+	})
+
+	// V4 (bind-to fronts every failed hello) judges the secrets served. Here the
+	// only ee secret with a host is the dropped user and the top-level secret is
+	// a hostless dd: judged before the drop, the file would load and front with
+	// nothing; judged after it, it is refused, as a file whose secrets cannot
+	// front is.
+	t.Run("the fronting check judges the secrets served", func(t *testing.T) {
+		t.Parallel()
+
+		conf := rotParse(t, "bind-to = \"0.0.0.0:3128\"\nsecret = \""+rotDD(rotKeyAlice)+"\"\n\n[secrets]\n"+
+			rotMisplaced(leaked))
+
+		names, holds := servedNames(conf, rotKeyLeak)
+		assert.Equal(t, []string{"default"}, names)
+		assert.False(t, holds, "the leaked key is served")
+
+		err := conf.Validate()
+		require.Empty(t, rotLeaks(rotErrText(err), leaked), "the refusal carries a key")
+		require.Error(t, err, "a file whose served secrets cannot front loads")
+		assert.Contains(t, err.Error(), "no secret carries a fronting hostname")
 	})
 
 	t.Run("a file without it is as before", func(t *testing.T) {

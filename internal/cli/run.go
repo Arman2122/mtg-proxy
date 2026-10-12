@@ -32,8 +32,10 @@ func (r *Run) Run(cli *CLI, version string) error {
 }
 
 var (
-	errUnknownKeys      = errors.New("unknown config keys")
-	errRetiringProblems = errors.New("retiring-secret entries that run ignores or warns about")
+	errUnknownKeys = errors.New("unknown config keys")
+	// "Settings": a [[retiring-secret]] block and a [secrets] user of that name
+	// alike. "Keys" would read as credentials.
+	errRetiringProblems = errors.New("retiring-secret settings that run ignores or warns about")
 )
 
 // checkConfig is `run --check`: the parse and validation `run` does before it
@@ -72,9 +74,12 @@ const retiringShapeAdvice = "[[retiring-secret]] blocks go in their own table, a
 
 // retiringReloadKept is what a reload refused at such a key adds: the file is
 // refused whole, so the set in force stays, and a re-key in the same edit -- the
-// usual company of a rotation -- is not applied either.
-const retiringReloadKept = "the secret set in force is kept: if this edit also re-keyed [secrets], " +
-	"that re-key is not applied, and the old key stays the primary until the file parses"
+// usual company of a rotation, in [secrets] or the top-level secret -- is not
+// applied either. The reloader cannot tell whether the edit re-keyed anything,
+// hence the "if". run does not watch its file: the old key stays until the file
+// is fixed and reloaded (or run restarted).
+const retiringReloadKept = "the secret set in force is kept: nothing in this edit is applied; " +
+	"if it re-keyed [secrets] or secret, the old key stays the primary until the file is fixed and reloaded"
 
 // retiringParseAdvice is the words to put before a parse error that stopped at a
 // key named retiring-secret, and whether it did. go-toml names a scalar or an
