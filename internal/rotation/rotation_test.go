@@ -98,7 +98,7 @@ func fixture(t *testing.T, name string) []byte {
 
 	data, err := os.ReadFile(filepath.Join("testdata", name))
 	require.NoError(t, err)
-	require.NotContains(t, string(data), "\r", "%s: fixtures are LF; a CRLF one is built in its test", name)
+	require.False(t, bytes.Contains(data, []byte("\r")), "%s: fixtures are LF; a CRLF one is built in its test", name)
 
 	return data
 }
@@ -575,8 +575,10 @@ func TestTheNewValueKeepsTheOldEncodingAndQuoteStyle(t *testing.T) {
 			out, err := prepared.Apply(newPrimary)
 			require.NoError(t, err)
 
-			assert.Contains(t, string(out), "\nalice = "+tc.quote+spelled+tc.quote+"\n", "the new value, in the old encoding and quotes")
-			assert.Contains(t, string(out), "\nsecret = "+tc.token+"\n", "the block's secret is the old text as written")
+			assert.True(t, bytes.Contains(out, []byte("\nalice = "+tc.quote+spelled+tc.quote+"\n")),
+				"the new value, in the old encoding and quotes")
+			assert.True(t, bytes.Contains(out, []byte("\nsecret = "+tc.token+"\n")),
+				"the block's secret is the old text as written")
 		})
 	}
 }
@@ -777,8 +779,14 @@ func TestPrepareRefuses(t *testing.T) {
 			prepared, err := Prepare(tc.doc, tc.req)
 			require.Error(t, err)
 			assert.Nil(t, prepared)
+
+			// The text is printed by a failing assertion only once it is
+			// known to carry no value.
+			if !assert.Empty(t, leaks(err.Error()), "the refusal carries no value") {
+				return
+			}
+
 			assert.Contains(t, err.Error(), tc.want)
-			assert.Empty(t, leaks(err.Error()), "the refusal carries no value")
 		})
 	}
 
@@ -830,17 +838,17 @@ func TestExistingProblemsDoNotBlockARotation(t *testing.T) {
 		require.NoError(t, err)
 
 		warnings := prepared.Warnings()
+		require.Empty(t, leaks(strings.Join(warnings, "\n")), "the warnings carry no value")
 		require.Len(t, warnings, 3)
 		assert.Contains(t, warnings[0], `retiring-secret #1 (name "carol"): name is not a configured secret`)
 		assert.Contains(t, warnings[1], `retiring-secret #2 (name "bob"): until is not an RFC 3339 date-time`)
 		assert.Contains(t, warnings[2], `retiring-secret #3 (name "bob"): until is more than 720h away`)
-		assert.Empty(t, leaks(strings.Join(warnings, "\n")), "the warnings carry no value")
 
 		out, err := prepared.Apply(newPrimaryLike(prepared.Primary()))
 		require.NoError(t, err)
 
 		for i, problem := range problems {
-			assert.Contains(t, string(out), problem, "problem block %d is left as it was", i+1)
+			assert.True(t, bytes.Contains(out, []byte(problem)), "problem block %d is left as it was", i+1)
 		}
 	})
 
@@ -854,14 +862,15 @@ func TestExistingProblemsDoNotBlockARotation(t *testing.T) {
 
 		prepared, err := Prepare(doc, Request{Name: "alice", Rotate: true, Until: testUntil, Prune: true, Now: testNow})
 		require.NoError(t, err)
+		require.Empty(t, leaks(strings.Join(prepared.Warnings(), "\n")), "the warnings carry no value")
 		require.Len(t, prepared.Warnings(), 1)
 		assert.Contains(t, prepared.Warnings()[0], `retiring-secret #2 (name "carol")`)
 
 		out, err := prepared.Apply(newPrimaryLike(prepared.Primary()))
 		require.NoError(t, err, "the problem is now #1, and it is still not a new one")
 
-		assert.NotContains(t, string(out), ee(keyOld1), "the expired block is gone")
-		assert.Contains(t, string(out), blockOf("carol", ee(keyOld2), at(time.Hour)), "the problem block stays")
+		assert.False(t, bytes.Contains(out, []byte(ee(keyOld1))), "the expired block is gone")
+		assert.True(t, bytes.Contains(out, []byte(blockOf("carol", ee(keyOld2), at(time.Hour)))), "the problem block stays")
 	})
 
 	t.Run("a pruned block's unknown field goes with it", func(t *testing.T) {
@@ -878,7 +887,7 @@ func TestExistingProblemsDoNotBlockARotation(t *testing.T) {
 
 		out, err := prepared.Apply(newPrimaryLike(prepared.Primary()))
 		require.NoError(t, err, "the unknown key the pruned block carried may go")
-		assert.NotContains(t, string(out), "untill")
+		assert.False(t, bytes.Contains(out, []byte("untill")), "the misspelt field is gone with its block")
 	})
 }
 
@@ -1016,14 +1025,14 @@ func TestEndOverlapAndPruneLeaveThePrimaryAlone(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			prepared, err := Prepare(doc, tc.req)
 			require.NoError(t, err)
-			require.Len(t, prepared.Summary().Removed, tc.removed)
+			require.Equal(t, tc.removed, len(prepared.Summary().Removed), "blocks removed")
 
 			// A real, different key: a verification that required it as the
 			// primary would refuse this edit.
 			out, err := prepared.Apply(mtglib.Secret{Key: mustKey(keyNew), Host: "storage.googleapis.com"})
 			require.NoError(t, err)
 			assert.True(t, bytes.HasSuffix(out, users), "[secrets] is byte for byte as it was")
-			assert.NotContains(t, string(out), keyNew)
+			assert.False(t, bytes.Contains(out, []byte(keyNew)), "the key handed to Apply is written nowhere")
 
 			spliceHook = func(out []byte) []byte {
 				return bytes.Replace(out, []byte(ee(keyAlice)), []byte(ee(keyNew)), 1)
@@ -1087,14 +1096,16 @@ func TestTheSummaryCarriesNoValue(t *testing.T) {
 			prepared, err := Prepare(doc, tc.req)
 			require.NoError(t, err)
 
+			// The leak checks come first: the assertions after them print
+			// what they compare when they fail.
 			summary := prepared.Summary()
+			require.Empty(t, leaks(fmt.Sprintf("%#v", summary)), "the summary carries no value")
+			require.Empty(t, leaks(strings.Join(prepared.Warnings(), "\n")), "the warnings carry no value")
+
 			assert.Equal(t, tc.req.Name, summary.Name)
 			assert.True(t, summary.Until.Equal(tc.until), "the summary's until is the one written")
 			assert.Equal(t, tc.removed, summary.Removed)
 			assert.False(t, summary.NoOp)
-
-			assert.Empty(t, leaks(fmt.Sprintf("%#v", summary)), "the summary carries no value")
-			assert.Empty(t, leaks(strings.Join(prepared.Warnings(), "\n")), "the warnings carry no value")
 		})
 	}
 }
