@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -280,14 +281,18 @@ func (c *Config) GetDomainFrontingProxyProtocol(defaultValue bool) bool {
 }
 
 func (c *Config) Validate() error {
-	// The secrets GetSecrets serves: a [secrets] user named retiring-secret is
-	// not one, so a [secrets] holding only that user leaves the top-level
-	// secret to validate.
-	if served := c.servedSecrets(); len(served) == 0 {
+	// The secrets GetSecrets serves: [secrets] when it has any key, the
+	// top-level secret only when it has none. A [secrets] user named
+	// retiring-secret is never served, so a [secrets] holding only that user
+	// serves nothing, and is refused before anything formats a value.
+	switch served := c.servedSecrets(); {
+	case len(c.Secrets) == 0:
 		if !c.Secret.Valid() {
 			return fmt.Errorf("invalid secret %s", c.Secret.String())
 		}
-	} else {
+	case len(served) == 0:
+		return errOnlyMisplacedRetiringUser
+	default:
 		for name, s := range served {
 			if !s.Valid() {
 				return fmt.Errorf("invalid secret %q: %s", name, s.String())
@@ -457,11 +462,15 @@ func (c *Config) validateSecretLimits() error {
 //
 // A [secrets] user named retiring-secret is never in it (misplacedRetiringUser):
 // every reader that serves or prints secrets -- run and its reloader, access,
-// doctor, the WEB relay -- reads this map, so none of them serves that user. A
-// [secrets] holding nothing else counts as empty.
+// doctor, the WEB relay -- reads this map, so none of them serves that user.
+// Whether [secrets] is used is decided by the table as written, that user
+// included: a [secrets] holding nothing else serves nothing, and never the
+// top-level secret, which the file left off when it took up [secrets] (final
+// review B, I-1: lost state kills a key, never revives one). Validate refuses
+// such a file.
 func (c *Config) GetSecrets() map[string]mtglib.Secret {
-	if served := c.servedSecrets(); len(served) > 0 {
-		return served
+	if len(c.Secrets) > 0 {
+		return c.servedSecrets()
 	}
 
 	return map[string]mtglib.Secret{"default": c.Secret}
@@ -471,10 +480,19 @@ func (c *Config) GetSecrets() map[string]mtglib.Secret {
 // the first table header, the hand edit meant to retire a leaked link,
 // retiring-secret = "<old value>", is no parse error: it is a [secrets] user of
 // that name whose primary key is the leaked one, accepted for ever. So the user
-// is dropped -- the kill direction R0 asks for, and never a refused load -- and
-// GetRetiringSecrets reports it as a problem: run warns, run --check and doctor
-// refuse.
+// is dropped -- the kill direction R0 asks for -- and GetRetiringSecrets reports
+// it as a problem: run warns, run --check and doctor refuse. The load is not
+// refused for it while [secrets] has another user to serve; a [secrets] holding
+// it alone serves nothing and is refused (errOnlyMisplacedRetiringUser).
 const misplacedRetiringUser = "retiring-secret"
+
+// errOnlyMisplacedRetiringUser is Validate's refusal of a [secrets] whose only
+// user is misplacedRetiringUser. It says why nothing is served and how the file
+// is written, and names no value.
+var errOnlyMisplacedRetiringUser = errors.New(`[secrets] holds only the reserved name "retiring-secret", ` +
+	"which is never served, and the top-level secret is not served while [secrets] is present, " +
+	"so the file serves no secret: name the users to serve in [secrets], " +
+	"and write an old key as a [[retiring-secret]] block above [secrets]")
 
 // servedSecrets is [secrets] without a user named misplacedRetiringUser: the
 // table itself when it has none, so a file without one reads as before.

@@ -17,6 +17,12 @@ import (
 const misplacedLine = `a [secrets] user named "retiring-secret" is ignored: ` +
 	`[[retiring-secret]] blocks go in their own table, above or between the other tables, one per old key`
 
+// onlyMisplacedRefusal is Validate's refusal of a [secrets] that holds that user
+// and nothing else (final review B, I-1).
+const onlyMisplacedRefusal = `[secrets] holds only the reserved name "retiring-secret", which is never served, ` +
+	"and the top-level secret is not served while [secrets] is present, so the file serves no secret: " +
+	"name the users to serve in [secrets], and write an old key as a [[retiring-secret]] block above [secrets]"
+
 // rotMisplaced is the hand edit the line is for: the old link retired by a line
 // appended where users are appended, below [secrets]. TOML makes it a user named
 // retiring-secret whose primary key is the leaked one.
@@ -84,22 +90,31 @@ func TestASecretsUserNamedRetiringSecretIsNotServed(t *testing.T) {
 		assert.Equal(t, []string{misplacedLine}, conf.GetRetiringSecrets(rotNow.Add(1000*time.Hour)).Lines)
 	})
 
+	// Final review B, I-1: a [secrets] that holds the user and nothing else is
+	// still a [secrets], so the top-level secret is not served -- the file was
+	// switched to [secrets], and the key it left at the top was off. Serving it
+	// because the table's only user is dropped would bring a key back. The file
+	// serves nothing, which no file may: refused, and nothing served.
 	t.Run("as the only user, beside a top-level secret", func(t *testing.T) {
 		t.Parallel()
 
 		conf := rotParse(t, rotSingleFile()+"\n[secrets]\n"+rotMisplaced(leaked))
-		require.NoError(t, conf.Validate())
+
+		err := conf.Validate()
+		require.Empty(t, rotLeaks(rotErrText(err), leaked, rotEE(rotKeyAlice)), "the refusal carries a key")
+		require.Error(t, err, "a file that serves nothing loads")
+		assert.Equal(t, onlyMisplacedRefusal, err.Error())
 
 		names, holds := servedNames(conf, rotKeyLeak)
-		assert.Equal(t, []string{"default"}, names, "an empty [secrets] serves the top-level secret")
+		assert.Empty(t, names, "a [secrets] holding only the user serves the top-level secret")
 		assert.False(t, holds, "the leaked key is served")
 		assert.Equal(t, []string{misplacedLine}, conf.GetRetiringSecrets(rotNow).Lines)
 	})
 
-	// Nothing is left to serve, which no file may be: refused, as a file with no
-	// secret at all is, and the leaked key is not served. With a fronting host
-	// set, only the check of the secrets served stands between the file and a
-	// proxy whose one secret is the empty top-level one.
+	// Nothing is left to serve, which no file may be: refused, in words that say
+	// why, and the leaked key is not served. With a fronting host set, only the
+	// check of the secrets served stands between the file and a proxy whose one
+	// secret is the empty top-level one.
 	for name, top := range map[string]string{
 		"as the only user, with nothing else to serve":                     "",
 		"as the only user, with nothing else to serve and a fronting host": "[domain-fronting]\nhost = \"cover.example.com\"\n\n",
@@ -112,6 +127,7 @@ func TestASecretsUserNamedRetiringSecretIsNotServed(t *testing.T) {
 			err := conf.Validate()
 			require.Empty(t, rotLeaks(rotErrText(err), leaked), "the refusal carries a key")
 			require.Error(t, err)
+			assert.Equal(t, onlyMisplacedRefusal, err.Error())
 
 			_, holds := servedNames(conf, rotKeyLeak)
 			assert.False(t, holds, "the leaked key is served")
@@ -193,18 +209,19 @@ func TestASecretsUserNamedRetiringSecretIsNotServed(t *testing.T) {
 	})
 
 	// V4 (bind-to fronts every failed hello) judges the secrets served. Here the
-	// only ee secret with a host is the dropped user and the top-level secret is
-	// a hostless dd: judged before the drop, the file would load and front with
+	// only ee secret with a host is the dropped user and the one other user is a
+	// hostless dd: judged before the drop, the file would load and front with
 	// nothing; judged after it, it is refused, as a file whose secrets cannot
-	// front is.
+	// front is. (The other user is in [secrets]: with the dropped user alone the
+	// file serves nothing and is refused before the fronting check.)
 	t.Run("the fronting check judges the secrets served", func(t *testing.T) {
 		t.Parallel()
 
-		conf := rotParse(t, "bind-to = \"0.0.0.0:3128\"\nsecret = \""+rotDD(rotKeyAlice)+"\"\n\n[secrets]\n"+
+		conf := rotParse(t, "bind-to = \"0.0.0.0:3128\"\n\n[secrets]\nalice = \""+rotDD(rotKeyAlice)+"\"\n"+
 			rotMisplaced(leaked))
 
 		names, holds := servedNames(conf, rotKeyLeak)
-		assert.Equal(t, []string{"default"}, names)
+		assert.Equal(t, []string{"alice"}, names)
 		assert.False(t, holds, "the leaked key is served")
 
 		err := conf.Validate()
@@ -230,5 +247,72 @@ func TestASecretsUserNamedRetiringSecretIsNotServed(t *testing.T) {
 		conf.Secrets = nil // what applyEnvSecret does
 
 		rotEmptyReport(t, conf.GetRetiringSecrets(rotNow), "[secrets] cleared")
+	})
+}
+
+// Final review B, I-1, on the reviewer's own file: a top-level secret and a
+// [secrets] holding only retiring-secret = "<old value>". Before the name was
+// reserved the table served the old value; with the user dropped and a fallback
+// to the top-level secret, it served that, a key the file had switched off when
+// it took up [secrets]. Now neither: the file is refused, and GetSecrets -- what
+// run, its reloader, access, doctor, rotate-secret and the WEB relay read --
+// holds neither key, nor the name "default". A block that names "default" there
+// names the top-level secret, not served while [secrets] is present, and its line
+// says so. Only an empty [secrets] header leaves the top-level secret served, as
+// it always has.
+func TestASecretsHoldingOnlyTheReservedNameServesNothing(t *testing.T) {
+	t.Parallel()
+
+	const (
+		topLevel    = "ee00112233445566778899aabbccddeeff6578616d706c652e636f6d"
+		topLevelKey = "00112233445566778899aabbccddeeff"
+		reserved    = "ee0f1e2d3c4b5a69788796a5b4c3d2e1f06578616d706c652e636f6d"
+		reservedKey = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+	)
+
+	file := func(blocks ...string) string {
+		return "secret = \"" + topLevel + "\"\nbind-to = \"127.0.0.1:3128\"\n\n" + strings.Join(blocks, "") +
+			"[secrets]\nretiring-secret = \"" + reserved + "\"\n"
+	}
+
+	t.Run("refused, and nothing served", func(t *testing.T) {
+		t.Parallel()
+
+		conf := rotParse(t, file())
+
+		err := conf.Validate()
+		require.Empty(t, rotLeaks(rotErrText(err)+conf.String(), topLevel, reserved), "a key is printed")
+		require.Error(t, err, "a file that serves nothing loads")
+		assert.Equal(t, onlyMisplacedRefusal, err.Error())
+
+		names, holdsTopLevel := servedNames(conf, topLevelKey)
+		_, holdsReserved := servedNames(conf, reservedKey)
+
+		assert.Empty(t, names, "a secret is served")
+		assert.False(t, holdsTopLevel, "the top-level secret is served while [secrets] is present")
+		assert.False(t, holdsReserved, "the reserved user is served")
+		assert.Equal(t, []string{misplacedLine}, conf.GetRetiringSecrets(rotNow).Lines)
+	})
+
+	t.Run("a block named default names the top-level secret, which is not served", func(t *testing.T) {
+		t.Parallel()
+
+		conf := rotParse(t, file(rotBlock(rotName("default"), rotSecret(rotEE(rotKeyOld1)), rotUntil(rotIn(time.Hour)))))
+
+		report := conf.GetRetiringSecrets(rotNow)
+		require.Empty(t, rotLeaks(strings.Join(report.Lines, "\n"), topLevel, reserved, rotEE(rotKeyOld1)))
+		assert.Equal(t, []string{misplacedLine, problemLine(1, "default", whyDanglingDefault)}, report.Lines)
+		assert.Zero(t, len(report.Usable), "an old key of a secret that is not served is accepted")
+	})
+
+	t.Run("an empty [secrets] header serves the top-level secret, as before", func(t *testing.T) {
+		t.Parallel()
+
+		conf := rotParse(t, "secret = \""+topLevel+"\"\nbind-to = \"127.0.0.1:3128\"\n\n[secrets]\n")
+		require.NoError(t, conf.Validate())
+
+		names, holds := servedNames(conf, topLevelKey)
+		assert.Equal(t, []string{"default"}, names)
+		assert.True(t, holds, "default is the top-level secret")
 	})
 }

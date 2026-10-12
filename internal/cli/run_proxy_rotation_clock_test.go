@@ -352,11 +352,10 @@ func TestOneRotationClockServesTheReloaderAndTheProxy(t *testing.T) {
 
 	// The loop harness's file (a hostless dd secret: no start-up DNS lookup), with
 	// debug and the API among the top-level keys, before the first table. The
-	// [secrets] table holds only the mis-edit, so default is still the top-level
-	// secret.
+	// [secrets] table holds alice and the mis-edit: a [secrets] holding the
+	// mis-edit alone serves nothing, and is refused (final review B, I-1).
 	raw := func(public, extra uint, api string) string {
 		return fmt.Sprintf(`
-secret = "%s"
 bind-to = "127.0.0.1:%d"
 debug = true
 api-bind-to = "%s"
@@ -373,24 +372,25 @@ bind-to = "127.0.0.1:%d"
 accept = ["dd"]
 
 [[retiring-secret]]
-name = "default"
+name = "alice"
 secret = "%s"
 until = "%s"
 
 [[retiring-secret]]
-name = "default"
+name = "alice"
 secret = "%s"
 until = "the day after tomorrow"
 
 [[retiring-secret]]
-name = "default"
+name = "alice"
 secret = "%s"
 until = "%s"
 
 [secrets]
+alice = "%s"
 retiring-secret = "%s"
-`, primary.Hex(), public, api, extra, old.Hex(), rfc3339(until), broken.Hex(), kept.Hex(), rfc3339(keptUntil),
-			misplaced.Hex())
+`, public, api, extra, old.Hex(), rfc3339(until), broken.Hex(), kept.Hex(), rfc3339(keptUntil),
+			primary.Hex(), misplaced.Hex())
 	}
 
 	// Read from the API handler's goroutine as well as this one.
@@ -405,12 +405,12 @@ retiring-secret = "%s"
 	// first set's build inside it.
 	run := startRotationRun(t, raw, now)
 
-	// What the proxy holds: default with the one entry still in its overlap, and
+	// What the proxy holds: alice with the one entry still in its overlap, and
 	// not the one the mark has passed; and no secret named retiring-secret.
 	requireServed := func(when string) {
 		t.Helper()
 
-		status, body, err := apiCall(t, http.MethodGet, "http://"+run.api+"/secrets/default")
+		status, body, err := apiCall(t, http.MethodGet, "http://"+run.api+"/secrets/alice")
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, status)
 
@@ -448,7 +448,7 @@ retiring-secret = "%s"
 		expiredSummary = "retiring-secret entries past their until are ignored; rotate-secret --prune removes them"
 		engineDrop     = "a retiring key was ignored"
 		behind         = "the wall clock is behind the latest time seen; rotation overlaps are judged by the latest time"
-		badBlock       = `retiring-secret #2 (name "default"): until is not an RFC 3339 date-time with an offset, ` +
+		badBlock       = `retiring-secret #2 (name "alice"): until is not an RFC 3339 date-time with an offset, ` +
 			`such as 2026-10-09T09:30:00Z; the entry is ignored and its key is not accepted`
 	)
 
