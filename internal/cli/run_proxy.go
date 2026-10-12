@@ -367,6 +367,41 @@ func clockBehindReporter(logger mtglib.Logger) func(time.Duration) {
 	}
 }
 
+// retiringExpiredSummary is the Info line that counts the [[retiring-secret]]
+// entries past their until (spec §6.2).
+const retiringExpiredSummary = "retiring-secret entries past their until are ignored; rotate-secret --prune removes them"
+
+// usableRetiringSecrets judges the [[retiring-secret]] table at the process's
+// one rotation clock, logs what it found, and returns the entries the engine is
+// to be handed. The start and every reload go through it, so both judge by the
+// same clock as the proxy and log the same way:
+//   - each problem or warning at Warning, one line each, as warnUnknownKeys
+//     does for a key: a problem drops its entry and never the load (D4), which
+//     kills that old key early rather than leave the leaked one the primary;
+//   - the count of entries past their until at Info, with expired;
+//   - each note (an entry that changes nothing) at Info.
+//
+// It logs nothing for a file without the table. No line carries a key.
+func usableRetiringSecrets(
+	conf *config.Config, clock *mtglib.RotationClock, logger mtglib.Logger,
+) []mtglib.RetiringSecret {
+	report := conf.GetRetiringSecrets(clock.Now())
+
+	for _, line := range report.Lines {
+		logger.Warning(line)
+	}
+
+	if report.Expired > 0 {
+		logger.BindInt("expired", report.Expired).Info(retiringExpiredSummary)
+	}
+
+	for _, note := range report.Notes {
+		logger.Info(note)
+	}
+
+	return report.Usable
+}
+
 // makeSecretsReloader builds the callback Proxy.ReloadSecrets uses to re-read
 // the secret set on a POST /reload. It re-parses the same config file passed to
 // `mtg run`, so an operator editing [secrets] and calling reload swaps the set
@@ -374,8 +409,11 @@ func clockBehindReporter(logger mtglib.Logger) func(time.Duration) {
 // leaving reload unsupported.
 //
 // clock is the process's one rotation clock, the instance the proxy is given
-// too. The reloader reads retiring keys through it once the config layer has
-// them; until then it only carries it.
+// too: the reloader judges the [[retiring-secret]] table by it, so during a
+// behind-clock episode it filters out an entry the proxy would judge expired,
+// rather than hand it over on a clock of its own. A problem in an entry drops
+// that entry and never fails the reload; only a file that does not parse does,
+// and the proxy then keeps the set in force.
 func makeSecretsReloader(
 	configPath string, logger mtglib.Logger, clock *mtglib.RotationClock,
 ) func() (mtglib.SecretConfig, error) {
@@ -397,6 +435,7 @@ func makeSecretsReloader(
 			SecretAdTags: conf.GetSecretAdTags(),
 			GlobalAdTag:  conf.GetAdTag(),
 			Limits:       conf.GetSecretLimits(),
+			Retiring:     usableRetiringSecrets(conf, clock, logger),
 		}, nil
 	}
 }
@@ -634,9 +673,9 @@ func runProxy(conf *config.Config, version, configPath string) error {
 // moves. Nothing else about the run differs.
 //
 // The rotation clock is built here, once, right after the logger, and the one
-// instance goes to everything that judges a retiring key by time: the secrets
-// reloader and the proxy. It is not a package variable, so a test's clock cannot
-// leak into another run.
+// instance goes to everything that judges a retiring key by time: the start's
+// reading of the [[retiring-secret]] table, the secrets reloader and the proxy.
+// It is not a package variable, so a test's clock cannot leak into another run.
 //
 // It is a channel and not a context on purpose. The run needs nothing from a
 // context but the signal to stop, and everything it builds -- the proxy, the
@@ -653,6 +692,9 @@ func runProxyWith( //nolint: funlen, cyclop
 	warnIgnoredOfficialEnvs(logger)
 	warnUnknownKeys(logger, conf)
 	warnDeprecatedDomainFronting(conf, logger)
+
+	// Judged, and logged, once, on the clock the proxy's first build reads too.
+	retiring := usableRetiringSecrets(conf, clock, logger)
 
 	eventStream, err := makeEventStream(conf, logger)
 	if err != nil {
@@ -709,6 +751,7 @@ func runProxyWith( //nolint: funlen, cyclop
 		EventStream:     eventStream,
 
 		Secrets:                     conf.GetSecrets(),
+		RetiringSecrets:             retiring,
 		Concurrency:                 conf.GetConcurrency(mtglib.DefaultConcurrency),
 		DomainFrontingPort:          conf.GetDomainFrontingPort(mtglib.DefaultDomainFrontingPort),
 		DomainFrontingHost:          conf.GetDomainFrontingHost(),

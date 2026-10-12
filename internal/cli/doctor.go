@@ -113,7 +113,7 @@ func queryNTPOffset(host string) (time.Duration, error) {
 func (d *Doctor) Run(cli *CLI, version string) error {
 	conf, err := utils.ReadConfig(d.ConfigPath)
 	if err != nil {
-		return fmt.Errorf("cannot init config: %w", err)
+		return fmt.Errorf("cannot init config: %w", explainConfigError(err))
 	}
 
 	d.conf = conf
@@ -181,12 +181,43 @@ func (d *Doctor) checkUnknownKeys() bool {
 	return false
 }
 
+// checkRetiringSecrets reads the [[retiring-secret]] table as run --check does,
+// at the wall clock: the doctor is a separate process with no high-water
+// history. Every problem or warning run would log is listed and fails the
+// verdict, as an unknown key does. Entries past their until are inert: they are
+// counted, with the way to remove them, and do not fail it. Every line names an
+// entry by its position and name, never by its key.
+func (d *Doctor) checkRetiringSecrets() bool {
+	report := d.conf.GetRetiringSecrets(time.Now())
+
+	for _, line := range report.Lines {
+		d.say("  ⚠️  %s", line)
+	}
+
+	if len(report.Lines) == 0 {
+		d.say("  ✅ No retiring-secret entry has a problem")
+	}
+
+	switch {
+	case report.Expired == 1:
+		d.say("  ℹ️  1 retiring-secret entry is past its until and ignored; rotate-secret --prune removes it")
+	case report.Expired > 1:
+		d.say("  ℹ️  %d retiring-secret entries are past their until and ignored; rotate-secret --prune removes them",
+			report.Expired)
+	}
+
+	return len(report.Lines) == 0
+}
+
 func (d *Doctor) diagnose(base mtglib.Network, resolver ipLookup) (bool, error) {
 	d.say("Deprecated options")
 	everythingOK := d.checkDeprecatedConfig()
 
 	d.say("Unknown config keys")
 	everythingOK = d.checkUnknownKeys() && everythingOK
+
+	d.say("Retiring secrets")
+	everythingOK = d.checkRetiringSecrets() && everythingOK
 
 	d.say("Time skewness")
 	everythingOK = d.checkTimeSkewness() && everythingOK

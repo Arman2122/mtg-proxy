@@ -12,8 +12,8 @@ import (
 
 // The run's one rotation clock is built on the time runProxyWith is given and
 // handed to the proxy. What proves it end to end -- one clock for the reloader
-// and the proxy, through a behind-clock episode -- needs the reloader to read
-// retiring keys, and arrives with it.
+// and the proxy, through a behind-clock episode -- is
+// TestOneRotationClockServesTheReloaderAndTheProxy.
 
 // TestRunProxyWithBuildsItsClockOnTheTimeItIsGiven: the proxy's first set is
 // built by reading the clock, so a run whose clock is on the given time reads it
