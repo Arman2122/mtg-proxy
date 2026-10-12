@@ -935,7 +935,9 @@ block's `name` or `until` when it reads as a secret value. A previous key is
 held to a stricter rule than that: it is never printed anywhere — no log line,
 no error, no API answer, not `/stats`, not `access`, not `rotate-secret`'s
 output — in neither spelling of the value nor of the key. The lines about it
-name the secret and the block's position in the file, never the key.
+name the secret and the block's position in the file, never the key. What
+escapes that rule is the same value pasted by hand somewhere else in the file,
+where the known limits below can reach it.
 
 **A config error does not echo a value written in the wrong place.** A value
 pasted where TOML reads a key or a number used to come back in the parser's
@@ -955,14 +957,20 @@ as a secret value>"` means scanning the `[secret-limits.*]` headers by eye. The
 relay's refusal of a `[web] host` is cleaned the same way, and `access` prints
 no WEB link for a host the config refuses.
 
-The known limits, which need a value written in a deliberately odd way to
-reach: a key spelled with TOML escapes and defined twice, or a float written
-with digit underscores, is quoted by the parser in its decoded form, which is
-not the file's text and so is not recognised; the second step of the parse
-(from TOML to the config's own types) names no position; and the refusal of a
-`[secrets]` value that is not valid, `invalid secret "<name>": <value>`, still
-quotes the name as written (only the unset secret's all-zero placeholder can
-reach its value part).
+The known limits, which need a value pasted where it does not belong, most of
+them written in a deliberately odd way too: a key or a value spelled with TOML
+escapes (`A` for one of its characters, say), or split by a line-ending
+backslash in a multi-line string, or a float written with digit underscores,
+can still be quoted by a parse error or a typed field's refusal — such as
+`client-speed: incorrect speed unit in "…"` — in its decoded form, which is not
+the file's text and so is not recognised; a value pasted into a field the
+config accepts — a name, a host, a URL or a path — is printed as that field is,
+wherever the field is shown (`access` prints a `[secrets]` user's name, the
+debug log the configuration's hosts, URLs and paths); the second step of the
+parse (from TOML to the config's own types) names no position; and the refusal
+of a `[secrets]` value that is not valid, `invalid secret "<name>": <value>`,
+still quotes the name as written (only the unset secret's all-zero placeholder
+can reach its value part).
 
 **The only file the proxy writes is the usage state file.**
 
