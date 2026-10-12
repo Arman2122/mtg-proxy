@@ -258,8 +258,18 @@ func (c *Config) GetRetiringSecrets(now time.Time) RetiringReport {
 // RetiringValues is the WEB relay's list of retired values: the value of every
 // [[retiring-secret]] entry that passes rule 1 of §1.3 (name, secret and until
 // present, of their types and well formed, the key not all zero), whatever its
-// name or its time. In file order, with the duplicates kept; nil when none
-// passes, and after the SECRET override, which clears the table (D29).
+// name or its time. Ordered by until, the latest first, ties in file order, with
+// the duplicates kept (so a value written twice has its later until first); nil
+// when none passes, and after the SECRET override, which clears the table (D29).
+//
+// The order is what the cap keeps. The relay's registry holds the first
+// MaxProfiles values it is given, and an expired block is inert, not deleted
+// (only --prune removes it), so a long-lived file can hold more than that of
+// them with a fresh rotation written after all of them. Ordered by until, the
+// cut leaves out the grants that expired first, as rule 8 does, and not the
+// newest retirements: the holders of a just-retired link are the ones most
+// likely to present it, and a cut in file order would forward them to the cover
+// site.
 //
 // It is not GetRetiringSecrets' Usable list, and deliberately asks less. The
 // relay recognises a retired key's capability so that its holder is answered by
@@ -275,7 +285,12 @@ func (c *Config) GetRetiringSecrets(now time.Time) RetiringReport {
 // It is pure and takes no clock. Never format an element of the result with
 // %v or %s: a Secret's String() is its value.
 func (c *Config) RetiringValues() []mtglib.Secret {
-	var values []mtglib.Secret
+	type retiredValue struct {
+		secret mtglib.Secret
+		until  time.Time
+	}
+
+	var entries []retiredValue
 
 	for i := range c.RetiringSecrets {
 		// The one judge of rule 1: a field of the wrong TOML type carries the
@@ -286,6 +301,18 @@ func (c *Config) RetiringValues() []mtglib.Secret {
 			continue
 		}
 
+		entries = append(entries, retiredValue{secret: entry.secret, until: entry.until})
+	}
+
+	if entries == nil {
+		return nil
+	}
+
+	// Stable, so ties stay in file order; Compare orders instants, not spellings.
+	slices.SortStableFunc(entries, func(a, b retiredValue) int { return b.until.Compare(a.until) })
+
+	values := make([]mtglib.Secret, 0, len(entries))
+	for _, entry := range entries {
 		values = append(values, entry.secret)
 	}
 

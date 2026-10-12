@@ -228,7 +228,10 @@ func (r *profileReloader) apply(data []byte, trigger string) {
 		// Only the retired list changed: the new list is swapped in with the
 		// profiles the registry already serves, and nothing else moves -- not
 		// current, not the profile names, not the reload counters. Counts only
-		// in the line: every element of the list is a credential.
+		// in the line: every element of the list is a credential. The count is
+		// of the values the file holds (Config.RetiringValues), before the
+		// registry trims duplicates, values equal to a live capability and any
+		// past its cap, hence the field's name.
 		if err := r.origin.SetSecretsWithRetired(r.current, retired); err != nil {
 			r.counters.OnReload(time.Now(), err)
 			log.WarningError("web relay reload: the new retired list cannot be applied, keeping the current one", err)
@@ -238,7 +241,7 @@ func (r *profileReloader) apply(data []byte, trigger string) {
 
 		r.retired = retired
 
-		log.BindInt("retired", len(retired)).Debug("web relay: the retired capabilities changed, the profiles did not")
+		log.BindInt("retired-values", len(retired)).Debug("web relay: the retired capabilities changed, the profiles did not")
 
 		return
 	}

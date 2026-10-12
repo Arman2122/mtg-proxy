@@ -3,6 +3,7 @@ package webrelay
 import (
 	"bytes"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Arman2122/mtg-proxy/internal/config"
 	"github.com/Arman2122/mtg-proxy/mtglib"
 	"github.com/stretchr/testify/require"
 )
@@ -31,6 +33,7 @@ const (
 	liveFamily     byte = 0x11
 	retiredFamily  byte = 0x22
 	strangerFamily byte = 0x33
+	freshFamily    byte = 0x44
 )
 
 func indexedSecret(family byte, index int) mtglib.Secret {
@@ -57,11 +60,27 @@ func asEE(secret mtglib.Secret) mtglib.Secret {
 	return mtglib.Secret{Mode: mtglib.SecretModeFakeTLS, Host: "www.cloudflare.com", Key: secret.Key}
 }
 
+// retiringBlockFor is the [[retiring-secret]] block of a key: its ee value, in
+// hex, and the instant it stops being accepted.
+func retiringBlockFor(secret mtglib.Secret, until string) string {
+	return fmt.Sprintf("[[retiring-secret]]\nname = %q\nsecret = %q\nuntil = %q\n\n", "alice", asEE(secret).Hex(), until)
+}
+
 // W5: with 4,096 live and 4,096 retired capabilities the recognition scan
-// visits all 8,192 whichever one matches, or none does -- a count taken at the
-// compare, not computed from the lengths, so a scan that breaks at the first
-// match cannot pass. A value that does not even parse is refused before the
-// scan and depends only on the prober's own input.
+// visits all 8,192 whichever one matches, or none does.
+//
+// What this proves: every capability of both lists is visited, and there is no
+// break. The count is taken inside ctEqual, the helper that also makes the
+// compare, so a scan that stops at a match, or that skips the compare once
+// something matched, reports fewer than 8,192 and fails here.
+//
+// What it cannot prove: any count the function under test reports about itself
+// can be made to lie (an early return of len(live)+len(retired) passes), and
+// this test does not claim otherwise. That is for review, and for a timing
+// measurement if the scan's timing ever matters.
+//
+// A value that does not even parse is refused before the scan and depends only
+// on the prober's own input.
 func TestTheScanVisitsEveryCapabilityOfBothLists(t *testing.T) {
 	t.Parallel()
 
@@ -71,7 +90,8 @@ func TestTheScanVisitsEveryCapabilityOfBothLists(t *testing.T) {
 	registry, err := NewRegistryWithRetired(originHost, live, retired)
 	require.NoError(t, err)
 	require.Equal(t, MaxProfiles, registry.Len(), "the retired list must not count as profiles")
-	require.Len(t, registry.retired, MaxProfiles, "the whole retired list is held")
+	// len, not require.Len: a failure of Len would print every capability.
+	require.Equal(t, MaxProfiles, len(registry.retired), "the whole retired list is held")
 
 	const bound = 2 * MaxProfiles
 
@@ -102,6 +122,78 @@ func TestTheScanVisitsEveryCapabilityOfBothLists(t *testing.T) {
 	found, compares := registry.authentic("not-a-capability")
 	require.False(t, found)
 	require.Zero(t, compares, "a value that does not parse is refused before the scan")
+}
+
+// The scan allocates the same however long the retired list is: the compare
+// counter lives on the stack, and a retired capability costs a compare, not an
+// allocation. Not parallel: AllocsPerRun cannot run in a parallel test.
+func TestTheScanAllocatesNothingPerCapability(t *testing.T) {
+	live := indexedSecrets(liveFamily, 4)
+
+	none, err := NewRegistryWithRetired(originHost, live, nil)
+	require.NoError(t, err)
+
+	many, err := NewRegistryWithRetired(originHost, live, indexedSecrets(retiredFamily, MaxProfiles))
+	require.NoError(t, err)
+
+	for name, probe := range map[string]string{
+		"a live capability":    webCapability(t, live[3]),
+		"a retired capability": webCapability(t, indexedSecret(retiredFamily, MaxProfiles-1)),
+		"an unknown one":       webCapability(t, indexedSecret(strangerFamily, 0)),
+	} {
+		without := testing.AllocsPerRun(20, func() { none.IsAuthentic(probe) })
+		with := testing.AllocsPerRun(20, func() { many.IsAuthentic(probe) })
+
+		require.InDelta(t, without, with, 0, "%s: a 4096-long retired list changed the allocations of one scan", name)
+	}
+}
+
+// The cap keeps the LATEST grants. A long-lived file can hold thousands of
+// expired blocks that nobody pruned (an expired block is inert, not deleted) and
+// a rotation writes its block after them, so a cap that kept the first values in
+// file order would leave the newest retirements out -- and the holders of those
+// just-retired links, the ones most likely to present them, would be forwarded
+// to the cover site. RetiringValues orders by until, latest first, so the
+// registry's cut keeps the grants that expire last.
+//
+// The file here is real: 4,500 old blocks, then ten fresh ones, loaded through
+// the config and the registry, and each fresh link derived on its own.
+func TestTheNewestRetirementsSurviveTheCap(t *testing.T) {
+	t.Parallel()
+
+	const (
+		stale = 4500
+		fresh = 10
+	)
+
+	var file strings.Builder
+
+	file.WriteString("bind-to = \"0.0.0.0:3128\"\n\n")
+
+	for i := range stale {
+		file.WriteString(retiringBlockFor(indexedSecret(retiredFamily, i), "2000-01-01T00:00:00Z"))
+	}
+
+	for i := range fresh {
+		file.WriteString(retiringBlockFor(indexedSecret(freshFamily, i), "2999-01-01T00:00:00Z"))
+	}
+
+	file.WriteString("[secrets]\nalice = \"" + asEE(indexedSecret(liveFamily, 0)).Hex() + "\"\n")
+
+	conf, err := config.Parse([]byte(file.String()))
+	require.NoError(t, err)
+
+	values := conf.RetiringValues()
+	require.Equal(t, stale+fresh, len(values), "every block that passes rule 1 gives its value")
+
+	registry, err := NewRegistryWithRetired(originHost, indexedSecrets(liveFamily, 1), values)
+	require.NoError(t, err)
+	require.Equal(t, MaxProfiles, len(registry.retired), "the cap was reached")
+
+	for i := range fresh {
+		found, _ := registry.authentic(webCapability(t, indexedSecret(freshFamily, i)))
+		require.True(t, found, "fresh retirement %d was left out by the cap", i)
+	}
 }
 
 // W4: a retired capability equal to a live one is dropped, and the live one
@@ -218,7 +310,7 @@ func TestARetiredListIsNeverAProfile(t *testing.T) {
 
 	plain, err := NewRegistry(originHost, live)
 	require.NoError(t, err)
-	require.Empty(t, plain.retired)
+	require.Zero(t, len(plain.retired), "NewRegistry holds no retired list")
 
 	found, compares := plain.authentic(webCapability(t, live[2]))
 	require.True(t, found)

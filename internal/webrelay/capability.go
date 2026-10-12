@@ -426,7 +426,7 @@ func deriveRetired(host string, retired []mtglib.Secret, live []Capability) []Ca
 		return nil
 	}
 
-	seen := make(map[Capability]struct{}, len(live)+len(retired))
+	seen := make(map[Capability]struct{}, len(live)+min(len(retired), MaxProfiles))
 	for _, capability := range live {
 		seen[capability] = struct{}{}
 	}
@@ -498,18 +498,26 @@ func (r *Registry) Lookup(param string) (int, bool) {
 // live capabilities and then the retired ones: a retired capability is
 // recognised, so its holder gets the local 404 and the cover site never sees
 // it. Every capability of both lists is compared whichever one matches, or
-// none, so how long the scan takes does not say which list a value is in. At
-// most MaxProfiles of each: 2 * MaxProfiles = 8,192 compares of 32 bytes.
+// none, so how long the scan takes does not say which list a value is in.
+//
+// The bound is per value: at most MaxProfiles of each list, so
+// 2 * MaxProfiles = 8,192 compares of 32 bytes for ONE credential-shaped value.
+// A request is scanned once per such value it carries (the origin stops at
+// maxCredentialAtoms = 64 of them), so at the worst a single request costs
+// 64 * 8,192 = 524,288 compares, about twice what it cost before retired
+// capabilities existed.
 func (r *Registry) IsAuthentic(param string) bool {
 	found, _ := r.authentic(param)
 
 	return found
 }
 
-// authentic is IsAuthentic that also reports how many compares the scan made,
-// counted where each compare is made. A value that does not parse is refused
-// before the scan with a count of zero: that depends only on the prober's own
-// input. The count is what the tests assert the bound on.
+// authentic is IsAuthentic that also reports how many compares the scan made.
+// The count is taken inside ctEqual, the one function that makes a compare, so
+// a scan that skips a compare skips its count: that is what lets a test assert
+// the 8,192 bound without trusting a second statement to keep step with the
+// first. A value that does not parse is refused before the scan with a count of
+// zero: that depends only on the prober's own input.
 func (r *Registry) authentic(param string) (bool, int) {
 	presented, ok := ParseCapabilityLenient(param)
 	if !ok {
@@ -518,15 +526,21 @@ func (r *Registry) authentic(param string) (bool, int) {
 
 	found, compares := 0, 0
 
-	for _, capability := range r.capabilities {
-		found |= subtle.ConstantTimeCompare(capability[:], presented[:])
-		compares++
+	for i := range r.capabilities {
+		found |= ctEqual(&r.capabilities[i], &presented, &compares)
 	}
 
-	for _, capability := range r.retired {
-		found |= subtle.ConstantTimeCompare(capability[:], presented[:])
-		compares++
+	for i := range r.retired {
+		found |= ctEqual(&r.retired[i], &presented, &compares)
 	}
 
 	return found == 1, compares
+}
+
+// ctEqual is one constant-time compare of two capabilities, 1 when they are
+// equal, and it counts itself in *compares.
+func ctEqual(a, b *Capability, compares *int) int {
+	*compares++
+
+	return subtle.ConstantTimeCompare(a[:], b[:])
 }

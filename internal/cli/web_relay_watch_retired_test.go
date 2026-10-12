@@ -24,9 +24,11 @@ import (
 // a change of the retired list alone reaches the registry without counting a
 // profile reload.
 //
-// No assertion here prints a capability or a value: a Secret's String() is its
-// value. Outcomes are told apart by the relay's own counters, because the
-// fixture's cover site is an empty directory that answers 404 too.
+// No assertion here prints a capability, a value or a log line on failure: a
+// Secret's String() is its value, so assertions compare booleans, counts and
+// labels (the convention of cf445c3). Outcomes are told apart by the relay's
+// own counters, because the fixture's cover site is an empty directory that
+// answers 404 too.
 
 // The values of the fixture's clients, as reloadConfigTOML spells them. alice
 // is oneSecret; rekeyed is bob's value, the key alice is rotated to.
@@ -131,11 +133,26 @@ func (c *capturingLogger) record(level, message string) {
 	c.sink.lines = append(c.sink.lines, level+":"+c.fields+" "+message)
 }
 
+// Every method of mtglib.Logger that takes text is overridden, so the leak
+// sweep sees a line however it was written: the embedded no-op logger answers
+// nothing at all.
 func (c *capturingLogger) Debug(message string)   { c.record("debug", message) }
 func (c *capturingLogger) Info(message string)    { c.record("info", message) }
 func (c *capturingLogger) Warning(message string) { c.record("warning", message) }
 func (c *capturingLogger) WarningError(message string, err error) {
 	c.record("warning", fmt.Sprintf("%s: %v", message, err))
+}
+
+func (c *capturingLogger) InfoError(message string, err error) {
+	c.record("info", fmt.Sprintf("%s: %v", message, err))
+}
+
+func (c *capturingLogger) DebugError(message string, err error) {
+	c.record("debug", fmt.Sprintf("%s: %v", message, err))
+}
+
+func (c *capturingLogger) Printf(format string, args ...any) {
+	c.record("printf", fmt.Sprintf(format, args...))
 }
 
 // at is the lines of one level.
@@ -273,7 +290,7 @@ func TestARetiredOnlyChangeIsRecognisedWithoutReloadingTheProfiles(t *testing.T)
 	require.Equal(t, answerLocal, relay.answer(t, one), "the new retired capability is not recognised")
 	require.Equal(t, answerCover, relay.answer(t, two), "a capability no block names is still the website")
 	require.True(t, servesBridge(t, relay.origin, relay.path, "alice"), "the live client stopped being served")
-	require.Empty(t, relay.log.at("warning"), "a clean retired-only change must report nothing")
+	require.Zero(t, len(relay.log.at("warning")), "a clean retired-only change must report nothing")
 
 	// A second block, an expired one, then the table emptied (a --prune).
 	relay.write(t, oneSecret,
@@ -315,23 +332,27 @@ func TestARetiredOnlyChangeIsLoggedAtDebugWithCountsOnly(t *testing.T) {
 		}
 	}
 
-	require.Len(t, changed, 1, "one Debug line says the retired list changed")
-	require.Contains(t, changed[0], "retired=2", "the line carries the count")
-	require.Empty(t, relay.log.at("info"), "a retired-only change is not an Info event")
-	require.Empty(t, relay.log.at("warning"))
+	// Booleans and counts only, never the line: a failure here must not print a
+	// log line, which is the very thing that may have leaked.
+	require.Equal(t, 1, len(changed), "one Debug line says the retired list changed")
+	require.True(t, strings.Contains(changed[0], "retired-values=2"), "the line carries the count of values")
+	require.Zero(t, len(relay.log.at("info")), "a retired-only change is not an Info event")
+	require.Zero(t, len(relay.log.at("warning")), "a clean retired-only change must warn of nothing")
 
-	all := relay.log.everything()
+	all := strings.ToLower(relay.log.everything())
 
-	for _, key := range []string{retiredKeyOne, retiredKeyTwo} {
-		for _, spelling := range spellingsOf(t, retiredEE(key)) {
-			require.NotContains(t, strings.ToLower(all), strings.ToLower(spelling), "a retired value reached a log line")
+	for k, key := range []string{retiredKeyOne, retiredKeyTwo} {
+		for s, spelling := range spellingsOf(t, retiredEE(key)) {
+			require.False(t, strings.Contains(all, strings.ToLower(spelling)),
+				"a retired value reached a log line (key %d, spelling %d)", k, s)
 		}
 	}
 
-	for _, capability := range []string{
+	for k, capability := range []string{
 		capabilityOfValue(t, retiredEE(retiredKeyOne)), capabilityOfValue(t, retiredEE(retiredKeyTwo)),
 	} {
-		require.NotContains(t, all, capability, "a retired capability reached a log line")
+		require.False(t, strings.Contains(all, strings.ToLower(capability)),
+			"a retired capability reached a log line (key %d)", k)
 	}
 }
 
@@ -369,7 +390,8 @@ func TestAnUnchangedRetiredListIsNotReapplied(t *testing.T) {
 	relay.ticks(2)
 
 	for _, line := range relay.log.at("debug") {
-		require.NotContains(t, line, "retired capabilities", "an edit that left the retired values alone was applied as a change")
+		require.False(t, strings.Contains(line, "retired capabilities"),
+			"an edit that left the retired values alone was applied as a change")
 	}
 
 	require.Equal(t, 2, len(relay.log.at("debug")), "each edit that changed nothing is said so, at Debug")

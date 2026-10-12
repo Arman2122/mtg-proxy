@@ -39,8 +39,10 @@ func valuesLabelled(conf *config.Config) []string {
 // (rule 7), not the caps (rule 8). Only an entry whose fields are not all there,
 // of their types and well formed (rule 1) has no value to give.
 //
-// The file order is kept and the duplicates are kept: the registry drops them,
-// because an inert file must never refuse the relay's start.
+// The duplicates are kept: the registry drops them, because an inert file must
+// never refuse the relay's start. The order is the latest until first, ties in
+// file order: the registry keeps the first 4,096 values, so a file with more
+// keeps the latest grants and not the oldest.
 func TestRetiringValuesFollowRuleOneOnly(t *testing.T) {
 	t.Parallel()
 
@@ -72,10 +74,28 @@ func TestRetiringValuesFollowRuleOneOnly(t *testing.T) {
 			rotBlock(rotName(rotValueLikeName), rotSecret(rotEE(rotKeyLeak)), rotUntil(day)),
 		))
 
+		// The latest until first (the registry's cap keeps the first values, so
+		// it keeps the latest grants), ties in file order, and a value that
+		// appears twice has its later until first. Duplicates are kept.
 		assert.Equal(t, []string{
-			"old1|ee", "old2|dd", "old3|ee", "old4|ee", "old1|ee",
-			"alice's key|ee", "alice's key|ee", "old5|plain", "leak|ee",
-		}, valuesLabelled(conf), "rule 1 alone decides, and the file's order and duplicates are kept")
+			"old5|plain",                    // 1000 days
+			"old1|ee",                       // 48h: the duplicate with the later until, from block 5
+			"old1|ee", "old3|ee", "old4|ee", // 24h, in file order
+			"alice's key|ee", "alice's key|ee", "leak|ee", // 24h, in file order
+			"old2|dd", // expired an hour ago
+		}, valuesLabelled(conf), "rule 1 alone decides, the latest until comes first, and the duplicates are kept")
+	})
+
+	t.Run("the order is by instant, not by how until is spelled", func(t *testing.T) {
+		t.Parallel()
+
+		// 09:00 at +03:00 is 06:00Z, earlier than 08:00Z though it sorts later as text.
+		conf := rotParse(t, rotFile(
+			rotBlock(rotName("alice"), rotSecret(rotEE(rotKeyOld1)), rotUntil("2026-10-09T09:00:00+03:00")),
+			rotBlock(rotName("alice"), rotSecret(rotEE(rotKeyOld2)), rotUntil("2026-10-09T08:00:00Z")),
+		))
+
+		assert.Equal(t, []string{"old2|ee", "old1|ee"}, valuesLabelled(conf))
 	})
 
 	t.Run("an entry that fails rule 1 gives nothing", func(t *testing.T) {

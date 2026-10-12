@@ -98,7 +98,8 @@ type OriginOptions struct {
 //
 //  1. Authentic and usable -- the carrier operation.
 //  2. Authentic but unusable -- expired, spent, wrong method, wrong path, a
-//     non-canonical spelling, a duplicated field. Answered LOCALLY with an
+//     non-canonical spelling, a duplicated field, or the capability of a key a
+//     rotation retired (recognised, never served). Answered LOCALLY with an
 //     uncacheable 404. Never delegated, because delegating it writes an
 //     operator's real credential into a third party's access log.
 //  3. Everything else -- the cover site, unaltered, on every path including the
@@ -111,9 +112,9 @@ type OriginOptions struct {
 type Origin struct {
 	host string
 
-	// registry is swapped whole by SetSecrets and never mutated in place, so a
-	// reload is invisible to a request already being served: every handler
-	// takes one snapshot and works from it.
+	// registry is swapped whole by SetSecretsWithRetired (SetSecrets is its nil
+	// form) and never mutated in place, so a reload is invisible to a request
+	// already being served: every handler takes one snapshot and works from it.
 	registry atomic.Pointer[Registry]
 
 	signer  *Signer
