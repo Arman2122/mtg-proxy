@@ -1,8 +1,6 @@
 package rotation
 
 import (
-	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"maps"
 	"reflect"
@@ -41,13 +39,16 @@ func (p *Prepared) verify(out []byte, newPrimary mtglib.Secret) error {
 
 	want := *p.conf
 	want.RetiringSecrets = p.expected
-	want.UnknownKeys = p.unknownKeys
+	want.UnknownKeys = unknownKeyPaths(p.unknownKeys)
 
 	if p.req.Rotate {
 		p.setPrimary(&want, newPrimary)
 	}
 
-	if !reflect.DeepEqual(want, *edited) {
+	got := *edited
+	got.UnknownKeys = unknownKeyPaths(edited.UnknownKeys)
+
+	if !reflect.DeepEqual(want, got) {
 		return ErrEditVerification
 	}
 
@@ -229,23 +230,22 @@ func withoutPosition(line string) string {
 	return label + line[end:]
 }
 
-// readsAsAValue reports whether text could be a secret value: it decodes as
-// hex or as base64 in either alphabet, padded or not, to at least a key's 16
-// bytes. It is the config package's display rule for a retiring entry's name,
-// kept here as a copy because that one is not exported: such a name is never
-// shown.
-func readsAsAValue(text string) bool {
-	for _, decode := range []func(string) ([]byte, error){
-		hex.DecodeString,
-		base64.RawURLEncoding.DecodeString,
-		base64.URLEncoding.DecodeString,
-		base64.RawStdEncoding.DecodeString,
-		base64.StdEncoding.DecodeString,
-	} {
-		if raw, err := decode(text); err == nil && len(raw) >= mtglib.SecretKeyLength {
-			return true
-		}
+// unknownKeyPaths are unknown keys compared by their path alone, sorted: a key
+// whose path hides a value-like part names the line it is on, which a block
+// inserted or removed above it moves (config.UnknownKeyPath). Every key stays
+// in the list, so two such keys are still two.
+func unknownKeyPaths(keys []string) []string {
+	if keys == nil {
+		return nil
 	}
 
-	return false
+	paths := make([]string, len(keys))
+
+	for i, key := range keys {
+		paths[i] = config.UnknownKeyPath(key)
+	}
+
+	slices.Sort(paths)
+
+	return paths
 }

@@ -391,9 +391,11 @@ func (c *Config) validateAdTags() error {
 		known["default"] = struct{}{}
 	}
 
+	// The name is the file's text, and could be a value pasted where a name
+	// goes: shownName hides that, and shows any other name as before.
 	for name := range c.SecretAdTags {
 		if _, ok := known[name]; !ok {
-			return fmt.Errorf("secret-ad-tags refers to unknown secret %q", name)
+			return fmt.Errorf("secret-ad-tags refers to unknown secret %s", shownName(name))
 		}
 	}
 
@@ -432,9 +434,10 @@ func (c *Config) validateSecretLimits() error {
 		known["default"] = struct{}{}
 	}
 
+	// A name is shown as validateAdTags shows it: never a value pasted there.
 	for name, l := range c.SecretLimits {
 		if _, ok := known[name]; !ok {
-			return fmt.Errorf("secret-limits refers to unknown secret %q", name)
+			return fmt.Errorf("secret-limits refers to unknown secret %s", shownName(name))
 		}
 
 		// client-speed is not a speed fair share divides: it holds one
@@ -442,7 +445,7 @@ func (c *Config) validateSecretLimits() error {
 		if l.ClientFair.Get(false) && l.Speed.Get(0) == 0 && l.SpeedUp.Get(0) == 0 && l.SpeedDown.Get(0) == 0 {
 			return fmt.Errorf(
 				"secret-limits.%s: client-fair divides the secret's speed among its addresses "+
-					"and needs speed, speed-up or speed-down beside it", name)
+					"and needs speed, speed-up or speed-down beside it", valueFreeName(name))
 		}
 	}
 

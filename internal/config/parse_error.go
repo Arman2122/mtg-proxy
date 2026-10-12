@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/pelletier/go-toml/v2"
@@ -103,10 +104,51 @@ func valueFreeKey(key []string) []string {
 	out := make([]string, len(key))
 
 	for i, part := range key {
-		out[i], _ = withoutValues(part, func(string) bool { return true })
+		out[i] = valueFreeName(part)
 	}
 
 	return out
+}
+
+// valueFreeName is a name of the file -- a key, a table's name, a host -- with
+// any text that could spell a value replaced. Every name is the document's
+// text, so none is held to being found there. An ordinary name is returned as
+// it is.
+func valueFreeName(name string) string {
+	text, _ := withoutValues(name, func(string) bool { return true })
+
+	return text
+}
+
+// shownName is a name of the file as an error quotes it: valueFreeName, quoted
+// as fmt's %q quotes a string. An ordinary name reads exactly as it did.
+func shownName(name string) string {
+	return strconv.Quote(valueFreeName(name))
+}
+
+// holdsAValue reports whether name holds text that could spell a value
+// (valueFreeName would replace some).
+func holdsAValue(name string) bool {
+	_, replaced := withoutValues(name, func(string) bool { return true })
+
+	return replaced
+}
+
+// unknownKeyLine is the suffix an unknown key whose path hides a part carries:
+// the line the key is on, so that the operator can find it, and which keeps
+// two such keys apart.
+const unknownKeyLine = " (line "
+
+// UnknownKeyPath is an entry of Config.UnknownKeys without the line a hidden
+// part adds to it: the dotted path alone, the same wherever the key moved in
+// the file. An entry with nothing hidden is its path already.
+func UnknownKeyPath(key string) string {
+	at := strings.LastIndex(key, unknownKeyLine)
+	if at < 0 || !strings.HasSuffix(key, ")") || !strings.Contains(key[:at], valueNotShown) {
+		return key
+	}
+
+	return key[:at]
 }
 
 // inDocument reports whether a run of text is text of doc.

@@ -247,7 +247,7 @@ func (p *Prepared) resolveName() ([]string, error) {
 	case served:
 	case p.req.Name == "default" && len(p.conf.Secrets) > 0:
 		return nil, errors.New(`"default" is not served while [secrets] is present; rotate a name from [secrets]`)
-	case readsAsAValue(p.req.Name):
+	case config.ReadsAsAValue(p.req.Name):
 		return nil, errors.New("there is no secret by that name (it is not shown: it reads as a secret value)")
 	default:
 		return nil, fmt.Errorf("there is no secret named %q", p.req.Name)
@@ -285,11 +285,11 @@ func (p *Prepared) locatePrimary() error {
 }
 
 // shown is a name as a message shows it: quoted, or, when it reads as a
-// secret value (readsAsAValue: a user named by a key's hex, say), a phrase in
-// its place. The name a run was asked for goes through it wherever it is
+// secret value whole or in part (config.ReadsAsAValue: a user named by a key's
+// hex, say, or a value with a space pasted after it), a phrase in its place. The name a run was asked for goes through it wherever it is
 // echoed, as every block's name does through entryLabel.
 func shown(name string) string {
-	if readsAsAValue(name) {
+	if config.ReadsAsAValue(name) {
 		return "the secret asked for (its name reads as a secret value and is not shown)"
 	}
 
@@ -475,7 +475,7 @@ func (p *Prepared) simulate() error {
 // holder is always unexpired (keyStillHeld reads what is usable now), so
 // --prune would not remove it.
 func endOverlapAdvice(holder string) string {
-	if readsAsAValue(holder) {
+	if config.ReadsAsAValue(holder) {
 		return "rotate-secret <config> <that name> --end-overlap ends every previous key of that name; " +
 			"or edit the block by hand"
 	}
@@ -611,7 +611,7 @@ func entryLabel(n int, name string) string {
 		label = fmt.Sprintf("retiring-secret #%d", n)
 	}
 
-	if !readsAsAValue(name) {
+	if !config.ReadsAsAValue(name) {
 		label += fmt.Sprintf(" (name %q)", name)
 	}
 
@@ -659,7 +659,7 @@ func (p *Prepared) summarise() Summary {
 		NoOp:  !p.req.Rotate && len(p.removed) == 0,
 	}
 
-	if !readsAsAValue(p.req.Name) {
+	if !config.ReadsAsAValue(p.req.Name) {
 		summary.Name = p.req.Name
 	}
 
@@ -668,7 +668,7 @@ func (p *Prepared) summarise() Summary {
 
 		var removed Removed
 
-		if p.loc.blocks[i].nameIsString && !readsAsAValue(entry.Name) {
+		if p.loc.blocks[i].nameIsString && !config.ReadsAsAValue(entry.Name) {
 			removed.Name = entry.Name
 		}
 

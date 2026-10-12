@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -304,9 +303,13 @@ func normaliseRetiringField(value any, dateTime bool) (string, bool) {
 // unknownKeys is the list of keys a strict decode of the same document would
 // have refused. The lenient decode above is the one that counts; this second
 // pass exists only to name what it dropped. Any failure of this pass other
-// than unknown keys is ignored, because the document already parsed. A part of
-// a key that could spell a secret value -- a value written where a key goes --
-// is not shown (valueFreeKey); the rest of its path is.
+// than unknown keys is ignored, because the document already parsed.
+//
+// A part of a key that could spell a secret value -- a value written where a
+// key goes -- is not shown (valueFreeKey); the rest of its path is, and the
+// line the key is on, so that the operator can find it (UnknownKeyPath takes
+// that off again). Keys are listed once each by their path as written, so two
+// such keys are two entries.
 func unknownKeys(rawData []byte) []string {
 	decoder := toml.NewDecoder(bytes.NewReader(rawData))
 	decoder.DisallowUnknownFields()
@@ -321,12 +324,28 @@ func unknownKeys(rawData []byte) []string {
 	}
 
 	keys := make([]string, 0, len(strict.Errors))
+	seen := make(map[string]bool, len(strict.Errors))
 
-	for _, decodeErr := range strict.Errors {
-		keys = append(keys, strings.Join(valueFreeKey(decodeErr.Key()), "."))
+	for i := range strict.Errors {
+		decodeErr := &strict.Errors[i]
+
+		written := strings.Join(decodeErr.Key(), ".")
+		if seen[written] {
+			continue
+		}
+
+		seen[written] = true
+
+		key := strings.Join(valueFreeKey(decodeErr.Key()), ".")
+		if key != written {
+			line, _ := decodeErr.Position()
+			key += fmt.Sprintf("%s%d)", unknownKeyLine, line)
+		}
+
+		keys = append(keys, key)
 	}
 
 	sort.Strings(keys)
 
-	return slices.Compact(keys)
+	return keys
 }

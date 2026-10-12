@@ -260,16 +260,18 @@ func webCanonicalHost(host string) (string, error) {
 		return "", fmt.Errorf("[web] host is required: it is the name a client derives its capability over")
 	}
 
+	// The host is quoted by shownName: a secret value pasted into it is not
+	// shown, and any other host is, as before.
 	if strings.ContainsAny(host, ":/?#@ ") {
-		return "", fmt.Errorf("[web] host %q must be a bare hostname, not a URL", host)
+		return "", fmt.Errorf("[web] host %s must be a bare hostname, not a URL", shownName(host))
 	}
 
 	if !strings.Contains(host, ".") {
-		return "", fmt.Errorf("[web] host %q must be a fully qualified name with a public certificate", host)
+		return "", fmt.Errorf("[web] host %s must be a fully qualified name with a public certificate", shownName(host))
 	}
 
 	if net.ParseIP(host) != nil {
-		return "", fmt.Errorf("[web] host %q is an IP address; a WEB client refuses one", host)
+		return "", fmt.Errorf("[web] host %s is an IP address; a WEB client refuses one", shownName(host))
 	}
 
 	return strings.ToLower(host), nil

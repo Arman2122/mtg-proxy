@@ -325,13 +325,18 @@ func judgeRetiringShape(n int, raw *ConfigRetiringSecret) judgedRetiring {
 }
 
 // readsAsAValue reports whether text, shown as a name or an until, could be a
-// secret value pasted into the wrong field: it decodes, as hex or as base64
-// in either alphabet, padded or not, to at least a key's 16 bytes. That covers
-// every text mtglib.ParseSecret accepts, and also the spellings no link uses
-// (standard base64, a wrong prefix, an all-zero key). Such text is at least 22
-// characters of one encoding's alphabet, so a real name -- and the help its
-// label gives with a typo -- is not affected. It is a display rule only: the
-// entry is judged by its name as written.
+// secret value pasted into the wrong field, whole or in part:
+//   - it decodes, as hex or as base64 in either alphabet, padded or not, to at
+//     least a key's 16 bytes. That covers every text mtglib.ParseSecret
+//     accepts, and also the spellings no link uses (standard base64, a wrong
+//     prefix, an all-zero key);
+//   - or it holds a run that could spell one (holdsAValue, parse_error.go's
+//     rule): a value with a space pasted after it, or between other words,
+//     decodes as nothing (Task 10's review, M-7).
+//
+// Either is at least 22 characters of one encoding's alphabet, so a real name
+// -- and the help its label gives with a typo -- is not affected. It is a
+// display rule only: the entry is judged by its name as written.
 func readsAsAValue(text string) bool {
 	for _, decode := range []func(string) ([]byte, error){
 		hex.DecodeString,
@@ -345,12 +350,11 @@ func readsAsAValue(text string) bool {
 		}
 	}
 
-	return false
+	return holdsAValue(text)
 }
 
-// ReadsAsAValue is readsAsAValue for the CLI, which names a secret it reads
-// back from a running proxy by the same display rule: such a name is never
-// shown.
+// ReadsAsAValue is readsAsAValue for the CLI and internal/rotation, which show
+// a name by the same display rule: such a name is never shown.
 func ReadsAsAValue(text string) bool { return readsAsAValue(text) }
 
 // danglingReason is rule 3's reason for name: "default" names the top-level
