@@ -1333,18 +1333,27 @@ func TestAnInterruptStopsTheRunCleanly(t *testing.T) {
 				mu             sync.Mutex
 				interrupts     chan<- os.Signal
 				caught         []os.Signal
+				notified       int    // how often the interrupts were asked for: once, or a second one would not kill
 				stoppedAt      []bool // whether the lock existed each time the interrupts were handed back
 				stopped        = make(chan struct{}, 4)
 				notify, stop   = notifySignals, stopSignals
+				ignored        = signalIgnored
 				originalSyncer = syncDir
 			)
 
-			t.Cleanup(func() { notifySignals, stopSignals, syncDir = notify, stop, originalSyncer })
+			t.Cleanup(func() {
+				notifySignals, stopSignals, signalIgnored, syncDir = notify, stop, ignored, originalSyncer
+			})
+
+			// None ignored, whatever this process started with (under nohup,
+			// SIGHUP would be).
+			signalIgnored = func(os.Signal) bool { return false }
 
 			notifySignals = func(c chan<- os.Signal, signals ...os.Signal) {
 				if slices.Contains(signals, os.Interrupt) {
 					mu.Lock()
 					interrupts, caught = c, signals
+					notified++
 					mu.Unlock()
 				}
 			}
@@ -1395,6 +1404,7 @@ func TestAnInterruptStopsTheRunCleanly(t *testing.T) {
 			defer mu.Unlock()
 
 			assert.Equal(t, []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}, caught)
+			assert.Equal(t, 1, notified, "the interrupts were asked for again: a second one would not kill")
 			assert.NoFileExists(t, lock)
 
 			if tc.when == "never" {
@@ -1424,6 +1434,80 @@ func TestAnInterruptStopsTheRunCleanly(t *testing.T) {
 			assert.Equal(t, []string{"config.toml"}, names(listing(t, files.dir)))
 		})
 	}
+}
+
+// N1 of the third review: a signal ignored when the run starts -- SIGHUP under
+// nohup, Ctrl-C in a background job -- is not asked for, which would make it
+// abort the run; and when every one is ignored nothing is asked for at all
+// (Notify with no signal relays every signal).
+func TestAnIgnoredSignalStaysIgnored(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ignored []os.Signal
+		want    [][]os.Signal
+	}{
+		{name: "none ignored", want: [][]os.Signal{{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}}},
+		{name: "SIGHUP ignored", ignored: []os.Signal{syscall.SIGHUP}, want: [][]os.Signal{{os.Interrupt, syscall.SIGTERM}}},
+		{name: "all ignored", ignored: []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := newRotateFiles(t)
+
+			var (
+				asked           [][]os.Signal
+				notify, ignored = notifySignals, signalIgnored
+				pipe            = pipeSignals()
+			)
+
+			t.Cleanup(func() { notifySignals, signalIgnored = notify, ignored })
+
+			// Every request but the one for SIGPIPE, which Run makes on Unix.
+			notifySignals = func(_ chan<- os.Signal, signals ...os.Signal) {
+				for _, sig := range signals {
+					if slices.Contains(pipe, sig) {
+						return
+					}
+				}
+
+				asked = append(asked, signals)
+			}
+
+			signalIgnored = func(sig os.Signal) bool { return slices.Contains(tc.ignored, sig) }
+
+			res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+			require.Empty(t, retiringLeaks(res.printed(), files.old()...), "stderr carries an old value")
+			require.NoError(t, res.err)
+
+			assert.Equal(t, tc.want, asked)
+		})
+	}
+}
+
+// N3 of the third review: the read-only-mount hint is given where the lock's
+// creation fails -- a writable file in a read-only container -- through the
+// run, not only by the helper.
+func TestALockOnAReadOnlyMountIsNamed(t *testing.T) {
+	files := newRotateFiles(t)
+	before := listing(t, files.dir)
+
+	original := openLock
+
+	t.Cleanup(func() { openLock = original })
+
+	openLock = func(path string) (*os.File, error) {
+		return nil, &fs.PathError{Op: "open", Path: path, Err: syscall.EROFS}
+	}
+
+	res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+	require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
+	require.Error(t, res.err)
+
+	assert.Contains(t, res.err.Error(), "the config's directory cannot take a new file: ")
+	assert.Contains(t, res.err.Error(), "(a read-only mount? run rotate-secret on the host, "+
+		"and mount the config's directory into the container)")
+	assert.Contains(t, res.err.Error(), "nothing was written")
+	assert.Empty(t, res.stdout)
+	assert.Equal(t, before, listing(t, files.dir))
 }
 
 // M-4 of the review: a config with another name (a hard link) keeps the old

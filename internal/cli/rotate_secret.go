@@ -57,11 +57,13 @@ var generateSecret = mtglib.GenerateSecretMode
 // nothingWritten ends every refusal, and every failure before the rename (§7.7).
 const nothingWritten = "nothing was written"
 
-// notifySignals and stopSignals are signal.Notify and signal.Stop, variables
-// so that a test can deliver an interrupt at a chosen point of a run.
+// notifySignals, stopSignals and signalIgnored are signal.Notify, signal.Stop
+// and signal.Ignored, variables so that a test can deliver an interrupt at a
+// chosen point of a run, and say which signals the run started with ignored.
 var (
 	notifySignals = signal.Notify
 	stopSignals   = signal.Stop
+	signalIgnored = signal.Ignored
 )
 
 // errInterrupted is an interrupt that arrived before the rename: the run
@@ -171,14 +173,31 @@ func (r *RotateSecret) run() (bool, error) {
 	// signal handler. The run is milliseconds of local file work; if it is
 	// stuck in the file system instead, a second interrupt kills it as by
 	// default, which leaves the lock (and before the rename the temporary
-	// file) for the next run's refusal to name.
-	notify, stop := notifySignals, stopSignals
+	// file) for the next run's refusal to name. Two interrupts within
+	// microseconds of each other can both be absorbed; a third kills.
+	//
+	// A signal the run started with ignored -- SIGHUP under nohup, Ctrl-C in a
+	// background job -- is not asked for: Notify would make it count, and
+	// abort the run. With every one ignored nothing is asked for at all, as
+	// Notify with no signal relays them all.
+	notify, stop, ignored := notifySignals, stopSignals, signalIgnored
 	interrupts := make(chan os.Signal, 1)
 	finished := make(chan struct{})
 
 	var caught atomic.Bool
 
-	notify(interrupts, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	var asked []os.Signal
+
+	for _, sig := range []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP} {
+		if !ignored(sig) {
+			asked = append(asked, sig)
+		}
+	}
+
+	if len(asked) > 0 {
+		notify(interrupts, asked...)
+	}
+
 	defer func() {
 		close(finished)
 		stop(interrupts)

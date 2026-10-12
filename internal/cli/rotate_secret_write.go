@@ -46,6 +46,12 @@ var createTemp = openTemp
 // variable so that a test can make it fail.
 var removeTemp = os.Remove
 
+// openLock creates the lock, 0600 and exclusively: a variable so that a test
+// can make its creation fail as a read-only file system does.
+var openLock = func(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+}
+
 // renameFile replaces the target with the written temporary file: os.Rename,
 // a variable so that a test can make it fail as a mount point does.
 var renameFile = os.Rename
@@ -67,7 +73,8 @@ const (
 )
 
 // checkWritable is §7.4 step 2 for the file: it must be a regular file that
-// can be opened for writing, and (on Windows) one this user can replace. A
+// can be opened for writing, and (on Windows) one this user can replace and
+// that is not encrypted with EFS. A
 // read-only config is a statement, so this holds even where a rename would
 // succeed. The file is closed at once: an open handle would stop the rename
 // on Windows.
@@ -90,7 +97,7 @@ func checkWritable(target string) (fs.FileInfo, error) {
 		return nil, notWritable(err)
 	}
 
-	if err := checkReplaceable(target); err != nil {
+	if err := checkReplaceable(target, info); err != nil {
 		return nil, err
 	}
 
@@ -129,7 +136,7 @@ func mountHint(err error) string {
 func takeLock(target string, now time.Time) (string, error) {
 	lock := target + lockSuffix
 
-	file, err := os.OpenFile(lock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := openLock(lock)
 
 	switch {
 	case errors.Is(err, fs.ErrExist):
