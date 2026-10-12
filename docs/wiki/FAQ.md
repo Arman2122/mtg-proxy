@@ -128,28 +128,30 @@ Rotate the secret with an overlap (feature `secret-rotation`). It gets a new key
 mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --overlap 24h --reload
 ```
 
-The new value is printed on stdout; `mtg-proxy access` prints the new links, which every rightful holder needs before the overlap ends. Until then, the old link works for whoever has it, the person it leaked to included, under the same quota and limits. For a link posted in public and being abused, keep the overlap short, or use `--overlap 0` (an immediate re-key) and ban the abusive places. `--end-overlap` and a reload end an overlap early.
+The new value is printed on stdout; `mtg-proxy access` prints the new links, which every rightful holder needs before the overlap ends. Until then, the old link works for whoever has it, the person it leaked to included, under the same quota and limits. For a link posted in public and being abused, keep the overlap short, or use `--overlap 0` (an immediate re-key) and ban the abusive places (with the WEB relay, the old WEB link then goes to the cover site at once; see [[WEB-Proxy-Setup]]). `--end-overlap` and a reload end an overlap early.
 
 WEB has no overlap: the old WEB link stops when the relay reads the file. A file the Penhoon panel writes cannot be rotated this way — re-key the client in the panel. See [[Multi-User-and-API]] and [[Security]].
 
 ### `run` refuses the file after I edited a rotation block
 
-The table's shape is wrong, not a value in it. A mistake inside a `[[retiring-secret]]` block — a typo in `until`, a name that is no secret — never stops the proxy: the block is dropped with a warning and the rest of the file applies. Three shapes stop the whole file, and the error says `the file does not parse at line N, at a key named retiring-secret` (or `inside a [[retiring-secret]] block`), then how the table is written:
+The table's shape or its TOML is wrong, not a value in it. A mistake inside a `[[retiring-secret]]` block — a typo in `until`, a name that is no secret — never stops the proxy: the block is dropped with a warning and the rest of the file applies. These shapes stop the whole file:
 
 - `retiring-secret = "…"` above the first table;
-- `retiring-secret = { name = …, secret = …, until = … }`, an inline table;
-- a TOML syntax error inside a block, such as `until = 2026-02-30T09:30:00Z`.
+- `retiring-secret = { name = …, secret = …, until = … }`, an inline table, above the first table or below `[secrets]`;
+- a TOML syntax error inside a block, such as `until = 2026-02-30T09:30:00Z`, a key written twice, or an unterminated string.
+
+For the first two above the first table, and for an error the parser reports at a field of a block (an impossible date), the error says `the file does not parse at line N, at a key named retiring-secret` (or `inside a [[retiring-secret]] block`), then how the table is written. A key written twice, an unterminated string, or an inline table below `[secrets]` gets the parser's short message with no line (`toml: key name is already defined`, `toml: basic strings cannot have new lines`, `toml: cannot decode TOML inline table into string`), so look at the block you last edited.
 
 Write one block per old key, header on its own line, just above `[secrets]`:
 
 ```toml
 [[retiring-secret]]
 name   = "alice"
-secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+secret = "eeffeeddccbbaa9988776655443322110073746f726167652e676f6f676c65617069732e636f6d"
 until  = "2026-10-13T09:30:00Z"
 ```
 
-Until the file is fixed, a running proxy keeps the secret set it had: if the same edit re-keyed `[secrets]`, **the leaked key is still the primary**. Fix the file, check it with `mtg-proxy run --check <config>`, and reload. `rotate-secret` never writes any of these shapes. See `[[retiring-secret]]` on [[Configuration]].
+Until the file is fixed, a running proxy keeps the secret set it had: if the same edit re-keyed `[secrets]`, **the leaked key is still the primary**. Fix the file, check it with `mtg-proxy run --check <config>`, and reload. `rotate-secret` never writes any of these shapes. (One one-line form does parse: an inline array of tables, `retiring-secret = [{ … }]`. `run` honours it, but `rotate-secret` refuses to edit the file until it is rewritten as blocks.) See `[[retiring-secret]]` on [[Configuration]].
 
 ### The log says a `[secrets]` user named "retiring-secret" is ignored
 

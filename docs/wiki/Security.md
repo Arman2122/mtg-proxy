@@ -734,9 +734,10 @@ out for as long as the overlap lasts.
 
 - **For a hostile leak** — a link posted in public and being abused — choose a
   short overlap, or `--overlap 0` (an immediate re-key, no grant at all), and
-  ban the abusive places. A ban is held per secret and place, so it refuses a
-  place on the old key and the new one alike, and it survives the rotation; it
-  lives in memory only, and a restart ends it.
+  ban the abusive places (with the WEB relay, the old WEB link then goes to the
+  cover site at once; see [[WEB-Proxy-Setup]]). A ban is held per secret and
+  place, so it refuses a place on the old key and the new one alike, and it
+  survives the rotation; it lives in memory only, and a restart ends it.
 - **To take a grant back early**, end it in the file: `rotate-secret <config>
   <name> --end-overlap` and a reload, which ends every old key of that name.
   No API route ends an overlap and keeps the secret, by design: a change made
@@ -767,7 +768,7 @@ out for as long as the overlap lasts.
   open on it.
 - **An old-link hello is checked after every current key.** Without a hint, it
   is verified after the primaries of every `ee` secret, so it is answered later
-  than a current-link hello by about one check per such secret. Only the holder
+  than a current-link hello by up to one check per such secret. Only the holder
   of that key can see that, and it tells them they hold an old key, which they
   know. A hello that matches nothing now tries the previous keys too: to a
   prober that looks like a proxy with that many more secrets, nothing specific
@@ -784,7 +785,8 @@ listener's loop. The ee handshake budget charges per candidate, so the scan CPU
 stays bounded at the share you configured; what grows is the cost of each scan,
 and so how soon the budget refuses during a flood. A secret keeps at most 4
 unexpired previous keys, and a proxy 4,096 in all; a hinted hello is checked
-against at most 32 keys. A config with no previous key costs nothing: the doors run as before.
+against at most 32 keys. A config with no previous key costs nothing: the doors
+run as before.
 
 ### The clock, and a restart
 
@@ -813,15 +815,21 @@ no longer answered locally and goes to the cover site (see [[WEB-Proxy-Setup]]).
   retired key a secret's primary again does exactly that until the next reload,
   and logs it at warning level. See [[Multi-User-and-API]].
 - **WEB has no overlap.** The relay serves current keys only; an old WEB link is
-  answered by the relay's local 404 and never forwarded to the cover site, until
-  its block is pruned. See [[WEB-Proxy-Setup]].
+  answered by the relay's local 404 and never forwarded to the cover site, while
+  its block stays in the file. See [[WEB-Proxy-Setup]].
 - **At rest** the old value sits in the config next to the current ones, under
   the file's own permissions, which `rotate-secret` keeps (on Windows, its
   access list and label; the list of what is not kept is on
-  [[Multi-User-and-API]]). It is in no other
-  file, with one exception: a run that dies between creating its temporary file
-  and the rename leaves `<config>.rotate-<8 hex>.tmp`, which holds every secret
-  of the config. Delete it; the next run's refusal names it.
+  [[Multi-User-and-API]]). It is in no other file, with these exceptions:
+  - a run that dies between creating its temporary file and the rename leaves
+    `<config>.rotate-<8 hex>.tmp`, which holds every secret of the config.
+    Delete it; the next run's refusal names it;
+  - a temporary file the run could not remove after a failure is left too, and
+    the run says so (`the temporary file … could not be removed …: delete it (it
+    holds the config's secrets)`);
+  - the config's other hard-link names keep the previous file, with the old key
+    as the primary; the run warns about them (`the config has N names (hard
+    links); the others keep the previous file: replace them by hand`).
 
 ## IP blocklists and allowlists 🚧
 
@@ -951,8 +959,10 @@ The known limits, which need a value written in a deliberately odd way to
 reach: a key spelled with TOML escapes and defined twice, or a float written
 with digit underscores, is quoted by the parser in its decoded form, which is
 not the file's text and so is not recognised; the second step of the parse
-(from TOML to the config's own types) names no position; and `invalid secret
-"<name>"`, the refusal of a secret that is not valid, still quotes the name.
+(from TOML to the config's own types) names no position; and the refusal of a
+`[secrets]` value that is not valid, `invalid secret "<name>": <value>`, still
+quotes the name as written (only the unset secret's all-zero placeholder can
+reach its value part).
 
 **The only file the proxy writes is the usage state file.**
 

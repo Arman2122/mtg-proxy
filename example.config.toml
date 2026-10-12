@@ -366,9 +366,10 @@ allow-fallback-on-unknown-dc = false
 #
 # Like [[listener]], every key after the header belongs to the block, so it goes
 # after every top-level key: just above [secrets], where rotate-secret puts it,
-# or between the other tables. Never write it as one line: retiring-secret = ...
-# above the first table refuses the whole file, and below [secrets] it is a user
-# named "retiring-secret", which is never served (a warning says so).
+# or between the other tables. Never write it on one line:
+# retiring-secret = "..." or = { ... } above the first table refuses the whole
+# file; below [secrets] the first is a user named "retiring-secret", which is
+# never served (a warning says so), and the second refuses the file.
 #
 #   name    a secret in [secrets], or "default" for the single top-level secret
 #           when there is no [secrets]
@@ -381,8 +382,9 @@ allow-fallback-on-unknown-dc = false
 # key early; run --check refuses the file and doctor fails. An older mtg-proxy
 # ignores the table, which ends every overlap at once. The WEB relay has no
 # overlap: an old WEB link stops working once the relay reads the rotated file,
-# and is answered locally, never by the cover site. Not for a config the Penhoon
-# panel writes: it rewrites the file from its own records.
+# and is answered locally, never by the cover site, while its block stays in the
+# file. Not for a config the Penhoon panel writes: it rewrites the file from its
+# own records.
 #
 # The block below is alice's previous key, for the [secrets] example after it:
 # [[retiring-secret]]

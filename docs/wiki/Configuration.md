@@ -498,7 +498,7 @@ and how the proxy reads them.
 [[retiring-secret]]
 # added by mtg-proxy rotate-secret at 2026-10-12T09:30:00Z
 name   = "alice"
-secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+secret = "eeffeeddccbbaa9988776655443322110073746f726167652e676f6f676c65617069732e636f6d"
 until  = "2026-10-13T09:30:00Z"
 
 [secrets]
@@ -516,37 +516,54 @@ Here alice has a new key, and her old link keeps working until 09:30 UTC on
 | `until` | RFC 3339 date-time **with an offset** (`Z` or `+03:30`), quoted or as a bare TOML offset date-time | The instant the old key stops being accepted. `rotate-secret` writes UTC, to the second. |
 
 All three are required. One secret may have several blocks, one per old key:
-up to 4 unexpired ones per secret, and 4,096 unexpired in all. The old key is the
-secret's in everything but its value: the same name, quota, limits, bans,
+up to 4 unexpired ones per secret, and 4,096 unexpired in all. The old key is
+the secret's in everything but its value: the same name, quota, limits, bans,
 counters and per-address entries, on the doors a secret of its form opens.
 
 **Placement.** Like `[[listener]]`, every key after the header belongs to the
 block until the next header, so a block goes after every top-level key: just
 above `[secrets]`, where `rotate-secret` writes it, or between the other tables.
 
-**Three hand edits refuse the whole file.** They are the edits of this table
-that do not parse, unlike a mistake inside a block:
+**Some hand edits refuse the whole file**: the ones that do not parse, unlike a
+mistake inside a block.
 
 - `retiring-secret = "…"` above the first table: a value where the table
   belongs;
-- `retiring-secret = { name = …, secret = …, until = … }`: an inline table;
+- `retiring-secret = { name = …, secret = …, until = … }`: an inline table,
+  above the first table or below `[secrets]`;
 - any TOML syntax error inside a block, such as an impossible date
-  (`until = 2026-02-30T09:30:00Z`).
+  (`until = 2026-02-30T09:30:00Z`), a key written twice, or an unterminated
+  string.
 
 `run` then does not start, and a `POST /reload` answers `500` and keeps the
 secret set in force — which, if the same edit re-keyed `[secrets]`, leaves the
-leaked key as the primary. `run`, `run --check`, `doctor`, `rotate-secret` and
-the reload put this before the parser's own error:
+leaked key as the primary. When the parser stops at the table — the first two
+shapes above the first table, or an error it reports at a field of a block,
+such as an impossible date — `run`, `run --check`, `doctor`, `rotate-secret`
+and the reload put this before the parser's own error:
 
 ```text
 the file does not parse at line 2, at a key named retiring-secret: [[retiring-secret]] blocks go in their own table, above or between the other tables, one per old key, each with name, secret and until: not a scalar (retiring-secret = ...), not an inline table (retiring-secret = { ... }), not a key of that name under another table such as [secrets]: cannot parse config: cannot parse toml config: toml: ...
 ```
 
-A refused reload adds `the secret set in force is kept: nothing in this edit is
-applied; if it re-keyed [secrets] or secret, the old key stays the primary until
-the file is fixed and reloaded`. A file saved with a UTF-8 byte-order mark is
-refused too, as it always was (`toml: invalid character at start of key: U+00EF
-'ï'`); that has nothing to do with this table.
+A reload refused at the table adds `the secret set in force is kept: nothing in
+this edit is applied; if it re-keyed [secrets] or secret, the old key stays the
+primary until the file is fixed and reloaded`. A key written twice, an
+unterminated string, or an inline table written below `[secrets]` gets the
+parser's short message alone, without the line — `toml: key name is already
+defined`, `toml: basic strings cannot have new lines`, `toml: cannot decode TOML
+inline table into string` — so look at the block you last edited.
+
+One one-line form does parse: an inline array of tables, `retiring-secret =
+[{ name = …, secret = …, until = … }]`. `run` honours it, but `rotate-secret`
+edits only blocks and refuses the file until it is rewritten as
+`[[retiring-secret]]` blocks. A single `[retiring-secret]` table (one pair of
+brackets) parses as one block too; `rotate-secret` can remove it, but will not
+add a block beside it until its header is written `[[retiring-secret]]`.
+
+A file saved with a UTF-8 byte-order mark is refused too, as it always was
+(`toml: invalid character at start of key: U+00EF 'ï'`); that has nothing to do
+with this table.
 
 **The name `retiring-secret` is reserved in `[secrets]`.** Written below
 `[secrets]`, the same line parses — as a user named `retiring-secret` whose key
@@ -626,7 +643,8 @@ and `rotate-secret` read the wall clock. A restart forgets the latest time; see
 
 `run --check` refuses the file for any problem or warning line, and reports them
 together with any unknown key. A misspelt field inside a block is an unknown
-key (`retiring-secret.hosts`):
+key (`retiring-secret.hosts`). The error reads, after the usual `mtg-proxy:
+error: ` prefix:
 
 ```text
 unknown config keys: retiring-secret.hosts
@@ -671,7 +689,7 @@ accept = ["dd"]
 
 [[retiring-secret]]
 name   = "alice"
-secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+secret = "eeffeeddccbbaa9988776655443322110073746f726167652e676f6f676c65617069732e636f6d"
 until  = "2026-10-20T09:30:00Z"
 
 [secrets]

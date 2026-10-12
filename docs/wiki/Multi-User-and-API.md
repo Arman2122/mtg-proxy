@@ -206,7 +206,7 @@ Per user:
 | `retiring_keys` | while the user has an unexpired previous key (`secret-rotation`) | How many previous keys of the secret are still accepted. See [Rotating a secret with an overlap](#rotating-a-secret-with-an-overlap). |
 | `retiring_until` | with `retiring_keys` | The latest `until` among them, in UTC: when the last old link stops working. |
 | `retiring_connections` | with `retiring_keys`, when non-zero | Live connections of the user on a key that is not its current one. |
-| `retiring_last_seen` | with `retiring_keys`, once a connection came in on a previous key during this overlap | When the last one did, in UTC. |
+| `retiring_last_seen` | with `retiring_keys`, once a connection came in on a previous key | When the last one did, in UTC. Cleared when a secret that had no unexpired previous key gets one. |
 
 The per-address fields are scalars inside the user object. Nothing per-address
 is ever a key under `users`, which a panel bills as one client per key; the
@@ -855,7 +855,9 @@ person it leaked to included — uses the secret exactly as its rightful holders
 do: the same quota, speed, address limit and connection caps. A link posted in
 public can crowd them out of `ip-limit` and `client-conns` for as long as the
 overlap lasts. Choose a short one, or `--overlap 0` with bans of the abusive
-places, for a hostile leak; see *Rotating a leaked link* on [[Security]].
+places, for a hostile leak (with the WEB relay, the old WEB link then goes to
+the cover site at once; see [[WEB-Proxy-Setup]]); see *Rotating a leaked link*
+on [[Security]].
 
 ### The command
 
@@ -892,10 +894,13 @@ What the edit does to the file:
   with `until` in UTC to the second and a `# added by mtg-proxy rotate-secret at
   <time>` comment inside it. A file with no `[secrets]` header gets it at the
   end.
-- **Nothing else changes.** The file is edited in place as text, never
+- **Nothing else changes.** The file is edited as text, spliced, never
   rewritten from scratch: comments, order, quoting and line endings stay. The
   result is parsed again and must differ from the original in exactly the
-  intended places, or nothing is written.
+  intended places, or nothing is written. Removing a block (`--end-overlap`,
+  `--prune`) removes its lines from the header to the next table, comments
+  inside it included; a comment above its header, or heading the next table,
+  stays.
 - **It never writes a block the proxy would drop**, or one that would make a
   dead key usable again, and it never writes an overlap over 720h.
 
@@ -975,8 +980,8 @@ the file is rotated but the proxy does not serve it: retiring_keys of "alice" di
   another process that rewrote the file.
 - **More previous keys than the file says** point at a proxy reading another
   file, or this machine's clock being ahead of the proxy's.
-- **After `--force` past an older binary**, a shortfall names `the running
-  proxy is an older binary (--force), which ignores [[retiring-secret]]` first,
+- **After `--force` past an older binary**, a shortfall names first
+  `the running proxy is an older binary (--force), which ignores [[retiring-secret]]`,
   and a proxy that does not serve `GET /secrets/{name}` is named as such. Expect
   a non-zero exit there after a rotation with an overlap: the older binary holds
   no previous key.
@@ -1012,6 +1017,10 @@ knowing:
   `run` would log;
 - a config that does not load, with the parser's error (the shapes on
   [[Configuration]] that refuse the whole file, a byte-order mark);
+- `the file's retiring-secret entries are not all [[retiring-secret]] blocks (an inline array of tables, or a retiring-secret key?); rotate-secret edits only blocks: rewrite them as blocks and retry`:
+  the file holds `retiring-secret = [{ … }]`, which `run` honours but this
+  command does not edit;
+- `the file has a [retiring-secret] table with one pair of brackets, and a [[retiring-secret]] block cannot be added beside it: write its header as [[retiring-secret]] and retry`;
 - `the file changed while rotating; nothing was written`: another writer (an
   editor, the panel) changed the file between the read and the replace;
 - `this looks like a config the Penhoon panel generates (…/mtproto/mtg-N.toml);
@@ -1057,22 +1066,28 @@ as the primary. A symlinked config has its target replaced; the link stays.
 On Unix the temporary file is created `0600`, then given the config's owner,
 group and permission bits exactly, whatever the umask; a run that cannot set
 the owner is refused (`run as the file's owner, in the file's group, or as
-root`). The directory is synced after the rename. A config with other hard
-links is warned about, here and on Windows: `the config has N names (hard
-links); the others keep the previous file: replace them by hand` — those names
-still hold the old key as the primary. A read-only mount is refused with `(a
-read-only mount? run rotate-secret on the host, and mount the config's
+root`). Nothing else is copied: set-id and sticky bits, the file's own ACL
+entries (`setfacl`), extended attributes and a non-default security label
+(SELinux, AppArmor) are not kept, so a config whose access rests on them needs
+them set again before the reload. (That list is from reading the code; it has
+not been run on Unix.) The directory is synced after the rename. A config with
+other hard links is warned about, here and on Windows: `the config has N names
+(hard links); the others keep the previous file: replace them by hand` — those
+names still hold the old key as the primary. A read-only mount is refused with
+`(a read-only mount? run rotate-secret on the host, and mount the config's
 directory into the container)`; a single-file bind mount, with `cannot replace
 <config>: it is a mount point (a single-file bind mount?); run rotate-secret on
-the host, and mount the config's directory into the container`. See [[Installation]] for
-Docker.
+the host, and mount the config's directory into the container`. See
+[[Installation]] for Docker.
 
 On Windows the new file is created readable by the runner alone and shared with
 no one until the config's security is copied onto it:
 
 - **Kept:** the access control list exactly as it was — its entries, the
   inherited ones as they were, protected or not, and a NULL list (open to
-  everyone) — and the mandatory integrity label, or its absence.
+  everyone) — and the mandatory integrity label, or its absence. A legacy
+  unprotected list (without the auto-inherited flag) comes back marked
+  protected, with the same entries.
 - **Not kept:** the owner (the new file's owner is the runner; for an elevated
   runner, Administrators), alternate data streams, audit entries, and the
   hidden and system attributes. A read-only config is refused like any config
@@ -1130,7 +1145,7 @@ absent for a secret with no unexpired previous key:
 | `retiring_keys` | How many previous keys the secret still accepts. |
 | `retiring_until` | The latest `until` among them, in UTC: when the last old link stops. |
 | `retiring_connections` | Live connections of the secret on a key that is not its current primary: the old-link users still connected. Counted when you ask, from each connection's own key, so right after a rotation it shows every old-link connection, and it falls as they move. Absent at `0`. |
-| `retiring_last_seen` | When a connection last came in on a previous key, in UTC. Cleared when the secret starts an overlap after having none, so it never shows an earlier overlap's traffic. |
+| `retiring_last_seen` | When a connection last came in on a previous key, in UTC. Cleared when a secret that had no unexpired previous key gets one; a second rotation inside a running overlap keeps it, so it can show traffic on the first old link. |
 
 `retiring_connections` at zero and an old `retiring_last_seen` say the old link
 is no longer used; `--end-overlap` ends it early. A user on the old link is
@@ -1237,9 +1252,10 @@ survives a reload rather than being replaced by whatever the file says. See
 
 A mistake inside a `[[retiring-secret]]` block is not an invalid file: the
 block is dropped with a warning and everything else is applied, the new primary
-included, so the worst it does is end that old link early. Only a shape of the
-table that does not parse refuses the reload, and then the `500` says the set in
-force is kept. See `[[retiring-secret]]` on [[Configuration]].
+included, so the worst it does is end that old link early. Only an edit of the
+table that does not parse refuses the reload, and then the set in force is kept
+(the `500` says so when the parser stopped at the table). See
+`[[retiring-secret]]` on [[Configuration]].
 
 `POST /reload` returns `503` when the proxy was started with `simple-run`, which
 takes flags instead of a file: there is no source to re-read.

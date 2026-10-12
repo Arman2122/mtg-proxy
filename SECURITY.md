@@ -181,10 +181,11 @@ gets a new key at once, and the old one stays accepted until an absolute
 holds it — the person it leaked to included — with the secret's quota, limits
 and connection slots, so a link posted in public can crowd out its rightful
 holders for as long as the overlap lasts. For a hostile leak use a short
-overlap, or `--overlap 0` (an immediate re-key) and bans; `--end-overlap` and a
-reload end an overlap early. After `until` a holder of the old key is refused
-as a wrong key is, and a prober without a key gets the same answers
-before, during and after an overlap.
+overlap, or `--overlap 0` (an immediate re-key) and bans (with the WEB relay,
+the old WEB link then goes to the cover site at once; see the wiki's
+WEB-Proxy-Setup page); `--end-overlap` and a reload end an overlap early. After
+`until` a holder of the old key is refused as a wrong key is, and a prober
+without a key gets the same answers before, during and after an overlap.
 
 One residual risk is known and not closed: the clock that judges `until` never
 runs backwards inside one process, but a restart forgets it, so if the wall

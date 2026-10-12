@@ -249,7 +249,7 @@ shape it always had:
 | `retiring_keys` | The user's secret was rotated and still accepts a previous key (feature `secret-rotation`): how many it accepts. |
 | `retiring_until` | Same: the latest `until` among them — when the last old link stops working. In UTC, as `retiring_last_seen` is; `last_seen` and `expires_at` are in the server's own zone. |
 | `retiring_connections` | Same, and it is non-zero: live connections on a key that is not the secret's current one. Counted from each connection's own key when you ask, so right after a rotation it shows every old-link user still connected, and it falls as they move to the new link. |
-| `retiring_last_seen` | Same, once a connection came in on a previous key during this overlap: when the last one did, in UTC. Cleared when a secret with no previous key gets one, so a second rotation never shows the first one's traffic. |
+| `retiring_last_seen` | Same, once a connection came in on a previous key: when the last one did, in UTC. Cleared when a secret that had no unexpired previous key gets one; a second rotation inside a running overlap keeps it, so it can show traffic on the first old link. |
 
 The throttle block reports `active` (whether caps are being applied at all),
 `limit`, and `caps` — a per-user connection ceiling, present only while some
@@ -711,7 +711,8 @@ how many connections of that secret the swap closed.
 - `previous key of the secret is the primary again` with `closed` — warn: a
   `POST` or `PUT /secrets` made the secret's retired key its primary again (a
   revert), and `closed` connections on the key it replaced were closed. The
-  leaked key is live again until the next reload; see [[Multi-User-and-API]].
+  leaked key is the primary again until the next reload (after it, the file's
+  block keeps it accepted until its `until`); see [[Multi-User-and-API]].
 - `addresses banned through the API` and `ban lifted through the API` — info,
   with the secret's name and, for a ban, how many places were banned and how many
   streams closed. No address.

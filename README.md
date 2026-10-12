@@ -417,13 +417,13 @@ On success it re-reads the same config file passed to `mtg-proxy run` and swaps
 the secret set in atomically:
 
 - added secrets start working immediately;
-- connections whose secret was removed or re-keyed are closed;
+- connections whose secret was removed or re-keyed are closed, except those on
+  a previous key a `[[retiring-secret]]` block keeps until its `until`;
 - every other user stays connected and their stats counters carry over.
 
 Only `[secrets]`, `ad-tag`, `[secret-ad-tags]`, `[secret-limits]` and
-`[[retiring-secret]]` are hot-applied. Changing the
-bind address, domain fronting, network, or throttle settings still needs a
-restart.
+`[[retiring-secret]]` are hot-applied. Changing the bind address, domain
+fronting, network, or throttle settings still needs a restart.
 
 Responses: `200 {"status":"ok"}` on success; `500` if the config cannot be read
 (the current set stays active); `503` when the proxy was started without a config
@@ -687,9 +687,11 @@ It writes the new key into `[secrets]` and the old one into a
 and with `--reload` reloads the proxy through the management API and reads the
 rotation back. Until `until` the old link works exactly as the new one does —
 for whoever holds it, so keep the overlap short for a link posted in public, or
-use `--overlap 0` and bans. Then the old key is refused and its connections
-close. `--end-overlap` ends an overlap early and `--prune` removes expired
-blocks. `/stats` and `GET /secrets` report `retiring_keys`, `retiring_until`,
+use `--overlap 0` and bans (with the WEB relay, the old WEB link then goes to
+the cover site at once; see the wiki's WEB-Proxy-Setup page). Then the old key
+is refused and its connections close. `--end-overlap` ends an overlap early and
+`--prune` removes expired blocks. `/stats` and `GET /secrets` report
+`retiring_keys`, `retiring_until`,
 `retiring_connections` and `retiring_last_seen` while an overlap runs. The WEB
 transport has no overlap, and a file the Penhoon panel writes cannot be rotated
 this way. The details are on the

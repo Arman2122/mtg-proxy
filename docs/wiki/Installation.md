@@ -239,9 +239,13 @@ keys. So, to rotate:
   `/config`:
 
   ```bash
-  docker run -d --name mtg -p 443:443 -v /etc/mtg-proxy:/config:ro ghcr.io/arman2122/mtg-proxy:1.4.0
+  docker run -d --name mtg -p 443:443 -v /etc/mtg-proxy:/config:ro ghcr.io/arman2122/mtg-proxy:<version>
   ```
 
+  `<version>` is a release with the feature: an image whose `/stats` `features`
+  lists `secret-rotation`. An older image ignores the `[[retiring-secret]]`
+  blocks, so its reload ends every overlap at once, and `--reload` refuses it
+  unless `--force`.
   Then run `rotate-secret` on the host against `/etc/mtg-proxy/config.toml`,
   and reload the proxy. Everything else in that directory is visible inside
   the container too, so keep files the proxy has no use for, such as the WEB
@@ -359,7 +363,11 @@ group membership, and nothing else on the box can.
 [[Multi-User-and-API]]), writes a new file beside the config and renames it
 over the old one, with the same owner, group and mode. With the layout above
 that takes root — `sudo mtg-proxy rotate-secret /etc/mtg-proxy/config.toml …` —
-and a run that cannot set them is refused with nothing written.
+and a run that cannot set them is refused with nothing written. Nothing else is
+copied: set-id and sticky bits, the file's own ACL entries (`setfacl`), extended
+attributes and a non-default security label (SELinux, AppArmor) are not kept,
+so a config whose access rests on them needs them set again before the reload.
+(That is from reading the code; it has not been run on Unix.)
 
 The WEB relay's signing key is separate and stricter. `generate-web-key` writes
 32 bytes at mode `0600` and refuses to overwrite an existing file, because a key
