@@ -297,6 +297,8 @@ func (t reloadTarget) reloadAndCheck(
 		since := after.GetRetiringSecrets(now())
 
 		switch {
+		case ctx.Err() != nil && len(failures) > 0:
+			return &readBackCut{failures: failures}
 		case ctx.Err() != nil:
 			return fmt.Errorf("the read-back was interrupted: %w", ctx.Err())
 		case errors.Is(err, errNotJSON):
@@ -345,6 +347,20 @@ func (t reloadTarget) reloadAndCheck(
 
 	return errors.New(fileRotatedNotServed + strings.Join(failures, "\n"+fileRotatedNotServed))
 }
+
+// readBackCut is a read-back the first interrupt ended after it had already
+// proven failures for earlier names (Task 10's second review, N-D). The
+// failures are its text, which the run returns as its error; it wraps
+// context.Canceled, so that the run also says the read-back was not finished.
+type readBackCut struct {
+	failures []string
+}
+
+func (c *readBackCut) Error() string {
+	return fileRotatedNotServed + strings.Join(c.failures, "\n"+fileRotatedNotServed)
+}
+
+func (c *readBackCut) Unwrap() error { return context.Canceled }
 
 // fewerCauses are the causes of a proxy holding fewer previous keys, or an
 // earlier end, than the file says.

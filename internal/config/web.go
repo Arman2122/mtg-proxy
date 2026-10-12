@@ -251,6 +251,13 @@ func webStatsBind(addr string) error {
 	return nil
 }
 
+// WebHost is [web] host as ValidateWeb accepts it, lowercased, or the error it
+// refuses it with, which never shows a secret value pasted there. access
+// prints no WEB link for a host it refuses (Task 10's second review, N-A).
+func (c *Config) WebHost() (string, error) {
+	return webCanonicalHost(c.Web.Host.Get(""))
+}
+
 // webCanonicalHost is a small local check so config does not import webrelay,
 // which would be a cycle in waiting: the relay reads config. The authoritative
 // canonicalisation lives with the capability derivation, and this only catches

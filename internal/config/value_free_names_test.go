@@ -102,6 +102,39 @@ func TestValidateNeverEchoesAValueWrittenAsAName(t *testing.T) {
 	})
 }
 
+// Task 10's second review, I-A: a typed field that changes the case of the text
+// before its refusal quotes it -- bytes upper, durations and enums lower. The
+// copy is still the value in hex, in the other case, which the document does
+// not hold verbatim; it is replaced all the same, in the canonical lowercase
+// spelling and in uppercase alike.
+func TestATypedFieldNeverEchoesAValueInAnotherCase(t *testing.T) {
+	t.Parallel()
+
+	old := rotEE(rotKeyLeak)
+	upper := strings.ToUpper(old)
+
+	for name, doc := range map[string]string{
+		"T06 a quota, in lowercase hex":           parseDoc("[secret-limits.alice]\nquota = \"" + old + "\"\n\n"),
+		"T16 the anti-replay max-size, lowercase": parseDoc("[defense.anti-replay]\nmax-size = \"" + old + "\"\n\n"),
+		"T02 prefer-ip, in uppercase hex":         parseDoc("prefer-ip = \"" + upper + "\"\n\n"),
+		"T08 a timeout, in uppercase hex":         parseDoc("[network.timeout]\ntcp = \"" + upper + "\"\n\n"),
+		"T10 the doppelganger shaping, uppercase": parseDoc("[defense.doppelganger]\nshaping = \"" + upper + "\"\n\n"),
+		"T13 tolerate-time-skewness, uppercase":   parseDoc("tolerate-time-skewness = \"" + upper + "\"\n\n"),
+		"T05 a listener's on-unknown-secret, upper": parseDoc("[[listener]]\nbind-to = \"127.0.0.1:2398\"\naccept = [\"dd\"]\n" +
+			"on-unknown-secret = \"" + upper + "\"\n\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := config.Parse([]byte(doc))
+			require.Error(t, err, "the file parses")
+			require.Empty(t, rotLeaks(err.Error(), old, rotEE(rotKeyAlice)), "the error carries the value")
+
+			assert.Contains(t, err.Error(), parseNotShown)
+		})
+	}
+}
+
 // An ordinary name -- a typo -- reads byte for byte as it did.
 func TestValidateShowsAnOrdinaryNameAsBefore(t *testing.T) {
 	t.Parallel()

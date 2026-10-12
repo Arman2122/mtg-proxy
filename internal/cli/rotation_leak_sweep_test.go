@@ -162,6 +162,44 @@ func keepingProblems(old mtglib.Secret, spares [3]mtglib.Secret) string {
 		block("old "+old.Base64()+" copy", spares[2])
 }
 
+// Task 10's second review, N-A: access prints no WEB section for a [web] host
+// the config refuses (ValidateWeb's host check), so a value pasted there --
+// the reviewer's W01, W03 and W04 -- is not printed in its links. A valid host
+// is printed as before.
+func TestAccessPrintsNoWebSectionForARefusedHost(t *testing.T) {
+	value := mustGenerate(t, mtglib.SecretModeFakeTLS, "cover.example.com")
+
+	for name, tc := range map[string]struct {
+		host string
+		web  bool
+	}{
+		"W01 the value in hex":               {host: value.Hex()},
+		"W03 the value in base64url, an URL": {host: value.Base64() + "@cdn.org"},
+		"W04 the value in uppercase hex":     {host: strings.ToUpper(value.Hex())},
+		"a valid host":                       {host: "relay.example.com", web: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			files := newRotateFiles(t, "[web]\nenabled = true\nhost = \""+tc.host+"\"\n\n")
+
+			out, err := captureStdout(t, func() error {
+				return (&Access{
+					ConfigPath: files.path, PublicIPv4: net.ParseIP("127.0.0.1"),
+					PublicIPv6: net.ParseIP("::1"),
+				}).Run(nil, "test")
+			})
+			require.Empty(t, retiringLeaks(out+"\n"+errText(err), value), "access prints the value")
+			require.NoError(t, err)
+
+			var printed map[string]any
+
+			require.NoError(t, json.Unmarshal([]byte(out), &printed))
+
+			_, web := printed["web"]
+			assert.Equal(t, tc.web, web, "the WEB section")
+		})
+	}
+}
+
 // sweepShape is one of Task 8b's five shapes, over a file that holds a block of
 // alice's right before [secrets].
 type sweepShape struct {
@@ -305,12 +343,16 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 
 	// 4c. Task 10's review, I-1: the retiring value written as the name of a
 	// [secret-limits] table, and as a key of [secret-ad-tags]. Validate refuses
-	// both, on every surface.
+	// both, on every surface. And (its second review, I-A) as alice's quota,
+	// whose type quotes the text uppercased: refused at the parse, on every
+	// surface.
 	for channel, text := range map[string]string{
 		"a [secret-limits] table named by the value": beforeSecrets(rotated,
 			"[secret-limits."+alice.Hex()+"]\nquota = \"1GB\"\n\n"),
 		"a [secret-ad-tags] key that is the value": beforeSecrets(rotated,
 			"[secret-ad-tags]\n"+alice.Base64()+" = \"0123456789abcdef0123456789abcdef\"\n\n"),
+		"alice's quota that is the value": beforeSecrets(rotated,
+			"[secret-limits.alice]\nquota = \""+alice.Hex()+"\"\n\n"),
 	} {
 		status, _ := reload(channel, text)
 		require.Equal(t, http.StatusInternalServerError, status, channel)

@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -687,6 +689,168 @@ func TestAForcedReloadOfAnOlderBinaryNamesIt(t *testing.T) {
 				tc.reported+`); likely: `+noReadCause, res.err.Error())
 		})
 	}
+}
+
+// Task 10's second review, M-A (S9): check 3 is judged just AFTER the GET. An
+// --overlap 2s block is usable just before the GET and expired just after it;
+// the proxy, judging between the two, reports no previous key and no
+// retiring_until, and the run passes.
+func TestCheck3IsJudgedJustAfterTheGet(t *testing.T) {
+	var path pathOf
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /stats", stubMux(everyFeature, nil))
+	mux.HandleFunc("POST /reload", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("GET /secrets/{name}", fileBackedRead(t, path.get, 0))
+
+	stub := newStubServer(t, mux)
+	files := filesBehind(t, stub.addr)
+	path.set(files.path)
+
+	res := runRotate(t, RotateSecret{
+		ConfigPath: files.path, Name: "alice", Overlap: "2s", Reload: true,
+		now: steppingClock(rotateNow, rotateNow.Add(time.Second), rotateNow.Add(3*time.Second)),
+	})
+	requireQuiet(t, res, files.old()...)
+
+	renewed := newValue(t, res)
+	requireQuiet(t, res, renewed)
+	require.NoError(t, res.err)
+}
+
+// failingWriter is a stdout that takes nothing: a closed pipe.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("the pipe is closed") }
+
+// Task 10's second review, M-A (S11): a new value that cannot be printed does
+// not stop the reload, which is the point of printing it first (M-5). The run
+// reloads and reads back, and its error is the print's, then the read-back's.
+func TestTheReloadRunsWhenTheValueCannotBePrinted(t *testing.T) {
+	var path pathOf
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /stats", stubMux(everyFeature, nil))
+	mux.HandleFunc("POST /reload", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("GET /secrets/{name}", fileBackedRead(t, path.get, 0))
+
+	stub := newStubServer(t, mux)
+	files := filesBehind(t, stub.addr)
+	path.set(files.path)
+
+	var stderr lockedBuffer
+
+	r := RotateSecret{
+		ConfigPath: files.path, Name: "alice", Overlap: "24h", Reload: true,
+		out: failingWriter{}, errOut: &stderr, now: func() time.Time { return rotateNow },
+	}
+	err := r.Run(nil, "test")
+
+	renewed := readSecrets(t, files.path).Secrets["alice"]
+	res := rotateResult{stderr: stderr.String(), err: err}
+	requireQuiet(t, res, append(files.old(), renewed)...)
+	require.Error(t, err)
+
+	assert.False(t, renewed.Key == files.alice.Key, "the file is not rotated")
+
+	requests, _ := stub.asked()
+	assert.Equal(t, []string{"GET /stats", "POST /reload", "GET /secrets/alice"}, requests, "the reload did not run")
+
+	assert.True(t, strings.HasPrefix(err.Error(), "the file is written, but the new value could not be printed: "+
+		"the pipe is closed; mtg-proxy access "+files.path+" shows it\n"), "the print's error does not come first")
+	assert.Contains(t, err.Error(), "\n"+notServing+`retiring_keys of "alice" differs (1 vs 0); likely: `)
+}
+
+// N-6: the run gives its connections to the API back when it is done with
+// them, rather than leaving one idle until the process exits.
+func TestTheReloadClosesItsConnections(t *testing.T) {
+	var (
+		path   pathOf
+		mu     sync.Mutex
+		active int
+	)
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /stats", stubMux(everyFeature, nil))
+	mux.HandleFunc("POST /reload", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("GET /secrets/{name}", fileBackedRead(t, path.get, 0))
+
+	server := httptest.NewUnstartedServer(mux)
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch state {
+		case http.StateNew:
+			active++
+		case http.StateClosed, http.StateHijacked:
+			active--
+		default:
+		}
+	}
+	server.Start()
+	t.Cleanup(server.Close)
+
+	files := filesBehind(t, strings.TrimPrefix(server.URL, "http://"))
+	path.set(files.path)
+
+	res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "0", Reload: true})
+	requireQuiet(t, res, files.old()...)
+
+	renewed := newValue(t, res)
+	requireQuiet(t, res, renewed)
+	require.NoError(t, res.err)
+
+	deadline := time.Now().Add(2 * time.Second)
+
+	for {
+		mu.Lock()
+		open := active
+		mu.Unlock()
+
+		if open == 0 {
+			return
+		}
+
+		require.True(t, time.Now().Before(deadline), "%d connection(s) to the API are still open after the run", open)
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Task 10's second review, N-D: failures already proven for an earlier name
+// are kept when the interrupt lands while a later name is read back. The run
+// exits non-zero with them, and says the reload was not read back to the end.
+func TestAnInterruptKeepsTheFailuresAlreadyFound(t *testing.T) {
+	interrupt := interruptSeam(t)
+
+	older := mustGenerate(t, mtglib.SecretModeDD, "")
+	bobsOld := mustGenerate(t, mtglib.SecretModeDD, "")
+	other := mustGenerate(t, mtglib.SecretModeDD, "")
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /stats", stubMux(everyFeature, nil))
+	mux.HandleFunc("POST /reload", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("GET /secrets/alice", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(mtglib.SecretInfo{Name: "alice", Secret: other.Base64(), Mode: "dd"}) //nolint: errcheck
+	})
+	mux.HandleFunc("GET /secrets/bob", stall(t, interruptingAt(interrupt)))
+
+	stub := newStubServer(t, mux)
+	files := filesBehind(t, stub.addr,
+		retiringBlock("alice", older, rfc3339(rotateNow.Add(time.Hour))),
+		retiringBlock("bob", bobsOld, rfc3339(rotateNow.Add(-time.Hour))))
+
+	res := rotateWithin(t, 10*time.Second, RotateSecret{
+		ConfigPath: files.path, Name: "alice", EndOverlap: true, Prune: true, Reload: true,
+	})
+	requireQuiet(t, res, append(files.old(), older, bobsOld, other)...)
+	require.Error(t, res.err, "the failure found before the interrupt is dropped")
+
+	assert.Equal(t, notServing+`the primary of "alice" differs (the written key, ee for old.example.com vs another key, dd); `+
+		`likely: `+primaryCauses, res.err.Error())
+	assert.Contains(t, res.stderr, "warning: interrupted after the file was written; the rotation is complete, "+
+		"but the proxy's reload was not finished or not read back: POST /reload on its management API, or restart it\n")
 }
 
 // stubAPI is a management API that answers as a test says, and records what it

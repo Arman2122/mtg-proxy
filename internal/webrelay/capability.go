@@ -45,6 +45,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Arman2122/mtg-proxy/internal/config"
 	"github.com/Arman2122/mtg-proxy/mtglib"
 	"golang.org/x/net/idna"
 )
@@ -123,7 +124,27 @@ func (c Capability) String() string {
 // guaranteed to round-trip identically on every client. A hand-typed Unicode
 // host can be mapped differently by different client toolkit versions and then
 // derive a capability this server never computes.
+//
+// A refusal quotes the host, and the IDNA library's own error can too. The host
+// is [web] host from the config file, where a secret value may have been
+// pasted, so the refusal is passed through config.ValueFreeText: any text that
+// could spell a value is replaced (Task 10's second review, N-A), and an
+// ordinary host reads as before. It still wraps ErrInvalidHost.
 func CanonicalHost(host string) (string, error) {
+	canonical, err := canonicalHost(host)
+	if err == nil {
+		return canonical, nil
+	}
+
+	if text := config.ValueFreeText(err.Error()); text != err.Error() {
+		return "", fmt.Errorf("%w%s", ErrInvalidHost, strings.TrimPrefix(text, ErrInvalidHost.Error()))
+	}
+
+	return "", err
+}
+
+// canonicalHost is CanonicalHost before its refusal is cleaned.
+func canonicalHost(host string) (string, error) {
 	if host == "" {
 		return "", fmt.Errorf("%w: empty", ErrInvalidHost)
 	}

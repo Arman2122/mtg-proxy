@@ -151,9 +151,22 @@ func UnknownKeyPath(key string) string {
 	return key[:at]
 }
 
-// inDocument reports whether a run of text is text of doc.
+// inDocument reports whether a run of text is text of doc, in any case: a
+// typed field may change the case of what it quotes -- bytes upper, durations
+// and enums lower (Task 10's second review, I-A) -- and hex is a value in
+// either case.
 func inDocument(doc []byte) func(string) bool {
-	return func(run string) bool { return bytes.Contains(doc, []byte(run)) }
+	lower := bytes.ToLower(doc)
+
+	return func(run string) bool { return bytes.Contains(lower, bytes.ToLower([]byte(run))) }
+}
+
+// ValueFreeText is text with every run that could spell a secret value
+// replaced, wherever the text came from: for a message of another package
+// that quotes a name of the file, such as the WEB relay's refusal of [web]
+// host. Ordinary text is returned as it is.
+func ValueFreeText(text string) string {
+	return valueFreeName(text)
 }
 
 // withoutValues is text with every run that could spell a value, and that

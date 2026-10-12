@@ -396,9 +396,13 @@ func (r *RotateSecret) run() (bool, error) {
 	// An interrupt after the rename stops nothing: the rotation is complete,
 	// and exiting non-zero would invite a second one. It is said, and the run
 	// ends as the success it is. One that cut --reload's reload or read-back
-	// short leaves the proxy unconfirmed, which is said instead.
+	// short leaves the proxy unconfirmed, which is said instead -- and when the
+	// read-back had already proven failures for earlier names, those are still
+	// the run's error (Task 10's second review, N-D).
 	reloadCut := reloadErr != nil && interrupted() && errors.Is(reloadErr, context.Canceled)
-	if reloadCut {
+
+	var proven *readBackCut
+	if reloadCut && !errors.As(reloadErr, &proven) {
 		reloadErr = nil
 	}
 
