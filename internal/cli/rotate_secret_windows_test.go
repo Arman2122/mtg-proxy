@@ -782,15 +782,7 @@ func TestANullDACLIsKept(t *testing.T) {
 // path: low-integrity processes of any user cannot read it.
 func labelMedium(t *testing.T, path string) {
 	t.Helper()
-
-	label, err := windows.SecurityDescriptorFromString("S:(ML;;NRNW;;;ME)")
-	require.NoError(t, err)
-
-	sacl, _, err := label.SACL()
-	require.NoError(t, err)
-
-	require.NoError(t, windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
-		windows.LABEL_SECURITY_INFORMATION, nil, nil, nil, sacl))
+	labelWith(t, path, "S:(ML;;NRNW;;;ME)")
 }
 
 // m-A of the third review: a config's mandatory label survives a rotation, as
@@ -817,67 +809,184 @@ func TestAMandatoryLabelIsKept(t *testing.T) {
 	assert.Equal(t, []string{"config.toml"}, names(listing(t, files.dir)))
 }
 
-// m-A: a label the new file cannot be given -- one above the runner's
-// integrity, say -- is a refusal that names it and the remedy, and nothing is
-// written.
+// labelWith gives path the mandatory label in sddl ("S:(ML;...)").
+func labelWith(t *testing.T, path, sddl string) {
+	t.Helper()
+
+	label, err := windows.SecurityDescriptorFromString(sddl)
+	require.NoError(t, err)
+
+	sacl, _, err := label.SACL()
+	require.NoError(t, err)
+
+	require.NoError(t, windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+		windows.LABEL_SECURITY_INFORMATION, nil, nil, nil, sacl))
+}
+
+// The conservative label remedy: no tool suggestion that would drop a
+// no-read-up or no-execute-up policy (m-F of the fifth review: icacls
+// /setintegritylevel writes no-write-up only).
+const keepItsPolicy = "restore the label with a tool that keeps its policy, or run rotate-secret as a user who may set it"
+
+// m-A: a label the new file cannot be given is a refusal that names the
+// label as it is and a remedy that does not weaken it -- never "remove the
+// label" -- and nothing is written. An unlabelled config, which takes the
+// same path now that the label is always set, gets a remedy that fits it.
+// (A runner below the config's label never gets here: the token's own
+// no-write-up policy refuses it at checkWritable, whatever the label's
+// policy; only a file system quirk does.)
 func TestALabelThatCannotBeKeptIsRefused(t *testing.T) {
-	files := newRotateFiles(t)
-	labelMedium(t, files.path)
+	for _, tc := range []struct {
+		name, label, shown, remedy, notRemedy string
+	}{
+		{
+			name: "Medium, no-read-up", label: "S:(ML;;NRNW;;;ME)", shown: "(ML;;NWNR;;;ME))",
+			remedy: keepItsPolicy,
+		},
+		{
+			name: "no label", shown: "(no label)",
+			remedy: "run rotate-secret as a user who may set it", notRemedy: "restore the label",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := newRotateFiles(t)
+			if tc.label != "" {
+				labelWith(t, files.path, tc.label)
+			}
 
-	before := listing(t, files.dir)
-	original := setKernelObjectSecurity
+			before := listing(t, files.dir)
+			original := setKernelObjectSecurity
 
-	replaceSetKernelObjectSecurity(t, func(handle windows.Handle, info windows.SECURITY_INFORMATION,
-		sd *windows.SECURITY_DESCRIPTOR,
-	) error {
-		if info&windows.LABEL_SECURITY_INFORMATION != 0 {
-			return windows.ERROR_ACCESS_DENIED
-		}
+			replaceSetKernelObjectSecurity(t, func(handle windows.Handle, info windows.SECURITY_INFORMATION,
+				sd *windows.SECURITY_DESCRIPTOR,
+			) error {
+				if info&windows.LABEL_SECURITY_INFORMATION != 0 {
+					return windows.ERROR_ACCESS_DENIED
+				}
 
-		return original(handle, info, sd)
-	})
+				return original(handle, info, sd)
+			})
 
-	res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
-	require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
-	require.Error(t, res.err)
+			res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+			require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
+			require.Error(t, res.err)
 
-	assert.Contains(t, res.err.Error(), "cannot give the new file the integrity label of "+resolved(t, files.path))
-	assert.Contains(t, res.err.Error(), "nothing was written")
-	assert.Empty(t, res.stdout)
-	assert.Equal(t, before, listing(t, files.dir))
+			assert.Contains(t, res.err.Error(), "cannot give the new file the integrity label of "+resolved(t, files.path)+" ")
+			assert.Contains(t, res.err.Error(), tc.shown)
+			assert.Contains(t, res.err.Error(), tc.remedy)
+			assert.NotContains(t, res.err.Error(), "remove the label")
+			assert.NotContains(t, res.err.Error(), "elevated prompt")
+
+			if tc.notRemedy != "" {
+				assert.NotContains(t, res.err.Error(), tc.notRemedy)
+			}
+
+			assert.Contains(t, res.err.Error(), "nothing was written")
+			assert.Empty(t, res.stdout)
+			assert.Equal(t, before, listing(t, files.dir))
+		})
+	}
 }
 
 // m-A: the read-back covers the label too. A label copy that silently does
-// nothing -- the list comes out right, the label not -- is refused, and the
-// remedy names the label (m-E of the fourth review: giving the file its own
-// list does not change its label).
+// nothing -- the list comes out right, the label not -- is refused. The
+// message names the label as it is; icacls is offered only for a label it
+// can write back whole -- no-write-up alone, Low, Medium or High -- and never
+// for one with no-read-up or no-execute-up, which icacls would drop (m-F of
+// the fifth review). Giving the file its own list does not change its label
+// (m-E of the fourth).
 func TestALabelThatComesOutDifferentIsRefused(t *testing.T) {
-	files := newRotateFiles(t)
-	labelMedium(t, files.path)
+	for _, tc := range []struct {
+		name, label, shown, remedy string
+	}{
+		{name: "Medium, no-read-up", label: "S:(ML;;NRNW;;;ME)", shown: "(ML;;NWNR;;;ME))", remedy: keepItsPolicy},
+		{name: "Low, no-write-up only", label: "S:(ML;;NW;;;LW)", shown: "(ML;;NW;;;LW))", remedy: `/setintegritylevel L`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := newRotateFiles(t)
+			labelWith(t, files.path, tc.label)
 
-	before := listing(t, files.dir)
-	original := setKernelObjectSecurity
+			before := listing(t, files.dir)
+			original := setKernelObjectSecurity
 
-	replaceSetKernelObjectSecurity(t, func(handle windows.Handle, info windows.SECURITY_INFORMATION,
-		sd *windows.SECURITY_DESCRIPTOR,
-	) error {
-		if info&windows.LABEL_SECURITY_INFORMATION != 0 {
-			return nil
-		}
+			replaceSetKernelObjectSecurity(t, func(handle windows.Handle, info windows.SECURITY_INFORMATION,
+				sd *windows.SECURITY_DESCRIPTOR,
+			) error {
+				if info&windows.LABEL_SECURITY_INFORMATION != 0 {
+					return nil
+				}
 
-		return original(handle, info, sd)
-	})
+				return original(handle, info, sd)
+			})
 
-	res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
-	require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
-	require.Error(t, res.err, "a rotation lost the config's label")
+			res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+			require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
+			require.Error(t, res.err, "a rotation lost the config's label")
 
-	assert.Contains(t, res.err.Error(), "the new file would not get the integrity label of "+resolved(t, files.path)+
-		": the copy differs from the original")
-	assert.Contains(t, res.err.Error(), `icacls "`+resolved(t, files.path)+`" /setintegritylevel M`)
-	assert.NotContains(t, res.err.Error(), "/inheritance:d")
-	assert.Contains(t, res.err.Error(), "nothing was written")
-	assert.Equal(t, before, listing(t, files.dir))
+			assert.Contains(t, res.err.Error(), "the new file would not get the integrity label of "+resolved(t, files.path)+" ")
+			assert.Contains(t, res.err.Error(), tc.shown+": the copy differs from the original")
+			assert.Contains(t, res.err.Error(), tc.remedy)
+
+			if tc.remedy == keepItsPolicy {
+				assert.NotContains(t, res.err.Error(), "icacls", "a remedy that would drop the label's no-read-up")
+			} else {
+				assert.Contains(t, res.err.Error(), `icacls "`+resolved(t, files.path)+`" `+tc.remedy)
+			}
+
+			assert.NotContains(t, res.err.Error(), "/inheritance:d")
+			assert.Contains(t, res.err.Error(), "nothing was written")
+			assert.Equal(t, before, listing(t, files.dir))
+		})
+	}
+}
+
+// m-F of the fifth review: which labels icacls can write back whole. It
+// writes no-write-up only, at Low, Medium or High: anything with no-read-up
+// or no-execute-up, or at a level icacls cannot set (System, Medium Plus),
+// gets the conservative remedy.
+func TestTheLabelRemedyNeverWeakensTheLabel(t *testing.T) {
+	t.Parallel()
+
+	const target = `C:\mtg\config.toml`
+
+	icacls := func(level string) string {
+		return `give the file its own label with icacls "` + target + `" /setintegritylevel ` + level
+	}
+
+	for label, want := range map[string]string{
+		"":                    icacls("M"),
+		"S:(ML;;NW;;;LW)":     icacls("L"),
+		"S:AI(ML;;NW;;;ME)":   icacls("M"),
+		"S:(ML;;NW;;;HI)":     icacls("H"),
+		"S:(ML;;NW;;;SI)":     keepItsPolicy,
+		"S:(ML;;NW;;;MP)":     keepItsPolicy,
+		"S:AI(ML;;NWNR;;;ME)": keepItsPolicy,
+		"S:(ML;;NWNX;;;LW)":   keepItsPolicy,
+		"S:(ML;;NR;;;HI)":     keepItsPolicy,
+	} {
+		assert.Equal(t, want, labelRemedy(target, label), "label %q", label)
+	}
+}
+
+// m-G of the fifth review: the born descriptor is the given token's -- its
+// user, and its own integrity level -- not a constant: a runner at another
+// level (an elevated High one) is born at its level. Shown with a Low token.
+func TestTheBornDescriptorIsTheTokens(t *testing.T) {
+	t.Parallel()
+
+	low := lowIntegrityToken(t)
+
+	level, err := integrityLevel(low)
+	require.NoError(t, err)
+	assert.Equal(t, "S-1-16-4096", level)
+
+	born, err := privateDescriptor(low)
+	require.NoError(t, err)
+
+	want, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + currentUser(t) + ")S:(ML;;NWNRNX;;;LW)")
+	require.NoError(t, err)
+
+	assert.Equal(t, want.String(), born.String())
 }
 
 // m-A: a config encrypted with EFS would come back in plain text, so it is

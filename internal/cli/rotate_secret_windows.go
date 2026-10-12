@@ -40,16 +40,16 @@ import (
 // SID is deny-only (a restricted token): the run then cannot set the list,
 // refuses, and may leave a named leftover, narrower than the config. CREATE_NEW
 // is O_EXCL, and the handle is not inherited by child processes, as Go's are
-// not. On a file system with no security (FAT) the descriptor is ignored; a
-// file system that rejects a label at creation (some SMB servers, ReFS or FAT
-// configurations; not tried here) fails the create, and the run refuses.
+// not. On a file system with no security (FAT) the descriptor is ignored.
+// Untested on SMB and ReFS: one that rejects the label at creation fails the
+// create, and the run refuses.
 func openTemp(path string) (tempFile, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
 
-	private, err := privateDescriptor()
+	private, err := privateDescriptor(windows.GetCurrentProcessToken())
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
@@ -71,12 +71,10 @@ func openTemp(path string) (tempFile, error) {
 	return os.NewFile(uintptr(handle), path), nil
 }
 
-// privateDescriptor is a protected list granting the process token's user
-// full control, and no one else anything, with a mandatory label at the
-// token's own integrity level that refuses lower levels every access.
-func privateDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
-	token := windows.GetCurrentProcessToken()
-
+// privateDescriptor is a protected list granting token's user full control,
+// and no one else anything, with a mandatory label at token's own integrity
+// level that refuses lower levels every access.
+func privateDescriptor(token windows.Token) (*windows.SECURITY_DESCRIPTOR, error) {
 	user, err := token.GetTokenUser()
 	if err != nil {
 		return nil, err //nolint: wrapcheck // worded by the caller
@@ -249,7 +247,9 @@ func keepSecurity(tmp, target string) error {
 		}
 	}
 
-	if err := setSecurity(tmp, target, sd); err != nil {
+	_, wantLabel := sddlParts(want)
+
+	if err := setSecurity(tmp, target, sd, wantLabel); err != nil {
 		return err
 	}
 
@@ -267,14 +267,19 @@ var setKernelObjectSecurity = windows.SetKernelObjectSecurity
 // Rights granted when a handle is opened stay with it, so the label is set
 // whatever the copied list says.
 //
-// The order, the list first, keeps the file at least as narrow as both its
-// birth and its end at every step: between the two calls it has the
-// config's list under the born label -- the runner's own integrity,
-// refusing every lower one -- which no lower process can open, and the
-// config's list admits no one the config does not. (The label first would do
-// as well; it is pinned by what a low-integrity process can open, not by the
-// order.)
-func setSecurity(tmp, target string, sd *windows.SECURITY_DESCRIPTOR) error {
+// The order is the list, then the label. Between the two calls the file has
+// the config's list under the born label -- the runner's own integrity,
+// refusing every lower one -- so it admits every principal the config's list
+// admits at the runner's level or above: wider than the born list, never
+// wider than the config. (The label first would do as well; what is pinned
+// is what a low-integrity process can open at each step, not the order.)
+//
+// label is the config's label, as the message names it if it cannot be set.
+// A runner below the config's label never gets here: checkWritable's open
+// for writing is refused by no-write-up, the token's own policy, whatever
+// the label's (NW, NR or NX alike). So this is a file system's refusal; its
+// remedy suggests nothing that would weaken the label.
+func setSecurity(tmp, target string, sd *windows.SECURITY_DESCRIPTOR, label string) error {
 	name, err := windows.UTF16PtrFromString(tmp)
 	if err != nil {
 		return aclRefusal(target, err)
@@ -293,8 +298,8 @@ func setSecurity(tmp, target string, sd *windows.SECURITY_DESCRIPTOR) error {
 	}
 
 	if err := setKernelObjectSecurity(handle, windows.LABEL_SECURITY_INFORMATION, sd); err != nil {
-		return fmt.Errorf("cannot give the new file the integrity label of %s: %w; run at an integrity level "+
-			"that may set it (an elevated prompt for a High label), or remove the label, and retry", target, err)
+		return fmt.Errorf("cannot give the new file the integrity label of %s (%s): %w; %s, and retry",
+			target, labelShown(label), err, keepLabelRemedy(label))
 	}
 
 	return nil
@@ -316,8 +321,8 @@ func aclRefusal(target string, err error) error {
 // no entry -- what removing a label leaves, "S:NO_ACCESS_CONTROL" -- is no
 // label. The message says what is known -- the copy came out different --
 // and the remedy for what differs: for the list, its own entries, protected
-// (the simplest list to copy); for the label, the file's own label, at the
-// level the config has (Medium, the default, when it has none).
+// (the simplest list to copy); for the label, the label as it is, and a
+// remedy that does not weaken it (labelRemedy).
 func sameSecurity(tmp, target, want string) error {
 	got, err := windows.GetNamedSecurityInfo(tmp, windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.LABEL_SECURITY_INFORMATION)
@@ -338,25 +343,70 @@ func sameSecurity(tmp, target, want string) error {
 	}
 
 	if gotLabel != wantLabel {
-		return fmt.Errorf("the new file would not get the integrity label of %s: the copy differs from the original; "+
-			`give the file its own label with icacls "%s" /setintegritylevel %s, and retry`,
-			target, target, labelLevel(wantLabel))
+		return fmt.Errorf("the new file would not get the integrity label of %s (%s): the copy differs from the original; "+
+			"%s, and retry", target, labelShown(wantLabel), labelRemedy(target, wantLabel))
 	}
 
 	return nil
 }
 
-// labelLevel is the icacls level letter of a label's SDDL: L, M or H; M, the
-// default, for no label or one icacls cannot name.
-func labelLevel(label string) string {
-	switch {
-	case strings.Contains(label, ";LW)"):
-		return "L"
-	case strings.Contains(label, ";HI)"), strings.Contains(label, ";SI)"):
-		return "H"
-	default:
-		return "M"
+// labelShown is a label's SDDL as a message names it -- an integrity level
+// and its policy, never a value -- or "no label".
+func labelShown(label string) string {
+	if label == "" {
+		return "no label"
 	}
+
+	return label
+}
+
+// labelRemedy is the remedy for a label the copy did not reproduce. icacls
+// /setintegritylevel writes a no-write-up label only, at Low, Medium or High,
+// so it is offered only for such a label (or none: Medium is the default);
+// for one with no-read-up or no-execute-up, which icacls would drop and so
+// widen the file, or one at a level icacls cannot set (System, Medium Plus),
+// the remedy suggests no tool that would weaken it.
+func labelRemedy(target, label string) string {
+	if level, ok := icaclsLevel(label); ok {
+		return fmt.Sprintf(`give the file its own label with icacls "%s" /setintegritylevel %s`, target, level)
+	}
+
+	return keepLabelRemedy(label)
+}
+
+// keepLabelRemedy is the remedy that keeps a label as it is: for a config
+// with a label, restore it with a tool that keeps its policy; either way, run
+// as a user who may set it.
+func keepLabelRemedy(label string) string {
+	if label == "" {
+		return "run rotate-secret as a user who may set it"
+	}
+
+	return "restore the label with a tool that keeps its policy, or run rotate-secret as a user who may set it"
+}
+
+// icaclsLevel is the icacls level letter for a label icacls can write back
+// whole: none (Medium, the default), or a no-write-up-only label at Low,
+// Medium or High.
+func icaclsLevel(label string) (string, bool) {
+	if label == "" {
+		return "M", true
+	}
+
+	start, end := strings.Index(label, "("), strings.LastIndex(label, ")")
+	if start < 0 || end < start || strings.Count(label, "(") != 1 {
+		return "", false
+	}
+
+	// (ML;flags;policy;;;level)
+	fields := strings.Split(label[start+1:end], ";")
+	if len(fields) != 6 || fields[0] != "ML" || fields[2] != "NW" {
+		return "", false
+	}
+
+	level, ok := map[string]string{"LW": "L", "ME": "M", "HI": "H"}[fields[5]]
+
+	return level, ok
 }
 
 // sddlParts is a descriptor's SDDL cut into its DACL ("D:" up to any "S:")
