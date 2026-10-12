@@ -1252,8 +1252,9 @@ the subtle bugs will be.
 - **After writing:** `POST /reload`, which must answer 200. Then, for each name the run touched
   (the rotated or ended name, and every pruned name still configured), `GET /secrets/{name}`.
   **Every expected value comes from one source: the bytes just written**, parsed with
-  `config.Parse` and judged with `GetRetiringSecrets(now)`, `now` read just before the GETs.
-  Each check that fails is named, with its own likely causes:
+  `config.Parse` and judged with `GetRetiringSecrets(now)`, `now` read just before **and just
+  after** each GET (revision 4, Task 10's review, M-1: checks 2 and 3 below say how each reading
+  is used). Each check that fails is named, with its own likely causes:
   1. **Primary** (every form that names a name: rotation, `--overlap 0`, `--end-overlap`). The
      `secret` field (base64) must **parse to the same key, mode and host** as the name's
      primary **parsed from the written bytes**, which may hold hex: compare the parsed
@@ -1283,8 +1284,10 @@ the subtle bugs will be.
      `until` passes.
 
   **Revision 4 (Task 10's review, M-3): an older binary.** With `--force` past a missing
-  `secret-rotation`, the checks run as above, and checks 2 and 3 name first the cause "the
-  running proxy is an older binary (--force), which ignores [[retiring-secret]]". A 404 or 405
+  `secret-rotation`, the checks run as above, and a shortfall in check 2, and check 3, name
+  first the cause "the running proxy is an older binary (--force), which ignores
+  [[retiring-secret]]"; a surplus in check 2 keeps the surplus causes, since an older binary can
+  only hold fewer keys (Task 10's second review, N-C). A 404 or 405
   to `GET /secrets/{name}` from a proxy whose features lack `secret-read` is reported with the
   cause "the running proxy does not serve GET /secrets/{name} (an older binary)" instead of
   check 1's.
