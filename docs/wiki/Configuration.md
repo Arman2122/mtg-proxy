@@ -16,6 +16,7 @@ default.
 - [`[secret-limits.<name>]`](#secret-limitsname)
   - [Per-address controls](#per-address-controls)
   - [Fair share: what to expect](#fair-share-what-to-expect)
+- [`[[retiring-secret]]`](#retiring-secret)
 - [`[[listener]]`](#listener)
 - [`[web]`](#-web)
 - [`[network]`](#network)
@@ -66,6 +67,8 @@ The layout that works, and the one the codebase's own tests pin:
    `[defense.*]`, `[throttle]`, `[stats.*]` — in any order.
 3. `[[listener]]` blocks, then `[web]`.
 4. `[secret-ad-tags]`, `[secret-limits.<name>]`, and `[secrets]` **last**.
+   `[[retiring-secret]]` blocks go just above `[secrets]`, which is where
+   `mtg-proxy rotate-secret` writes them.
 
 **Every boolean defaults to `false` when omitted** — with a few exceptions. There
 is no "unset" state for most bools in this config: `TypeBool.Get` returns the
@@ -104,7 +107,7 @@ rejects IP literals.
 | `allow-fallback-on-unknown-dc` | bool | `false` | When a client asks for a DC number the proxy does not know, fall back to another DC instead of rejecting. Any DC can serve any request, at some latency cost. |
 | `concurrency` | integer, 1–65535 | `4096` | Maximum concurrent connections. Everything above this is dropped. |
 | `tolerate-time-skewness` | duration | `3s` | How far a FakeTLS message's encrypted timestamp may be from local time before the connection is refused. This is anti-probe machinery, so widen it only if your clock is genuinely bad. |
-| `debug` | bool | `false` | Drops the log level from warn to debug. The configuration dump it emits has `secret`, every `[secrets]` value and `api-token` replaced with `[redacted]`; secret *names* are kept. |
+| `debug` | bool | `false` | Drops the log level from warn to debug. The configuration dump it emits has `secret`, every `[secrets]` value and `api-token` replaced with `[redacted]`; secret *names* are kept. Every `[[retiring-secret]]` `secret` is replaced too, and so is a block's `name` or `until` that reads as a secret value. |
 | `domain-fronting-port` | port | — | **Deprecated.** Use `[domain-fronting] port`. |
 | `domain-fronting-ip` | IP literal | — | **Deprecated and ignored**, with a startup warning. Use `[domain-fronting] host`. |
 | `domain-fronting-proxy-protocol` | bool | `false` | **Deprecated.** Use `[domain-fronting] proxy-protocol`. |
@@ -479,6 +482,213 @@ What to expect:
 
 The proxy's per-address usage, and how to watch fair share work, are on
 [[Monitoring]].
+
+## `[[retiring-secret]]`
+
+New with the `secret-rotation` feature. A block is a previous key of a secret,
+still accepted until an absolute instant after the secret was given a new key:
+the overlap that lets the holders of a leaked link move to the new one without
+a gap. The new link works at once, the old one keeps working until `until`,
+and from then the old key is refused and its live connections are closed.
+Let `mtg-proxy rotate-secret` write the blocks — see *Rotating a secret with an
+overlap* on [[Multi-User-and-API]] — and read this section for what they mean
+and how the proxy reads them.
+
+```toml
+[[retiring-secret]]
+# added by mtg-proxy rotate-secret at 2026-10-12T09:30:00Z
+name   = "alice"
+secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+until  = "2026-10-13T09:30:00Z"
+
+[secrets]
+alice = "ee00112233445566778899aabbccddeeff73746f726167652e676f6f676c65617069732e636f6d"
+bob   = "ee0123456789abcdef0123456789abcd9573746f726167652e676f6f676c65617069732e636f6d"
+```
+
+Here alice has a new key, and her old link keeps working until 09:30 UTC on
+13 October.
+
+| key | type | meaning |
+|---|---|---|
+| `name` | string | The secret this was a key of: a name in `[secrets]`, or `"default"` for the single top-level `secret` when there is no `[secrets]`. |
+| `secret` | hex or base64url string, any form (`ee`, `dd` or plain) | The old value, read like a `[secrets]` value. |
+| `until` | RFC 3339 date-time **with an offset** (`Z` or `+03:30`), quoted or as a bare TOML date-time | The instant the old key stops being accepted. `rotate-secret` writes UTC, to the second. |
+
+All three are required. One secret may have several blocks, one per old key:
+up to 4 unexpired ones per secret and 4,096 in the file. The old key is the
+secret's in everything but its value: the same name, quota, limits, bans,
+counters and per-address entries, on the doors a secret of its form opens.
+
+**Placement.** Like `[[listener]]`, every key after the header belongs to the
+block until the next header, so a block goes after every top-level key: just
+above `[secrets]`, where `rotate-secret` writes it, or between the other tables.
+
+**Three hand edits refuse the whole file.** They are the edits of this table
+that do not parse, unlike a mistake inside a block:
+
+- `retiring-secret = "…"` above the first table: a value where the table
+  belongs;
+- `retiring-secret = { name = …, secret = …, until = … }`: an inline table;
+- any TOML syntax error inside a block, such as an impossible date
+  (`until = 2026-02-30T09:30:00Z`).
+
+`run` then does not start, and a `POST /reload` answers `500` and keeps the
+secret set in force — which, if the same edit re-keyed `[secrets]`, leaves the
+leaked key as the primary. `run`, `run --check`, `doctor`, `rotate-secret` and
+the reload put this before the parser's own error:
+
+```text
+the file does not parse at line 2, at a key named retiring-secret: [[retiring-secret]] blocks go in their own table, above or between the other tables, one per old key, each with name, secret and until: not a scalar (retiring-secret = ...), not an inline table (retiring-secret = { ... }), not a key of that name under another table such as [secrets]: cannot parse config: cannot parse toml config: toml: ...
+```
+
+A refused reload adds `the secret set in force is kept: nothing in this edit is
+applied; if it re-keyed [secrets] or secret, the old key stays the primary until
+the file is fixed and reloaded`. A file saved with a UTF-8 byte-order mark is
+refused too, as it always was (`toml: invalid character at start of key: U+00EF
+'ï'`); that has nothing to do with this table.
+
+**The name `retiring-secret` is reserved in `[secrets]`.** Written below
+`[secrets]`, the same line parses — as a user named `retiring-secret` whose key
+is the old one. That user is never served: the start and every reload drop it
+and `run` logs a warning, `run --check` refuses the file, and `doctor` fails on
+the same line:
+
+```text
+a [secrets] user named "retiring-secret" is ignored: [[retiring-secret]] blocks go in their own table, above or between the other tables, one per old key
+```
+
+The management API accepts any name, so a user given that name through
+`POST` or `PUT /secrets` is served until the next start or reload.
+
+### How the proxy reads the blocks
+
+A mistake inside a block never stops the proxy. The block is dropped, with a
+warning, and its key is not accepted: the worst it does is end that old link
+early. Refusing the file instead would keep the set in force, and with it the
+leaked key, after an edit that re-keyed the secret in the same breath. This is
+the split unknown keys already have: `run` warns, `run --check` refuses.
+
+| class | when | under `run` and `POST /reload` | under `run --check` |
+|---|---|---|---|
+| problem | a field missing, of the wrong type or malformed, or an all-zero key; a `name` that is not a configured secret; a key that is another secret's primary, or the key of a block of another name; past the caps | the block is dropped; a warning line | refused |
+| warning | `until` more than 720h ahead | the block is kept, bounded by its own `until`; a warning at every load | refused |
+| inert | `until` has passed; the key is the secret's own primary; the same key as another block of that name (the later `until` is kept) | ignored; the expired ones counted, the others an info line each | accepted |
+
+Each problem is one warning line, naming the block by its position in the file
+and never by its value:
+
+```text
+retiring-secret #3 (name "carol"): name is not a configured secret; the entry is ignored and its key is not accepted
+```
+
+The reasons are fixed phrases: `name is missing or empty`, `name is not a
+string`, `secret is missing or empty`, `secret is not a string`, `secret is not
+a valid secret value (hex or base64url, in the ee, dd or plain form)`, `secret
+has an all-zero key`, `until is missing or empty`, `until is not an RFC 3339
+date-time with an offset, such as 2026-10-09T09:30:00Z`, `name is not a
+configured secret`, `name "default" is the top-level secret, which is not served
+while [secrets] is present`, `the key is another secret's primary key`, `the key
+is also the key of a retiring-secret entry of another name`, and the two caps,
+`more than 4 unexpired entries for this name; only the 4 with the latest until
+are kept` and `more than 4096 unexpired entries in all; only the 4096 with the
+latest until are kept`. A name that reads as a secret value is left out of the
+line.
+
+The over-long warning is `retiring-secret #<n> (name "<name>"): until is more
+than 720h away; it is honoured, but an overlap is a migration window, not a
+second key: shorten it (run --check refuses this file)`.
+
+Four things about the order:
+
+- **A field is checked first.** A block that fails there is dropped whatever
+  its `until`.
+- **Then expiry.** A block whose `until` has passed is inert whatever else is
+  wrong with it, a name that is no secret included. The expired blocks are
+  counted at info level, `retiring-secret entries past their until are ignored;
+  rotate-secret --prune removes them`, with `expired`.
+- **A shared key is judged on the whole file**, expired and dangling blocks
+  included: when two names claim one key, as a primary or in a block, every
+  unexpired block holding it is dropped, and stays dropped until the other
+  claim is removed. A primary is never touched.
+- **The caps keep the latest `until`.** Past 4 unexpired blocks for a name, or
+  4,096 in the file, the ones that expire first are dropped.
+
+Expiry is judged by a clock that never runs backwards inside one `run`: when
+the wall clock is more than a second behind the latest time it has seen, `run`
+logs `the wall clock is behind the latest time seen; rotation overlaps are
+judged by the latest time` with `behind_by`, once each time that happens, and an
+overlap that latest time already passed stays ended. `run --check`, `doctor`
+and `rotate-secret` read the wall clock. A restart forgets the latest time; see
+*Rotating a leaked link* on [[Security]].
+
+### Checking the blocks
+
+`run --check` refuses the file for any problem or warning line, and reports them
+together with any unknown key. A misspelt field inside a block is an unknown
+key (`retiring-secret.hosts`):
+
+```text
+unknown config keys: retiring-secret.hosts
+retiring-secret settings that run ignores or warns about:
+  retiring-secret #1 (name "alice"): until is not an RFC 3339 date-time with an offset, such as 2026-10-09T09:30:00Z; the entry is ignored and its key is not accepted
+```
+
+It accepts an inert block, so a file it accepts today it accepts tomorrow.
+
+`mtg-proxy doctor` adds a `Retiring secrets` section when it has something to
+say. Each problem or warning line, and the reserved-name line, fails its
+verdict, as an unknown key does; blocks past their `until` are only counted:
+
+```text
+Retiring secrets
+  ⚠️  retiring-secret #3 (name "carol"): name is not a configured secret; the entry is ignored and its key is not accepted
+  ℹ️  1 retiring-secret entry is past its until and ignored; rotate-secret --prune removes it
+```
+
+**An expired block stays in the file.** The proxy never writes its config, so a
+block is inert from its `until` on and is removed only by
+`mtg-proxy rotate-secret <config> --prune` (or by hand). Prune after each
+overlap: an expired block still stands in the way of its key under another
+name, still counts towards the WEB relay's list of retired links (see
+[[WEB-Proxy-Setup]]), and after a clock step back across a restart it can be
+accepted again (see [[Security]]).
+
+### A mode change is a hand edit
+
+`rotate-secret` gives the new key the old one's form (`ee`, `dd` or plain) and,
+for `ee`, its fronting host, or the one `--host` names. To move a secret to
+another form with an overlap, edit the file yourself: the new value in
+`[secrets]`, the old one in a block. Here alice moves from `ee` to `dd`, with a
+new key (`mtg-proxy generate-secret --mode dd --hex` makes one):
+
+```toml
+[[listener]]
+bind-to = "127.0.0.1:2398"
+accept = ["dd"]
+
+[[retiring-secret]]
+name   = "alice"
+secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+until  = "2026-10-20T09:30:00Z"
+
+[secrets]
+alice = "dd00112233445566778899aabbccddeeff"
+bob   = "ee0123456789abcdef0123456789abcd9573746f726167652e676f6f676c65617069732e636f6d"
+```
+
+Each key is tried on the doors of its own form: until `until`, alice's old `ee`
+link keeps working on `bind-to`, with its fronting host, and her new `dd` link
+works on the listener that accepts `dd`. Three things to check by hand that
+`rotate-secret` would have checked for you:
+
+- **Use a new key.** A block whose key is the secret's own primary is ignored
+  (`the key is the secret's own primary; the entry changes nothing`), so moving
+  alice to `dd` with the same key ends her `ee` link at once.
+- **`bind-to` still needs something to front with.** At least one secret must
+  stay `ee`, or `[domain-fronting] host` must be set; a previous key does not
+  count.
+- **`run --check` the file before you reload.**
 
 ## `[[listener]]`
 
@@ -1040,7 +1250,7 @@ always wins, and it is re-applied on every config read — including a
 
 | variable | effect |
 |---|---|
-| `SECRET` | A full mtg secret (`ee…` hex or base64), or a bare 16-byte hex key in the official-image format, which then also needs `SECRET_HOST`. **Replaces the entire `[secrets]` set**, along with `[secret-ad-tags]` and `[secret-limits]`. |
+| `SECRET` | A full mtg secret (`ee…` hex or base64), or a bare 16-byte hex key in the official-image format, which then also needs `SECRET_HOST`. **Replaces the entire `[secrets]` set**, along with `[secret-ad-tags]` and `[secret-limits]`. It also clears every `[[retiring-secret]]` block, so no previous key is accepted while it is set. |
 | `SECRET_HOST` | Fronting hostname combined with a bare-key `SECRET` into a FakeTLS secret. Ignored when `SECRET` is already a full secret. |
 | `TAG` | Same as `ad-tag`. An empty value clears the tag. Not persisted — supply it on every run. |
 | `MTG_BIND_TO` | Comma-separated `host:port` list overriding `bind-to`. No unprefixed form. |

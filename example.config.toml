@@ -31,7 +31,7 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 # (127.0.0.1) unless you set api-token below, since the API can mutate secrets.
 # Endpoints:
 #   GET    /stats            per-user connection counts, traffic and quota usage
-#   POST   /reload           re-read [secrets], ad-tag, [secret-ad-tags] and [secret-limits] from this file
+#   POST   /reload           re-read [secrets], ad-tag, [secret-ad-tags], [secret-limits] and [[retiring-secret]] from this file
 #   GET    /secrets          list secrets (name, secret, host, ad_tag, effective_ad_tag, quota/expiry/disabled/speed_limit/ip_limit)
 #   GET    /secrets/{name}   one entry of that list, by name
 #   POST   /secrets          add/update one secret: {"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?}
@@ -346,6 +346,50 @@ allow-fallback-on-unknown-dc = false
 # accounting is in-memory only and resets when the process restarts. The file is
 # rewritten atomically every ~30s and on shutdown.
 # usage-state-file = "/var/lib/mtg/usage.json"
+
+# A previous key of a secret, still accepted until an absolute instant after the
+# secret was given a new key: the overlap that lets the holders of a leaked link
+# move to the new one without a gap. Let the command write it rather than you:
+#
+#     mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --overlap 24h
+#
+# gives alice a new key in [secrets] (same form and fronting host), prints the
+# new value on stdout, and writes a block like the one below just above the
+# [secrets] header. The proxy picks it up on POST /reload (--reload does that
+# too) or at a restart; hand out the new links (mtg-proxy access) before until.
+#   --overlap 0     an immediate re-key, with no block
+#   --end-overlap   removes every block of the name: the overlap ends early
+#   --prune         removes every block whose until has passed
+#
+# An overlap is a grant: until then the old link works exactly as the new one
+# does, under the same name, quota, limits and bans. At most 720h.
+#
+# Like [[listener]], every key after the header belongs to the block, so it goes
+# after every top-level key: just above [secrets], where rotate-secret puts it,
+# or between the other tables. Never write it as one line: retiring-secret = ...
+# above the first table refuses the whole file, and below [secrets] it is a user
+# named "retiring-secret", which is never served (a warning says so).
+#
+#   name    a secret in [secrets], or "default" for the single top-level secret
+#           when there is no [secrets]
+#   secret  the old value, hex or base64url, in any form (ee, dd or plain)
+#   until   an RFC 3339 date-time with an offset, quoted or not: the old key is
+#           refused from that instant
+#
+# A problem in a block (a malformed until, a name that is not a secret) drops
+# that block with a warning and never stops the proxy, which only ends that old
+# key early; run --check refuses the file and doctor fails. An older mtg-proxy
+# ignores the table, which ends every overlap at once. The WEB relay has no
+# overlap: an old WEB link stops working once the relay reads the rotated file,
+# and is answered locally, never by the cover site. Not for a config the Penhoon
+# panel writes: it rewrites the file from its own records.
+#
+# The block below is alice's previous key, for the [secrets] example after it:
+# [[retiring-secret]]
+# # added by mtg-proxy rotate-secret at 2026-10-12T09:30:00Z
+# name   = "alice"
+# secret = "eeffeeddccbbaa9988776655443322110073746f726167652e676f6f676c65617069732e636f6d"
+# until  = "2026-10-13T09:30:00Z"
 
 # For multi-user support, use the [secrets] section instead of "secret".
 # Each key is a user name, used for per-user stats tracking.

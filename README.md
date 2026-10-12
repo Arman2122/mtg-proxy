@@ -32,6 +32,9 @@ hard to block in the first place. See [Credits](#credits).
 - **Per-address controls inside a shared secret** — a connection cap and a speed
   ceiling per source address, a fair share of the secret's speed, per-address
   usage on its own endpoint, and temporary bans.
+- **Secret rotation with an overlap** — give a leaked link's secret a new key
+  and keep the old one working until a time you choose, so its holders can
+  move without a gap.
 - **WEB proxy transport** — the connection type Telegram Desktop 7.1
   added: a page on your hostname carries MTProto over a WebSocket, so a
   network in between sees a browser visiting a website.
@@ -80,6 +83,7 @@ for questions. **[Contributing](CONTRIBUTING.md)** if you want to send a change.
   - [Connection throttling](#connection-throttling)
   - [Per-user quotas, expiry & disable](#per-user-quotas-expiry--disable)
   - [Per-address controls](#per-address-controls)
+  - [Secret rotation](#secret-rotation)
   - [WEB proxy transport](#web-proxy-transport)
   - [Public IP override](#public-ip-override)
   - [Environment variables](#environment-variables)
@@ -416,8 +420,8 @@ the secret set in atomically:
 - connections whose secret was removed or re-keyed are closed;
 - every other user stays connected and their stats counters carry over.
 
-Only `[secrets]`, `ad-tag`, `[secret-ad-tags]`, and `[secret-limits]` are
-hot-applied. Changing the
+Only `[secrets]`, `ad-tag`, `[secret-ad-tags]`, `[secret-limits]` and
+`[[retiring-secret]]` are hot-applied. Changing the
 bind address, domain fronting, network, or throttle settings still needs a
 restart.
 
@@ -668,6 +672,31 @@ share does at scale, are in the
 and [Security](https://github.com/Arman2122/mtg-proxy/wiki/Security) pages of
 the wiki.
 
+### Secret rotation
+
+When a link leaks, re-keying its secret cuts every holder at once.
+`rotate-secret` gives the secret a new key and keeps the old one accepted until
+a time you choose (feature `secret-rotation`):
+
+```console
+mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --overlap 24h --reload
+```
+
+It writes the new key into `[secrets]` and the old one into a
+`[[retiring-secret]]` block with its `until`, prints the new value on stdout,
+and with `--reload` reloads the proxy through the management API and reads the
+rotation back. Until `until` the old link works exactly as the new one does —
+for whoever holds it, so keep the overlap short for a link posted in public, or
+use `--overlap 0` and bans. Then the old key is refused and its connections
+close. `--end-overlap` ends an overlap early and `--prune` removes expired
+blocks. `/stats` and `GET /secrets` report `retiring_keys`, `retiring_until`,
+`retiring_connections` and `retiring_last_seen` while an overlap runs. The WEB
+transport has no overlap, and a file the Penhoon panel writes cannot be rotated
+this way. The details are on the
+[Multi-User-and-API](https://github.com/Arman2122/mtg-proxy/wiki/Multi-User-and-API)
+and [Security](https://github.com/Arman2122/mtg-proxy/wiki/Security) pages of
+the wiki.
+
 ### WEB proxy transport
 
 Telegram Desktop 7.1 added a **WEB proxy** connection type. The client loads a
@@ -821,6 +850,7 @@ process already uses every CPU core, and multiple secrets are configured through
 | `mtg-proxy simple-run <bind-to> <secret>` | Run without a config file, from flags only (no `[secrets]`, no reload). |
 | `mtg-proxy access [--ipv4 IP] [--ipv6 IP] [--port N] [--hex] <config>` | Print `tg://` / `t.me` links and QR-code URLs for the configured secrets. |
 | `mtg-proxy doctor [--skip-native-check] <config>` | Check connectivity, clock skew, fronting reachability, and SNI-to-DNS match. Run this first when something is off. |
+| `mtg-proxy rotate-secret <config> <name> --overlap <duration>` | Give a secret a new key and keep the old one accepted until the overlap ends. Also `<name> --end-overlap`, `--prune`, `--host`, `--dry-run`, `--reload` and `--force`. |
 | `mtg-proxy web-relay [--check] <config>` | Run the WEB proxy relay for the secrets in a config file. `--check` validates the `[web]` table and exits. |
 | `mtg-proxy generate-web-key <path>` | Write the WEB relay's 32-byte token signing key. |
 | `mtg-proxy version` | Print the version. |

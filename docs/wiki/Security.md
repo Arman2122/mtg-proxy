@@ -14,6 +14,7 @@ Sections on this page:
 - The obfuscated2 door
 - The WEB relay
 - Per-address controls and bans
+- Rotating a leaked link
 - IP blocklists and allowlists
 - The management API
 - What gets written down
@@ -654,9 +655,9 @@ To someone who holds the key, a ban is visible:
   key from another address works.
 
 So a ban is a short-term tool. For a leaked link, re-key the secret: every
-holder then needs a new link. Rotation with an overlap period, which would let
-the rightful holders move to a new key without a gap, is not part of this
-release.
+holder then needs a new link. Or rotate it with an overlap, which lets the
+rightful holders move to the new key without a gap, at a price: see *Rotating a
+leaked link* below.
 
 What a ban touches besides the refusal:
 
@@ -713,6 +714,113 @@ What a ban touches besides the refusal:
   not write these keys and its config file never carries them.
 - **Metrics.** Prometheus and statsd gain nothing, and nothing per-address is a
   label.
+
+## Rotating a leaked link
+
+`mtg-proxy rotate-secret` (feature `secret-rotation`) gives a secret a new key
+and keeps the old one accepted until an absolute `until` written into the
+config file, then refuses it and closes its live connections. How to run it is
+on [[Multi-User-and-API]] and the table it writes on [[Configuration]]; this
+section is what it costs and where its edges are.
+
+### The overlap is a grant
+
+Until `until` the old key is the secret's in everything but its value. Whoever
+holds the old link — the person it leaked to, and anyone they passed it on to —
+spends the secret's quota and speed, takes its `ip-limit` and `client-conns`
+slots, and earns handshake hints for their addresses, exactly as a rightful
+holder does. A link posted in public can therefore crowd the rightful holders
+out for as long as the overlap lasts.
+
+- **For a hostile leak** — a link posted in public and being abused — choose a
+  short overlap, or `--overlap 0` (an immediate re-key, no grant at all), and
+  ban the abusive places. A ban is held per secret and place, so it refuses a
+  place on the old key and the new one alike, and it survives the rotation; it
+  lives in memory only, and a restart ends it.
+- **To take a grant back early**, end it in the file: `rotate-secret <config>
+  <name> --end-overlap` and a reload, which ends every old key of that name.
+  No API route ends an overlap and keeps the secret, by design: a change made
+  only in memory would be granted again by the next reload of the unchanged
+  file.
+- **The leaker inside the group** gets the new link like everyone else. Rotation
+  retires a link that escaped; bans and `ip-limit` deal with a holder who leaks
+  again.
+- **Over 720h is refused** by `rotate-secret` and by `run --check`. A block
+  written by hand that far ahead is honoured by `run`, with a warning at every
+  load: an overlap is a migration window, not a second key.
+
+### What can be told from outside
+
+- **Without a key, nothing changes.** Before, during and after an overlap a
+  prober gets what it got: the cover site on FakeTLS, the one disposal of the
+  obfuscated door.
+- **A holder of the old key after `until`** is refused exactly as a wrong key
+  is: on FakeTLS the expired key is skipped before it is checked, and the hello
+  is fronted with a wrong key's bytes; on an obfuscated listener the key is not
+  tried. The only difference is the check skipped.
+- **The one new visible difference** is a connection that matched a key in the
+  instant before a reload or the expiry took it away. It is refused after the
+  handshake, at registration, logged with `deny_reason` `key_revoked` — the same
+  window and the same shape as the ban re-check. That re-check covers every
+  connection, not only rotations, so it also closes a race a plain re-key always
+  had: a connection that matched the old key just before the swap used to stay
+  open on it.
+- **An old-link hello is checked after every current key.** Without a hint, it
+  is verified after the primaries of every `ee` secret, so it is answered later
+  than a current-link hello by about one check per such secret. Only the holder
+  of that key can see that, and it tells them they hold an old key, which they
+  know. A hello that matches nothing now tries the previous keys too: to a
+  prober that looks like a proxy with that many more secrets, nothing specific
+  to rotation.
+- **After a restart** the hint cache is empty, so every old-link client pays a
+  full scan; old-link clients are the last tried. Under a flood the budget may
+  front them until it allows; the client retries.
+
+### What it costs
+
+Each previous `ee` key adds one candidate to every scan of a hello no hint
+matched, and each previous key of any form adds one trial to an obfuscated
+listener's loop. The ee handshake budget charges per candidate, so the scan CPU
+stays bounded at the share you configured; what grows is the cost of each scan,
+and so how soon the budget refuses during a flood. A secret keeps at most 4
+previous keys and a file 4,096, and a hinted hello is checked against at most 32
+keys. A config with no previous key costs nothing: the doors run as before.
+
+### The clock, and a restart
+
+Expiry is judged by a clock that never runs backwards within one process: when
+NTP steps the wall clock back, an overlap that already ended stays ended, and
+the proxy logs `the wall clock is behind the latest time seen; rotation overlaps
+are judged by the latest time` with `behind_by`. A forward jump followed by a
+correction ends early every overlap the jump passed, for the rest of that
+process — fail-safe, and logged.
+
+**The residual risk is a restart.** The latest time is not written anywhere, so
+if the wall clock stepped back past an `until` and the proxy then restarts, the
+old key is accepted again for up to the size of the step. Run NTP, and
+`rotate-secret <config> --prune` after each overlap: a block that is gone cannot
+come back.
+
+### Other edges
+
+- **The file is the only source.** An older mtg-proxy, or a binary started with
+  `SECRET` in the environment, ignores every block, which ends every overlap at
+  once — the safe direction. Rotation is not supported on a file the panel
+  writes: the panel rewrites it from its own records with the old key as the
+  primary.
+- **Revert is possible, on purpose.** A `POST` or `PUT /secrets` that makes the
+  retired key a secret's primary again does exactly that until the next reload,
+  and logs it at warning level. See [[Multi-User-and-API]].
+- **WEB has no overlap.** The relay serves current keys only; an old WEB link is
+  answered by the relay's local 404 and never forwarded to the cover site, until
+  its block is pruned. See [[WEB-Proxy-Setup]].
+- **At rest** the old value sits in the config next to the current ones, under
+  the file's own permissions, which `rotate-secret` keeps (on Windows, its
+  access list and label; the list of what is not kept is on
+  [[Multi-User-and-API]]). It is in no other
+  file, with one exception: a run that dies between creating its temporary file
+  and the rename leaves `<config>.rotate-<8 hex>.tmp`, which holds every secret
+  of the config. Delete it; the next run's refusal names it.
 
 ## IP blocklists and allowlists 🚧
 
@@ -813,6 +921,38 @@ guarantee that no code path anywhere can log a secret. If you add code, the
 pull-request checklist asks you to confirm that no secret, token or client
 address reaches a log, a persisted file, or an error message.
 
+The same dump replaces the `secret` of every `[[retiring-secret]]` block, and a
+block's `name` or `until` when it reads as a secret value. A previous key is
+held to a stricter rule than that: it is never printed anywhere — no log line,
+no error, no API answer, not `/stats`, not `access`, not `rotate-secret`'s
+output — in neither spelling of the value nor of the key. The lines about it
+name the secret and the block's position in the file, never the key.
+
+**A config error does not echo a value written in the wrong place.** A value
+pasted where TOML reads a key or a number used to come back in the parser's
+error, in the list of unknown keys, or in a refusal that quotes a name — on
+`run`, `run --check`, `doctor`, `rotate-secret`, the `/reload` error body and
+the log. Now any text in those messages that could spell a secret value is
+replaced with the marker `<not shown: reads as a secret value>`, and the place
+is named instead: a parse error gains ` (line L, column C)`, an unknown key
+` (line L)`. Everything else reads as the parser wrote it. Text counts as a
+possible value when it holds a run of at least 22 characters of the hex and
+base64 alphabets that is not only lowercase letters, `-` and `_` — and a name
+in a rotation line also when it decodes as hex or base64 to at least 16 bytes.
+So a long name with a digit or a capital in it, such as
+`team_berlin_2024_october_a`, is hidden too. A refusal that hides a
+name names no place: `secret-limits refers to unknown secret "<not shown: reads
+as a secret value>"` means scanning the `[secret-limits.*]` headers by eye. The
+relay's refusal of a `[web] host` is cleaned the same way, and `access` prints
+no WEB link for a host the config refuses.
+
+The known limits, which need a value written in a deliberately odd way to
+reach: a key spelled with TOML escapes and defined twice, or a float written
+with digit underscores, is quoted by the parser in its decoded form, which is
+not the file's text and so is not recognised; the second step of the parse
+(from TOML to the config's own types) names no position; and `invalid secret
+"<name>"`, the refusal of a secret that is not valid, still quotes the name.
+
 **The only file the proxy writes is the usage state file.**
 
 ```toml
@@ -822,6 +962,12 @@ usage-state-file = "/var/lib/mtg/usage.json"
 It holds per-secret quota byte counters and nothing else. No secret, no
 hostname, no address. When unset, quota accounting is in-memory and resets on
 restart.
+
+`mtg-proxy rotate-secret` is a separate command, and it writes the config file
+itself: atomically, through `<config>.rotate-<8 hex>.tmp`, with
+`<config>.rotate.lock` beside it while it runs. Neither outlives a run that ends
+normally, and no backup of the old file is ever made. See *Rotating a leaked
+link* above for what a crashed run leaves.
 
 ## Client addresses 📍
 
@@ -1014,5 +1160,8 @@ and neither you nor they will see it happen. See [[Installation]].
   sees real client addresses: not behind a front that sends no PROXY header, and
   behind a PROXY-protocol listener only when nothing but your own front can reach
   it. The start warning says when they meet such a listener.
+- `[[retiring-secret]]` blocks are pruned (`rotate-secret <config> --prune`)
+  once their overlap has ended, and no `<config>.rotate-*.tmp` file is left
+  beside the config.
 - You verified the release you are running, and your automation fails closed
   when verification does.

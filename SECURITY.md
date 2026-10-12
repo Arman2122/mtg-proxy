@@ -105,7 +105,9 @@ not. Reports that matter most:
   the wire, since that is the whole point of FakeTLS;
 - anything that lets one user's traffic, secret or counters reach another user;
 - anything reachable through the management API without its token;
-- anything that turns the proxy into a relay to a destination it should refuse.
+- anything that turns the proxy into a relay to a destination it should refuse;
+- anything that makes a key a rotation retired work after its `until`, or makes
+  it a secret's primary again without the operator asking.
 
 Denial of service by simply sending a lot of traffic is out of scope. So is
 anything that requires the operator to already have configured the proxy
@@ -170,3 +172,23 @@ it can tell the key is valid and the address is refused. Someone without the key
 learns nothing. A ban is a refusal, not concealment: for a leaked link, re-key
 the secret. The Security page of the wiki, under *Per-address controls and
 bans*, has the detail.
+
+## Rotating a leaked link: an overlap is a grant
+
+`mtg-proxy rotate-secret` can retire a leaked link with an overlap: the secret
+gets a new key at once, and the old one stays accepted until an absolute
+`until` written into the config file. Until then the old key works for whoever
+holds it — the person it leaked to included — with the secret's quota, limits
+and connection slots, so a link posted in public can crowd out its rightful
+holders for as long as the overlap lasts. For a hostile leak use a short
+overlap, or `--overlap 0` (an immediate re-key) and bans; `--end-overlap` and a
+reload end an overlap early. After `until` a holder of the old key is refused
+as a wrong key is, and a prober without a key gets the same answers
+before, during and after an overlap.
+
+One residual risk is known and not closed: the clock that judges `until` never
+runs backwards inside one process, but a restart forgets it, so if the wall
+clock stepped back past an `until` and the proxy then restarts, the old key is
+accepted again for up to the size of the step. Run NTP, and remove ended
+overlaps with `rotate-secret --prune`. The Security page of the wiki, under
+*Rotating a leaked link*, has the detail.

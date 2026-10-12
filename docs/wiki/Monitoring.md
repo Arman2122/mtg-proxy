@@ -246,6 +246,10 @@ shape it always had:
 | `clients_overflow` | It is non-zero: connections sent to the rest entry because the table had no room for their address, since the process started; a secret removed and added again starts from zero. Peers that do not stand for one place, which share the rest entry anyway, are not counted here. |
 | `connected_ips` / `last_ip` | `track-client-ips` is on. See below. |
 | `external_ips` / `external_expires_at` | `track-client-ips` is on and a panel has reported the user's addresses elsewhere through `PUT /secrets/{name}/external-ips`. See [[Multi-User-and-API]]. |
+| `retiring_keys` | The user's secret was rotated and still accepts a previous key (feature `secret-rotation`): how many it accepts. |
+| `retiring_until` | Same: the latest `until` among them — when the last old link stops working. In UTC, as `retiring_last_seen` is; `last_seen` and `expires_at` are in the server's own zone. |
+| `retiring_connections` | Same, and it is non-zero: live connections on a key that is not the secret's current one. Counted from each connection's own key when you ask, so right after a rotation it shows every old-link user still connected, and it falls as they move to the new link. |
+| `retiring_last_seen` | Same, once a connection came in on a previous key during this overlap: when the last one did, in UTC. Cleared when a secret with no previous key gets one, so a second rotation never shows the first one's traffic. |
 
 The throttle block reports `active` (whether caps are being applied at all),
 `limit`, and `caps` — a per-user connection ceiling, present only while some
@@ -253,7 +257,8 @@ user is actually capped. Configuring it belongs to [[Limits-and-Quotas]].
 
 `GET /secrets` on the same listener carries `connections`, `last_seen` and the
 quota fields for each secret, so a panel rendering one user does not have to
-fetch and filter the whole of `/stats`. See [[Multi-User-and-API]].
+fetch and filter the whole of `/stats`. It carries the four `retiring_` fields
+too. See [[Multi-User-and-API]].
 
 ## Per-user client addresses 🔒
 
@@ -664,6 +669,49 @@ Lines worth knowing, all at warn level unless noted:
   `banned` — info, so debug only, like the other reasons. It carries the stream's
   `client-ip` like every stream line. `client_conns_refused` on `/stats` is the
   way to watch the first at the default level; a ban refusal has no counter.
+- The same line with `deny_reason` `key_revoked` — info, no counter, no event. A
+  connection matched a key in the instant before a reload, an API change or the
+  end of an overlap took that key away, and was refused when it registered. It
+  can appear on a proxy that never rotates: a plain re-key has the same window.
+- `the wall clock is behind the latest time seen; rotation overlaps are judged
+  by the latest time` with `behind_by` — warn, once each time the wall clock
+  falls more than a second behind the latest time the process has seen, such as
+  an NTP step back. Overlaps are judged by that latest time, so none comes back.
+  Every reload and API change reads that clock, so this too can appear on a
+  proxy that never rotates.
+- A `[[retiring-secret]]` problem — `retiring-secret #<n> (name "<name>"): …;
+  the entry is ignored and its key is not accepted`, or the over-long `until is
+  more than 720h away` — warn, at start and on every reload, one line per block.
+  So is `a [secrets] user named "retiring-secret" is ignored: …`. The lines are
+  on [[Configuration]].
+- `retiring-secret entries past their until are ignored; rotate-secret --prune
+  removes them` with `expired` — info, at start and on every reload, while the
+  file holds expired blocks.
+
+The proxy writes one line per change to a secret's previous keys, at each swap
+— the start, a reload, an API change, the five-second expiry sweep — with
+`secret_name` and never a key. They are info, so debug only, except where
+marked warn; the four `/stats` fields above are the always-on view. `closed` is
+how many connections of that secret the swap closed.
+
+- `secret accepts a previous key until its overlap ends` with `until` — a
+  previous key is accepted from now on: at the start, once per block, and at
+  the reload after a rotation.
+- `previous key of the secret is no longer accepted: overlap ended` with
+  `until` and `closed` — its `until` passed; the connections on it are the ones
+  closed.
+- `previous key of the secret is no longer accepted` with `reason` `removed`
+  and `closed` — it left before its `until`: `--end-overlap` and a reload, the
+  secret deleted, or the key given to another secret.
+- `a retiring key was ignored` with `reason` — the proxy dropped a previous key
+  it was handed: info for `same_as_primary`, `duplicate` and `expired`, warn for
+  `invalid`, `dangling`, `key_of_other_secret` and `over_cap`. Under `run` the
+  file's blocks are judged before the proxy sees them, so these come mostly
+  from API changes.
+- `previous key of the secret is the primary again` with `closed` — warn: a
+  `POST` or `PUT /secrets` made the secret's retired key its primary again (a
+  revert), and `closed` connections on the key it replaced were closed. The
+  leaked key is live again until the next reload; see [[Multi-User-and-API]].
 - `addresses banned through the API` and `ban lifted through the API` — info,
   with the secret's name and, for a ban, how many places were banned and how many
   streams closed. No address.
@@ -719,6 +767,13 @@ On the proxy, from `GET /stats`:
   `/clients` says which address, by its own `throttled_ms`.
 - At start, the `per-address controls are in use and this listener expects
   PROXY headers` warning on a listener that anyone but your own front can reach.
+- Per user, `retiring_connections` still high as `retiring_until` approaches.
+  Those are people on the old link who have not moved, and at `until` they are
+  cut. A recent `retiring_last_seen` means someone still opens new
+  connections with the old link.
+- In the log, `previous key of the secret is the primary again` that nobody
+  meant: a retired key is live again. And `the wall clock is behind the latest
+  time seen…`: the clock stepped back; check NTP.
 
 On the WEB relay, from its own `/stats`:
 

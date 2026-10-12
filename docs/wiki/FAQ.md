@@ -81,7 +81,7 @@ interval = "15s"
 count = 9
 ```
 
-Those two timeout values are the built-in defaults; the keep-alive numbers fall back to the Go runtime's own behaviour when you leave them unset. None of this hot-reloads — only `[secrets]`, `ad-tag`, `[secret-ad-tags]` and `[secret-limits]` do, so a timeout change needs a restart. The WEB relay's own lifetimes (a two-minute bootstrap TTL, a two-minute reconnect grace) are compiled constants and are not configurable; nothing about them is negotiated with the client. See [[Configuration]].
+Those two timeout values are the built-in defaults; the keep-alive numbers fall back to the Go runtime's own behaviour when you leave them unset. None of this hot-reloads — only `[secrets]`, `ad-tag`, `[secret-ad-tags]`, `[secret-limits]` and `[[retiring-secret]]` do, so a timeout change needs a restart. The WEB relay's own lifetimes (a two-minute bootstrap TTL, a two-minute reconnect grace) are compiled constants and are not configurable; nothing about them is negotiated with the client. See [[Configuration]].
 
 ### Does it work behind Cloudflare?
 
@@ -119,6 +119,47 @@ systemctl reload mtg-proxy-web-relay
 ```
 
 What the relay cannot see is a change made through the API and never written to the file. That user's WEB link is answered by the cover site — which, from their side, looks exactly like the censorship the relay exists to get around. Write the file. See [[Multi-User-and-API]].
+
+### How do I retire a leaked link without cutting everyone off?
+
+Rotate the secret with an overlap (feature `secret-rotation`). It gets a new key at once, and the old one keeps working until a time you choose:
+
+```bash
+mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --overlap 24h --reload
+```
+
+The new value is printed on stdout; `mtg-proxy access` prints the new links, which every rightful holder needs before the overlap ends. Until then, the old link works for whoever has it, the person it leaked to included, under the same quota and limits. For a link posted in public and being abused, keep the overlap short, or use `--overlap 0` (an immediate re-key) and ban the abusive places. `--end-overlap` and a reload end an overlap early.
+
+WEB has no overlap: the old WEB link stops when the relay reads the file. A file the Penhoon panel writes cannot be rotated this way — re-key the client in the panel. See [[Multi-User-and-API]] and [[Security]].
+
+### `run` refuses the file after I edited a rotation block
+
+The table's shape is wrong, not a value in it. A mistake inside a `[[retiring-secret]]` block — a typo in `until`, a name that is no secret — never stops the proxy: the block is dropped with a warning and the rest of the file applies. Three shapes stop the whole file, and the error says `the file does not parse at line N, at a key named retiring-secret` (or `inside a [[retiring-secret]] block`), then how the table is written:
+
+- `retiring-secret = "…"` above the first table;
+- `retiring-secret = { name = …, secret = …, until = … }`, an inline table;
+- a TOML syntax error inside a block, such as `until = 2026-02-30T09:30:00Z`.
+
+Write one block per old key, header on its own line, just above `[secrets]`:
+
+```toml
+[[retiring-secret]]
+name   = "alice"
+secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+until  = "2026-10-13T09:30:00Z"
+```
+
+Until the file is fixed, a running proxy keeps the secret set it had: if the same edit re-keyed `[secrets]`, **the leaked key is still the primary**. Fix the file, check it with `mtg-proxy run --check <config>`, and reload. `rotate-secret` never writes any of these shapes. See `[[retiring-secret]]` on [[Configuration]].
+
+### The log says a `[secrets]` user named "retiring-secret" is ignored
+
+```text
+a [secrets] user named "retiring-secret" is ignored: [[retiring-secret]] blocks go in their own table, above or between the other tables, one per old key
+```
+
+**Cause:** a line `retiring-secret = "<old value>"` written below `[secrets]`. There it is not a parse error but a user named `retiring-secret` whose key is the old one — which would keep the leaked link working for good. So that name is reserved: the user is never served, `run` warns at the start and on every reload, `run --check` refuses the file and `doctor` fails. The old link is therefore refused already: the user it would have made does not exist.
+
+**Fix:** delete the line. If you meant an overlap, write a `[[retiring-secret]]` block above `[secrets]` instead (previous answer), or let `mtg-proxy rotate-secret` write it. A client that really is called `retiring-secret` needs another name.
 
 ### What happens to sessions when I restart the relay?
 
