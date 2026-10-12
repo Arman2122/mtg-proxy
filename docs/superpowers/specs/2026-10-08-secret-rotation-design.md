@@ -268,7 +268,12 @@ against the pinned go-toml:
   forever as a primary — the exact revival R0 forbids. So a `[secrets]` user named
   `retiring-secret` is a problem of the rotation machinery: `run` drops that user with a
   Warning (value-free, naming the mis-edit and the right syntax), `run --check` and `doctor`
-  refuse it, and no secret is ever served under that name.) At start the process does not start (for the parse-error shapes). On a reload, the
+  refuse it, and no secret is ever served under that name. **A `[secrets]` that holds only that
+  user serves nothing, and the top-level `secret` is not served while `[secrets]` is present
+  (the table as written decides, that user included): `Validate` refuses such a file, so `run`,
+  the reloader, `run --check`, `doctor`, `access`, `rotate-secret` and the WEB relay all refuse
+  it, and a reload keeps the set in force** (revision 4, the final review, I-1: serving the
+  top-level key instead would revive a key the file had switched off).) At start the process does not start (for the parse-error shapes). On a reload, the
   previous set stays active, and if the same edit also re-keyed `[secrets]`, **the leaked key
   stays the primary** until the file is fixed. How it surfaces:
   - `run --check` and `rotate-secret` (step 1 of §7.3) refuse it with the parser's own error;

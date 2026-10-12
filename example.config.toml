@@ -369,7 +369,8 @@ allow-fallback-on-unknown-dc = false
 # or between the other tables. Never write it on one line:
 # retiring-secret = "..." or = { ... } above the first table refuses the whole
 # file; below [secrets] the first is a user named "retiring-secret", which is
-# never served (a warning says so), and the second refuses the file.
+# never served (a warning says so; if it is the only user in [secrets], the
+# file serves nothing and is refused), and the second refuses the file.
 #
 #   name    a secret in [secrets], or "default" for the single top-level secret
 #           when there is no [secrets]
