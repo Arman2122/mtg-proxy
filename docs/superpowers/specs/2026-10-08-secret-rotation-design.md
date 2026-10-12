@@ -257,7 +257,11 @@ against the pinned go-toml:
   (§7.3).
 - **A scalar where the table belongs** (`retiring-secret = "x"`, or any non-table value) is a
   parse error of the whole file, as for every other table. That is **the one hand edit of a
-  rotation block that blocks a load.** At start the process does not start. On a reload, the
+  rotation block that blocks a load, besides a TOML syntax error and the INLINE-TABLE form**
+  (`retiring-secret = { name = …, secret = …, until = … }`, which `Parse` refuses as a decode
+  error into a slice field; revision 4, Task 8a's review: C15 pins it in Task 8b, and `--check`,
+  `rotate-secret` and the FAQ name "an inline table" and "any TOML syntax error" alongside the
+  scalar, e.g. an out-of-range date-time such as Feb 30 or `24:00` in `until`). At start the process does not start. On a reload, the
   previous set stays active, and if the same edit also re-keyed `[secrets]`, **the leaked key
   stays the primary** until the file is fixed. How it surfaces:
   - `run --check` and `rotate-secret` (step 1 of §7.3) refuse it with the parser's own error;
@@ -326,6 +330,14 @@ Each entry is classified in this order.
 | 6 | the key equals its own name's primary key | inert (the primary already accepts it) | ignored, Info | accepted |
 | 7 | two unexpired entries of one name with the same key | inert duplicate | collapsed to one with the later `until`, Info | accepted |
 | 8 | more than 4 unexpired entries for one name (`mtglib.MaxRetiringPerSecret`), or more than 4,096 in all (`mtglib.MaxRetiringSecrets`) | problem | keep the 4 latest `until` per name, then the 4,096 latest overall (ties broken by name, then key bytes); drop the rest, warning | refused |
+
+**Rule 4 and rule 6 (revision 4, Task 8a's review).** The order in the table is the order the
+entries are examined, but rule 4's warning is raised only for an entry that would otherwise be
+honoured ("kept"): an over-long entry whose key is its own name's primary (rule 6) gets only the
+rule-6 Info/Note, and `--check` accepts it, because it changes nothing the primary does not
+already allow. A wrong-typed `name` or `secret` (including a TOML date-time in either) is a
+rule-1 problem; only `until` may be a TOML date-time. A secret value pasted into `name` is
+withheld from the label and redacted in `Config.String()` (a name that parses as a secret).
 
 **Why a problem drops the entry instead of refusing the file.** A refused reload keeps the
 previous set. Take a hand edit that re-keys `[secrets]` and adds a retiring block with a typo
