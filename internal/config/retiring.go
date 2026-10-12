@@ -255,6 +255,43 @@ func (c *Config) GetRetiringSecrets(now time.Time) RetiringReport {
 	return report
 }
 
+// RetiringValues is the WEB relay's list of retired values: the value of every
+// [[retiring-secret]] entry that passes rule 1 of §1.3 (name, secret and until
+// present, of their types and well formed, the key not all zero), whatever its
+// name or its time. In file order, with the duplicates kept; nil when none
+// passes, and after the SECRET override, which clears the table (D29).
+//
+// It is not GetRetiringSecrets' Usable list, and deliberately asks less. The
+// relay recognises a retired key's capability so that its holder is answered by
+// the local 404 and the capability is never forwarded to the cover site; an
+// expired entry (rule 2), a name that is no secret (rule 3), a key that is
+// another entry's (rules 5 to 7) or one past a cap (rule 8) is still a link
+// somebody holds, and the relay has no clock to tell the live ones from the
+// rest. Only an entry that is no key a client could hold (rule 1) has nothing
+// to recognise. The relay's registry trims the list itself (duplicates, a value
+// equal to a live one, more than MaxProfiles), so an inert file never refuses
+// the relay's start or a reload.
+//
+// It is pure and takes no clock. Never format an element of the result with
+// %v or %s: a Secret's String() is its value.
+func (c *Config) RetiringValues() []mtglib.Secret {
+	var values []mtglib.Secret
+
+	for i := range c.RetiringSecrets {
+		// The one judge of rule 1: a field of the wrong TOML type carries the
+		// text fmt.Sprint made of it, which can parse by accident, and only the
+		// marks judgeRetiringShape reads tell it from a string.
+		entry := judgeRetiringShape(i+1, &c.RetiringSecrets[i])
+		if entry.verdict == retiringProblem {
+			continue
+		}
+
+		values = append(values, entry.secret)
+	}
+
+	return values
+}
+
 // judgeRetiringShape is rule 1 for the n-th entry: every field present, of
 // its type and well formed. It returns the entry with its parsed secret and
 // until, or dropped with the first field's reason.
