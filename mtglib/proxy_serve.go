@@ -255,6 +255,15 @@ func (p *Proxy) admit(ctx *streamContext) bool {
 	p.stats.UpdateLastSeen(ctx.secretName)
 	ctx.lastActiveUnix.Store(time.Now().Unix())
 
+	// An admission under a previous key of the secret: "has anyone used the old
+	// link lately" (retiring_last_seen). Stamped only here, once the stream is
+	// registered, so a refusal is not an admission; a timestamp for the operator,
+	// read from the wall clock like last_seen, not a decision the rotation clock
+	// makes. A stream on the name's primary has no retiringUntil and stamps nothing.
+	if !ctx.retiringUntil.IsZero() {
+		p.stats.markRetiringSeen(ctx.secretName, time.Now())
+	}
+
 	// Only once the secret is known, for the same reason nothing is billed
 	// before attribution: on the dd/plain door the name does not exist until
 	// the frame is trial-decrypted, and an address recorded earlier would be

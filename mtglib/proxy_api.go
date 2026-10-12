@@ -100,6 +100,16 @@ type SecretInfo struct {
 	// exactly as ConnectedIPs is.
 	ExternalIPs       []string   `json:"external_ips,omitempty"`
 	ExternalExpiresAt *time.Time `json:"external_expires_at,omitempty"`
+
+	// RetiringKeys, RetiringUntil, RetiringConnections and RetiringLastSeen mirror
+	// the same four fields on GET /stats, read from the same set and the same
+	// counters, and absent for a secret with no unexpired previous key. A count,
+	// two times and a count: none is an address, so none is gated, and none is
+	// ever a key.
+	RetiringKeys        int        `json:"retiring_keys,omitempty"`
+	RetiringUntil       *time.Time `json:"retiring_until,omitempty"`
+	RetiringConnections int        `json:"retiring_connections,omitempty"`
+	RetiringLastSeen    *time.Time `json:"retiring_last_seen,omitempty"`
 }
 
 // SnapshotSecrets returns the active secret set as a name-sorted list, exposing
@@ -122,6 +132,15 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 	// counts are not, and a lookup of a user with no ledger is the zero
 	// report, so nothing below needs a second branch.
 	addresses := p.addressReports()
+
+	// The overlap of every name that still accepts a previous key, read once for
+	// the whole list and only when the set holds a retiring entry: the registry
+	// is walked under liveMu, as for the addresses above, and the rotation
+	// clock's high-water mark is not moved by a read that has nothing to judge.
+	var overlaps map[string]retiringView
+	if len(set.retiring) > 0 {
+		overlaps = p.retiringViews(set, p.rotation.Now())
+	}
 
 	for i, name := range set.names {
 		secret := set.secrets[i]
@@ -150,6 +169,11 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 		info.ConnectedIPsLastSeen = report.ConnectedIPsLastSeen
 		info.ExternalIPs = report.ExternalIPs
 		info.ExternalExpiresAt = report.ExternalExpiresAt
+
+		if view, ok := overlaps[name]; ok {
+			info.RetiringKeys, info.RetiringConnections = view.keys, view.connections
+			info.RetiringUntil, info.RetiringLastSeen = view.times()
+		}
 
 		out[i] = info
 	}
@@ -606,6 +630,18 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	set := p.secrets.Load()
+
+	// The overlap of every name that still accepts a previous key: four scalars
+	// inside a user object that is already there, for the same reason as the
+	// counts above -- every key under Users is billed as a client, and a name is
+	// not one for having an overlap. The clock is read only when the set holds a
+	// retiring entry, and once for the whole response; a set that holds none costs
+	// this length check.
+	var overlaps map[string]retiringView
+	if len(set.retiring) > 0 {
+		overlaps = p.retiringViews(set, p.rotation.Now())
+	}
+
 	for i, name := range set.names {
 		user, ok := resp.Users[name]
 		if !ok {
@@ -613,6 +649,11 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		}
 
 		lim := set.limits[i]
+
+		if view, ok := overlaps[name]; ok {
+			user.RetiringKeys, user.RetiringConnections = view.keys, view.connections
+			user.RetiringUntil, user.RetiringLastSeen = view.times()
+		}
 
 		if lim.QuotaBytes > 0 {
 			user.Quota = lim.QuotaBytes

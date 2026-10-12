@@ -88,6 +88,12 @@ type secretStats struct {
 	// over the per-address table: the table forgets an address ten minutes
 	// after its last stream, and the figure must never go back.
 	clientThrottledNanos atomic.Int64
+
+	// retiringLastSeen is the unix-nano time of the last admission made under one
+	// of the secret's retiring keys, 0 for none yet (admit stamps it). Runtime
+	// state like lastSeen: never persisted, and only ever reported while the
+	// secret still has a retiring key (see retiringViews).
+	retiringLastSeen atomic.Int64
 }
 
 // rolloverIfNeeded zeroes quotaUsed when the monthly quota period has elapsed.
@@ -608,6 +614,14 @@ const (
 
 	// FeatureSecretRead means GET /secrets/{name} is served.
 	FeatureSecretRead = "secret-read"
+
+	// FeatureSecretRotation means a secret may be given a new key while its old
+	// one is still accepted until an absolute time: the [[retiring-secret]]
+	// config table is honoured, the `rotate-secret` command exists, and /stats
+	// and GET /secrets/{name} may carry retiring_keys, retiring_until,
+	// retiring_connections and retiring_last_seen inside the secret's own
+	// object -- never as a key under users.
+	FeatureSecretRotation = "secret-rotation"
 )
 
 // supportedFeatures is the sorted capability list this build advertises. Keep it
@@ -627,6 +641,7 @@ var supportedFeatures = []string{
 	FeatureQuotaReset,
 	FeatureSecretModes,
 	FeatureSecretRead,
+	FeatureSecretRotation,
 	FeatureSecretsAPI,
 	FeatureSpeedDirections,
 	FeatureSpeedLimits,
@@ -835,6 +850,21 @@ type UserStatsJSON struct {
 	// the address. Gated and omitted exactly as ConnectedIPs is, so a panel
 	// can tell a device that fell silent from one still talking.
 	ConnectedIPsLastSeen map[string]time.Time `json:"connected_ips_last_seen,omitempty"`
+
+	// RetiringKeys, RetiringUntil, RetiringConnections and RetiringLastSeen are
+	// the read-back of a rotation's overlap: how many previous keys of the secret
+	// are still accepted, when the last of them stops being (UTC), how many live
+	// streams hold a key that is not the secret's current one, and when a stream
+	// last came in on a previous key. Four scalars inside the user object, never
+	// a key under users and never a key's value: all are absent for a secret
+	// with no unexpired previous key, so /stats on a deployment that never
+	// rotates is byte-identical to before they existed, and none is gated.
+	// handleStats fills them from the set in force, onto users that are already
+	// there; ProxyStats itself knows nothing of keys.
+	RetiringKeys        int        `json:"retiring_keys,omitempty"`
+	RetiringUntil       *time.Time `json:"retiring_until,omitempty"`
+	RetiringConnections int        `json:"retiring_connections,omitempty"`
+	RetiringLastSeen    *time.Time `json:"retiring_last_seen,omitempty"`
 }
 
 // buildResponse assembles the base stats response (runtime counters and throttle
