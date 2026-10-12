@@ -716,19 +716,31 @@ func TestPrepareRefuses(t *testing.T) {
 			name: "a block of the name holding its key for longer",
 			doc:  refusalDoc(blockOf("alice", ee(keyAlice), at(48*time.Hour))),
 			req:  rotate,
-			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z: a [[retiring-secret]] block of "alice" holds it`,
+			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z ` +
+				`by retiring-secret #1 (name "alice"); remove that block with --end-overlap or --prune, or edit it, then rotate`,
 		},
 		{
 			name: "the same, with an overlap of 0",
 			doc:  refusalDoc(blockOf("alice", ee(keyAlice), at(48*time.Hour))),
 			req:  with(func(r *Request) { r.Until = time.Time{} }),
-			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z: a [[retiring-secret]] block of "alice" holds it`,
+			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z ` +
+				`by retiring-secret #1 (name "alice"); remove that block with --end-overlap or --prune, or edit it, then rotate`,
+		},
+		{
+			// The block is named by its place in the file as it is, not in
+			// the edited one, where the pruned block above it is gone.
+			name: "a block of the name holding its key, below a block the run prunes",
+			doc:  refusalDoc(blockOf("alice", ee(keyOld1), at(-time.Hour)), blockOf("alice", ee(keyAlice), at(48*time.Hour))),
+			req:  with(func(r *Request) { r.Prune = true }),
+			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z ` +
+				`by retiring-secret #2 (name "alice"); remove that block with --end-overlap or --prune, or edit it, then rotate`,
 		},
 		{
 			name: "another name's block holding the key, with an overlap of 0",
-			doc:  refusalDoc(blockOf("bob", ee(keyAlice), at(48*time.Hour))),
+			doc:  refusalDoc(blockOf("bob", ee(keyOld1), at(time.Hour)), blockOf("bob", ee(keyAlice), at(48*time.Hour))),
 			req:  with(func(r *Request) { r.Until = time.Time{} }),
-			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z: a [[retiring-secret]] block of "bob" holds it`,
+			want: `the current key of "alice" would still be accepted until 2026-10-10T09:30:00Z ` +
+				`by retiring-secret #2 (name "bob"); remove that block with --end-overlap or --prune, or edit it, then rotate`,
 		},
 		{
 			name: "another name's block that the new one would collide with",
@@ -1223,6 +1235,120 @@ func TestEndingTheOverlapUndoesTheBlock(t *testing.T) {
 			want = bytes.Replace(want, []byte(prepared.ValueText(old)), []byte(prepared.ValueText(newPrimary)), 1)
 
 			assertSameBytes(t, want, ended, tc.fixture)
+		})
+	}
+}
+
+// overCapDoc is a file one name past the overall cap: 1,025 names with 4
+// unexpired blocks each, 4,100 entries, each until a minute after the one
+// before. The 4 earliest, u0000's, are the 4 the cap drops; the 4 latest are
+// u1024's.
+func overCapDoc() []byte {
+	const names = 1025
+
+	var doc strings.Builder
+
+	doc.WriteString("bind-to = \"0.0.0.0:3128\"\n\n")
+
+	for i := range names * mtglib.MaxRetiringPerSecret {
+		until := testNow.Add(time.Hour + time.Duration(i)*time.Minute).Format(time.RFC3339)
+		doc.WriteString(blockOf(fmt.Sprintf("u%04d", i/mtglib.MaxRetiringPerSecret), ee(fmt.Sprintf("%032x", i+1)), until) + "\n")
+	}
+
+	doc.WriteString("[secrets]\n")
+
+	for n := range names {
+		fmt.Fprintf(&doc, "u%04d = %q\n", n, ee(fmt.Sprintf("f%031x", n+1)))
+	}
+
+	return []byte(doc.String())
+}
+
+// R0 for the tool: an edit never makes a key usable that nothing accepts now.
+// Removing one block of a colliding pair (rule 5, judged against expired
+// entries too) would bring the other name's copy back, and freeing room under
+// the overall cap (rule 8) would bring back the entries it dropped; either
+// refuses, value-free, and nothing is written. A block added by a rotation can
+// only make rules stricter for the others, so a rotation revives only through
+// the blocks it prunes.
+func TestAnEditNeverMakesADeadKeyUsable(t *testing.T) {
+	t.Parallel()
+
+	collidingPair := []string{
+		blockOf("alice", ee(keyOld1), at(-time.Hour)),
+		blockOf("bob", ee(keyOld1), at(time.Hour)),
+	}
+
+	for _, tc := range []struct {
+		name  string
+		doc   []byte
+		req   Request
+		named string // the name of the block that would come back; empty for a clean case
+	}{
+		{
+			name:  "--prune of one block of a colliding pair",
+			doc:   refusalDoc(collidingPair...),
+			req:   Request{Prune: true, Now: testNow},
+			named: "bob",
+		},
+		{
+			// alice's live block goes and bob's dead one comes back: as many
+			// keys are usable after as before, and one of them is new.
+			name: "--end-overlap of one block of a colliding pair, as many keys usable",
+			doc: refusalDoc(
+				blockOf("alice", ee(keyOld2), at(2*time.Hour)),
+				collidingPair[0], collidingPair[1],
+			),
+			req:   Request{Name: "alice", EndOverlap: true, Now: testNow},
+			named: "bob",
+		},
+		{
+			name:  "a rotation whose prune would revive the other block of a pair",
+			doc:   refusalDoc(collidingPair...),
+			req:   Request{Name: "alice", Rotate: true, Until: testUntil, Prune: true, Now: testNow},
+			named: "bob",
+		},
+		{
+			name:  "--end-overlap that frees room under the overall cap",
+			doc:   overCapDoc(),
+			req:   Request{Name: "u1024", EndOverlap: true, Now: testNow},
+			named: "u0000",
+		},
+		{
+			name: "clean: --prune where the pair still collides with a third block",
+			doc:  refusalDoc(collidingPair[0], collidingPair[1], blockOf("alice", ee(keyOld1), at(2*time.Hour))),
+			req:  Request{Prune: true, Now: testNow},
+		},
+		{
+			name: "clean: --end-overlap that only takes keys away",
+			doc:  refusalDoc(blockOf("alice", ee(keyOld1), at(time.Hour)), blockOf("alice", ee(keyOld2), at(2*time.Hour))),
+			req:  Request{Name: "alice", EndOverlap: true, Now: testNow},
+		},
+		{
+			name: "clean: a rotation and --prune with nothing colliding",
+			doc:  refusalDoc(blockOf("alice", ee(keyOld1), at(-time.Hour)), blockOf("bob", ee(keyOld2), at(time.Hour))),
+			req:  Request{Name: "alice", Rotate: true, Until: testUntil, Prune: true, Now: testNow},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			prepared, err := Prepare(tc.doc, tc.req)
+
+			if tc.named == "" {
+				require.NoError(t, err)
+
+				_, err = prepared.Apply(newPrimaryLike(prepared.Primary()))
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.ErrorIs(t, err, ErrKeyRevived)
+			assert.Nil(t, prepared, "nothing to write")
+			require.Empty(t, leaks(err.Error()), "the refusal carries no value")
+			assert.Equal(t, "removing these blocks would make a key usable again that is not accepted now "+
+				`(a block for name "`+tc.named+`" would come back); remove or change that block first`, err.Error())
 		})
 	}
 }

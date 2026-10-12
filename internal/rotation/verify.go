@@ -3,6 +3,7 @@ package rotation
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"maps"
 	"reflect"
 	"slices"
@@ -27,11 +28,15 @@ import (
 // removed block goes with it, and nothing else may come or go. Validate must
 // still pass, the edited file may have no problem line the old one did not
 // have, and after a rotation the old key may be accepted only by the new
-// block, until exactly the until asked.
-func (p *Prepared) verify(out []byte, newPrimary mtglib.Secret) bool {
+// block, until exactly the until asked. All of that is ErrEditVerification.
+//
+// Last, R0 for the tool's own edit: no key may become usable that nothing
+// accepts now (revived), which is ErrKeyRevived, named for the block that
+// would come back.
+func (p *Prepared) verify(out []byte, newPrimary mtglib.Secret) error {
 	edited, err := config.Parse(out)
 	if err != nil || edited.Validate() != nil {
-		return false
+		return ErrEditVerification
 	}
 
 	want := *p.conf
@@ -43,22 +48,78 @@ func (p *Prepared) verify(out []byte, newPrimary mtglib.Secret) bool {
 	}
 
 	if !reflect.DeepEqual(want, *edited) {
-		return false
+		return ErrEditVerification
 	}
 
 	report := edited.GetRetiringSecrets(p.req.Now)
 
 	if len(newLines(p.report.Lines, report.Lines)) > 0 {
-		return false
+		return ErrEditVerification
+	}
+
+	if name, revived := p.revived(report, edited.GetSecrets(), newPrimary); revived {
+		return revivalError(name)
 	}
 
 	if p.req.Rotate {
 		if _, _, held := p.keyStillHeld(report); held || (p.addBlock && !p.grantMade(report)) {
-			return false
+			return ErrEditVerification
 		}
 	}
 
-	return true
+	return nil
+}
+
+// revived finds a key the edit would make usable that nothing accepts now,
+// and the name it would come back under. The keys usable now are the
+// primaries and GetRetiringSecrets' usable entries at the run's instant;
+// after the edit they must be a subset of those, except for a rotation's new
+// primary (the old primary, which the new block holds, is a key usable now).
+// Removing one block of a colliding pair (rule 5), or freeing room under a
+// cap (rule 8), is what would bring a key back. Keys are compared by their
+// bytes, as sets: an edit that takes one key away and brings another back is
+// caught although as many keys are usable as before.
+func (p *Prepared) revived(after config.RetiringReport, primaries map[string]mtglib.Secret,
+	newPrimary mtglib.Secret,
+) (string, bool) {
+	before := map[[mtglib.SecretKeyLength]byte]bool{}
+
+	for _, secret := range p.conf.GetSecrets() {
+		before[secret.Key] = true
+	}
+
+	for _, entry := range p.report.Usable {
+		before[entry.Secret.Key] = true
+	}
+
+	allowed := func(key [mtglib.SecretKeyLength]byte) bool {
+		return before[key] || (p.req.Rotate && key == newPrimary.Key)
+	}
+
+	for _, entry := range after.Usable {
+		if !allowed(entry.Secret.Key) {
+			return entry.Name, true
+		}
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(primaries)) {
+		if !allowed(primaries[name].Key) {
+			return name, true
+		}
+	}
+
+	return "", false
+}
+
+// revivalError is ErrKeyRevived for the block of name that would come back;
+// a name that reads as a value is not shown.
+func revivalError(name string) error {
+	what := fmt.Sprintf("a block for name %q would come back", name)
+	if name == "" || readsAsAValue(name) {
+		what = "a block whose name is not shown would come back"
+	}
+
+	return fmt.Errorf("%w (%s); remove or change that block first", ErrKeyRevived, what)
 }
 
 // setPrimary puts s in c as the name's primary, on a copy of the map.
