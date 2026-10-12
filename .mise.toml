@@ -26,7 +26,7 @@
 # not know fails `golangci-lint config verify`, the first step of the lint task,
 # even when `golangci-lint run` alone reports 0 issues. Check both steps under
 # the pinned version, not only `run`.
-go = "1.26.8"
+go = "1.26.9"
 golangci-lint = "2.13.2"
 
 [vars]
