@@ -24,11 +24,14 @@ import (
 // not expired, names configured), so none is dropped: the row counts them kept,
 // and the candidates they add (every key is ee), in every iteration.
 //
-// BenchmarkCloseStaleConns/<rotation|unrelated> times closeStaleConns, the walk
-// a swap makes over the live registry under liveMu (so the time every admission
-// waits for it), with 10,000 live streams: 1,000 names of 10 streams each. It is
-// the function itself, called with the old set, the new set and the swap's
-// instant, on streams registered the way a door registers them.
+// BenchmarkCloseStaleConns/<rotation|unrelated|unrelated/no-retiring|expiry>
+// times closeStaleConns, the walk a swap makes over the live registry under
+// liveMu (so the time every admission waits for it), with 10,000 live streams:
+// 1,000 names of 10 streams each. It is the function itself, called with the old
+// set, the new set and the swap's instant, on streams registered the way a door
+// registers them. The streams have no sockets, so what a close costs here is the
+// judgment, the collection under liveMu and the cancellation of each stream's
+// context; closing 10,000 real sockets is not in any figure.
 //
 //   - rotation: the swap is a rotation. Every name gets a new primary and its old
 //     key becomes a retiring entry; the streams hold the old keys. The held keys
@@ -48,6 +51,22 @@ import (
 //     stream. Before the loop the call is made with staleSkipHook on, which must
 //     hear of every name once and close nothing; the hook is off in the loop,
 //     where its mutex or closure would be timed inside the fast path.
+//   - unrelated/no-retiring: the same swap on a proxy that has never rotated,
+//     the {K} -> {K} swap every deployment runs on every reload: no retiring
+//     entry in either set, all streams on the one key, an ad tag for every name.
+//     Same checks as unrelated; the difference between the two rows is what the
+//     retiring entries add to the fast path's comparison of held keys.
+//   - expiry: the swap that ENDS an overlap, which the expiry sweep makes. The
+//     rotated set is in force with the streams on the old keys, and the new set
+//     is the same file rebuilt at the entries' until, which drops all of them as
+//     expired. The held keys of every name changed, so every one of the 10,000
+//     streams is judged, none is accepted, all 10,000 are collected under liveMu
+//     and cancelled outside it. Closed streams stay in the registry (no ServeConn
+//     unregisters them), so a second call would close the same ones again: each
+//     iteration times one call on 10,000 fresh streams, and between iterations,
+//     with the timer stopped, the closed ones are unregistered and fresh ones
+//     registered. Every iteration requires that the call closed exactly ten
+//     streams of each of the 1,000 names, and that every stream is cancelled.
 
 // benchRotationBuildSecrets is how many primaries the build rows host.
 const benchRotationBuildSecrets = 5000
@@ -206,7 +225,9 @@ func requireStaleWorldOpen(b *testing.B, w *staleWorld) {
 
 func BenchmarkCloseStaleConns(b *testing.B) {
 	b.Run("rotation", benchCloseStaleRotation)
-	b.Run("unrelated", benchCloseStaleUnrelated)
+	b.Run("unrelated", benchCloseStaleUnrelated(true))
+	b.Run("unrelated/no-retiring", benchCloseStaleUnrelated(false))
+	b.Run("expiry", benchCloseStaleExpiry)
 }
 
 // benchCloseStaleRotation: see the file header.
@@ -299,24 +320,153 @@ func benchCloseStaleRotation(b *testing.B) {
 	requireStaleWorldOpen(b, w)
 }
 
-// benchCloseStaleUnrelated: see the file header.
-func benchCloseStaleUnrelated(b *testing.B) {
+// benchCloseStaleUnrelated is the row of a swap that changes nothing about the
+// keys of the streams: see the file header. withRetiring says whether the sets
+// hold a retiring entry for every name (a swap during an overlap) or none (the
+// {K} -> {K} swap a proxy with no rotation runs on every reload).
+func benchCloseStaleUnrelated(withRetiring bool) func(b *testing.B) {
+	return func(b *testing.B) {
+		now := time.Now()
+		until := now.Add(benchRotationOverlap)
+
+		primaries := make(map[string]Secret, benchStaleNames)
+		olds := make(map[string]Secret, benchStaleNames)
+		tags := make(map[string][AdTagLength]byte, benchStaleNames)
+
+		var retiring []RetiringSecret
+
+		wantRetiring := 0
+
+		if withRetiring {
+			retiring = make([]RetiringSecret, 0, benchStaleNames)
+			wantRetiring = benchStaleNames
+		}
+
+		for i := range benchStaleNames {
+			name := rotationBenchName(i)
+			primaries[name], olds[name] = rotationBenchSecret(0x32, i), rotationBenchSecret(0x31, i)
+			tags[name] = adTagFilled(7)
+
+			if withRetiring {
+				retiring = append(retiring, RetiringSecret{Name: name, Secret: olds[name], Until: until})
+			}
+		}
+
+		// A rotated set is in force, as it is during an overlap; or, with no
+		// retiring entry, the plain set of a proxy that has never rotated.
+		p := newReloadTestProxy(primaries)
+		p.rotation = NewRotationClock(nil, nil)
+
+		rotated, drops := buildSecretSetAt(primaries, nil, nil, nil, retiring, now)
+
+		require.Zero(b, len(drops), "no entry may be dropped")
+		require.Equal(b, wantRetiring, len(rotated.retiring))
+
+		p.secrets.Store(rotated)
+
+		w := &staleWorld{p: p, oldSet: rotated, now: now}
+
+		// Half the streams of every name on the old key (a retiring match), half on
+		// the new one; with no retiring entry, all on the one key.
+		w.streams = make([]*streamContext, 0, benchStaleStreams)
+
+		for i := range benchStaleNames {
+			name := rotationBenchName(i)
+
+			for k := range benchStalePerName {
+				key := primaries[name].Key
+				if withRetiring && k%2 == 0 {
+					key = olds[name].Key
+				}
+
+				w.streams = append(w.streams, registerOnKey(b, p, name, key))
+			}
+		}
+
+		// The swap: every name gets an ad tag, and nothing else changes.
+		w.newSet, drops = buildSecretSetAt(primaries, tags, nil, nil, retiring, now)
+
+		require.Zero(b, len(drops))
+		require.Equal(b, wantRetiring, len(w.newSet.retiring))
+		require.True(b, w.oldSet.adTags[0] == nil && w.newSet.adTags[0] != nil, "the sets do differ, in the ad tags")
+
+		for i := range benchStaleNames {
+			name := rotationBenchName(i)
+
+			require.True(b, sameHeldKeys(w.oldSet, w.newSet, name), "the held keys of %s are the same: the fast path", name)
+		}
+
+		requireStaleWorldOpen(b, w)
+
+		// One untimed call of the real function, with the fast path's hook on: it
+		// must hear of every name that has streams, once, and close nothing.
+		skipped := make(map[string]int, benchStaleNames)
+		p.staleSkipHook = func(name string) { skipped[name]++ }
+		closed := p.closeStaleConns(w.oldSet, w.newSet, now)
+		p.staleSkipHook = nil
+
+		require.Nil(b, closed, "an unrelated swap closes no stream")
+		require.Equal(b, benchStaleNames, len(skipped), "the fast path must apply to every name with streams")
+
+		for name, times := range skipped {
+			require.Equal(b, 1, times, "%s must be skipped once", name)
+		}
+
+		requireStaleWorldOpen(b, w)
+		b.ReportAllocs()
+
+		for b.Loop() {
+			if closed := p.closeStaleConns(w.oldSet, w.newSet, now); closed != nil {
+				b.Fatalf("an unrelated swap must close no stream, closed %d names", len(closed))
+			}
+		}
+
+		requireStaleWorldOpen(b, w)
+	}
+}
+
+// registerStaleStream registers one stream of name on key against set, the set in
+// force, as a door's attribution and admission do, and fails the benchmark if it
+// is refused. It leaves nothing to a testing cleanup: the expiry row registers
+// 10,000 of them in every iteration, and unregisters them.
+func registerStaleStream(b *testing.B, p *Proxy, set *secretSet, name string, key [SecretKeyLength]byte) *streamContext {
+	ctx, cancel := context.WithCancel(context.Background())
+	sc := &streamContext{ctx: ctx, ctxCancel: cancel, logger: testLogger()}
+
+	if reason := p.attributeMatch(sc, set, matchOfKey(b, set, name, key)); reason != DenyNone {
+		b.Fatalf("stream of %s refused at attribution: %s", name, reason)
+	}
+
+	if reason := p.tryRegisterConn(sc); reason != DenyNone {
+		b.Fatalf("stream of %s refused at registration: %s", name, reason)
+	}
+
+	return sc
+}
+
+// benchCloseStaleExpiry is the row of the swap that ENDS an overlap, the one the
+// expiry sweep makes: see the file header. The streams a call closes are closed,
+// and stay in the registry (no ServeConn unregisters them), so a second call would
+// close the same ones again. Each iteration therefore times one call on 10,000
+// fresh streams, and the registry is refreshed between iterations with the timer
+// stopped.
+func benchCloseStaleExpiry(b *testing.B) {
 	now := time.Now()
 	until := now.Add(benchRotationOverlap)
 
 	primaries := make(map[string]Secret, benchStaleNames)
-	olds := make(map[string]Secret, benchStaleNames)
-	tags := make(map[string][AdTagLength]byte, benchStaleNames)
+	olds := make([][SecretKeyLength]byte, benchStaleNames)
 	retiring := make([]RetiringSecret, 0, benchStaleNames)
 
 	for i := range benchStaleNames {
 		name := rotationBenchName(i)
-		primaries[name], olds[name] = rotationBenchSecret(0x32, i), rotationBenchSecret(0x31, i)
-		tags[name] = adTagFilled(7)
-		retiring = append(retiring, RetiringSecret{Name: name, Secret: olds[name], Until: until})
+		primaries[name] = rotationBenchSecret(0x32, i)
+		old := rotationBenchSecret(0x31, i)
+		olds[i] = old.Key
+		retiring = append(retiring, RetiringSecret{Name: name, Secret: old, Until: until})
 	}
 
-	// A rotated set is in force, as it is during an overlap.
+	// The rotated set is in force, and the streams hold the old keys.
 	p := newReloadTestProxy(primaries)
 	p.rotation = NewRotationClock(nil, nil)
 
@@ -327,62 +477,67 @@ func benchCloseStaleUnrelated(b *testing.B) {
 
 	p.secrets.Store(rotated)
 
-	w := &staleWorld{p: p, oldSet: rotated, now: now}
+	// The set the sweep swaps in: the same file rebuilt at the entries' until,
+	// which drops every one of them as expired.
+	after, drops := buildSecretSetAt(primaries, nil, nil, nil, retiring, until)
 
-	// Half the streams of every name on the old key (a retiring match), half on
-	// the new one.
-	w.streams = make([]*streamContext, 0, benchStaleStreams)
+	require.Equal(b, benchStaleNames, len(drops), "every entry must be dropped as expired")
+
+	for _, drop := range drops {
+		require.Equal(b, retiringExpired, drop.reason)
+	}
+
+	require.Zero(b, len(after.retiring), "the swap leaves no retiring entry")
 
 	for i := range benchStaleNames {
 		name := rotationBenchName(i)
+		primary := primaries[name].Key
 
-		for k := range benchStalePerName {
-			key := primaries[name].Key
-			if k%2 == 0 {
-				key = olds[name].Key
+		require.False(b, sameHeldKeys(rotated, after, name), "the held keys of %s changed: no fast path", name)
+		require.False(b, after.accepts(name, olds[i][:], until), "the swap's set must not accept %s's old key", name)
+		require.True(b, after.accepts(name, primary[:], until), "and must accept its primary")
+	}
+
+	streams := make([]*streamContext, 0, benchStaleStreams)
+
+	register := func() {
+		streams = streams[:0]
+
+		for i := range benchStaleNames {
+			for range benchStalePerName {
+				streams = append(streams, registerStaleStream(b, p, rotated, rotationBenchName(i), olds[i]))
 			}
-
-			w.streams = append(w.streams, registerOnKey(b, p, name, key))
 		}
 	}
 
-	// The swap: every name gets an ad tag, and nothing else changes.
-	w.newSet, drops = buildSecretSetAt(primaries, tags, nil, nil, retiring, now)
-
-	require.Zero(b, len(drops))
-	require.Equal(b, benchStaleNames, len(w.newSet.retiring))
-	require.True(b, w.oldSet.adTags[0] == nil && w.newSet.adTags[0] != nil, "the sets do differ, in the ad tags")
-
-	for i := range benchStaleNames {
-		name := rotationBenchName(i)
-
-		require.True(b, sameHeldKeys(w.oldSet, w.newSet, name), "the held keys of %s are the same: the fast path", name)
-	}
-
-	requireStaleWorldOpen(b, w)
-
-	// One untimed call of the real function, with the fast path's hook on: it
-	// must hear of every name that has streams, once, and close nothing.
-	skipped := make(map[string]int, benchStaleNames)
-	p.staleSkipHook = func(name string) { skipped[name]++ }
-	closed := p.closeStaleConns(w.oldSet, w.newSet, now)
-	p.staleSkipHook = nil
-
-	require.Nil(b, closed, "an unrelated swap closes no stream")
-	require.Equal(b, benchStaleNames, len(skipped), "the fast path must apply to every name with streams")
-
-	for name, times := range skipped {
-		require.Equal(b, 1, times, "%s must be skipped once", name)
-	}
-
-	requireStaleWorldOpen(b, w)
+	register()
 	b.ReportAllocs()
 
 	for b.Loop() {
-		if closed := p.closeStaleConns(w.oldSet, w.newSet, now); closed != nil {
-			b.Fatalf("an unrelated swap must close no stream, closed %d names", len(closed))
-		}
-	}
+		closed := p.closeStaleConns(rotated, after, until)
 
-	requireStaleWorldOpen(b, w)
+		b.StopTimer()
+
+		// Every name's ten streams, and no others, were closed by this call.
+		if len(closed) != benchStaleNames {
+			b.Fatalf("the swap closed streams of %d names, want %d", len(closed), benchStaleNames)
+		}
+
+		for i := range benchStaleNames {
+			if got := closed[rotationBenchName(i)]; got != benchStalePerName {
+				b.Fatalf("the swap closed %d streams of name %d, want %d", got, i, benchStalePerName)
+			}
+		}
+
+		for i, sc := range streams {
+			if sc.Err() == nil {
+				b.Fatalf("stream %d was not closed", i)
+			}
+
+			p.unregisterConn(sc)
+		}
+
+		register()
+		b.StartTimer()
+	}
 }

@@ -966,6 +966,14 @@ func retiringFits(n, r int) bool {
 // (a miss) and the old key (the match): two verifications and no scan, whatever
 // N and R are.
 //
+// Each <...>/old row has a sibling <...>/control: the same connection, from a
+// primary key, against a door that hosts N+R secrets and no retiring entry at
+// all (benchDoorHandshakeAmong with the client sorting last, the work of a
+// BenchmarkDoorHandshake `last` row at N+R candidates). It is the same binary
+// in the same session, so "an old key costs about a last row at N+R" has a
+// direct reference at every point of the matrix, R=100 included, where no
+// existing row has that many candidates. It runs the existing helper unchanged.
+//
 // Each row proves what it timed rather than trusting its setup, because every
 // connection would succeed on a primary key too. The set's layout is read back
 // (N names, R entries kept, the client's old key the last of them and the last
@@ -973,7 +981,12 @@ func retiringFits(n, r int) bool {
 // (attributed to the entry's until, holding the old key, not the primary's); and
 // after the loop the door's own counters must say that EVERY connection went
 // the way the row names (ee: verifications per connection; dd: trials, no
-// miss), with a hook counting each attribution that was on the old key.
+// miss), with a hook counting each attribution that was on the old key. Neither
+// counter can tell a walk that got shorter, so the walk is also re-derived from
+// the set in force, after the warm connection and after the loop: no swap has
+// replaced the set, no retiring entry has expired by the proxy's own clock, and
+// the key list the obfuscated door would build is still N+R long, the client's
+// last.
 func BenchmarkDoorHandshakeRetiring(b *testing.B) {
 	for _, name := range []string{"ee-unpaced", "dd"} {
 		dc := doorNamed(name)
@@ -999,6 +1012,11 @@ func BenchmarkDoorHandshakeRetiring(b *testing.B) {
 						benchDoorHandshakeRetiringHinted(b, dc, n, r)
 					})
 				}
+
+				// The same binary's `last` row at N+R candidates, no retiring entry.
+				b.Run(fmt.Sprintf("%s/secrets=%d/retiring=%d/control", name, n, r), func(b *testing.B) {
+					benchDoorHandshakeAmong(b, dc, n+r, "last")
+				})
 			}
 		}
 	}
@@ -1009,10 +1027,11 @@ func BenchmarkDoorHandshakeRetiring(b *testing.B) {
 // is its value, so a failed assertion below says counts and labels only.
 type retiringDoor struct {
 	h       *entryHarness
-	name    string    // the client's name, which sorts last
-	primary Secret    // the name's key now
-	old     Secret    // the key the client holds: the name's last retiring entry
-	until   time.Time // when the old key stops being accepted
+	name    string     // the client's name, which sorts last
+	primary Secret     // the name's key now
+	old     Secret     // the key the client holds: the name's last retiring entry
+	until   time.Time  // when the old key stops being accepted
+	set     *secretSet // the rotated set the row starts from: no swap may replace it while the row runs
 	n, r    int
 }
 
@@ -1053,9 +1072,43 @@ func hostedDoorRetiring(b *testing.B, dc doorCase, n, r int) retiringDoor {
 	}
 
 	require.NoError(b, h.proxy.ReplaceSecrets(SecretConfig{Secrets: secrets, Retiring: retiring}))
+
+	d.set = h.proxy.secrets.Load()
 	d.requireLayout(b, dc)
 
 	return d
+}
+
+// requireWalkIntact is the guard against a row that times a shorter walk under
+// the label of a longer one. Layout is read once, at setup, and the counters
+// cannot tell: a retiring entry that expires while the row runs (ee skips its
+// candidate unverified, dd leaves its key out of the list) leaves every
+// connection succeeding, the old key still found, the walk shorter. It is run
+// after the warm connection and again after the loop, and requires that the set
+// in force is still the one the row was built on, that every retiring entry of
+// it is still ahead of the proxy's own clock, and that the key list the
+// obfuscated door builds from it is still N+R long with the client's old key
+// last. It formats counts only.
+func (d retiringDoor) requireWalkIntact(b *testing.B) {
+	b.Helper()
+
+	p := d.h.proxy
+	set := p.secrets.Load()
+
+	require.True(b, set == d.set, "a swap replaced the door's set while the row ran")
+
+	now := p.rotation.Now()
+
+	for r := range set.retiring {
+		require.True(b, now.Before(set.retiring[r].until),
+			"retiring entry %d of %d expired while the row ran: the walk is shorter than the row's label", r, d.r)
+	}
+
+	keys, keyRetiring := obfuscatedKeys(set, p.rotation)
+
+	require.Equal(b, d.n+d.r, len(keys), "the key list must hold n primaries and r retiring keys")
+	require.Equal(b, d.r, len(keyRetiring))
+	require.Equal(b, len(set.retiring)-1, keyRetiring[len(keyRetiring)-1], "the client's old key must be the last key tried")
 }
 
 // requireLayout reads the rotated set back from the door. Where the client's old
@@ -1182,6 +1235,8 @@ func (d retiringDoor) requireOutcome(
 ) {
 	b.Helper()
 
+	d.requireWalkIntact(b)
+
 	p := d.h.proxy
 	connections := int64(iterations) + 1
 
@@ -1238,6 +1293,7 @@ func benchDoorHandshakeRetiring(b *testing.B, dc doorCase, n, r int) {
 		require.EqualValues(b, n+r, warm.verifications, "the old key is found after n primaries and r-1 other old keys")
 	}
 
+	d.requireWalkIntact(b)
 	b.ReportAllocs()
 
 	iterations := 0
@@ -1275,6 +1331,7 @@ func benchDoorHandshakeRetiringHinted(b *testing.B, dc doorCase, n, r int) {
 	require.Zero(b, warm.hinted)
 	require.Equal(b, []string{d.name}, d.h.proxy.hints.recall(addr.IP), "the hint is the client's name")
 
+	d.requireWalkIntact(b)
 	b.ReportAllocs()
 
 	iterations := 0
