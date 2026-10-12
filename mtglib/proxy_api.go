@@ -261,11 +261,17 @@ func (p *Proxy) replaceSecretsKeepingRetiring(cfg SecretConfig) error {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
 
+	// The set's own entries, read in place and in its order: toConfig would
+	// build every name's maps, under the lock, for this one list (final review
+	// A, n1).
+	set := p.secrets.Load()
+
 	var kept []RetiringSecret
 
-	for _, entry := range p.secrets.Load().toConfig().Retiring {
-		if _, ok := cfg.Secrets[entry.Name]; ok {
-			kept = append(kept, entry)
+	for _, entry := range set.retiring {
+		name := set.names[entry.nameIdx]
+		if _, ok := cfg.Secrets[name]; ok {
+			kept = append(kept, RetiringSecret{Name: name, Secret: entry.secret, Until: entry.until})
 		}
 	}
 

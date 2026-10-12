@@ -266,6 +266,14 @@ func (p *Proxy) admit(ctx *streamContext) bool {
 	// registered, so a refusal is not an admission; a timestamp for the operator,
 	// read from the wall clock like last_seen, not a decision the rotation clock
 	// makes. A stream on the name's primary has no retiringUntil and stamps nothing.
+	//
+	// Whether the key is a previous one is the attribution's word (retiringUntil,
+	// from the set the hello met), not the set registration read, and the two
+	// can differ within one swap's window (final review A, n2): a stream that
+	// matched the primary, which a swap then made a previous key before the
+	// stream registered, is an old-link admission and stamps nothing; one that
+	// matched a previous key, which a revert made the primary again, stamps. Only
+	// this operator timestamp moves, by one admission; no decision reads it.
 	if !ctx.retiringUntil.IsZero() {
 		p.stats.markRetiringSeen(ctx.secretName, time.Now())
 	}
