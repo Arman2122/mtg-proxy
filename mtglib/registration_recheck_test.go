@@ -570,6 +570,85 @@ func TestRegistrationReleasesTheAttributedSet(t *testing.T) {
 	p.release(sc)
 }
 
+// Final review A, m1: a refused attribution lets go of the set too. The FakeTLS
+// door fronts a refused hello and relays it to the cover site for as long as the
+// client keeps that session busy, the stream alive all the while; holding the
+// set there would keep every candidate and pad state of it -- about 2.5 MiB at
+// 5,000 secrets -- for that long, one set per such stream, on a deployment that
+// never rotates as much as on one that does. Every refusal attribution makes:
+// the user's own limits (disabled, expired, over quota), a ban, and the
+// reviewer's own probe, a user disabled by a swap.
+func TestARefusedAttributionReleasesTheSet(t *testing.T) {
+	t.Parallel()
+
+	t.Run("by the user's own limits", func(t *testing.T) {
+		t.Parallel()
+
+		set := buildSecretSet(map[string]Secret{
+			"alice": GenerateSecret("cover.example.com"),
+			"bob":   GenerateSecret("cover.example.com"),
+			"carol": GenerateSecret("cover.example.com"),
+		}, nil, nil, map[string]SecretLimits{
+			"alice": {Disabled: true},
+			"bob":   {ExpiresAt: time.Now().Add(-time.Hour)},
+			"carol": {QuotaBytes: 1000},
+		})
+
+		probe := newDenyProbe(t)
+		probe.proxy.stats.PreRegister("carol")
+		probe.proxy.stats.users["carol"].quotaUsed.Store(1000)
+
+		for name, want := range map[string]DenyReason{"alice": DenyDisabled, "bob": DenyExpired, "carol": DenyQuota} {
+			index := slices.Index(set.names, name)
+			require.NotEqual(t, -1, index)
+
+			sc := probe.stream(t, tcpFrom("198.51.100.7", 50001), 0)
+			require.Equal(t, want, probe.proxy.attribute(sc, set, index), name)
+
+			// Compared as pointers, not with Nil: on failure that prints the
+			// whole set, keys and pad states.
+			assert.True(t, sc.attrSet == nil, "%s: a refused stream holds the set it was attributed from", name)
+		}
+	})
+
+	t.Run("by a ban", func(t *testing.T) {
+		t.Parallel()
+
+		probe, _ := banProbe(t, false)
+		p := probe.proxy
+		set := p.secrets.Load()
+
+		mustBan(t, p, "alice", `{"ips":["203.0.113.9"]}`)
+
+		sc := probe.stream(t, tcpFrom("203.0.113.9", 50001), 0)
+		require.Equal(t, DenyBanned, p.attribute(sc, set, slices.Index(set.names, "alice")))
+
+		assert.True(t, sc.attrSet == nil, "a banned stream holds the set it was attributed from")
+	})
+
+	t.Run("a user disabled by a swap", func(t *testing.T) {
+		t.Parallel()
+
+		alice := GenerateSecret("alice.example.com")
+		p := newReloadTestProxy(map[string]Secret{"alice": alice})
+		p.logger = testLogger()
+
+		require.NoError(t, p.ReplaceSecrets(SecretConfig{
+			Secrets: map[string]Secret{"alice": alice},
+			Limits:  map[string]SecretLimits{"alice": {Disabled: true}},
+		}))
+
+		set := p.secrets.Load()
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		sc := &streamContext{ctx: ctx, ctxCancel: cancel, logger: testLogger()}
+
+		require.Equal(t, DenyDisabled, p.attributeMatch(sc, set, set.primaryMatch(0)))
+		assert.True(t, sc.attrSet == nil, "after a refusal the stream still holds the whole set it was attributed from")
+	})
+}
+
 // accepts in its primary form: a set accepts, for a name it holds, that name's
 // primary key and nothing else, at any time.
 func TestAcceptsPrimaryForm(t *testing.T) {

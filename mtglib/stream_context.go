@@ -48,7 +48,9 @@ type streamContext struct {
 	// force: the same set still accepts the key it matched, and any other set
 	// is asked whether it does. Set to nil once the stream is registered, so a
 	// stream that lives for hours does not pin a whole old set -- candidates,
-	// pad states -- for as long; matchedSecretKey is kept.
+	// pad states -- for as long; matchedSecretKey is kept. Set to nil when
+	// attribution refuses the stream, too: a refused FakeTLS hello is fronted,
+	// and the relay to the cover site can last as long.
 	attrSet *secretSet
 
 	// retiringUntil is the until of the retiring entry whose key this stream

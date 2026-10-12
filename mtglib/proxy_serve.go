@@ -227,6 +227,12 @@ func (p *Proxy) attributeMatch(ctx *streamContext, set *secretSet, m secretMatch
 
 	ctx.logger.BindStr("deny_reason", reason.String()).Info("connection denied by per-user limit")
 
+	// Refused, the stream never registers, and nothing reads the set again
+	// (final review A, m1). The FakeTLS door fronts it, relaying to the cover
+	// site for as long as the client keeps that session busy: holding the set
+	// would keep all of it -- every candidate and pad state -- alive that long.
+	ctx.attrSet = nil
+
 	return reason
 }
 
