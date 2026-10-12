@@ -8,10 +8,56 @@ import (
 	"io/fs"
 	"os"
 	"runtime"
-	"strings"
 
 	"golang.org/x/sys/windows"
 )
+
+// openTemp creates the temporary file shared with no one (I-A of the second
+// review). Windows checks access when a handle is opened, and a list narrowed
+// afterwards does not take back a handle opened under the directory's
+// inherited one: a reader that opened the file in that moment would read the
+// whole new config after the rename. With no sharing, no handle with data
+// access can be opened on it until it is closed -- by then its list is the
+// target's. The calls that copy the list open it for READ_CONTROL and
+// WRITE_DAC only, which sharing does not govern. CREATE_NEW is O_EXCL, and
+// the handle is not inherited by child processes, as Go's are not.
+func openTemp(path string) (tempFile, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+
+	handle, err := windows.CreateFile(name, windows.GENERIC_WRITE|windows.FILE_READ_ATTRIBUTES, 0, nil,
+		windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+
+	return os.NewFile(uintptr(handle), path), nil
+}
+
+// checkReplaceable refuses, before anything is created, a config this user
+// could not replace: the rename needs to delete it, through its own list or
+// the directory's. The temporary file gets the same list in the same
+// directory, so this is also what keeps it deletable on every failure path.
+// A config another program holds open without sharing its deletion is
+// refused here too.
+func checkReplaceable(target string) error {
+	name, err := windows.UTF16PtrFromString(target)
+	if err != nil {
+		return replaceRefusal(target, err)
+	}
+
+	handle, err := windows.CreateFile(name, windows.DELETE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		return replaceRefusal(target, err)
+	}
+
+	windows.CloseHandle(handle) //nolint: errcheck // a handle with no data access
+
+	return nil
+}
 
 // keepPermissions gives the temporary file the target's read-only attribute
 // (all a mode is on Windows) and its access control list, before a byte of the
@@ -35,12 +81,16 @@ func keepPermissions(file tempFile, tmp, target string, info fs.FileInfo) error 
 	return keepDACL(tmp, target)
 }
 
-// keepDACL copies the target's DACL onto tmp, protected or not as the target's
-// is. A list of inherited entries only is not copied: the temporary file sits
-// in the same directory and inherits from it. Either way the temporary file's
-// list is then read back and must be the target's (sameDACL) -- which is what
-// catches a config moved here from another directory, whose inherited entries
-// came from there. A failure is a refusal, as the owner is on Unix.
+// keepDACL copies the target's DACL onto tmp exactly: its entries as they
+// are, the inherited ones included, and protected or not as it is. The
+// low-level SetKernelObjectSecurity does that; the high-level
+// SetNamedSecurityInfo would recompute the inherited entries from this
+// directory, which differ for a config moved here from another one, or one
+// created by another user under a CREATOR OWNER or CREATOR GROUP entry. The
+// temporary file's list is then read back and must be the target's, so any
+// other outcome is a refusal, never a wider file. A failure is a refusal, as
+// the owner is on Unix. A config with no list, or a null one -- open to all,
+// as on a FAT volume -- has nothing to keep.
 func keepDACL(tmp, target string) error {
 	sd, err := windows.GetNamedSecurityInfo(target, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
@@ -49,107 +99,78 @@ func keepDACL(tmp, target string) error {
 
 	defer runtime.KeepAlive(sd)
 
-	control, _, err := sd.Control()
-	if err != nil {
-		return fmt.Errorf("cannot read the access control list of %s: %w", target, err)
-	}
-
 	dacl, _, err := sd.DACL()
 
 	switch {
 	case errors.Is(err, windows.ERROR_OBJECT_NOT_FOUND) || (err == nil && dacl == nil):
-		// No DACL, or a null one: everyone may do everything. The inherited
-		// list is narrower, which errs the safe way.
 		return nil
 	case err != nil:
 		return fmt.Errorf("cannot read the access control list of %s: %w", target, err)
 	}
 
-	protected := control&windows.SE_DACL_PROTECTED != 0
+	want := sd.String()
 
-	explicit, err := hasExplicitACE(dacl)
+	control, _, err := sd.Control()
 	if err != nil {
 		return fmt.Errorf("cannot read the access control list of %s: %w", target, err)
 	}
 
-	if protected || explicit {
-		flags := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.UNPROTECTED_DACL_SECURITY_INFORMATION)
-		if protected {
-			flags = windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION
-		}
-
-		if err := setNamedSecurityInfo(tmp, windows.SE_FILE_OBJECT, flags, nil, nil, dacl, nil); err != nil {
-			return fmt.Errorf("cannot give the new file the access control list of %s: %w; "+
-				"run as a user who may change the file's permissions, or as an administrator", target, err)
+	// Without the request the copy loses the auto-inherited flag.
+	if control&windows.SE_DACL_AUTO_INHERITED != 0 {
+		if err := sd.SetControl(windows.SE_DACL_AUTO_INHERIT_REQ, windows.SE_DACL_AUTO_INHERIT_REQ); err != nil {
+			return fmt.Errorf("cannot read the access control list of %s: %w", target, err)
 		}
 	}
 
-	return sameDACL(tmp, target, sd)
+	if err := setDACL(tmp, sd); err != nil {
+		return fmt.Errorf("cannot give the new file the access control list of %s: %w; "+
+			"run as a user who may change the file's permissions, or as an administrator", target, err)
+	}
+
+	return sameDACL(tmp, target, want)
 }
 
-// sameDACL reads the temporary file's DACL back and refuses unless it is the
-// target's: the same entries, and protected or not alike. An unprotected list
-// keeps the entries a file inherited where it was created, so a config moved
-// here from another directory has entries a new file here cannot inherit;
-// giving the new file that list would mean protecting it, which is the
-// operator's call, so the run refuses and says how.
-func sameDACL(tmp, target string, want *windows.SECURITY_DESCRIPTOR) error {
+// setKernelObjectSecurity is windows.SetKernelObjectSecurity, a variable so
+// that a test can make the copy fail, or come out different.
+var setKernelObjectSecurity = windows.SetKernelObjectSecurity
+
+// setDACL sets sd's DACL on tmp through a handle of its own that asks for
+// READ_CONTROL and WRITE_DAC only: the owner always has them, and sharing
+// does not govern them, so the exclusive handle the file is written through
+// does not stand in the way.
+func setDACL(tmp string, sd *windows.SECURITY_DESCRIPTOR) error {
+	name, err := windows.UTF16PtrFromString(tmp)
+	if err != nil {
+		return err //nolint: wrapcheck // worded by the caller
+	}
+
+	handle, err := windows.CreateFile(name, windows.READ_CONTROL|windows.WRITE_DAC,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		return err //nolint: wrapcheck // worded by the caller
+	}
+
+	defer windows.CloseHandle(handle) //nolint: errcheck // a handle with no data access
+
+	return setKernelObjectSecurity(handle, windows.DACL_SECURITY_INFORMATION, sd)
+}
+
+// sameDACL reads the temporary file's DACL back and refuses unless its SDDL
+// is want, the target's, byte for byte. The message says what is known --
+// the copy came out different -- and the remedy that gives the file the
+// simplest list to copy, its own entries, protected.
+func sameDACL(tmp, target, want string) error {
 	got, err := windows.GetNamedSecurityInfo(tmp, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return fmt.Errorf("cannot read the access control list of the temporary file beside %s: %w", target, err)
 	}
 
-	if wanted := daclForm(want.String()); wanted == "" || daclForm(got.String()) != wanted {
-		return fmt.Errorf("the new file would not get the access control list of %s: a new file here takes "+
-			"this directory's inherited entries, and the config's differ (was it moved here from another directory?); "+
-			`give it a list of its own with icacls "%s" /inheritance:d, and retry`, target, target)
+	if want == "" || got.String() != want {
+		return fmt.Errorf("the new file would not get the access control list of %s: the copy differs from the original; "+
+			`give the file a list of its own with icacls "%s" /inheritance:d, and retry`, target, target)
 	}
 
 	return nil
-}
-
-// daclForm is a DACL in SDDL as the comparison reads it: whether it is
-// protected, and its entries. The auto-inheritance flags (AI, AR) are left
-// out: they record how a list was last propagated, not who may do what.
-// Empty for an SDDL that is not a DACL.
-func daclForm(sddl string) string {
-	rest, ok := strings.CutPrefix(sddl, "D:")
-	if !ok {
-		return ""
-	}
-
-	flags, entries := rest, ""
-	if at := strings.IndexByte(rest, '('); at >= 0 {
-		flags, entries = rest[:at], rest[at:]
-	}
-
-	if strings.Contains(flags, "P") {
-		return "D:P" + entries
-	}
-
-	return "D:" + entries
-}
-
-// setNamedSecurityInfo is windows.SetNamedSecurityInfo, a variable so that a
-// test can make it fail.
-var setNamedSecurityInfo = windows.SetNamedSecurityInfo
-
-// hasExplicitACE reports whether any entry of dacl was set on the file
-// itself rather than inherited.
-func hasExplicitACE(dacl *windows.ACL) (bool, error) {
-	for i := range uint32(dacl.AceCount) {
-		var ace *windows.ACCESS_ALLOWED_ACE
-
-		if err := windows.GetAce(dacl, i, &ace); err != nil {
-			return false, err
-		}
-
-		if ace.Header.AceFlags&windows.INHERITED_ACE == 0 {
-			return true, nil
-		}
-	}
-
-	return false, nil
 }
 
 // linkCount is the number of names the target has: a hard-linked config keeps

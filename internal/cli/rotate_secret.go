@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -163,26 +164,36 @@ func (r *RotateSecret) run() (bool, error) {
 
 	names := linkCount(target, info)
 
-	// From here an interrupt (Ctrl-C, SIGTERM) does not kill the process: it
-	// is noted, the run stops cleanly at the rename if it came before it, and
-	// the defers below -- the lock's removal first -- run either way. No
-	// cleanup is done inside a signal handler. The run is milliseconds of
-	// local file work.
+	// From here the first interrupt (Ctrl-C, SIGTERM, or SIGHUP from a
+	// dropped session) does not kill the process: it is noted, the run stops
+	// cleanly at the rename if it came before it, and the defers below -- the
+	// lock's removal first -- run either way. No cleanup is done inside a
+	// signal handler. The run is milliseconds of local file work; if it is
+	// stuck in the file system instead, a second interrupt kills it as by
+	// default, which leaves the lock (and before the rename the temporary
+	// file) for the next run's refusal to name.
+	notify, stop := notifySignals, stopSignals
 	interrupts := make(chan os.Signal, 1)
+	finished := make(chan struct{})
 
-	notifySignals(interrupts, os.Interrupt, syscall.SIGTERM)
-	defer stopSignals(interrupts)
+	var caught atomic.Bool
 
-	caught := false
-	interrupted := func() bool {
+	notify(interrupts, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer func() {
+		close(finished)
+		stop(interrupts)
+	}()
+
+	go func() {
 		select {
 		case <-interrupts:
-			caught = true
-		default:
+			caught.Store(true)
+			stop(interrupts) // the default disposition again: a second interrupt kills
+		case <-finished:
 		}
+	}()
 
-		return caught
-	}
+	interrupted := caught.Load
 
 	// 5. The lock, held until the run ends.
 	lock, err := takeLock(target, now)

@@ -36,12 +36,11 @@ type tempFile interface {
 	Close() error
 }
 
-// createTemp creates the temporary file, 0600 and exclusively. A variable so
-// that a test can see the mode it is created with, and hand back a file whose
-// write, sync or close fails.
-var createTemp = func(path string) (tempFile, error) {
-	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-}
+// createTemp creates the temporary file exclusively, so that no one else can
+// open it while it is written: 0600 on Unix, shared with no one on Windows
+// (openTemp). A variable so that a test can see how it is created, and hand
+// back a file whose write, sync or close fails.
+var createTemp = openTemp
 
 // removeTemp removes the temporary file after a failure: os.Remove, a
 // variable so that a test can make it fail.
@@ -68,9 +67,10 @@ const (
 )
 
 // checkWritable is §7.4 step 2 for the file: it must be a regular file that
-// can be opened for writing. A read-only config is a statement, so this holds
-// even where a rename would succeed. The file is closed at once: an open
-// handle would stop the rename on Windows.
+// can be opened for writing, and (on Windows) one this user can replace. A
+// read-only config is a statement, so this holds even where a rename would
+// succeed. The file is closed at once: an open handle would stop the rename
+// on Windows.
 func checkWritable(target string) (fs.FileInfo, error) {
 	info, err := os.Stat(target)
 	if err != nil {
@@ -90,19 +90,35 @@ func checkWritable(target string) (fs.FileInfo, error) {
 		return nil, notWritable(err)
 	}
 
+	if err := checkReplaceable(target); err != nil {
+		return nil, err
+	}
+
 	return info, nil
 }
 
-// notWritable is the refusal for a file that cannot be opened for writing. A
-// read-only file system is most often the documented Docker form, a
-// single-file bind mount with :ro, so it gets §7.4's remedy.
+// notWritable is the refusal for a file that cannot be opened for writing,
+// with mountHint's remedy for a read-only file system.
 func notWritable(err error) error {
+	return fmt.Errorf("the config file is not writable: %w%s", err, mountHint(err))
+}
+
+// cannotTakeAFile is the refusal for a directory in which the lock cannot be
+// created, with mountHint's remedy for a read-only file system: a writable
+// single-file mount in a read-only container (docker run --read-only).
+func cannotTakeAFile(err error) error {
+	return fmt.Errorf("the config's directory cannot take a new file: %w%s", err, mountHint(err))
+}
+
+// mountHint is §7.4's remedy for a read-only file system, which is most often
+// a container's: a single-file bind mount with :ro, or a read-only container
+// around a writable file.
+func mountHint(err error) string {
 	if errors.Is(err, syscall.EROFS) {
-		return fmt.Errorf("the config file is not writable: %w (a read-only mount? run rotate-secret on the host, "+
-			"and mount the config's directory into the container)", err)
+		return " (a read-only mount? run rotate-secret on the host, and mount the config's directory into the container)"
 	}
 
-	return fmt.Errorf("the config file is not writable: %w", err)
+	return ""
 }
 
 // takeLock is §7.4 step 3: <target>.rotate.lock, created with O_EXCL, holding
@@ -119,7 +135,7 @@ func takeLock(target string, now time.Time) (string, error) {
 	case errors.Is(err, fs.ErrExist):
 		return "", lockHeld(target, lock, now)
 	case err != nil:
-		return "", fmt.Errorf("the config's directory cannot take a new file: %w", err)
+		return "", cannotTakeAFile(err)
 	}
 
 	_, writeErr := fmt.Fprintf(file, "pid %d\nstarted %s\n", os.Getpid(), now.UTC().Format(time.RFC3339))
@@ -137,7 +153,10 @@ func takeLock(target string, now time.Time) (string, error) {
 // lockHeld is the refusal for a lock that exists. Its age is from its own
 // modification time, which is its creation: the file is written once. A
 // temporary file beside the target is named too: a run that held the lock and
-// died left it, and it holds every secret of the config.
+// died -- killed, or stopped by a second interrupt -- left it, and it holds
+// every secret of the config. A run still at work has one for milliseconds,
+// hence the condition; deleting that one is harmless, as its rename then
+// fails and nothing is written.
 func lockHeld(target, lock string, now time.Time) error {
 	age := "an unknown time"
 
@@ -148,7 +167,8 @@ func lockHeld(target, lock string, now time.Time) error {
 	var leftovers strings.Builder
 
 	for _, tmp := range leftoverTemps(target) {
-		fmt.Fprintf(&leftovers, "; %s was left by a crashed run and holds the config's secrets: delete it", tmp)
+		fmt.Fprintf(&leftovers, "; if no rotate-secret is running, %s was left by a crashed run "+
+			"and holds the config's secrets: delete it", tmp)
 	}
 
 	return fmt.Errorf("another rotate-secret holds %s (started %s ago); if none is running, remove it and retry%s",

@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1299,24 +1300,29 @@ func TestALeftoverTempIsNamedOnALockRefusal(t *testing.T) {
 	require.Error(t, res.err)
 
 	assert.Contains(t, res.err.Error(), "another rotate-secret holds ")
-	assert.Contains(t, res.err.Error(), "; "+leftover+" was left by a crashed run and holds the config's secrets: delete it")
+	assert.Contains(t, res.err.Error(), "; if no rotate-secret is running, "+leftover+
+		" was left by a crashed run and holds the config's secrets: delete it")
 	assert.NotContains(t, res.err.Error(), "nothex")
 	assert.NotContains(t, res.err.Error(), ".tmp.old")
 	assert.Equal(t, before, listing(t, files.dir), "a refused run removed or wrote something")
 }
 
-// M-1 (b) of the review: an interrupt does not kill a run that holds the lock.
-// Before the rename it stops the run there, with nothing written and the
-// temporary file and the lock removed; after the rename the rotation is
-// complete, said, and a success. Either way the interrupts are let go only
-// after the lock is removed. Delivered through the notifySignals seam.
+// M-1 (b) of the review, and m-1 and m-3 of the second: an interrupt does not
+// kill a run that holds the lock. Before the rename it stops the run there,
+// with nothing written and the temporary file and the lock removed; after the
+// rename the rotation is complete, said, and a success. Ctrl-C, SIGTERM and
+// SIGHUP are all caught. The first interrupt hands the signals back at once,
+// while the lock is still held, so that a second one kills as by default;
+// without one they are handed back once, after the lock is removed.
+// Delivered through the notifySignals and stopSignals seams.
 func TestAnInterruptStopsTheRunCleanly(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		after bool // the interrupt comes after the rename
+		name string
+		when string // "before" or "after" the rename, or "never"
 	}{
-		{name: "before the rename"},
-		{name: "after the rename", after: true},
+		{name: "before the rename", when: "before"},
+		{name: "after the rename", when: "after"},
+		{name: "no interrupt", when: "never"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files := newRotateFiles(t)
@@ -1324,8 +1330,11 @@ func TestAnInterruptStopsTheRunCleanly(t *testing.T) {
 			before := listing(t, files.dir)
 
 			var (
+				mu             sync.Mutex
 				interrupts     chan<- os.Signal
-				stoppedAt      []bool // whether the lock existed when the interrupts were let go
+				caught         []os.Signal
+				stoppedAt      []bool // whether the lock existed each time the interrupts were handed back
+				stopped        = make(chan struct{}, 4)
 				notify, stop   = notifySignals, stopSignals
 				originalSyncer = syncDir
 			)
@@ -1334,36 +1343,71 @@ func TestAnInterruptStopsTheRunCleanly(t *testing.T) {
 
 			notifySignals = func(c chan<- os.Signal, signals ...os.Signal) {
 				if slices.Contains(signals, os.Interrupt) {
-					interrupts = c
+					mu.Lock()
+					interrupts, caught = c, signals
+					mu.Unlock()
 				}
 			}
 
+			// Called from the run's goroutine and from its signal watcher.
 			stopSignals = func(c chan<- os.Signal) {
+				mu.Lock()
+				defer mu.Unlock()
+
 				if c == interrupts {
 					_, err := os.Stat(lock)
 					stoppedAt = append(stoppedAt, err == nil)
+					stopped <- struct{}{}
 				}
 			}
 
-			interrupt := func() { interrupts <- os.Interrupt }
+			// The interrupt, then a wait for the signals to be handed back:
+			// what lets a second interrupt kill.
+			interrupt := func() {
+				mu.Lock()
+				c := interrupts
+				mu.Unlock()
 
-			if tc.after {
+				c <- os.Interrupt
+
+				select {
+				case <-stopped:
+				case <-time.After(5 * time.Second):
+					t.Error("the first interrupt did not hand the signals back: a second one would not kill")
+				}
+			}
+
+			switch tc.when {
+			case "before":
+				recordGenerations(t, interrupt)
+			case "after":
 				syncDir = func(dir string) error {
 					interrupt()
 
 					return originalSyncer(dir)
 				}
-			} else {
-				recordGenerations(t, interrupt)
 			}
 
 			res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
 			require.Empty(t, retiringLeaks(res.printed(), files.old()...), "a message carries an old value")
 
-			assert.Equal(t, []bool{false}, stoppedAt, "the interrupts were let go before the lock was removed")
+			mu.Lock()
+			defer mu.Unlock()
+
+			assert.Equal(t, []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}, caught)
 			assert.NoFileExists(t, lock)
 
-			if !tc.after {
+			if tc.when == "never" {
+				require.NoError(t, res.err)
+				assert.Equal(t, []bool{false}, stoppedAt, "the signals were handed back before the lock was removed")
+
+				return
+			}
+
+			assert.Equal(t, []bool{true, false}, stoppedAt,
+				"the signals were not handed back at the first interrupt, while the lock was held, and again at the end")
+
+			if tc.when == "before" {
 				require.Error(t, res.err)
 				assert.Contains(t, res.err.Error(), "interrupted; nothing was written")
 				assert.Empty(t, res.stdout)
@@ -1409,19 +1453,26 @@ func TestAHardLinkedConfigIsWarnedAbout(t *testing.T) {
 	assert.True(t, bytes.Equal(original, held), "the other name does not hold the previous file")
 }
 
-// M-2 of the review: a read-only file system -- the documented Docker form, a
-// :ro single-file bind mount -- gets §7.4's remedy; another refusal does not.
+// M-2 of the review, and a nit of the second: a read-only file system -- the
+// documented Docker form, a :ro single-file bind mount, or a read-only
+// container around a writable file, where the lock cannot be made -- gets
+// §7.4's remedy, for the file and for the lock; another refusal does not.
 func TestAReadOnlyMountIsNamed(t *testing.T) {
 	t.Parallel()
 
 	const hint = "(a read-only mount? run rotate-secret on the host, and mount the config's directory into the container)"
 
-	readOnly := notWritable(&fs.PathError{Op: "open", Path: "/config/config.toml", Err: syscall.EROFS})
-	assert.Contains(t, readOnly.Error(), "the config file is not writable: ")
-	assert.Contains(t, readOnly.Error(), hint)
-	assert.ErrorIs(t, readOnly, syscall.EROFS)
+	for refusal, refuse := range map[string]func(error) error{
+		"the config file is not writable: ":               notWritable,
+		"the config's directory cannot take a new file: ": cannotTakeAFile,
+	} {
+		readOnly := refuse(&fs.PathError{Op: "open", Path: "/config/config.toml", Err: syscall.EROFS})
+		assert.Contains(t, readOnly.Error(), refusal)
+		assert.Contains(t, readOnly.Error(), hint, refusal)
+		assert.ErrorIs(t, readOnly, syscall.EROFS)
 
-	denied := notWritable(&fs.PathError{Op: "open", Path: "/config/config.toml", Err: syscall.EACCES})
-	assert.Contains(t, denied.Error(), "the config file is not writable: ")
-	assert.NotContains(t, denied.Error(), "read-only mount")
+		denied := refuse(&fs.PathError{Op: "open", Path: "/config/config.toml", Err: syscall.EACCES})
+		assert.Contains(t, denied.Error(), refusal)
+		assert.NotContains(t, denied.Error(), "read-only mount", refusal)
+	}
 }

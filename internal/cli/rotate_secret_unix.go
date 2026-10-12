@@ -11,6 +11,19 @@ import (
 	"syscall"
 )
 
+// openTemp creates the temporary file 0600 and exclusively: no one but its
+// owner can open it before it is given the target's owner and mode.
+//
+// On failure the returned interface holds a nil *os.File, which is harmless:
+// the caller checks the error first and never uses the file then.
+func openTemp(path string) (tempFile, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+}
+
+// checkReplaceable has nothing to check on Unix: a rename needs the
+// directory's write permission, which the lock's creation proves.
+func checkReplaceable(string) error { return nil }
+
 // chownFile gives the temporary file an owner: its Chown, a variable so that a
 // test can make it fail as it does for a user who is neither the file's owner
 // nor root.
