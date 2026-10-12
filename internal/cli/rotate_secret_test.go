@@ -784,7 +784,13 @@ func TestRotateSecretRefuses(t *testing.T) {
 			run:    RotateSecret{Name: "alice", Overlap: "24h"},
 			want:   `"alice" already has 4 unexpired previous keys`,
 		},
-		{name: "--reload", run: RotateSecret{Name: "alice", Overlap: "24h", Reload: true}, want: "--reload is not available yet"},
+		// Task 10: --reload exists, and a config without api-bind-to is
+		// refused before anything is written.
+		{
+			name: "--reload without api-bind-to",
+			run:  RotateSecret{Name: "alice", Overlap: "24h", Reload: true},
+			want: "--reload needs the proxy's management API, and the config sets no api-bind-to",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			generated := recordGenerations(t, nil)

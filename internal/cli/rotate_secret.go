@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -23,7 +24,9 @@ import (
 // key and keeps the previous one accepted until an overlap ends, by an edit of
 // the config file -- the only place a previous key lives (D1). The edit is
 // internal/rotation's; this is its I/O: the flags, the lock, the checks and
-// the atomic write (§7.4), and what is printed (§7.2).
+// the atomic write (§7.4), what is printed (§7.2), and with --reload the
+// running proxy's reload and read-back (§7.5, rotate_secret_reload.go) -- the
+// one network access the command makes.
 //
 // stdout carries one line, the new value, and only after a rotation was
 // written. Nothing the command prints, on either stream or in its error, holds
@@ -38,8 +41,8 @@ type RotateSecret struct {
 	EndOverlap bool   `kong:"help='Remove every [[retiring-secret]] block of the name: its previous keys stop being accepted at the reload.',name='end-overlap'"`                                            //nolint: lll
 	Prune      bool   `kong:"help='Remove every expired [[retiring-secret]] block, of any name.',name='prune'"`
 	DryRun     bool   `kong:"help='Print on stderr what the run would do, and write nothing.',name='dry-run'"`
-	Reload     bool   `kong:"help='Reload the running proxy and read the rotation back (not available yet).',name='reload'"`
-	Force      bool   `kong:"help='Proceed although the file looks like one the Penhoon panel generates.',name='force'"`
+	Reload     bool   `kong:"help='Reload the running proxy through its management API (api-bind-to) and read the rotation back.',name='reload'"`                                                 //nolint: lll
+	Force      bool   `kong:"help='Proceed although the file looks like one the Penhoon panel generates, or (with --reload) the running proxy does not advertise secret-rotation.',name='force'"` //nolint: lll
 
 	// out is where the new value goes, errOut everything for people, and now
 	// the run's one instant; Run points them at stdout, stderr and the wall
@@ -180,9 +183,17 @@ func (r *RotateSecret) run() (bool, error) {
 	// background job -- is not asked for: Notify would make it count, and
 	// abort the run. With every one ignored nothing is asked for at all, as
 	// Notify with no signal relays them all.
+	//
+	// The first interrupt also cancels ctx, which every wait of --reload on the
+	// network runs under: a stalled management API ends there, and is never
+	// waited out. Before the rename that is the same clean stop; after it, the
+	// rotation is complete and the run says the reload was not finished.
 	notify, stop, ignored := notifySignals, stopSignals, signalIgnored
 	interrupts := make(chan os.Signal, 1)
 	finished := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	var caught atomic.Bool
 
@@ -207,6 +218,7 @@ func (r *RotateSecret) run() (bool, error) {
 		select {
 		case <-interrupts:
 			caught.Store(true)
+			cancel()
 			stop(interrupts) // the default disposition again: a second interrupt kills
 		case <-finished:
 		}
@@ -241,6 +253,15 @@ func (r *RotateSecret) run() (bool, error) {
 		return false, errors.New("the config does not load: " + explainConfigError(err).Error())
 	}
 
+	// --reload needs the management API the file names (§7.5).
+	var api reloadTarget
+
+	if r.Reload {
+		if api, err = reloadTargetOf(conf); err != nil {
+			return false, err
+		}
+	}
+
 	req := rotation.Request{Name: r.Name, Rotate: rotate, EndOverlap: r.EndOverlap, Prune: r.Prune, Now: now}
 	if rotate && overlap > 0 {
 		req.Until = now.Add(overlap)
@@ -270,12 +291,33 @@ func (r *RotateSecret) run() (bool, error) {
 		return false, nil
 	}
 
+	// --reload's question to the running proxy, before a key is generated or
+	// a byte written: is it there, and does it know the table (§7.5)?
+	if r.Reload {
+		forced, err := api.preCheck(ctx, r.Force)
+
+		switch {
+		case err != nil && interrupted():
+			return false, errInterrupted
+		case err != nil:
+			return false, err
+		case forced:
+			r.say("warning: the running proxy does not advertise %s; --force reloads it anyway: "+
+				"an older binary stops accepting the previous key at the reload", mtglib.FeatureSecretRotation)
+		}
+	}
+
 	report := r.report(summary, rotate, overlap, conf.Web.Enabled.Get(false))
 
 	// 7. A dry run stops here: no key, no write.
 	if r.DryRun {
 		for _, line := range report(wouldDo) {
 			r.say("dry run: %s", line)
+		}
+
+		if r.Reload {
+			r.say("dry run: would reload the proxy through its management API at %s and read the rotation back",
+				api.addr())
 		}
 
 		r.say("dry run: %s, and no key was generated", nothingWritten)
@@ -316,7 +358,9 @@ func (r *RotateSecret) run() (bool, error) {
 		r.say("warning: the file is written, but its directory could not be synced: %s", err.Error())
 	}
 
-	// 12. What happened, for people; then the new value, once, on stdout.
+	// 12. What happened, for people; with --reload, the reload and what it read
+	// back; then the new value, once, on stdout -- whatever the reload's
+	// outcome, as the file holds it either way.
 	for _, line := range report(done) {
 		r.say("%s", line)
 	}
@@ -326,25 +370,82 @@ func (r *RotateSecret) run() (bool, error) {
 			names)
 	}
 
+	var reloadErr error
+
+	if r.Reload {
+		reloadErr = r.reload(ctx, api, conf, edited, summary)
+
+		if rotate {
+			r.say("links: mtg-proxy access %s", r.ConfigPath)
+		}
+	}
+
 	// An interrupt after the rename stops nothing: the rotation is complete,
 	// and exiting non-zero would invite a second one. It is said, and the run
-	// ends as the success it is.
+	// ends as the success it is. One that cut --reload's reload or read-back
+	// short leaves the proxy unconfirmed, which is said instead.
+	reloadCut := reloadErr != nil && interrupted() && errors.Is(reloadErr, context.Canceled)
+	if reloadCut {
+		reloadErr = nil
+	}
+
 	defer func() {
-		if interrupted() {
+		switch {
+		case reloadCut:
+			r.say("warning: interrupted after the file was written; the rotation is complete, but the proxy's " +
+				"reload was not finished or not read back: POST /reload on its management API, or restart it")
+		case interrupted():
 			r.say("warning: interrupted after the file was written; the rotation is complete")
 		}
 	}()
 
 	if !rotate {
-		return true, nil
+		return true, reloadErr
 	}
 
 	if _, err := fmt.Fprintln(r.out, prepared.ValueText(newPrimary)); err != nil {
-		return true, fmt.Errorf("the file is written, but the new value could not be printed: %w; "+
-			"mtg-proxy access %s shows it", err, r.ConfigPath)
+		return true, errors.Join(reloadErr, fmt.Errorf("the file is written, but the new value could not be printed: "+
+			"%w; mtg-proxy access %s shows it", err, r.ConfigPath))
 	}
 
-	return true, nil
+	return true, reloadErr
+}
+
+// reload is --reload after the write (§7.5): the proxy reloads, and what it
+// serves of each name the run touched is read back against the written bytes.
+// It says so when all of it holds, and returns what did not; the file is never
+// rolled back. before is the file as the run read it, so that the names whose
+// expired blocks --prune removed can be told.
+func (r *RotateSecret) reload(ctx context.Context, api reloadTarget, before *config.Config, written []byte,
+	summary rotation.Summary,
+) error {
+	after, err := config.Parse(written)
+	if err != nil {
+		return fmt.Errorf("internal error: the file written does not parse again: %w", err)
+	}
+
+	back := readBack{
+		named:  r.Name,
+		pruned: prunedNames(before, after, r.Name),
+		label: func(name string) string {
+			switch {
+			case name == r.Name:
+				return label(summary.Name)
+			case config.ReadsAsAValue(name):
+				return "a secret whose name reads as a secret value (not shown)"
+			default:
+				return fmt.Sprintf("%q", name)
+			}
+		},
+	}
+
+	if err := api.reloadAndCheck(ctx, written, back, summary.Until, r.now); err != nil {
+		return err
+	}
+
+	r.say("reloaded the proxy through its management API at %s; it serves the file as written", api.addr())
+
+	return nil
 }
 
 // checkFlags is §7.1: one of the three forms, and an overlap from 0 to 720h
@@ -352,9 +453,6 @@ func (r *RotateSecret) run() (bool, error) {
 // as a value.
 func (r *RotateSecret) checkFlags() (time.Duration, error) {
 	switch {
-	case r.Reload:
-		return 0, errors.New("--reload is not available yet: rotate without it, " +
-			"then POST /reload on the proxy's management API or restart the proxy")
 	case r.Overlap != "" && r.EndOverlap:
 		return 0, errors.New("--overlap and --end-overlap cannot be given together: --overlap rotates the key, " +
 			"--end-overlap ends the overlap of an earlier rotation")
@@ -524,7 +622,9 @@ func (r *RotateSecret) report(summary rotation.Summary, rotate bool, overlap tim
 				label(summary.Name), p.change))
 		}
 
-		if p.afterwards {
+		// With --reload, the run reloads the proxy and says how that went
+		// before the links line.
+		if p.afterwards && !r.Reload {
 			lines = append(lines,
 				"the running proxy does not know yet: POST /reload on its management API, or restart it")
 

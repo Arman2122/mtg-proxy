@@ -348,6 +348,11 @@ func readsAsAValue(text string) bool {
 	return false
 }
 
+// ReadsAsAValue is readsAsAValue for the CLI, which names a secret it reads
+// back from a running proxy by the same display rule: such a name is never
+// shown.
+func ReadsAsAValue(text string) bool { return readsAsAValue(text) }
+
 // danglingReason is rule 3's reason for name: "default" names the top-level
 // secret, which GetSecrets serves only while [secrets] is empty.
 func (c *Config) danglingReason(name string) string {

@@ -183,6 +183,7 @@ func apiCall(t *testing.T, method, url string) (int, string, error) {
 // rotationRun is one runProxyWith the E6 harness started and saw serve its API.
 type rotationRun struct {
 	api    string // host:port of the management API
+	path   string // the config file the run reads, and reloads
 	log    *runLog
 	endLog func()
 
@@ -256,6 +257,7 @@ func tryRotationRun(
 
 	run := &rotationRun{
 		api:    api,
+		path:   path,
 		log:    log,
 		endLog: endLog,
 		stop:   func() { stopOnce.Do(func() { close(stop) }) },
