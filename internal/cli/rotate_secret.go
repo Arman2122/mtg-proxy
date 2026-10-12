@@ -356,24 +356,16 @@ func (r *RotateSecret) run() (bool, error) {
 		return false, err
 	}
 
-	if err := syncDir(filepath.Dir(target)); err != nil {
-		r.say("warning: the file is written, but its directory could not be synced: %s", err.Error())
-	}
+	syncErr := syncDir(filepath.Dir(target))
 
-	// 12. What happened, for people; then the new value, once, on stdout; then,
-	// with --reload, the reload and what it read back. The value comes before
-	// the reload (Task 10's review, M-5): a run killed while the API stalls --
-	// by a second interrupt, kill or a closed terminal -- has printed it, and
-	// the file holds it whatever the reload's outcome.
-	for _, line := range report(done) {
-		r.say("%s", line)
-	}
-
-	if names > 1 {
-		r.say("warning: the config has %d names (hard links); the others keep the previous file: replace them by hand",
-			names)
-	}
-
+	// 12. The new value, once, on stdout, right after the rename and its
+	// directory sync; then what happened, for people, on stderr; then, with
+	// --reload, the reload and what it read back. The value comes first (Task
+	// 10's review, M-5; final review B, n-1): the two streams are separate, so a
+	// stderr that blocks -- a full pipe nobody drains -- does not hold it back,
+	// and a run killed while it waits there or while the API stalls -- by a
+	// second interrupt, kill or a closed terminal -- has printed it. The file
+	// holds it whatever happens after.
 	var printErr error
 
 	if rotate {
@@ -381,6 +373,19 @@ func (r *RotateSecret) run() (bool, error) {
 			printErr = fmt.Errorf("the file is written, but the new value could not be printed: %w; "+
 				"mtg-proxy access %s shows it", err, r.ConfigPath)
 		}
+	}
+
+	if syncErr != nil {
+		r.say("warning: the file is written, but its directory could not be synced: %s", syncErr.Error())
+	}
+
+	for _, line := range report(done) {
+		r.say("%s", line)
+	}
+
+	if names > 1 {
+		r.say("warning: the config has %d names (hard links); the others keep the previous file: replace them by hand",
+			names)
 	}
 
 	var reloadErr error

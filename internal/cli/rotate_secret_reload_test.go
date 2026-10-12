@@ -1353,6 +1353,114 @@ func TestTheNewValueIsPrintedBeforeTheReload(t *testing.T) {
 	}
 }
 
+// blockedWriter is a stderr nobody drains, a full pipe: every Write waits until
+// the test lets it go, and the first one says it has begun waiting.
+type blockedWriter struct {
+	waiting  chan struct{}
+	released chan struct{}
+	entered  sync.Once
+	release  sync.Once
+	text     lockedBuffer
+}
+
+func newBlockedWriter(t *testing.T) *blockedWriter {
+	t.Helper()
+
+	w := &blockedWriter{waiting: make(chan struct{}), released: make(chan struct{})}
+	t.Cleanup(w.letGo)
+
+	return w
+}
+
+func (w *blockedWriter) Write(p []byte) (int, error) {
+	w.entered.Do(func() { close(w.waiting) })
+	<-w.released
+
+	return w.text.Write(p)
+}
+
+func (w *blockedWriter) letGo() { w.release.Do(func() { close(w.released) }) }
+
+// Final review B, n-1 (Task 10's review, M-5): the new value is on stdout right
+// after the rename and its directory sync, before anything on stderr -- the
+// report, the hard-link warning, even the warning that the sync failed. The two
+// streams are separate, and a stderr that blocks -- a full pipe nobody drains --
+// must not hold the value back: a run killed while it waits there has printed
+// it. Seen from inside the first write to stderr, which waits until the test
+// has looked.
+//
+// Not parallel: one row replaces syncDir.
+func TestTheNewValueIsPrintedBeforeTheReport(t *testing.T) {
+	for name, tc := range map[string]struct {
+		syncFails bool
+		first     string // how stderr begins
+	}{
+		"a clean run": {first: `rotated "alice" in `},
+		"a directory that cannot be synced": {
+			syncFails: true,
+			first: "warning: the file is written, but its directory could not be synced: " +
+				"the directory is gone\nrotated \"alice\" in ",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if tc.syncFails {
+				original := syncDir
+
+				t.Cleanup(func() { syncDir = original })
+
+				syncDir = func(string) error { return errors.New("the directory is gone") }
+			}
+
+			files := newRotateFiles(t)
+			stderr := newBlockedWriter(t)
+
+			var stdout lockedBuffer
+
+			done := make(chan error, 1)
+
+			go func() {
+				r := RotateSecret{
+					ConfigPath: files.path, Name: "alice", Overlap: "24h",
+					out: &stdout, errOut: stderr, now: func() time.Time { return rotateNow },
+				}
+				done <- r.Run(nil, "test")
+			}()
+
+			select {
+			case <-stderr.waiting:
+			case err := <-done:
+				// Not the error's text, which is not leak-checked here.
+				t.Fatalf("the run ended without a word on stderr (with an error: %t)", err != nil)
+			case <-time.After(10 * time.Second):
+				t.Fatal("the run never wrote to stderr")
+			}
+
+			during := stdout.String()
+
+			stderr.letGo()
+
+			var err error
+
+			select {
+			case err = <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the run did not end once stderr was let go")
+			}
+
+			res := rotateResult{stdout: stdout.String(), stderr: stderr.text.String(), err: err}
+			requireQuiet(t, res, files.old()...)
+
+			renewed := newValue(t, res)
+			requireQuiet(t, res, renewed)
+			require.NoError(t, res.err)
+
+			assert.True(t, during != "" && during == res.stdout,
+				"the value was not on stdout, alone, while stderr was blocked")
+			assert.True(t, strings.HasPrefix(res.stderr, tc.first), "stderr does not begin as it should")
+		})
+	}
+}
+
 // statusLine prints a code with no standard text without a trailing space
 // (Task 10's review, N-6).
 func TestTheStatusLineIsTheCodeAndItsText(t *testing.T) {
