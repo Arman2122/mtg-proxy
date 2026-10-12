@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"runtime"
+	"strings"
 
 	"golang.org/x/sys/windows"
 )
@@ -35,9 +36,11 @@ func keepPermissions(file tempFile, tmp, target string, info fs.FileInfo) error 
 }
 
 // keepDACL copies the target's DACL onto tmp, protected or not as the target's
-// is. A list of inherited entries only needs nothing: the temporary file sits
-// in the same directory and inherits the same. A failure is a refusal, as the
-// owner is on Unix.
+// is. A list of inherited entries only is not copied: the temporary file sits
+// in the same directory and inherits from it. Either way the temporary file's
+// list is then read back and must be the target's (sameDACL) -- which is what
+// catches a config moved here from another directory, whose inherited entries
+// came from there. A failure is a refusal, as the owner is on Unix.
 func keepDACL(tmp, target string) error {
 	sd, err := windows.GetNamedSecurityInfo(target, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
@@ -69,21 +72,62 @@ func keepDACL(tmp, target string) error {
 		return fmt.Errorf("cannot read the access control list of %s: %w", target, err)
 	}
 
-	if !protected && !explicit {
-		return nil
+	if protected || explicit {
+		flags := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.UNPROTECTED_DACL_SECURITY_INFORMATION)
+		if protected {
+			flags = windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION
+		}
+
+		if err := setNamedSecurityInfo(tmp, windows.SE_FILE_OBJECT, flags, nil, nil, dacl, nil); err != nil {
+			return fmt.Errorf("cannot give the new file the access control list of %s: %w; "+
+				"run as a user who may change the file's permissions, or as an administrator", target, err)
+		}
 	}
 
-	flags := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.UNPROTECTED_DACL_SECURITY_INFORMATION)
-	if protected {
-		flags = windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION
+	return sameDACL(tmp, target, sd)
+}
+
+// sameDACL reads the temporary file's DACL back and refuses unless it is the
+// target's: the same entries, and protected or not alike. An unprotected list
+// keeps the entries a file inherited where it was created, so a config moved
+// here from another directory has entries a new file here cannot inherit;
+// giving the new file that list would mean protecting it, which is the
+// operator's call, so the run refuses and says how.
+func sameDACL(tmp, target string, want *windows.SECURITY_DESCRIPTOR) error {
+	got, err := windows.GetNamedSecurityInfo(tmp, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return fmt.Errorf("cannot read the access control list of the temporary file beside %s: %w", target, err)
 	}
 
-	if err := setNamedSecurityInfo(tmp, windows.SE_FILE_OBJECT, flags, nil, nil, dacl, nil); err != nil {
-		return fmt.Errorf("cannot give the new file the access control list of %s: %w; "+
-			"run as a user who may change the file's permissions, or as an administrator", target, err)
+	if wanted := daclForm(want.String()); wanted == "" || daclForm(got.String()) != wanted {
+		return fmt.Errorf("the new file would not get the access control list of %s: a new file here takes "+
+			"this directory's inherited entries, and the config's differ (was it moved here from another directory?); "+
+			`give it a list of its own with icacls "%s" /inheritance:d, and retry`, target, target)
 	}
 
 	return nil
+}
+
+// daclForm is a DACL in SDDL as the comparison reads it: whether it is
+// protected, and its entries. The auto-inheritance flags (AI, AR) are left
+// out: they record how a list was last propagated, not who may do what.
+// Empty for an SDDL that is not a DACL.
+func daclForm(sddl string) string {
+	rest, ok := strings.CutPrefix(sddl, "D:")
+	if !ok {
+		return ""
+	}
+
+	flags, entries := rest, ""
+	if at := strings.IndexByte(rest, '('); at >= 0 {
+		flags, entries = rest[:at], rest[at:]
+	}
+
+	if strings.Contains(flags, "P") {
+		return "D:P" + entries
+	}
+
+	return "D:" + entries
 }
 
 // setNamedSecurityInfo is windows.SetNamedSecurityInfo, a variable so that a
@@ -135,11 +179,12 @@ func linkCount(target string, _ fs.FileInfo) uint64 {
 }
 
 // renameHint is what a rename refused by Windows adds: a file another program
-// holds open without sharing its deletion cannot be replaced.
+// holds open without sharing its deletion cannot be replaced, and Windows
+// says "Access is denied." for that as for a user who may not replace it.
 func renameHint(err error) string {
 	if errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED) ||
 		errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
-		return " (is the file open in another program?)"
+		return " (is the file open in another program, or may this user not replace it?)"
 	}
 
 	return ""

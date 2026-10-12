@@ -5,6 +5,7 @@ package cli
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -117,6 +118,55 @@ func TestTheFilesAccessControlListIsKept(t *testing.T) {
 	}
 }
 
+// I-1: a config moved here from another directory keeps the entries it
+// inherited there, while a new file here inherits this directory's. The run
+// cannot give the new file that list without changing whether it inherits,
+// so it refuses, with nothing written, and says how to give the file a list
+// of its own; once it has one, the rotation keeps it.
+func TestAListInheritedFromAnotherDirectoryIsRefused(t *testing.T) {
+	t.Parallel()
+
+	files := newRotateFiles(t)
+
+	data, err := os.ReadFile(files.path)
+	require.NoError(t, err)
+
+	elsewhere := filepath.Join(files.dir, "elsewhere")
+	require.NoError(t, os.Mkdir(elsewhere, 0o700))
+	icacls(t, elsewhere, "/inheritance:r", "/grant:r", "*"+currentUser(t)+":(OI)(CI)F")
+
+	moved := filepath.Join(elsewhere, "config.toml")
+	require.NoError(t, os.WriteFile(moved, data, 0o600))
+	require.NoError(t, os.Rename(moved, files.path))
+	require.NoError(t, os.Remove(elsewhere))
+
+	before := daclOf(t, files.path)
+	require.False(t, strings.HasPrefix(before, "D:P"), "the list is protected: %s", before)
+	require.Contains(t, before, ";ID;", "the list inherited nothing")
+
+	listed := listing(t, files.dir)
+
+	res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+	require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
+	require.Error(t, res.err, "a rotation gave the config this directory's inherited list")
+
+	assert.Contains(t, res.err.Error(), "was it moved here from another directory?")
+	assert.Contains(t, res.err.Error(), `icacls "`+resolved(t, files.path)+`" /inheritance:d`)
+	assert.Contains(t, res.err.Error(), "nothing was written")
+	assert.Empty(t, res.stdout)
+	assert.Equal(t, listed, listing(t, files.dir))
+	assert.Equal(t, before, daclOf(t, files.path))
+
+	// The remedy: the same entries, the file's own.
+	icacls(t, files.path, "/inheritance:d")
+	own := daclOf(t, files.path)
+
+	res = runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+	require.Empty(t, retiringLeaks(res.printed(), files.old()...), "stderr carries an old value")
+	require.NoError(t, res.err)
+	assert.Equal(t, own, daclOf(t, files.path), "the access control list changed")
+}
+
 // I-1: a list the new file cannot be given is a refusal, as an owner is on
 // Unix: nothing is written, and the temporary file is removed.
 func TestAnAccessControlListThatCannotBeKeptIsRefused(t *testing.T) {
@@ -162,7 +212,7 @@ func TestAFileOpenElsewhereIsNamed(t *testing.T) {
 	require.Error(t, res.err)
 
 	assert.Contains(t, res.err.Error(), "cannot replace ")
-	assert.Contains(t, res.err.Error(), "(is the file open in another program?)")
+	assert.Contains(t, res.err.Error(), "(is the file open in another program, or may this user not replace it?)")
 	assert.Contains(t, res.err.Error(), "nothing was written")
 	assert.Empty(t, res.stdout)
 	assert.Equal(t, before, listing(t, files.dir))
