@@ -280,12 +280,15 @@ func (c *Config) GetDomainFrontingProxyProtocol(defaultValue bool) bool {
 }
 
 func (c *Config) Validate() error {
-	if len(c.Secrets) == 0 {
+	// The secrets GetSecrets serves: a [secrets] user named retiring-secret is
+	// not one, so a [secrets] holding only that user leaves the top-level
+	// secret to validate.
+	if served := c.servedSecrets(); len(served) == 0 {
 		if !c.Secret.Valid() {
 			return fmt.Errorf("invalid secret %s", c.Secret.String())
 		}
 	} else {
-		for name, s := range c.Secrets {
+		for name, s := range served {
 			if !s.Valid() {
 				return fmt.Errorf("invalid secret %q: %s", name, s.String())
 			}
@@ -448,12 +451,44 @@ func (c *Config) validateSecretLimits() error {
 
 // GetSecrets returns all secrets as a map. If the new [secrets] section is used,
 // returns that map. Otherwise, wraps the single Secret as {"default": Secret}.
+//
+// A [secrets] user named retiring-secret is never in it (misplacedRetiringUser):
+// every reader that serves or prints secrets -- run and its reloader, access,
+// doctor, the WEB relay -- reads this map, so none of them serves that user. A
+// [secrets] holding nothing else counts as empty.
 func (c *Config) GetSecrets() map[string]mtglib.Secret {
-	if len(c.Secrets) > 0 {
-		return c.Secrets
+	if served := c.servedSecrets(); len(served) > 0 {
+		return served
 	}
 
 	return map[string]mtglib.Secret{"default": c.Secret}
+}
+
+// misplacedRetiringUser is the one [secrets] name never served. Written below
+// the first table header, the hand edit meant to retire a leaked link,
+// retiring-secret = "<old value>", is no parse error: it is a [secrets] user of
+// that name whose primary key is the leaked one, accepted for ever. So the user
+// is dropped -- the kill direction R0 asks for, and never a refused load -- and
+// GetRetiringSecrets reports it as a problem: run warns, run --check and doctor
+// refuse.
+const misplacedRetiringUser = "retiring-secret"
+
+// servedSecrets is [secrets] without a user named misplacedRetiringUser: the
+// table itself when it has none, so a file without one reads as before.
+func (c *Config) servedSecrets() map[string]mtglib.Secret {
+	if _, misplaced := c.Secrets[misplacedRetiringUser]; !misplaced {
+		return c.Secrets
+	}
+
+	served := make(map[string]mtglib.Secret, len(c.Secrets)-1)
+
+	for name, secret := range c.Secrets {
+		if name != misplacedRetiringUser {
+			served[name] = secret
+		}
+	}
+
+	return served
 }
 
 // GetAdTag returns the global advertising tag, or nil when none is configured.

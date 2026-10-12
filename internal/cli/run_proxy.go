@@ -424,6 +424,13 @@ func makeSecretsReloader(
 	return func() (mtglib.SecretConfig, error) {
 		conf, err := utils.ReadConfig(configPath)
 		if err != nil {
+			// The text reaches the operator as the /reload 500 body and the
+			// "secret reload failed" Warning. Refused at a key named
+			// retiring-secret, it also says what the refusal keeps in force.
+			if advice, ok := retiringParseAdvice(err); ok {
+				return mtglib.SecretConfig{}, fmt.Errorf("%s: %w; %s", advice, err, retiringReloadKept)
+			}
+
 			return mtglib.SecretConfig{}, err
 		}
 

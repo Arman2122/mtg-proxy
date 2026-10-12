@@ -69,6 +69,12 @@ const (
 	retiringDuplicateNote  = ": the same key as another entry of this name; the later until is kept"
 )
 
+// retiringMisplacedUser is the line for a [secrets] user named retiring-secret
+// (misplacedRetiringUser), which is never served. It names the mis-edit and the
+// right syntax, and never the value.
+const retiringMisplacedUser = `a [secrets] user named "retiring-secret" is ignored: ` +
+	`[[retiring-secret]] blocks go in their own table, above or between the other tables, one per old key`
+
 // The per-name and overall caps of rule 8, as their lines say them.
 var (
 	retiringOverCapName = fmt.Sprintf(
@@ -89,8 +95,10 @@ type RetiringReport struct {
 	// (until more than 720h away) is in it: it is warned about, not dropped.
 	Usable []mtglib.RetiringSecret
 
-	// Lines has one line per problem or warning, in file order. run and the
-	// reloader log each at Warning; run --check refuses the file for any.
+	// Lines has one line per problem or warning, in file order, after a first
+	// line for a [secrets] user named retiring-secret when the file has one
+	// (the mis-edit GetSecrets never serves). run and the reloader log each at
+	// Warning; run --check refuses the file for any.
 	Lines []string
 
 	// Expired counts the entries rule 2 made inert: until is not after now.
@@ -153,6 +161,9 @@ func (e *judgedRetiring) drop(reason string) {
 //     MaxRetiringSecrets in all: the latest until are kept (ties broken by
 //     name, then key bytes), the rest are problems.
 //
+// Before the entries it reports a [secrets] user named retiring-secret, which
+// GetSecrets never serves, as a problem line of its own (§1.1, revision 4).
+//
 // It is pure -- no log, no state, no clock but now -- and Validate never calls
 // it: a problem drops its entry under run and never refuses the file. Two
 // properties hold for an unchanged file and a later now: what has no line at
@@ -161,8 +172,16 @@ func (e *judgedRetiring) drop(reason string) {
 // entries too, and rule 8's order is fixed by the entries alone, for P2; rule 4
 // is a warning, not a drop, for the same reason.
 func (c *Config) GetRetiringSecrets(now time.Time) RetiringReport {
+	var report RetiringReport
+
+	// Not an entry, and so not numbered: the old link retired by a line written
+	// below [secrets], which GetSecrets drops. A function of the text alone.
+	if _, misplaced := c.Secrets[misplacedRetiringUser]; misplaced {
+		report.Lines = append(report.Lines, retiringMisplacedUser)
+	}
+
 	if len(c.RetiringSecrets) == 0 {
-		return RetiringReport{}
+		return report
 	}
 
 	primaries := c.GetSecrets()
@@ -174,10 +193,7 @@ func (c *Config) GetRetiringSecrets(now time.Time) RetiringReport {
 
 	primaryOwners, allOwners := retiringKeyOwners(primaries, entries)
 
-	var (
-		report    RetiringReport
-		survivors []int
-	)
+	var survivors []int
 
 	for i := range entries {
 		entry := &entries[i]

@@ -184,18 +184,24 @@ func (d *Doctor) checkUnknownKeys() bool {
 // checkRetiringSecrets reads the [[retiring-secret]] table as run --check does,
 // at the wall clock: the doctor is a separate process with no high-water
 // history. Every problem or warning run would log is listed and fails the
-// verdict, as an unknown key does. Entries past their until are inert: they are
-// counted, with the way to remove them, and do not fail it. Every line names an
-// entry by its position and name, never by its key.
+// verdict, as an unknown key does; so does a [secrets] user named
+// retiring-secret, which is never served. Entries past their until are inert:
+// they are counted, with the way to remove them, and do not fail it. Every line
+// names an entry by its position and name, never by its key.
+//
+// It prints its section only when it has one of those to show, so the report
+// of a config without the table -- the panel's -- reads as it did.
 func (d *Doctor) checkRetiringSecrets() bool {
 	report := d.conf.GetRetiringSecrets(time.Now())
 
-	for _, line := range report.Lines {
-		d.say("  ⚠️  %s", line)
+	if len(report.Lines) == 0 && report.Expired == 0 {
+		return true
 	}
 
-	if len(report.Lines) == 0 {
-		d.say("  ✅ No retiring-secret entry has a problem")
+	d.say("Retiring secrets")
+
+	for _, line := range report.Lines {
+		d.say("  ⚠️  %s", line)
 	}
 
 	switch {
@@ -216,7 +222,7 @@ func (d *Doctor) diagnose(base mtglib.Network, resolver ipLookup) (bool, error) 
 	d.say("Unknown config keys")
 	everythingOK = d.checkUnknownKeys() && everythingOK
 
-	d.say("Retiring secrets")
+	// Its own header, printed only when it has something to say.
 	everythingOK = d.checkRetiringSecrets() && everythingOK
 
 	d.say("Time skewness")

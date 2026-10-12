@@ -61,36 +61,71 @@ func checkConfig(conf *config.Config, now time.Time) error {
 	return errors.Join(refusals...)
 }
 
-// retiringShapeAdvice is what run, run --check and doctor say when a file does
-// not parse at its [[retiring-secret]] table. It names the shapes that refuse
-// the whole file, never what the file holds: the refused line may carry a key.
-const retiringShapeAdvice = "write one [[retiring-secret]] block per old key, with name, secret and until; " +
-	"a scalar (retiring-secret = ...), an inline table (retiring-secret = { ... }) " +
-	"or a TOML syntax error inside a block refuses the whole file"
+// retiringShapeAdvice is what run, run --check, doctor and a refused reload say
+// when a file does not parse at a key named retiring-secret. It says how the
+// table is written and which shapes are not it, never what the file holds: the
+// refused line may carry a key. It opens as the line run gives a [secrets] user
+// of that name, the same mis-edit when it parses.
+const retiringShapeAdvice = "[[retiring-secret]] blocks go in their own table, above or between the other tables, " +
+	"one per old key, each with name, secret and until: not a scalar (retiring-secret = ...), " +
+	"not an inline table (retiring-secret = { ... }), not a key of that name under another table such as [secrets]"
 
-// explainConfigError puts words of its own before a parse error that stopped at
-// the [[retiring-secret]] table. go-toml names a scalar or an inline table there
-// by the Go type it could not decode into, struct tags and all, which tells an
-// operator nothing about the file; it says which shapes are refused instead.
+// retiringReloadKept is what a reload refused at such a key adds: the file is
+// refused whole, so the set in force stays, and a re-key in the same edit -- the
+// usual company of a rotation -- is not applied either.
+const retiringReloadKept = "the secret set in force is kept: if this edit also re-keyed [secrets], " +
+	"that re-key is not applied, and the old key stays the primary until the file parses"
+
+// retiringParseAdvice is the words to put before a parse error that stopped at a
+// key named retiring-secret, and whether it did. go-toml names a scalar or an
+// inline table there by the Go type it could not decode into, struct tags and
+// all, which tells an operator nothing about the file.
 //
-// The table is recognised by the key the parser was at when it stopped, and
-// only the line is taken from the error. Neither the key's other parts nor any
-// of the document are printed: the parser's own text follows in its Error()
-// form, which carries none of the document, and never in its String() form,
-// which quotes the refused line -- a key, for a scalar holding a secret. An
-// error elsewhere in the file, a byte-order mark among them, is returned as it
-// is.
-func explainConfigError(err error) error {
+// The key is recognised by the first part of the key the parser was at when it
+// stopped: the table itself (a scalar, an inline table, a duplicate table), a
+// field inside one of its blocks (a syntax error such as an impossible date),
+// or -- the key being relative there -- a duplicate key of that name inside
+// another table, such as two retiring-secret users in [secrets]. Only the line
+// is taken from the error, and no other part of the key, which could be a value
+// pasted where a key belongs.
+//
+// What follows the words is the parser's Error() form, never its String() form,
+// which quotes the refused line and so, for a scalar holding a secret, the key.
+// Error() quotes no line of the document. It is not value-free in every case:
+// go-toml puts a key's name into some messages (a key defined twice) and the
+// literal into others (a number out of range), so a value written as a TOML key
+// or as an unquoted number is echoed, as it is by the unknown-key list. No
+// shape that writes a value as a string -- every shape the CLI or a reasonable
+// hand edit produces -- is.
+func retiringParseAdvice(err error) (string, bool) {
 	var decodeErr *toml.DecodeError
 	if !errors.As(err, &decodeErr) {
-		return err
+		return "", false
 	}
 
-	if key := decodeErr.Key(); len(key) == 0 || key[0] != "retiring-secret" {
-		return err
+	key := decodeErr.Key()
+	if len(key) == 0 || key[0] != "retiring-secret" {
+		return "", false
 	}
 
 	line, _ := decodeErr.Position()
 
-	return fmt.Errorf("the retiring-secret table does not parse at line %d: %s: %w", line, retiringShapeAdvice, err)
+	where := "at a key named retiring-secret"
+	if len(key) > 1 {
+		where = "inside a [[retiring-secret]] block"
+	}
+
+	return fmt.Sprintf("the file does not parse at line %d, %s: %s", line, where, retiringShapeAdvice), true
+}
+
+// explainConfigError is err with retiringParseAdvice's words before it when it
+// stopped at a key named retiring-secret, and err as it is otherwise -- a
+// byte-order mark, say, which has nothing to do with the table.
+func explainConfigError(err error) error {
+	advice, ok := retiringParseAdvice(err)
+	if !ok {
+		return err
+	}
+
+	return fmt.Errorf("%s: %w", advice, err)
 }

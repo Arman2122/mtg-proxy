@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -150,15 +152,16 @@ func TestRunCheckRefusesProblemsAndAcceptsInertEntries(t *testing.T) {
 
 			r := &Run{ConfigPath: writeConfig(t, retiringFile("127.0.0.1:3128", primaries, tc.blocks...)), Check: true}
 
+			// First, so that no failing assertion below prints a key.
 			err := r.Run(nil, "test")
+			require.Empty(t, retiringLeaks(errText(err), everyValue...), "the refusal carries a key")
+
 			require.ErrorIs(t, err, errRetiringProblems)
 			assert.NotErrorIs(t, err, errUnknownKeys)
 
 			for _, line := range tc.lines {
 				assert.Contains(t, err.Error(), line)
 			}
-
-			require.Empty(t, retiringLeaks(err.Error(), everyValue...), "the refusal carries a key")
 		})
 	}
 
@@ -177,7 +180,10 @@ func TestRunCheckRefusesProblemsAndAcceptsInertEntries(t *testing.T) {
 			t.Parallel()
 
 			r := &Run{ConfigPath: writeConfig(t, retiringFile("127.0.0.1:3128", primaries, blocks...)), Check: true}
-			require.NoError(t, r.Run(nil, "test"))
+
+			err := r.Run(nil, "test")
+			require.Empty(t, retiringLeaks(errText(err), everyValue...), "the refusal carries a key")
+			require.NoError(t, err)
 		})
 	}
 
@@ -205,11 +211,11 @@ func TestRunCheckRefusesProblemsAndAcceptsInertEntries(t *testing.T) {
 		raw := "track-client-ip = true\n" + retiringFile("127.0.0.1:3128", primaries, retiringBlock("carol", aliceOld, tomorrow))
 
 		err := (&Run{ConfigPath: writeConfig(t, raw), Check: true}).Run(nil, "test")
+		require.Empty(t, retiringLeaks(errText(err), everyValue...), "the refusal carries a key")
 		require.ErrorIs(t, err, errUnknownKeys)
 		require.ErrorIs(t, err, errRetiringProblems)
 		assert.Contains(t, err.Error(), "track-client-ip")
 		assert.Contains(t, err.Error(), `retiring-secret #1 (name "carol")`)
-		require.Empty(t, retiringLeaks(err.Error(), everyValue...), "the refusal carries a key")
 	})
 }
 
@@ -240,6 +246,13 @@ func TestThePanelsConfigHasNoRetiringLines(t *testing.T) {
 		assert.Zero(t, report.Expired)
 		assert.Zero(t, len(report.Usable), "the panel's file holds no retiring entry")
 	}
+
+	// It serves what it always served, and run logs nothing new over it.
+	assert.Equal(t, []string{"alice"}, slices.Sorted(maps.Keys(conf.GetSecrets())))
+
+	log, sink := newLevelLogger()
+	assert.Zero(t, len(usableRetiringSecrets(conf, mtglib.NewRotationClock(time.Now, nil), log)))
+	assert.Zero(t, len(sink.all()), "run logs something new for the panel's file")
 }
 
 // runRefuses runs `run` (not --check) on path and returns what it returned. A
@@ -263,12 +276,15 @@ func runRefuses(t *testing.T, path string) error {
 }
 
 // C15. The table's shapes. A single [retiring-secret] table is one usable
-// entry. A scalar, an inline table and a TOML syntax error inside a block each
-// refuse the whole file: run does not start, a reload keeps the set in force --
-// the leaked key included, when the same edit re-keyed it -- and run --check and
-// doctor print the parser's Error() form only, after words of their own that
-// name the shape and never the value. A file that starts with a UTF-8
-// byte-order mark is refused too, as it is today, with no such words.
+// entry. A scalar, an inline table, a TOML syntax error inside a block, and a
+// [secrets] user named retiring-secret written twice each refuse the whole file:
+// run does not start, a reload keeps the set in force -- the leaked key
+// included, when the same edit re-keyed it, which the reload's error says -- and
+// run --check and doctor print the parser's Error() form only, after words of
+// their own that name the shape and never the value. A file that starts with a
+// UTF-8 byte-order mark is refused too, as it is today, with no such words.
+//
+// Every failing assertion here runs after the leak check, so none prints a key.
 func TestTheTablesShapes(t *testing.T) {
 	t.Parallel()
 
@@ -286,7 +302,10 @@ func TestTheTablesShapes(t *testing.T) {
 		conf, err := utils.ParseConfig([]byte(raw))
 		require.NoError(t, err)
 		assert.Empty(t, conf.UnknownKeys)
-		require.NoError(t, (&Run{ConfigPath: path, Check: true}).Run(nil, "test"))
+
+		err = (&Run{ConfigPath: path, Check: true}).Run(nil, "test")
+		require.Empty(t, retiringLeaks(errText(err), old, renewed), "the refusal carries a key")
+		require.NoError(t, err)
 
 		cfg, err := makeSecretsReloader(path, newRecordingLogger(), mtglib.NewRotationClock(time.Now, nil))()
 		require.NoError(t, err)
@@ -300,13 +319,18 @@ func TestTheTablesShapes(t *testing.T) {
 	renewed := mtglib.GenerateSecret("cover.example.com")
 	tomorrow := rfc3339(time.Now().Add(24 * time.Hour))
 
+	const (
+		atTheKey     = "at a key named retiring-secret"
+		insideABlock = "inside a [[retiring-secret]] block"
+	)
+
 	// Every refused file re-keys alice to renewed and keeps old on the refused
 	// line, so a printed document shows a value and a reload that went through
 	// would change the primary.
 	refused := map[string]struct {
 		text   func(bindTo string) string
-		line   int  // where the parser stops; 0 for the BOM, which names none
-		advice bool // whether run, --check and doctor name the table's shape
+		line   int    // where the parser stops; 0 for the BOM, which names none
+		where  string // what run, --check and doctor say it stopped at; "" for no advice
 		reason string
 	}{
 		"a scalar where the table belongs": {
@@ -315,7 +339,7 @@ func TestTheTablesShapes(t *testing.T) {
 					bindTo, old.Hex(), renewed.Hex())
 			},
 			line:   2,
-			advice: true,
+			where:  atTheKey,
 			reason: "cannot decode TOML string",
 		},
 		"an inline table": {
@@ -324,7 +348,7 @@ func TestTheTablesShapes(t *testing.T) {
 					"[secrets]\nalice = %q\n", bindTo, old.Hex(), tomorrow, renewed.Hex())
 			},
 			line:   2,
-			advice: true,
+			where:  atTheKey,
 			reason: "cannot decode TOML inline table",
 		},
 		"a TOML syntax error inside a block": {
@@ -333,8 +357,19 @@ func TestTheTablesShapes(t *testing.T) {
 					"until = 2026-02-30T09:30:00Z\n\n[secrets]\nalice = %q\n", bindTo, old.Hex(), renewed.Hex())
 			},
 			line:   6,
-			advice: true,
+			where:  insideABlock,
 			reason: "impossible date",
+		},
+		// The I1 mis-edit, written twice below [secrets]: that does not parse,
+		// and the words are the ones its single form gets from run.
+		"a [secrets] user named retiring-secret, twice": {
+			text: func(bindTo string) string {
+				return fmt.Sprintf("bind-to = %q\n\n[secrets]\nalice = %q\nretiring-secret = %q\nretiring-secret = %q\n",
+					bindTo, renewed.Hex(), old.Hex(), old.Hex())
+			},
+			line:   6,
+			where:  atTheKey,
+			reason: "is already defined",
 		},
 		"a UTF-8 byte-order mark": {
 			text: func(bindTo string) string {
@@ -356,25 +391,26 @@ func TestTheTablesShapes(t *testing.T) {
 			path := writeConfig(t, raw)
 
 			_, err := utils.ParseConfig([]byte(raw))
+			require.Empty(t, retiringLeaks(errText(err), old, renewed), "the parse error carries a key")
 			require.Error(t, err, "the whole file is refused")
 
-			err = runRefuses(t, path)
-			require.ErrorContains(t, err, "cannot init config", "run does not start")
-
+			ran := runRefuses(t, path)
 			checked := (&Run{ConfigPath: path, Check: true}).Run(nil, "test")
 			doctored := (&Doctor{ConfigPath: path}).Run(nil, "test")
 
-			for who, err := range map[string]error{"run": err, "run --check": checked, "doctor": doctored} {
-				require.Error(t, err, who)
-
-				text := err.Error()
-
-				assert.Contains(t, text, tc.reason, who+" prints the parser's error")
-				assert.NotContains(t, text, "\n", who+" prints the one-line Error() form only")
+			for who, err := range map[string]error{"run": ran, "run --check": checked, "doctor": doctored} {
+				// First, so that no failing assertion below prints a key: a
+				// String() form, which quotes the refused line, has one.
+				text := errText(err)
 				require.Empty(t, retiringLeaks(text, old, renewed), who+" prints a key")
 
-				if tc.advice {
-					assert.Contains(t, text, fmt.Sprintf("the retiring-secret table does not parse at line %d", tc.line), who)
+				require.Error(t, err, who)
+				assert.Contains(t, text, "cannot init config", who+" refuses before anything else")
+				assert.Contains(t, text, tc.reason, who+" prints the parser's error")
+				assert.False(t, strings.Contains(text, "\n"), who+" prints the one-line Error() form only")
+
+				if tc.where != "" {
+					assert.Contains(t, text, fmt.Sprintf("the file does not parse at line %d, %s", tc.line, tc.where), who)
 					assert.Contains(t, text, retiringShapeAdvice, who)
 				} else {
 					assert.NotContains(t, text, retiringShapeAdvice, who+" blames the table for an error elsewhere")
@@ -382,14 +418,21 @@ func TestTheTablesShapes(t *testing.T) {
 			}
 
 			// A reload keeps the set in force, and so the leaked key stays the
-			// primary until the file is fixed.
+			// primary until the file is fixed -- which the reload's error says.
 			proxy := reloadingProxy(t, path, retiringFile(bindTo, map[string]mtglib.Secret{"alice": old}))
 
 			require.NoError(t, os.WriteFile(path, []byte(raw), 0o600))
 
 			reloadErr := proxy.ReloadSecrets()
+			require.Empty(t, retiringLeaks(errText(reloadErr), old, renewed), "the reload's error carries a key")
 			require.Error(t, reloadErr)
-			require.Empty(t, retiringLeaks(reloadErr.Error(), old, renewed), "the reload's error carries a key")
+
+			if tc.where != "" {
+				assert.Contains(t, reloadErr.Error(), retiringShapeAdvice)
+				assert.Contains(t, reloadErr.Error(), retiringReloadKept, "the refused reload does not say what stays in force")
+			} else {
+				assert.NotContains(t, reloadErr.Error(), retiringReloadKept)
+			}
 
 			alice := snapshotOf(t, proxy, "alice")
 			assert.True(t, alice.Secret == old.Base64(), "the refused reload changed the primary")
