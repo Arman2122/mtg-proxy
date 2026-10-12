@@ -39,6 +39,25 @@ type ConfigSecretLimit struct {
 	ClientFair  TypeBool        `json:"clientFair,omitzero"`
 }
 
+// ConfigRetiringSecret is one [[retiring-secret]] block, its three fields as
+// the file spelled them: Name, Secret (the old value, hex or base64url, any
+// mode) and Until (an RFC 3339 instant; a TOML offset date-time arrives here
+// in RFC 3339 with nanoseconds). None is parsed while decoding, so a bad value
+// never fails the file and no decoder error, which carries no entry index and
+// might echo the value, is ever raised; GetRetiringSecrets parses and judges
+// them. Secret is a credential: Config.String() redacts it.
+type ConfigRetiringSecret struct {
+	Name   string `json:"name"`
+	Secret string `json:"secret"`
+	Until  string `json:"until"`
+
+	// wrongType marks, one bit per field, the fields whose TOML value had the
+	// wrong type: their text above is fmt.Sprint of that value. Parse sets it
+	// after the JSON step, which an unexported field does not cross, and for
+	// the same reason Config.String() never shows it.
+	wrongType uint8
+}
+
 // ConfigListener is one [[listener]] block: an extra socket serving the
 // pre-FakeTLS secret forms. It is purely additive -- the top-level bind-to is
 // never replaced and always stays FakeTLS-only, because a socket that answers
@@ -108,6 +127,13 @@ type Config struct {
 	AdTag                    TypeAdTag                    `json:"adTag"`
 	SecretAdTags             map[string]TypeAdTag         `json:"secretAdTags"`
 	SecretLimits             map[string]ConfigSecretLimit `json:"secretLimits"`
+
+	// RetiringSecrets are the [[retiring-secret]] blocks, raw: a secret's
+	// previous key and when it stops being accepted. GetRetiringSecrets judges
+	// them; Validate never does, because a problem in one drops that entry and
+	// never refuses the file. omitempty keeps Config.String() byte-identical
+	// for every file without the table, the panel's included.
+	RetiringSecrets []ConfigRetiringSecret `json:"retiringSecrets,omitempty"`
 
 	// UnknownKeys are the dotted paths of every key the file carried that this
 	// binary does not know, sorted. The parser is deliberately lenient -- a
@@ -615,6 +641,7 @@ func (c *Config) String() string {
 	}
 
 	redactConfigCredentials(fields)
+	redactMistypedRetiringFields(fields, c.RetiringSecrets)
 
 	buf := &bytes.Buffer{}
 	encoder := json.NewEncoder(buf)
@@ -655,4 +682,55 @@ func redactConfigCredentials(fields map[string]any) {
 			named[name] = redactedValue
 		}
 	}
+
+	// A retiring entry keeps its name and until -- which rotations are
+	// configured, and until when, is the point of the line -- and loses its
+	// value, the old link's credential (D21).
+	for _, entry := range retiringEntryFields(fields) {
+		if _, found := entry["secret"]; found {
+			entry["secret"] = redactedValue
+		}
+	}
+}
+
+// redactMistypedRetiringFields blanks a retiring entry's name or until when
+// its TOML value had the wrong type. Such a field holds fmt.Sprint of an
+// array or an inline table, which can carry a value pasted in the wrong
+// place; a string name or until is shown as written.
+func redactMistypedRetiringFields(fields map[string]any, entries []ConfigRetiringSecret) {
+	for i, entry := range retiringEntryFields(fields) {
+		if i >= len(entries) {
+			return
+		}
+
+		if entries[i].wrongType&retiringNameWrongType != 0 {
+			entry["name"] = redactedValue
+		}
+
+		if entries[i].wrongType&retiringUntilWrongType != 0 {
+			entry["until"] = redactedValue
+		}
+	}
+}
+
+// retiringEntryFields is the rendering's retiringSecrets list, one map per
+// entry, in file order; nil when the table is absent.
+func retiringEntryFields(fields map[string]any) []map[string]any {
+	list, ok := fields["retiringSecrets"].([]any)
+	if !ok {
+		return nil
+	}
+
+	out := make([]map[string]any, 0, len(list))
+
+	for _, item := range list {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			entry = map[string]any{}
+		}
+
+		out = append(out, entry)
+	}
+
+	return out
 }

@@ -3,9 +3,13 @@ package config_test
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -181,4 +185,46 @@ func (suite *EnvTestSuite) TestBindToEmpty() {
 
 func TestEnv(t *testing.T) {
 	suite.Run(t, &EnvTestSuite{})
+}
+
+// C6 (D29): the environment's secret fully defines the secret set, so the
+// file's [[retiring-secret]] entries -- previous keys of names no longer in
+// effect -- are cleared with the rest of the file's set. That is the kill
+// direction: a previous key is accepted only beside the file that granted it.
+// Mutates the process environment, so it does not run in parallel.
+func TestTheSecretEnvironmentClearsRetiringEntries(t *testing.T) {
+	text := envTestMultiSecretConfig + `
+[[retiring-secret]]
+name = "alice"
+secret = "ee0f1e2d3c4b5a69788796a5b4c3d2e1f0676f6f676c652e636f6d"
+until = "2999-01-01T00:00:00Z"
+`
+	now := time.Date(2026, 10, 8, 9, 30, 0, 0, time.UTC)
+
+	// Neither spelling of the variable is set, whatever the test process
+	// inherited; t.Setenv restores both afterwards.
+	for _, name := range []string{"SECRET", "MTG_SECRET"} {
+		t.Setenv(name, "")
+		require.NoError(t, os.Unsetenv(name))
+	}
+
+	conf, err := config.Parse([]byte(text))
+	require.NoError(t, err)
+	require.NoError(t, conf.ApplyEnvironment())
+	require.Len(t, conf.RetiringSecrets, 1, "without the variable the file's entry stays")
+	require.Len(t, conf.GetRetiringSecrets(now).Usable, 1)
+
+	for _, name := range []string{"SECRET", "MTG_SECRET"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, envTestSecretHex)
+
+			conf, err := config.Parse([]byte(text))
+			require.NoError(t, err)
+			require.NoError(t, conf.ApplyEnvironment())
+
+			assert.Nil(t, conf.RetiringSecrets)
+			assert.Equal(t, config.RetiringReport{}, conf.GetRetiringSecrets(now))
+			assert.NotContains(t, conf.String(), "retiringSecrets")
+		})
+	}
 }

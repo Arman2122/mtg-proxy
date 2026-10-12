@@ -1,0 +1,34 @@
+bind-to = "0.0.0.0:8443"
+api-bind-to = "127.0.0.1:41337"
+api-token = "tok"
+track-client-ips = true
+
+[throttle]
+max-connections = 5000
+
+[[listener]]
+bind-to = "127.0.0.1:2398"
+accept = ["dd", "plain"]
+proxy-protocol = true
+
+[web]
+enabled = true
+host = "web.example.com"
+bind-to = "127.0.0.1:8099"
+backend = "127.0.0.1:2398"
+token-key = "/etc/p-ui/mtproto/7.web.key"
+cover-dir = "/srv/site"
+stats-bind-to = "127.0.0.1:8100"
+
+[secret-ad-tags]
+"alice" = "0123456789abcdef0123456789abcdef"
+
+[secret-limits."alice"]
+quota = "1073741824B"
+expires = "2026-12-31T23:59:59Z"
+speed-up = "125000"
+speed-down = "250000"
+ip-limit = 3
+
+[secrets]
+"alice" = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"

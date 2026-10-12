@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -33,6 +34,18 @@ type tomlConfig struct {
 		ClientSpeed string `toml:"client-speed" json:"clientSpeed,omitempty"`
 		ClientFair  bool   `toml:"client-fair" json:"clientFair,omitempty"`
 	} `toml:"secret-limits" json:"secretLimits,omitempty"`
+	// The fields are any so that a wrong TOML type is a problem of that one
+	// entry, never a failure to parse the file; Parse turns each into a string
+	// before the JSON step (normaliseRetiringSecrets). The table itself keeps a
+	// typed shape, so go-toml still names a misspelt field inside a block as
+	// an unknown key, and a scalar where the table belongs
+	// (retiring-secret = "x") is the one hand edit of this table that refuses
+	// the file.
+	RetiringSecrets []struct {
+		Name   any `toml:"name"   json:"name"`
+		Secret any `toml:"secret" json:"secret"`
+		Until  any `toml:"until"  json:"until"`
+	} `toml:"retiring-secret" json:"retiringSecrets,omitempty"`
 	UsageStateFile string `toml:"usage-state-file" json:"usageStateFile,omitempty"`
 	APIToken       string `toml:"api-token" json:"apiToken,omitempty"`
 	BindTo         any    `toml:"bind-to" json:"bindTo"`
@@ -195,6 +208,8 @@ func Parse(rawData []byte) (*Config, error) {
 		tomlConf.BindTo = strs
 	}
 
+	retiringMarks := normaliseRetiringSecrets(tomlConf)
+
 	// G117: the buffer is decoded back into conf three lines down and never
 	// leaves this function. This is the TOML-to-struct pipeline, not output.
 	//nolint:gosec // an in-memory round trip
@@ -206,6 +221,14 @@ func Parse(rawData []byte) (*Config, error) {
 		return nil, fmt.Errorf("cannot parse a config: %w", err)
 	}
 
+	// The wrong-type marks are unexported, so they cannot cross the JSON step:
+	// they are set here, from the record the normalisation kept.
+	for i, mark := range retiringMarks {
+		if i < len(conf.RetiringSecrets) {
+			conf.RetiringSecrets[i].wrongType = mark
+		}
+	}
+
 	if len(conf.BindTo) == 0 {
 		return nil, fmt.Errorf("bind-to is required")
 	}
@@ -213,6 +236,60 @@ func Parse(rawData []byte) (*Config, error) {
 	conf.UnknownKeys = unknownKeys(rawData)
 
 	return conf, nil
+}
+
+// normaliseRetiringSecrets turns every field of every [[retiring-secret]]
+// block into a string, in place, and returns which fields of each entry had
+// the wrong TOML type, as wrong-type marks:
+//   - a string is kept;
+//   - an offset date-time (a time.Time) becomes RFC 3339 with nanoseconds;
+//   - an absent field becomes "", which rule 1 reports as missing, not as a
+//     wrong type;
+//   - anything else -- a number, a boolean, an array, an inline table, a
+//     local date-time, date or time -- becomes fmt.Sprint of it, marked.
+func normaliseRetiringSecrets(conf *tomlConfig) []uint8 {
+	if len(conf.RetiringSecrets) == 0 {
+		return nil
+	}
+
+	marks := make([]uint8, len(conf.RetiringSecrets))
+
+	for i := range conf.RetiringSecrets {
+		entry := &conf.RetiringSecrets[i]
+
+		for _, field := range []struct {
+			value *any
+			mark  uint8
+		}{
+			{&entry.Name, retiringNameWrongType},
+			{&entry.Secret, retiringSecretWrongType},
+			{&entry.Until, retiringUntilWrongType},
+		} {
+			text, wrongType := normaliseRetiringField(*field.value)
+			*field.value = text
+
+			if wrongType {
+				marks[i] |= field.mark
+			}
+		}
+	}
+
+	return marks
+}
+
+// normaliseRetiringField is one field of normaliseRetiringSecrets: its text,
+// and whether its TOML type was wrong.
+func normaliseRetiringField(value any) (string, bool) {
+	switch v := value.(type) {
+	case nil:
+		return "", false
+	case string:
+		return v, false
+	case time.Time:
+		return v.Format(time.RFC3339Nano), false
+	default:
+		return fmt.Sprint(v), true
+	}
 }
 
 // unknownKeys is the list of keys a strict decode of the same document would

@@ -76,10 +76,14 @@ func (c *Config) applyEnvSecret() error {
 
 	// The environment fully defines the secret set: named [secrets] and
 	// their [secret-ad-tags]/[secret-limits] from the file no longer apply.
+	// Nor do its [[retiring-secret]] entries (D29): a previous key of a name
+	// no longer in effect would dangle, and clearing it kills that old key,
+	// which is the safe direction.
 	c.Secret = secret
 	c.Secrets = nil
 	c.SecretAdTags = nil
 	c.SecretLimits = nil
+	c.RetiringSecrets = nil
 
 	return nil
 }
