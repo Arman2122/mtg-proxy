@@ -47,7 +47,7 @@ func NewLoadBalancedSocks5Dialer(baseDialer Dialer, proxyURLs []*url.URL) (Diale
 	for _, u := range proxyURLs {
 		dialer, err := NewSocks5Dialer(newProxyDialer(baseDialer, u), u)
 		if err != nil {
-			return nil, fmt.Errorf("cannot build dialer for %s: %w", u.String(), err)
+			return nil, fmt.Errorf("cannot build dialer for %s: %w", u.Redacted(), err)
 		}
 
 		dialers = append(dialers, dialer)
