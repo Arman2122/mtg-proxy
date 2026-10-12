@@ -390,9 +390,15 @@ A drop caused by an API mutation (§5.1, a re-key onto a retiring key) is not co
 next reload returns to the file, and the file's grant is still in force: it is not a key past
 its overlap.
 
-Nor is a drop undone by a **deliberate edit** covered by P2. Example: `--end-overlap` for one
-name shrinks the unexpired population, and can bring another name's entry back under the rule 8
+Nor is a drop undone by a **deliberate hand edit** covered by P2. Example: deleting one name's
+block shrinks the unexpired population, and can bring another name's entry back under the rule 8
 cap. That is a changed file, not lost state, and the entry is still bounded by its own `until`.
+**The `rotate-secret` tool does not do this silently** (revision 4, Task 9a's ruling): its edit
+is refused when it would make a key usable that is not usable now (a removal that revives the
+other copy of a colliding pair, or promotes an entry under the rule 8 cap), with a value-free
+message, nothing written (§7.3, the no-new-usable-key check, also run by `--dry-run`). It is
+also refused when another block would keep the key being retired accepted past the new `until`
+(or at all with `--overlap 0`).
 
 **Messages are value-free.**
 - A problem: `retiring-secret #<n> (name "<name>"): <reason>; the entry is ignored and its key
