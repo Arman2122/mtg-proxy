@@ -159,7 +159,7 @@ Until the file is fixed, a running proxy keeps the secret set it had: if the sam
 a [secrets] user named "retiring-secret" is ignored: [[retiring-secret]] blocks go in their own table, above or between the other tables, one per old key
 ```
 
-**Cause:** a line `retiring-secret = "<old value>"` written below `[secrets]`. There it is not a parse error but a user named `retiring-secret` whose key is the old one — which would keep the leaked link working for good. So that name is reserved: the user is never served, `run` warns at the start and on every reload, `run --check` refuses the file and `doctor` fails. The old link is therefore refused already: the user it would have made does not exist.
+**Cause:** a line `retiring-secret = "<old value>"` written below `[secrets]`. There it is not a parse error but a user named `retiring-secret` whose key is the old one — which would keep the leaked link working for good. So that name is reserved: the user is never served, `run` warns at the start and on every reload, `run --check` refuses the file and `doctor` fails. The old link is therefore refused already: the user it would have made does not exist. If `[secrets]` holds nothing but that line, the file serves no secret — the top-level `secret` is not served while `[secrets]` is present — and `run` refuses it too, as does a reload (which keeps the secret set in force), with `[secrets] holds only the reserved name "retiring-secret", which is never served, …`.
 
 **Fix:** delete the line. If you meant an overlap, write a `[[retiring-secret]]` block above `[secrets]` instead (previous answer), or let `mtg-proxy rotate-secret` write it. A client that really is called `retiring-secret` needs another name.
 

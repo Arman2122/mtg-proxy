@@ -575,6 +575,15 @@ the same line:
 a [secrets] user named "retiring-secret" is ignored: [[retiring-secret]] blocks go in their own table, above or between the other tables, one per old key
 ```
 
+A `[secrets]` that holds nothing but that user would serve no secret at all —
+the top-level `secret` is not served while `[secrets]` is present — so `run`,
+`run --check`, `doctor`, `access` and `rotate-secret` refuse that file, and a
+reload refuses it and keeps the secret set in force. `run --check` says:
+
+```text
+cannot init config: invalid config: [secrets] holds only the reserved name "retiring-secret", which is never served, and the top-level secret is not served while [secrets] is present, so the file serves no secret: name the users to serve in [secrets], and write an old key as a [[retiring-secret]] block above [secrets]
+```
+
 The management API accepts any name, so a user given that name through
 `POST` or `PUT /secrets` is served until the next start or reload.
 
