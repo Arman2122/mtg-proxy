@@ -190,5 +190,6 @@ One residual risk is known and not closed: the clock that judges `until` never
 runs backwards inside one process, but a restart forgets it, so if the wall
 clock stepped back past an `until` and the proxy then restarts, the old key is
 accepted again for up to the size of the step. Run NTP, and remove ended
-overlaps with `rotate-secret --prune`. The Security page of the wiki, under
-*Rotating a leaked link*, has the detail.
+overlaps with `rotate-secret --prune` — with the WEB relay, at the price of the
+old WEB links then reaching the cover site instead of a local answer. The
+Security page of the wiki, under *Rotating a leaked link*, has the detail.

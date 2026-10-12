@@ -783,8 +783,8 @@ matched, and each previous key of any form adds one trial to an obfuscated
 listener's loop. The ee handshake budget charges per candidate, so the scan CPU
 stays bounded at the share you configured; what grows is the cost of each scan,
 and so how soon the budget refuses during a flood. A secret keeps at most 4
-previous keys and a file 4,096, and a hinted hello is checked against at most 32
-keys. A config with no previous key costs nothing: the doors run as before.
+unexpired previous keys, and a proxy 4,096 in all; a hinted hello is checked
+against at most 32 keys. A config with no previous key costs nothing: the doors run as before.
 
 ### The clock, and a restart
 
@@ -799,7 +799,8 @@ process — fail-safe, and logged.
 if the wall clock stepped back past an `until` and the proxy then restarts, the
 old key is accepted again for up to the size of the step. Run NTP, and
 `rotate-secret <config> --prune` after each overlap: a block that is gone cannot
-come back.
+come back. With the WEB relay that is a trade: a pruned block's old WEB link is
+no longer answered locally and goes to the cover site (see [[WEB-Proxy-Setup]]).
 
 ### Other edges
 
@@ -1161,7 +1162,8 @@ and neither you nor they will see it happen. See [[Installation]].
   behind a PROXY-protocol listener only when nothing but your own front can reach
   it. The start warning says when they meet such a listener.
 - `[[retiring-secret]]` blocks are pruned (`rotate-secret <config> --prune`)
-  once their overlap has ended, and no `<config>.rotate-*.tmp` file is left
-  beside the config.
+  once their overlap has ended — on a WEB deployment, once you accept that their
+  old WEB links then reach the cover site — and no `<config>.rotate-*.tmp` file
+  is left beside the config.
 - You verified the release you are running, and your automation fails closed
   when verification does.

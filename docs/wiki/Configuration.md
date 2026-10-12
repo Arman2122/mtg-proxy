@@ -513,10 +513,10 @@ Here alice has a new key, and her old link keeps working until 09:30 UTC on
 |---|---|---|
 | `name` | string | The secret this was a key of: a name in `[secrets]`, or `"default"` for the single top-level `secret` when there is no `[secrets]`. |
 | `secret` | hex or base64url string, any form (`ee`, `dd` or plain) | The old value, read like a `[secrets]` value. |
-| `until` | RFC 3339 date-time **with an offset** (`Z` or `+03:30`), quoted or as a bare TOML date-time | The instant the old key stops being accepted. `rotate-secret` writes UTC, to the second. |
+| `until` | RFC 3339 date-time **with an offset** (`Z` or `+03:30`), quoted or as a bare TOML offset date-time | The instant the old key stops being accepted. `rotate-secret` writes UTC, to the second. |
 
 All three are required. One secret may have several blocks, one per old key:
-up to 4 unexpired ones per secret and 4,096 in the file. The old key is the
+up to 4 unexpired ones per secret, and 4,096 unexpired in all. The old key is the
 secret's in everything but its value: the same name, quota, limits, bans,
 counters and per-address entries, on the doors a secret of its form opens.
 
@@ -612,7 +612,7 @@ Four things about the order:
   unexpired block holding it is dropped, and stays dropped until the other
   claim is removed. A primary is never touched.
 - **The caps keep the latest `until`.** Past 4 unexpired blocks for a name, or
-  4,096 in the file, the ones that expire first are dropped.
+  4,096 unexpired in all, the ones that expire first are dropped.
 
 Expiry is judged by a clock that never runs backwards inside one `run`: when
 the wall clock is more than a second behind the latest time it has seen, `run`
@@ -648,11 +648,13 @@ Retiring secrets
 
 **An expired block stays in the file.** The proxy never writes its config, so a
 block is inert from its `until` on and is removed only by
-`mtg-proxy rotate-secret <config> --prune` (or by hand). Prune after each
-overlap: an expired block still stands in the way of its key under another
-name, still counts towards the WEB relay's list of retired links (see
-[[WEB-Proxy-Setup]]), and after a clock step back across a restart it can be
-accepted again (see [[Security]]).
+`mtg-proxy rotate-secret <config> --prune` (or by hand). Pruning is a trade.
+Removing an expired block takes away the one way it can come back — after a
+clock step back across a restart it can be accepted again (see [[Security]]) —
+and it stops standing in the way of its key under another name. But on a
+deployment with the WEB relay, the block is also what keeps the old WEB link
+answered locally: once it is gone, that link goes to the cover site, which with
+`cover-upstream` is a third party (see [[WEB-Proxy-Setup]]).
 
 ### A mode change is a hand edit
 
