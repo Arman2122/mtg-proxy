@@ -2,6 +2,7 @@ package mtglib
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"encoding/binary"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -923,6 +925,367 @@ func benchDoorHandshakeHinted(b *testing.B, dc doorCase, n int) {
 	require.Zero(b, moved.scanned, "no timed connection may scan")
 	require.LessOrEqual(b, moved.verifications, 2*int64(iterations),
 		"a hint hit costs one verification, not a walk of the candidates")
+}
+
+// benchRetiringSecrets and benchRetiringKeys are the matrix of the retiring rows.
+var (
+	benchRetiringSecrets = []int{1, 100, 1000, 5000}
+	benchRetiringKeys    = []int{1, 100}
+)
+
+// benchRetiringOverlap is how far ahead of the wall clock the retiring entries'
+// until is: further than any benchmark runs.
+const benchRetiringOverlap = 24 * time.Hour
+
+// retiringFits says whether a door of n secrets can keep r retiring entries the
+// way the retiring rows lay them out: the client's name has one, and the other
+// r-1 sit on the n-1 decoy names, MaxRetiringPerSecret at most on each.
+func retiringFits(n, r int) bool {
+	return r >= 1 && r <= MaxRetiringSecrets && r-1 <= MaxRetiringPerSecret*(n-1)
+}
+
+// BenchmarkDoorHandshakeRetiring has BenchmarkDoorHandshake's secrets-count rows
+// for a client that holds a RETIRING key: the old key of a secret that was given a new one,
+// still accepted until its until. They are a top-level benchmark of their own
+// because Go matches a -bench pattern level by level, so anything under
+// BenchmarkDoorHandshake would run for every selector of the existing rows.
+//
+// BenchmarkDoorHandshakeRetiring/<ee-unpaced|dd>/secrets=<N>/retiring=<R>/old is
+// one whole connection per iteration against a door that hosts N secrets, with R
+// retiring entries after them. The client is the name that sorts last, and it
+// holds the old key of that name, the retiring entry that sorts last: the
+// door's last candidate (ee) or last trial (dd), N+R in all. Its figure is
+// therefore a `last` row of BenchmarkDoorHandshake at N+R candidates. The R-1
+// other entries are old keys of the decoy names, one each (four at most: a name
+// keeps MaxRetiringPerSecret), so no combination with R-1 > 4*(N-1) exists:
+// secrets=1 has retiring=1 only.
+//
+// ee-unpaced alone has <...>/old/hinted: the same connection from one fixed,
+// keyed address that has connected before. The hint is the name, and a name's
+// hint is its primary then its retiring keys, so the door verifies the primary
+// (a miss) and the old key (the match): two verifications and no scan, whatever
+// N and R are.
+//
+// Each row proves what it timed rather than trusting its setup, because every
+// connection would succeed on a primary key too. The set's layout is read back
+// (N names, R entries kept, the client's old key the last of them and the last
+// candidate); the first connection, untimed, is read back from the registry
+// (attributed to the entry's until, holding the old key, not the primary's); and
+// after the loop the door's own counters must say that EVERY connection went
+// the way the row names (ee: verifications per connection; dd: trials, no
+// miss), with a hook counting each attribution that was on the old key.
+func BenchmarkDoorHandshakeRetiring(b *testing.B) {
+	for _, name := range []string{"ee-unpaced", "dd"} {
+		dc := doorNamed(name)
+
+		if dc.entry.mode == SecretModeFakeTLS {
+			dc.entry = dc.entry.withHelloSize(benchHelloSize)
+		}
+
+		for _, n := range benchRetiringSecrets {
+			for _, r := range benchRetiringKeys {
+				if !retiringFits(n, r) {
+					continue
+				}
+
+				row := fmt.Sprintf("%s/secrets=%d/retiring=%d/old", name, n, r)
+
+				b.Run(row, func(b *testing.B) {
+					benchDoorHandshakeRetiring(b, dc, n, r)
+				})
+
+				if name == "ee-unpaced" && slices.Contains(benchHintedSecrets, n) {
+					b.Run(row+"/hinted", func(b *testing.B) {
+						benchDoorHandshakeRetiringHinted(b, dc, n, r)
+					})
+				}
+			}
+		}
+	}
+}
+
+// retiringDoor is a door built for a retiring row, and what the row needs to
+// check it. The keys are here to be compared, never printed: a Secret's String()
+// is its value, so a failed assertion below says counts and labels only.
+type retiringDoor struct {
+	h       *entryHarness
+	name    string    // the client's name, which sorts last
+	primary Secret    // the name's key now
+	old     Secret    // the key the client holds: the name's last retiring entry
+	until   time.Time // when the old key stops being accepted
+	n, r    int
+}
+
+// hostedDoorRetiring is a door over n secrets, as hostedAmongDecoys makes them
+// with the client's sorting last, that has then been rotated: a swap through
+// ReplaceSecrets hands it r retiring entries, the client's name holding one and
+// the decoys the rest. The rotation clock is the production one, a high-water
+// mark on time.Now, so the retiring rows pay what a proxy pays for the clock.
+func hostedDoorRetiring(b *testing.B, dc doorCase, n, r int) retiringDoor {
+	b.Helper()
+
+	if !retiringFits(n, r) {
+		b.Fatalf("a door of %d secrets cannot keep %d retiring entries", n, r)
+	}
+
+	secrets, name := hostedAmongDecoys(b, dc.entry, n, "last")
+	h := dc.build(b, secrets, nil)
+	h.proxy.rotation = NewRotationClock(nil, nil)
+
+	d := retiringDoor{
+		h:       h,
+		name:    name,
+		primary: secrets[name],
+		old:     dc.entry.secret(b),
+		until:   time.Now().Add(benchRetiringOverlap),
+		n:       n,
+		r:       r,
+	}
+
+	retiring := make([]RetiringSecret, 0, r)
+	retiring = append(retiring, RetiringSecret{Name: name, Secret: d.old, Until: d.until})
+
+	// The names of hostedAmongDecoys, which are all below the client's.
+	for j := range r - 1 {
+		retiring = append(retiring, RetiringSecret{
+			Name: fmt.Sprintf("d%05d", j%(n-1)), Secret: dc.entry.secret(b), Until: d.until,
+		})
+	}
+
+	require.NoError(b, h.proxy.ReplaceSecrets(SecretConfig{Secrets: secrets, Retiring: retiring}))
+	d.requireLayout(b, dc)
+
+	return d
+}
+
+// requireLayout reads the rotated set back from the door. Where the client's old
+// key sits is where the row says it does: the last retiring entry, and on ee the
+// last candidate of N+R, so the scan walks them all; on dd the last of N+R keys
+// tried. A client that sat earlier would time a shorter walk under the row's name.
+func (d retiringDoor) requireLayout(b *testing.B, dc doorCase) {
+	b.Helper()
+
+	set := d.h.proxy.secrets.Load()
+
+	require.Equal(b, d.n, len(set.names), "the door must host n secrets")
+	require.Equal(b, d.r, len(set.retiring), "every retiring entry must be kept: none may be dropped")
+
+	last := &set.retiring[len(set.retiring)-1]
+
+	require.Equal(b, d.name, set.names[last.nameIdx], "the client's entry must sort last among the retiring entries")
+	require.True(b, last.secret.Key == d.old.Key, "the last retiring entry must hold the client's old key")
+	require.True(b, last.until.Equal(d.until), "and its until")
+	require.True(b, set.secrets[last.nameIdx].Key == d.primary.Key, "the name's primary must be its new key")
+	require.False(b, d.primary.Key == d.old.Key, "the old key must not be the primary")
+
+	if dc.entry.mode != SecretModeFakeTLS {
+		require.Zero(b, len(set.cands), "the obfuscated door tries keys, not candidates")
+
+		return
+	}
+
+	require.Equal(b, d.n, set.primaryEnd(), "n primary candidates, then the retiring ones")
+	require.Equal(b, d.n+d.r, len(set.cands), "every key is a candidate")
+	require.Equal(b, d.r, len(set.candRetiring))
+	require.Equal(b, len(set.retiring)-1, set.candRetiring[len(set.candRetiring)-1],
+		"the client's old key must be the last candidate")
+}
+
+// attributionCensus counts what the door attributed.
+type attributionCensus struct {
+	attributed atomic.Int64 // streams attributed to any key
+	onOld      atomic.Int64 // streams attributed to the client's old key, as the retiring entry
+}
+
+// countAttributions installs a hook that counts every stream the door attributes,
+// and how many of those were attributed to the client's old key as the retiring
+// entry (its name, its until, its key). The hook is the seam ServeConn calls
+// between a successful entry and admission; it runs on the stream's goroutine, so
+// it only counts. It is put back when the benchmark ends.
+func (d retiringDoor) countAttributions(b *testing.B) *attributionCensus {
+	b.Helper()
+
+	census := &attributionCensus{}
+	name, until, old := d.name, d.until, d.old.Key
+	previous := afterAttributeHook
+
+	afterAttributeHook = func(sc *streamContext) {
+		census.attributed.Add(1)
+
+		if sc.secretName == name && sc.retiringUntil.Equal(until) && bytes.Equal(sc.matchedSecretKey, old[:]) {
+			census.onOld.Add(1)
+		}
+	}
+
+	b.Cleanup(func() { afterAttributeHook = previous })
+
+	return census
+}
+
+// connect is one whole connection of the client with its old key: dial (from
+// addr, or loopback when it is nil), open the entry, reach the relay, end the
+// stream. inspect also reads the registered stream back.
+func (d retiringDoor) connect(b *testing.B, dc doorCase, addr net.Addr, inspect bool) {
+	var (
+		client net.Conn
+		done   <-chan struct{}
+	)
+
+	if addr == nil {
+		client, done = d.h.dialProxy(b, dc.entry.policy)
+	} else {
+		client, done = dialProxyFrom(b, d.h, dc.entry.policy, addr)
+	}
+
+	upstream := connectThrough(b, dc.entry, d.h, client, d.name, d.old.Key)
+
+	if inspect {
+		d.requireLiveOnOldKey(b)
+	}
+
+	resetOnClose(b, client)
+	resetOnClose(b, upstream)
+	endStream(client, upstream, done)
+}
+
+// requireLiveOnOldKey reads the one registered stream back from the proxy's
+// registry: it is the client's, attributed to the retiring entry (the entry's
+// until, and a key that is the entry's own storage in the set) and not to the
+// name's primary.
+func (d retiringDoor) requireLiveOnOldKey(b *testing.B) {
+	b.Helper()
+
+	stream := d.h.liveStream(b, d.name)
+	require.NotNil(b, stream, "the admitted stream must be registered under the client's name")
+
+	set := d.h.proxy.secrets.Load()
+
+	d.h.proxy.liveMu.Lock()
+	name, until, key := stream.secretName, stream.retiringUntil, stream.matchedSecretKey
+	d.h.proxy.liveMu.Unlock()
+
+	require.Equal(b, d.name, name)
+	require.True(b, until.Equal(d.until), "the stream must carry the retiring entry's until: it matched a retiring key")
+	require.True(b, bytes.Equal(key, d.old.Key[:]), "the stream must hold the old key")
+	require.False(b, bytes.Equal(key, d.primary.Key[:]), "and not the name's primary")
+	require.True(b, &key[0] == &set.retiring[len(set.retiring)-1].secret.Key[0],
+		"its key must be the retiring entry's own, in the set")
+}
+
+// requireOutcome is what a retiring row checks after its loop, about the warm
+// connection and the iterations timed after it together: every connection was
+// attributed to the old key, none was refused, and the door's own counters say
+// how it got there. warm and warmTrials are the counters after the warm
+// connection. hinted says the timed connections were all hint hits.
+func (d retiringDoor) requireOutcome(
+	b *testing.B, dc doorCase, census *attributionCensus, warm doorTally, warmTrials int64, iterations int, hinted bool,
+) {
+	b.Helper()
+
+	p := d.h.proxy
+	connections := int64(iterations) + 1
+
+	require.Equal(b, connections, census.attributed.Load(), "every connection must have been attributed to a key")
+	require.Equal(b, connections, census.onOld.Load(),
+		"every connection must have been attributed to the retiring entry: the benchmark would otherwise time another path")
+	require.False(b, p.stats.retiringSeenAt(d.name).IsZero(), "an admission under a retiring key stamps retiring_last_seen")
+
+	if dc.entry.mode != SecretModeFakeTLS {
+		require.EqualValues(b, iterations, p.obfsStats.trials.Load()-warmTrials, "one trial loop per timed connection")
+		require.Zero(b, p.obfsStats.misses.Load(), "no frame may have matched nothing")
+		require.Zero(b, p.obfsStats.denied.Load(), "no connection may have been refused")
+		require.Zero(b, p.obfsStats.rateLimited.Load())
+
+		return
+	}
+
+	moved := tallyOf(p).minus(warm)
+
+	require.Zero(b, moved.unmatched, "no hello may have matched nothing")
+	require.Zero(b, d.h.events.frontings(), "no connection may have been fronted")
+
+	if hinted {
+		require.EqualValues(b, iterations, moved.hinted,
+			"every timed connection must be a hint hit: the benchmark would otherwise time a scan")
+		require.Zero(b, moved.scanned, "no timed connection may scan")
+		require.EqualValues(b, 2*iterations, moved.verifications,
+			"a hint hit on a retiring key is two verifications: the primary, a miss, then the old key")
+
+		return
+	}
+
+	require.EqualValues(b, iterations, moved.scanned, "every timed connection must be found by the scan")
+	require.Zero(b, moved.hinted, "a loopback client is unkeyed and has no hints")
+	require.EqualValues(b, int64(iterations)*int64(d.n+d.r), moved.verifications,
+		"every timed connection must verify all n+r candidates: the old key is the last, past every primary")
+}
+
+// benchDoorHandshakeRetiring is one whole connection per iteration, as the loop
+// in BenchmarkDoorHandshake, against a rotated door whose client holds the old
+// key. One untimed connection comes first and is read back from the registry.
+func benchDoorHandshakeRetiring(b *testing.B, dc doorCase, n, r int) {
+	b.Helper()
+
+	d := hostedDoorRetiring(b, dc, n, r)
+	census := d.countAttributions(b)
+
+	d.connect(b, dc, nil, true)
+
+	warm, warmTrials := tallyOf(d.h.proxy), d.h.proxy.obfsStats.trials.Load()
+
+	if dc.entry.mode == SecretModeFakeTLS {
+		require.EqualValues(b, 1, warm.scanned)
+		require.EqualValues(b, n+r, warm.verifications, "the old key is found after n primaries and r-1 other old keys")
+	}
+
+	b.ReportAllocs()
+
+	iterations := 0
+
+	for b.Loop() {
+		d.connect(b, dc, nil, false)
+
+		iterations++
+	}
+
+	d.requireOutcome(b, dc, census, warm, warmTrials, iterations, false)
+}
+
+// benchDoorHandshakeRetiringHinted is benchDoorHandshakeHinted for a client of
+// the old key: one untimed connection scans (the address has no hint yet) and
+// writes the hint, which is the name, and the timed ones are hint hits that
+// verify the name's primary and then its old key.
+func benchDoorHandshakeRetiringHinted(b *testing.B, dc doorCase, n, r int) {
+	b.Helper()
+
+	d := hostedDoorRetiring(b, dc, n, r)
+	census := d.countAttributions(b)
+
+	// The entry harness builds a Proxy literal, which has no hint cache.
+	d.h.proxy.hints = newMatchHints(d.h.proxy.ctx)
+
+	addr := tcpFrom(benchHintedAddr, 41000)
+
+	d.connect(b, dc, addr, true)
+
+	warm := tallyOf(d.h.proxy)
+
+	require.EqualValues(b, 1, warm.scanned, "the untimed connection is the scan that writes the hint")
+	require.EqualValues(b, n+r, warm.verifications)
+	require.Zero(b, warm.hinted)
+	require.Equal(b, []string{d.name}, d.h.proxy.hints.recall(addr.IP), "the hint is the client's name")
+
+	b.ReportAllocs()
+
+	iterations := 0
+
+	for b.Loop() {
+		d.connect(b, dc, addr, false)
+
+		iterations++
+	}
+
+	d.requireOutcome(b, dc, census, warm, 0, iterations, true)
 }
 
 // BenchmarkDoorIdle holds 1,000 streams open and reports what each costs. The
