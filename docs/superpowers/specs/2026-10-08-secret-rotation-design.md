@@ -261,7 +261,14 @@ against the pinned go-toml:
   (`retiring-secret = { name = …, secret = …, until = … }`, which `Parse` refuses as a decode
   error into a slice field; revision 4, Task 8a's review: C15 pins it in Task 8b, and `--check`,
   `rotate-secret` and the FAQ name "an inline table" and "any TOML syntax error" alongside the
-  scalar, e.g. an out-of-range date-time such as Feb 30 or `24:00` in `until`). At start the process does not start. On a reload, the
+  scalar, e.g. an out-of-range date-time such as Feb 30 or `24:00` in `until`).
+  **The same scalar written BELOW the first table header is not a parse error** (revision 4, Task
+  8b's review, I1): after `[secrets]`, `retiring-secret = "<old value>"` is a key of the
+  `[secrets]` table, i.e. a USER named `retiring-secret` whose key is the leaked one, accepted
+  forever as a primary — the exact revival R0 forbids. So a `[secrets]` user named
+  `retiring-secret` is a problem of the rotation machinery: `run` drops that user with a
+  Warning (value-free, naming the mis-edit and the right syntax), `run --check` and `doctor`
+  refuse it, and no secret is ever served under that name.) At start the process does not start (for the parse-error shapes). On a reload, the
   previous set stays active, and if the same edit also re-keyed `[secrets]`, **the leaked key
   stays the primary** until the file is fixed. How it surfaces:
   - `run --check` and `rotate-secret` (step 1 of §7.3) refuse it with the parser's own error;
