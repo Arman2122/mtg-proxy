@@ -8,7 +8,6 @@ import (
 
 	"github.com/Arman2122/mtg-proxy/internal/config"
 	"github.com/Arman2122/mtg-proxy/internal/utils"
-	"github.com/pelletier/go-toml/v2"
 )
 
 type Run struct {
@@ -94,26 +93,27 @@ const retiringReloadKept = "the secret set in force is kept: nothing in this edi
 // is taken from the error, and no other part of the key, which could be a value
 // pasted where a key belongs.
 //
-// What follows the words is the parser's Error() form, never its String() form,
-// which quotes the refused line and so, for a scalar holding a secret, the key.
-// Error() quotes no line of the document. It is not value-free in every case:
-// go-toml puts a key's name into some messages (a key defined twice) and the
-// literal into others (a number out of range), so a value written as a TOML key
-// or as an unquoted number is echoed, as it is by the unknown-key list. No
-// shape that writes a value as a string -- every shape the CLI or a reasonable
-// hand edit produces -- is.
+// What follows the words is config.Parse's error, a config.ParseError: the
+// parser's Error() form, never its String() form, which quotes the refused line
+// and so, for a scalar holding a secret, the key. Error() quotes no line of the
+// document, but go-toml puts a key's name into some messages (a key defined
+// twice) and a number's literal into others (a float out of range): a value
+// written as a TOML key or as an unquoted number would be echoed there, so
+// config.Parse replaces any text of the file that could spell a value, and
+// names the line and column instead. The key it keeps has such parts replaced
+// too, so only its first part, the table's name, is compared here.
 func retiringParseAdvice(err error) (string, bool) {
-	var decodeErr *toml.DecodeError
-	if !errors.As(err, &decodeErr) {
+	var parseErr *config.ParseError
+	if !errors.As(err, &parseErr) {
 		return "", false
 	}
 
-	key := decodeErr.Key()
+	key := parseErr.Key()
 	if len(key) == 0 || key[0] != "retiring-secret" {
 		return "", false
 	}
 
-	line, _ := decodeErr.Position()
+	line, _ := parseErr.Position()
 
 	where := "at a key named retiring-secret"
 	if len(key) > 1 {

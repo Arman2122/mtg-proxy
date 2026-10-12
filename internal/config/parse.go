@@ -184,8 +184,9 @@ func Parse(rawData []byte) (*Config, error) {
 	jsonEncoder.SetEscapeHTML(false)
 	jsonEncoder.SetIndent("", "")
 
+	// Neither error below may carry a value of the file (parse_error.go).
 	if err := toml.Unmarshal(rawData, tomlConf); err != nil {
-		return nil, fmt.Errorf("cannot parse toml config: %w", err)
+		return nil, fmt.Errorf("cannot parse toml config: %w", parseError(rawData, err))
 	}
 
 	switch v := tomlConf.BindTo.(type) {
@@ -218,7 +219,7 @@ func Parse(rawData []byte) (*Config, error) {
 	}
 
 	if err := json.NewDecoder(jsonBuf).Decode(conf); err != nil {
-		return nil, fmt.Errorf("cannot parse a config: %w", err)
+		return nil, fmt.Errorf("cannot parse a config: %w", valueFreeError(rawData, err))
 	}
 
 	// The wrong-type marks are unexported, so they cannot cross the JSON step:
@@ -303,7 +304,9 @@ func normaliseRetiringField(value any, dateTime bool) (string, bool) {
 // unknownKeys is the list of keys a strict decode of the same document would
 // have refused. The lenient decode above is the one that counts; this second
 // pass exists only to name what it dropped. Any failure of this pass other
-// than unknown keys is ignored, because the document already parsed.
+// than unknown keys is ignored, because the document already parsed. A part of
+// a key that could spell a secret value -- a value written where a key goes --
+// is not shown (valueFreeKey); the rest of its path is.
 func unknownKeys(rawData []byte) []string {
 	decoder := toml.NewDecoder(bytes.NewReader(rawData))
 	decoder.DisallowUnknownFields()
@@ -320,7 +323,7 @@ func unknownKeys(rawData []byte) []string {
 	keys := make([]string, 0, len(strict.Errors))
 
 	for _, decodeErr := range strict.Errors {
-		keys = append(keys, strings.Join(decodeErr.Key(), "."))
+		keys = append(keys, strings.Join(valueFreeKey(decodeErr.Key()), "."))
 	}
 
 	sort.Strings(keys)
