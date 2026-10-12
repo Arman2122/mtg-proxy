@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -143,6 +144,24 @@ func withoutSecrets(text string) string {
 	return text[:strings.Index(text, "[secrets]\n")]
 }
 
+// keepingProblems are blocks with problem lines that leave every usable entry
+// of the file as it was: a block of alice's holding old with a malformed until
+// (rule 1 drops it, so it claims no key), a block of a name that is not served,
+// and two blocks whose names hold old's spellings -- with a space pasted after
+// the hex, and the base64url between words -- each holding a spare key of its
+// own. Those three names are not served either.
+func keepingProblems(old mtglib.Secret, spares [3]mtglib.Secret) string {
+	block := func(name string, secret mtglib.Secret) string {
+		return "[[retiring-secret]]\nname = \"" + name + "\"\nsecret = \"" + secret.Hex() +
+			"\"\nuntil = \"" + rfc3339(time.Now().Add(48*time.Hour)) + "\"\n\n"
+	}
+
+	return retiringBlock("alice", old, "tomorrow") +
+		block("carol", spares[0]) +
+		block(old.Hex()+" ", spares[1]) +
+		block("old "+old.Base64()+" copy", spares[2])
+}
+
 // sweepShape is one of Task 8b's five shapes, over a file that holds a block of
 // alice's right before [secrets].
 type sweepShape struct {
@@ -166,6 +185,14 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 	floating, err := mtglib.ParseSecret("1234567890123456789012345678e999")
 	require.NoError(t, err)
 
+	// The keys of keepingProblems' blocks of names not served: values of the
+	// file, never printed either.
+	spares := [3]mtglib.Secret{
+		mustGenerate(t, mtglib.SecretModeDD, ""),
+		mustGenerate(t, mtglib.SecretModeDD, ""),
+		mustGenerate(t, mtglib.SecretModeDD, ""),
+	}
+
 	var sweep leakSweep
 
 	// 1. The proxy, with debug = true (reloadFile's): its log holds every Debug
@@ -186,7 +213,7 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 	require.Empty(t, retiringLeaks(res.printed(), renewed), "the new value is printed beyond stdout")
 	require.NoError(t, res.err)
 
-	retiring := []mtglib.Secret{alice, floating}
+	retiring := []mtglib.Secret{alice, floating, spares[0], spares[1], spares[2]}
 	primaries := []mtglib.Secret{renewed, bob}
 
 	data, err := os.ReadFile(run.path)
@@ -212,9 +239,9 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 		return status, body
 	}
 
-	// The rest of the surfaces, over a copy of text: run --check, doctor and
-	// rotate-secret (a dry run of bob's rotation, and a real one); run too, for
-	// a file it refuses -- one it accepts is started below.
+	// The rest of the surfaces, over a copy of text: run --check, doctor,
+	// rotate-secret (a dry run of bob's rotation, and a real one) and access;
+	// run too, for a file it refuses -- one it accepts is started below.
 	surfaces := func(channel, text string, parses bool) {
 		t.Helper()
 
@@ -238,6 +265,11 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 			sweep.add(channel+": rotate-secret: stderr and error", rotation.printed(), false)
 			sweep.add(channel+": rotate-secret: stdout", rotation.stdout, true)
 		}
+
+		out, err := captureStdout(t, func() error {
+			return (&Access{ConfigPath: path, PublicIPv4: net.ParseIP("127.0.0.1"), PublicIPv6: net.ParseIP("::1")}).Run(nil, "test")
+		})
+		sweep.add(channel+": access", out+"\n"+errText(err), true)
 	}
 
 	// 4. Problem lines: blocks that hold the retiring value where it does not
@@ -250,6 +282,40 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 	status, _ := reload("problem lines", problems)
 	require.Equal(t, http.StatusOK, status, "a problem in a block never refuses a reload")
 	surfaces("problem lines", problems, true)
+
+	// 4b. Problem lines beside a previous key of alice's that stays usable, so
+	// that a line printed with the usable entries would show it (Task 10's
+	// review, M-8): a malformed until holding the value, a name that is not
+	// served, and names that hold the value with a space after it, or between
+	// words (M-7). None claims alice's key, which the first fails rule 1 for.
+	keeping := beforeSecrets(rotated, keepingProblems(alice, spares))
+
+	status, _ = reload("problem lines beside a usable previous key", keeping)
+	require.Equal(t, http.StatusOK, status)
+
+	_, body := apiGet(t, run.api, "/secrets/alice")
+	sweep.add("GET /secrets/alice beside problem lines", body, true)
+
+	var kept mtglib.SecretInfo
+
+	require.NoError(t, json.Unmarshal([]byte(body), &kept))
+	require.Equal(t, 1, kept.RetiringKeys, "alice's previous key is not usable beside the problem lines")
+
+	surfaces("problem lines beside a usable previous key", keeping, true)
+
+	// 4c. Task 10's review, I-1: the retiring value written as the name of a
+	// [secret-limits] table, and as a key of [secret-ad-tags]. Validate refuses
+	// both, on every surface.
+	for channel, text := range map[string]string{
+		"a [secret-limits] table named by the value": beforeSecrets(rotated,
+			"[secret-limits."+alice.Hex()+"]\nquota = \"1GB\"\n\n"),
+		"a [secret-ad-tags] key that is the value": beforeSecrets(rotated,
+			"[secret-ad-tags]\n"+alice.Base64()+" = \"0123456789abcdef0123456789abcdef\"\n\n"),
+	} {
+		status, _ := reload(channel, text)
+		require.Equal(t, http.StatusInternalServerError, status, channel)
+		surfaces(channel, text, false)
+	}
 
 	// 5. The scalar shape, whose refused line holds the retiring value (m13′).
 	scalar := "retiring-secret = \"" + alice.Hex() + "\"\n" + rotated
@@ -331,6 +397,19 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 		sweep.add(shape.name+": run", started.log.text(), false)
 	}
 
+	// And on the problem lines beside alice's usable previous key, which its
+	// start logs once (Task 10's review, M-8).
+	started := startRotationRun(t, func(public, extra uint, api string) string {
+		return beforeSecrets(reloadFile(public, extra, api, map[string]mtglib.Secret{"alice": renewed, "bob": bob},
+			retiringBlock("alice", alice, until)), keepingProblems(alice, spares))
+	}, clock)
+
+	require.NoError(t, started.end(t))
+	started.endLog()
+
+	problemsLog := started.log.text()
+	sweep.add("problem lines beside a usable previous key: run", problemsLog, false)
+
 	// 9. access over the rotated file: primaries only (§6.1, §8.2).
 	accessOut, accessErr := captureStdout(t, func() error {
 		return (&Access{ConfigPath: run.path, PublicIPv4: net.ParseIP("127.0.0.1"), PublicIPv6: net.ParseIP("::1")}).Run(nil, "test")
@@ -353,6 +432,10 @@ func TestNoSpellingOfTheRetiringValueEverAppears(t *testing.T) {
 	for _, log := range shapeLogs {
 		assert.True(t, strings.Contains(log, "unknown config key is ignored"), "a start did not log its unknown keys")
 	}
+
+	assert.True(t, strings.Contains(problemsLog, "name is not a configured secret"), "the start logged no problem line")
+	assert.True(t, strings.Contains(problemsLog, "secret accepts a previous key until its overlap ends"),
+		"the start holds no usable previous key beside the problem lines")
 
 	assert.True(t, strings.Contains(res.stderr, "reloaded the proxy through its management API at "+run.api),
 		"the rotation did not say it reloaded the proxy")

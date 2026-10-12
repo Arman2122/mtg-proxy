@@ -43,14 +43,25 @@ const reloadRequestTimeout = 60 * time.Second
 // user.
 const reloadAnswerLimit = 64 << 20
 
-// The likely causes §7.5 gives for a failed check: the primary (check 1, and a
-// name the proxy does not serve at all), and the previous keys (checks 2 and
-// 3).
+// The likely causes §7.5 gives for a failed check:
+//   - the primary (check 1, and a name the proxy does not serve at all);
+//   - fewer previous keys, or an earlier end, than the file says (checks 2 and
+//     3), with forcedCause before them when --force went past a proxy without
+//     secret-rotation;
+//   - more previous keys than the file says (check 2; revision 4, Task 10's
+//     review, M-2): a clock ahead can only take keys away, so the proxy reads
+//     another file, or this machine's clock is the one ahead;
+//   - a 404 or 405 from a proxy without secret-read (M-3), which does not
+//     serve the route at all.
 const (
 	primaryMismatchCauses = "a SECRET environment variable overriding [secrets]; a single-file bind mount that still " +
 		"shows the old file (mount the config's directory instead); another process that rewrote the file"
 	retiringMismatchCauses = "the proxy's clock is ahead of this machine's (its latest time judged an entry expired), " +
 		"or the proxy logged a problem with a [[retiring-secret]] block"
+	retiringSurplusCauses = "the proxy reads a file other than this one (a single-file bind mount that still shows " +
+		"the old file; another process that rewrote the file), or this machine's clock is ahead of the proxy's"
+	forcedCause       = "the running proxy is an older binary (--force), which ignores [[retiring-secret]]; "
+	noSecretReadCause = "the running proxy does not serve GET /secrets/{name} (an older binary)"
 )
 
 // fileRotatedNotServed opens every failure after the write that the read-back,
@@ -146,6 +157,12 @@ func (t reloadTarget) call(ctx context.Context, method, path string, into any) (
 
 	if resp.StatusCode == http.StatusOK && into != nil {
 		if err := json.NewDecoder(body).Decode(into); err != nil {
+			// A body cut short by the context is an interrupt, not an answer
+			// of the wrong kind (Task 10's review, M-4).
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+
 			return resp.StatusCode, errNotJSON
 		}
 	}
@@ -156,9 +173,23 @@ func (t reloadTarget) call(ctx context.Context, method, path string, into any) (
 }
 
 // statusLine is an answer's status as the run prints it: the code and the
-// standard text for it, never the reason phrase the server sent.
+// standard text for it, never the reason phrase the server sent; the code
+// alone when it has no standard text.
 func statusLine(code int) string {
-	return strconv.Itoa(code) + " " + http.StatusText(code)
+	if text := http.StatusText(code); text != "" {
+		return strconv.Itoa(code) + " " + text
+	}
+
+	return strconv.Itoa(code)
+}
+
+// apiFeatures is what the pre-check learned of the running proxy, for the
+// read-back's causes.
+type apiFeatures struct {
+	// forced: it lacks secret-rotation, and --force went past that.
+	forced bool
+	// secretRead: it advertises GET /secrets/{name}.
+	secretRead bool
 }
 
 // preCheck is §7.5's question before anything is written: GET /stats, and
@@ -167,28 +198,32 @@ func statusLine(code int) string {
 // binary, which ignores the [[retiring-secret]] block and so kills the previous
 // key at the reload -- unless force, which it reports as forced. An error that
 // the context ended wraps the context's error.
-func (t reloadTarget) preCheck(ctx context.Context, force bool) (bool, error) {
+func (t reloadTarget) preCheck(ctx context.Context, force bool) (apiFeatures, error) {
 	var stats struct {
 		Features []string `json:"features"`
 	}
 
 	code, err := t.call(ctx, http.MethodGet, "/stats", &stats)
 
+	features := apiFeatures{secretRead: slices.Contains(stats.Features, mtglib.FeatureSecretRead)}
+
 	switch {
 	case errors.Is(err, errNotJSON):
-		return false, fmt.Errorf("--reload: GET /stats on the proxy's management API at %s: %w", t.addr(), err)
+		return apiFeatures{}, fmt.Errorf("--reload: GET /stats on the proxy's management API at %s: %w", t.addr(), err)
 	case err != nil:
-		return false, fmt.Errorf("--reload: the proxy's management API at %s cannot be reached: %w", t.addr(), err)
+		return apiFeatures{}, fmt.Errorf("--reload: the proxy's management API at %s cannot be reached: %w", t.addr(), err)
 	case code != http.StatusOK:
-		return false, fmt.Errorf("--reload: GET /stats on the proxy's management API at %s answered %s",
+		return apiFeatures{}, fmt.Errorf("--reload: GET /stats on the proxy's management API at %s answered %s",
 			t.addr(), statusLine(code))
 	case slices.Contains(stats.Features, mtglib.FeatureSecretRotation):
-		return false, nil
+		return features, nil
 	case force:
-		return true, nil
+		features.forced = true
+
+		return features, nil
 	default:
-		return false, fmt.Errorf("--reload: the running proxy does not advertise %s: it is an older binary, which "+
-			"ignores the [[retiring-secret]] block and stops accepting the previous key at the reload; "+
+		return apiFeatures{}, fmt.Errorf("--reload: the running proxy does not advertise %s: it is an older binary, "+
+			"which ignores the [[retiring-secret]] block and stops accepting the previous key at the reload; "+
 			"upgrade it first, or give --force to reload it anyway", mtglib.FeatureSecretRotation)
 	}
 }
@@ -197,36 +232,45 @@ func (t reloadTarget) preCheck(ctx context.Context, force bool) (bool, error) {
 // run rotated or ended, and the names whose expired blocks it pruned that the
 // written file still configures. The named one gets all three checks of §7.5,
 // each pruned one check 2 (§7.5, "--prune alone"). label is how each is
-// printed: never a name that reads as a value.
+// printed: never a name that reads as a value. features is the pre-check's,
+// which the causes follow.
 type readBack struct {
-	named  string
-	pruned []string
-	label  func(name string) string
+	named    string
+	pruned   []string
+	label    func(name string) string
+	features apiFeatures
 }
 
 // reloadAndCheck is §7.5 after the write: POST /reload, which must answer
 // 200, then GET /secrets/{name} for each name of back, compared with what the
-// written bytes say at now's instant, read once the reload has answered:
+// written file, after, says:
 //
 //  1. the named name's primary: the same key, mode and host as the written
 //     primary, compared parsed, never as strings;
-//  2. retiring_keys (absent means 0): the name's usable entries in the written
-//     file;
+//  2. retiring_keys (absent means 0): the name's usable entries. The proxy
+//     judges them when it handles the GET, after this machine read its clock
+//     (Task 10's review, M-1), so now is read just before and just after each
+//     GET, and any count from the one after to the one before is right: an
+//     entry that expires during the GET is no mismatch, and a proxy whose
+//     clock is ahead by more than the round trip is still caught;
 //  3. retiring_until, when the run added a block (newUntil is not zero): not
-//     before newUntil. It is the latest until of the name's entries, so an
+//     before newUntil while that block is usable just after the GET, and
+//     otherwise absent or not before it (M-1: an --overlap 1s can end before
+//     the read-back). It is the latest until of the name's entries, so an
 //     earlier, longer overlap reports a later one (M1 of the review).
 //
-// Every check that fails is a line of the error, with its likely causes. A
-// refused reload is its status line only. An error that the context ended
-// wraps the context's error.
+// Every check that fails is a line of the error, with its likely causes, which
+// depend on which way it differs and on the pre-check's features. A refused
+// reload is its status line only. An error that the context ended wraps the
+// context's error.
 func (t reloadTarget) reloadAndCheck(
-	ctx context.Context, written []byte, back readBack, newUntil time.Time, now func() time.Time,
+	ctx context.Context, after *config.Config, back readBack, newUntil time.Time, now func() time.Time,
 ) error {
 	code, err := t.call(ctx, http.MethodPost, "/reload", nil)
 
 	switch {
-	case err != nil && ctx.Err() != nil:
-		return fmt.Errorf("the reload was interrupted: %w", err)
+	case ctx.Err() != nil:
+		return fmt.Errorf("the reload was interrupted: %w", ctx.Err())
 	case err != nil:
 		return fmt.Errorf("the file is rotated, but whether the proxy reloaded it is not known: POST /reload on its "+
 			"management API at %s got no answer (%w); POST /reload again, or restart the proxy", t.addr(), err)
@@ -236,13 +280,7 @@ func (t reloadTarget) reloadAndCheck(
 			fileRotatedNotServed, statusLine(code))
 	}
 
-	conf, err := config.Parse(written)
-	if err != nil {
-		return fmt.Errorf("internal error: the file written does not parse again: %w", err)
-	}
-
-	report := conf.GetRetiringSecrets(now())
-	primaries := conf.GetSecrets()
+	primaries := after.GetSecrets()
 
 	names := back.pruned
 	if back.named != "" {
@@ -254,17 +292,29 @@ func (t reloadTarget) reloadAndCheck(
 	for _, name := range names {
 		var info mtglib.SecretInfo
 
+		before := after.GetRetiringSecrets(now())
 		code, err := t.call(ctx, http.MethodGet, "/secrets/"+url.PathEscape(name), &info)
+		since := after.GetRetiringSecrets(now())
 
 		switch {
-		case err != nil && ctx.Err() != nil:
-			return fmt.Errorf("the read-back was interrupted: %w", err)
+		case ctx.Err() != nil:
+			return fmt.Errorf("the read-back was interrupted: %w", ctx.Err())
 		case errors.Is(err, errNotJSON):
 			return fmt.Errorf("the file is rotated and the proxy reloaded it, but GET /secrets/{name} for %s: %w",
 				back.label(name), err)
 		case err != nil:
 			return fmt.Errorf("the file is rotated and the proxy reloaded it, but reading %s back got no answer "+
 				"(%w): GET /secrets/{name} on its management API shows what it serves", back.label(name), err)
+		case !back.features.secretRead && (code == http.StatusNotFound || code == http.StatusMethodNotAllowed):
+			reported := "no secret of that name"
+			if code == http.StatusMethodNotAllowed {
+				reported = statusLine(code)
+			}
+
+			failures = append(failures, fmt.Sprintf("the primary of %s differs (%s vs %s); likely: %s",
+				back.label(name), describeWritten(primaries[name]), reported, noSecretReadCause))
+
+			continue
 		case code == http.StatusNotFound:
 			failures = append(failures, fmt.Sprintf("the primary of %s differs (%s vs no secret of that name); likely: %s",
 				back.label(name), describeWritten(primaries[name]), primaryMismatchCauses))
@@ -282,20 +332,10 @@ func (t reloadTarget) reloadAndCheck(
 			}
 		}
 
-		if want := usableOf(report, name); info.RetiringKeys != want {
-			failures = append(failures, fmt.Sprintf("retiring_keys of %s differs (%d vs %d); likely: %s",
-				back.label(name), want, info.RetiringKeys, retiringMismatchCauses))
-		}
+		failures = append(failures, back.checkKeys(name, info, before, since)...)
 
-		if name == back.named && !newUntil.IsZero() &&
-			(info.RetiringUntil == nil || info.RetiringUntil.Before(newUntil)) {
-			reported := "none"
-			if info.RetiringUntil != nil {
-				reported = info.RetiringUntil.UTC().Format(time.RFC3339)
-			}
-
-			failures = append(failures, fmt.Sprintf("retiring_until of %s differs (%s or later vs %s); likely: %s",
-				back.label(name), newUntil.UTC().Format(time.RFC3339), reported, retiringMismatchCauses))
+		if name == back.named && !newUntil.IsZero() {
+			failures = append(failures, back.checkUntil(name, info, since, newUntil)...)
 		}
 	}
 
@@ -304,6 +344,62 @@ func (t reloadTarget) reloadAndCheck(
 	}
 
 	return errors.New(fileRotatedNotServed + strings.Join(failures, "\n"+fileRotatedNotServed))
+}
+
+// fewerCauses are the causes of a proxy holding fewer previous keys, or an
+// earlier end, than the file says.
+func (b readBack) fewerCauses() string {
+	if b.features.forced {
+		return forcedCause + retiringMismatchCauses
+	}
+
+	return retiringMismatchCauses
+}
+
+// checkKeys is check 2: retiring_keys from the count just after the GET to the
+// one just before it.
+func (b readBack) checkKeys(name string, info mtglib.SecretInfo, before, since config.RetiringReport) []string {
+	most, least := usableOf(before, name), usableOf(since, name)
+
+	expected := strconv.Itoa(most)
+	if least != most {
+		expected = strconv.Itoa(least) + " to " + strconv.Itoa(most)
+	}
+
+	switch {
+	case info.RetiringKeys > most:
+		return []string{fmt.Sprintf("retiring_keys of %s differs (%s vs %d); likely: %s",
+			b.label(name), expected, info.RetiringKeys, retiringSurplusCauses)}
+	case info.RetiringKeys < least:
+		return []string{fmt.Sprintf("retiring_keys of %s differs (%s vs %d); likely: %s",
+			b.label(name), expected, info.RetiringKeys, b.fewerCauses())}
+	default:
+		return nil
+	}
+}
+
+// checkUntil is check 3: retiring_until not before newUntil while the new block
+// is usable just after the GET; absent or not before it once that block has
+// expired.
+func (b readBack) checkUntil(name string, info mtglib.SecretInfo, since config.RetiringReport,
+	newUntil time.Time,
+) []string {
+	reported := info.RetiringUntil
+	usable := slices.ContainsFunc(since.Usable, func(entry mtglib.RetiringSecret) bool {
+		return entry.Name == name && entry.Until.Equal(newUntil)
+	})
+
+	if (reported != nil && !reported.Before(newUntil)) || (reported == nil && !usable) {
+		return nil
+	}
+
+	shown := "none"
+	if reported != nil {
+		shown = reported.UTC().Format(time.RFC3339)
+	}
+
+	return []string{fmt.Sprintf("retiring_until of %s differs (%s or later vs %s); likely: %s",
+		b.label(name), newUntil.UTC().Format(time.RFC3339), shown, b.fewerCauses())}
 }
 
 // usableOf is how many usable previous keys report holds for name.

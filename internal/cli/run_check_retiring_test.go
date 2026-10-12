@@ -27,6 +27,11 @@ import (
 // hex (any case), in standard base64 and in base64url. It returns labels, never
 // a spelling, so a failing assertion prints no credential. The unpadded base64
 // forms are checked because the padded ones contain them.
+//
+// The key in another mode's form is looked for too (Task 10's review, M-8):
+// its dd value in both base64 alphabets, and the first 21 characters of its ee
+// value in both, which are the same whatever host follows. Hex needs no such
+// row: the key's hex is inside every mode's.
 func retiringLeaks(text string, secrets ...mtglib.Secret) []string {
 	var leaks []string
 
@@ -38,13 +43,20 @@ func retiringLeaks(text string, secrets ...mtglib.Secret) []string {
 			panic(err)
 		}
 
+		ddForm := append([]byte{0xdd}, secret.Key[:]...)
+		eeForm := append([]byte{0xee}, secret.Key[:]...)
+
 		for label, spelling := range map[string]string{
-			"the value in hex":             secret.Hex(),
-			"the value in base64url":       base64.RawURLEncoding.EncodeToString(value),
-			"the value in standard base64": base64.RawStdEncoding.EncodeToString(value),
-			"the key in hex":               hex.EncodeToString(secret.Key[:]),
-			"the key in standard base64":   base64.RawStdEncoding.EncodeToString(secret.Key[:]),
-			"the key in base64url":         base64.RawURLEncoding.EncodeToString(secret.Key[:]),
+			"the value in hex":                     secret.Hex(),
+			"the value in base64url":               base64.RawURLEncoding.EncodeToString(value),
+			"the value in standard base64":         base64.RawStdEncoding.EncodeToString(value),
+			"the key in hex":                       hex.EncodeToString(secret.Key[:]),
+			"the key in standard base64":           base64.RawStdEncoding.EncodeToString(secret.Key[:]),
+			"the key in base64url":                 base64.RawURLEncoding.EncodeToString(secret.Key[:]),
+			"the key's dd form in standard base64": base64.RawStdEncoding.EncodeToString(ddForm),
+			"the key's dd form in base64url":       base64.RawURLEncoding.EncodeToString(ddForm),
+			"the key's ee form in standard base64": base64.RawStdEncoding.EncodeToString(eeForm)[:21],
+			"the key's ee form in base64url":       base64.RawURLEncoding.EncodeToString(eeForm)[:21],
 		} {
 			haystack := text
 			if strings.HasPrefix(label, "the value in hex") || strings.HasPrefix(label, "the key in hex") {

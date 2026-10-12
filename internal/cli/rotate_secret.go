@@ -293,15 +293,17 @@ func (r *RotateSecret) run() (bool, error) {
 
 	// --reload's question to the running proxy, before a key is generated or
 	// a byte written: is it there, and does it know the table (§7.5)?
+	var features apiFeatures
+
 	if r.Reload {
-		forced, err := api.preCheck(ctx, r.Force)
+		features, err = api.preCheck(ctx, r.Force)
 
 		switch {
 		case err != nil && interrupted():
 			return false, errInterrupted
 		case err != nil:
 			return false, err
-		case forced:
+		case features.forced:
 			r.say("warning: the running proxy does not advertise %s; --force reloads it anyway: "+
 				"an older binary stops accepting the previous key at the reload", mtglib.FeatureSecretRotation)
 		}
@@ -358,9 +360,11 @@ func (r *RotateSecret) run() (bool, error) {
 		r.say("warning: the file is written, but its directory could not be synced: %s", err.Error())
 	}
 
-	// 12. What happened, for people; with --reload, the reload and what it read
-	// back; then the new value, once, on stdout -- whatever the reload's
-	// outcome, as the file holds it either way.
+	// 12. What happened, for people; then the new value, once, on stdout; then,
+	// with --reload, the reload and what it read back. The value comes before
+	// the reload (Task 10's review, M-5): a run killed while the API stalls --
+	// by a second interrupt, kill or a closed terminal -- has printed it, and
+	// the file holds it whatever the reload's outcome.
 	for _, line := range report(done) {
 		r.say("%s", line)
 	}
@@ -370,10 +374,19 @@ func (r *RotateSecret) run() (bool, error) {
 			names)
 	}
 
+	var printErr error
+
+	if rotate {
+		if _, err := fmt.Fprintln(r.out, prepared.ValueText(newPrimary)); err != nil {
+			printErr = fmt.Errorf("the file is written, but the new value could not be printed: %w; "+
+				"mtg-proxy access %s shows it", err, r.ConfigPath)
+		}
+	}
+
 	var reloadErr error
 
 	if r.Reload {
-		reloadErr = r.reload(ctx, api, conf, edited, summary)
+		reloadErr = r.reload(ctx, api, features, conf, edited, summary)
 
 		if rotate {
 			r.say("links: mtg-proxy access %s", r.ConfigPath)
@@ -399,34 +412,30 @@ func (r *RotateSecret) run() (bool, error) {
 		}
 	}()
 
-	if !rotate {
-		return true, reloadErr
-	}
-
-	if _, err := fmt.Fprintln(r.out, prepared.ValueText(newPrimary)); err != nil {
-		return true, errors.Join(reloadErr, fmt.Errorf("the file is written, but the new value could not be printed: "+
-			"%w; mtg-proxy access %s shows it", err, r.ConfigPath))
-	}
-
-	return true, reloadErr
+	return true, errors.Join(printErr, reloadErr)
 }
 
 // reload is --reload after the write (§7.5): the proxy reloads, and what it
-// serves of each name the run touched is read back against the written bytes.
-// It says so when all of it holds, and returns what did not; the file is never
-// rolled back. before is the file as the run read it, so that the names whose
-// expired blocks --prune removed can be told.
-func (r *RotateSecret) reload(ctx context.Context, api reloadTarget, before *config.Config, written []byte,
-	summary rotation.Summary,
+// serves of each name the run touched is read back against the written bytes,
+// parsed once here. It says so when all of it holds, and returns what did not;
+// the file is never rolled back. before is the file as the run read it, so
+// that the names whose expired blocks --prune removed can be told; features is
+// what the pre-check learned of the proxy.
+func (r *RotateSecret) reload(ctx context.Context, api reloadTarget, features apiFeatures, before *config.Config,
+	written []byte, summary rotation.Summary,
 ) error {
+	// Nothing more is asked of the API after this run.
+	defer api.client.CloseIdleConnections()
+
 	after, err := config.Parse(written)
 	if err != nil {
 		return fmt.Errorf("internal error: the file written does not parse again: %w", err)
 	}
 
 	back := readBack{
-		named:  r.Name,
-		pruned: prunedNames(before, after, r.Name),
+		named:    r.Name,
+		pruned:   prunedNames(before, after, r.Name),
+		features: features,
 		label: func(name string) string {
 			switch {
 			case name == r.Name:
@@ -439,7 +448,7 @@ func (r *RotateSecret) reload(ctx context.Context, api reloadTarget, before *con
 		},
 	}
 
-	if err := api.reloadAndCheck(ctx, written, back, summary.Until, r.now); err != nil {
+	if err := api.reloadAndCheck(ctx, after, back, summary.Until, r.now); err != nil {
 		return err
 	}
 

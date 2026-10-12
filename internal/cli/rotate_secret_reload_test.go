@@ -164,7 +164,34 @@ const (
 	retiringCauses = "the proxy's clock is ahead of this machine's (its latest time judged an entry expired), " +
 		"or the proxy logged a problem with a [[retiring-secret]] block"
 	notServing = "the file is rotated but the proxy does not serve it: "
+
+	// Task 10's review: a proxy holding MORE previous keys than the file says
+	// (M-2), one forced past its missing secret-rotation (M-3), one that does
+	// not serve GET /secrets/{name} at all (M-3).
+	moreCauses = "the proxy reads a file other than this one (a single-file bind mount that still shows the old " +
+		"file; another process that rewrote the file), or this machine's clock is ahead of the proxy's"
+	wantForcedCause = "the running proxy is an older binary (--force), which ignores [[retiring-secret]]; "
+	noReadCause     = "the running proxy does not serve GET /secrets/{name} (an older binary)"
 )
+
+// steppingClock is a clock that reads each instant in turn, then stays at the
+// last: a run's instant, then what its read-back reads before and after a GET.
+func steppingClock(instants ...time.Time) func() time.Time {
+	var (
+		mu   sync.Mutex
+		next int
+	)
+
+	return func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+
+		at := instants[min(next, len(instants)-1)]
+		next++
+
+		return at
+	}
+}
 
 // R10. --reload against a real proxy: runProxyWith with its API, its reloader
 // and its one rotation clock, through the loop harness.
@@ -367,6 +394,46 @@ func TestRotateSecretReloadsTheProxy(t *testing.T) {
 		assert.Contains(t, res.stderr, "reloaded the proxy through its management API at "+run.api)
 	})
 
+	// Task 10's review, M-1: an --overlap 1s whose until falls between the
+	// run's instant and its read-back. Both sides judge the block expired by
+	// then and the proxy serves the file as written, so nothing differs.
+	t.Run("an overlap that ends before the read-back passes", func(t *testing.T) {
+		run := startReloadRun(t, clockAt(at.Add(1500*time.Millisecond)), primaries)
+
+		res := runRotate(t, RotateSecret{
+			ConfigPath: run.path, Name: "alice", Overlap: "1s", Reload: true,
+			now: steppingClock(at.Add(900*time.Millisecond), at.Add(1500*time.Millisecond)),
+		})
+		requireQuiet(t, res, alice, bob)
+
+		renewed := newValue(t, res)
+		requireQuiet(t, res, renewed)
+		require.NoError(t, res.err)
+
+		info := secretOn(t, run.api, "alice")
+		assert.True(t, info.Secret == renewed.Base64())
+		assert.Zero(t, info.RetiringKeys, "the block has expired")
+	})
+
+	// Task 10's review, M-2: after --end-overlap the proxy still holds the
+	// block -- here another process put the old file back, as a single-file
+	// bind mount shows the old one. A proxy holding MORE previous keys than
+	// the file says is no clock ahead.
+	t.Run("--end-overlap on a proxy that still holds the block", func(t *testing.T) {
+		run := startReloadRun(t, clock, primaries, retiringBlock("alice", older, rfc3339(at.Add(48*time.Hour))))
+
+		original, err := os.ReadFile(run.path)
+		require.NoError(t, err)
+
+		rewriteAfterTheRename(t, func(string) string { return string(original) })
+
+		res := runRotate(t, RotateSecret{ConfigPath: run.path, Name: "alice", EndOverlap: true, Reload: true, now: clock})
+		requireQuiet(t, res, alice, bob, older)
+		require.Error(t, res.err)
+
+		assert.Equal(t, notServing+`retiring_keys of "alice" differs (0 vs 1); likely: `+moreCauses, res.err.Error())
+	})
+
 	// The same read-back is a check: a pruned name the proxy counts otherwise
 	// fails check 2, here because the proxy's clock is ahead.
 	t.Run("--prune alone checks the previous keys of a pruned name", func(t *testing.T) {
@@ -443,6 +510,185 @@ func TestAReadBackNeverPrintsANameThatReadsAsAValue(t *testing.T) {
 	}
 }
 
+// fileBackedRead is a GET /secrets/{name} that serves the primary the file at
+// path() holds, with retiringKeys previous keys and no retiring_until -- what
+// a proxy that reloaded the file shows, when the test says how many previous
+// keys it holds.
+func fileBackedRead(t *testing.T, path func() string, retiringKeys int) http.HandlerFunc {
+	t.Helper()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		data, err := os.ReadFile(path())
+		if err != nil {
+			http.Error(w, "cannot read", http.StatusInternalServerError)
+
+			return
+		}
+
+		conf, err := config.Parse(data)
+		if err != nil {
+			http.Error(w, "cannot parse", http.StatusInternalServerError)
+
+			return
+		}
+
+		primary, found := conf.GetSecrets()[r.PathValue("name")]
+		if !found {
+			http.NotFound(w, r)
+
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(mtglib.SecretInfo{ //nolint: errcheck
+			Name: r.PathValue("name"), Secret: primary.Base64(), Mode: primary.Mode.String(), RetiringKeys: retiringKeys,
+		})
+	}
+}
+
+// pathOf is a path a handler reads that the test sets once it knows it.
+type pathOf struct {
+	mu   sync.Mutex
+	path string
+}
+
+func (p *pathOf) set(path string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.path = path
+}
+
+func (p *pathOf) get() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.path
+}
+
+// Task 10's review, M-1: the proxy judges a name's previous keys when it
+// handles its GET, which is after this machine read its clock. Check 2 accepts
+// any count from the one at the instant just after the GET to the one just
+// before it: an entry that expires during the GET is not a mismatch either way,
+// and a count outside that range still is. Here alice's earlier block is
+// usable before the GET and expired after it.
+func TestTheReadBackAllowsAnEntryThatExpiresDuringIt(t *testing.T) {
+	older := mustGenerate(t, mtglib.SecretModeDD, "")
+
+	for _, tc := range []struct {
+		reported int
+		want     string // "" for a pass
+	}{
+		{reported: 1},
+		{reported: 0},
+		{reported: 2, want: notServing + `retiring_keys of "alice" differs (0 to 1 vs 2); likely: ` + moreCauses},
+	} {
+		t.Run(fmt.Sprintf("%d reported", tc.reported), func(t *testing.T) {
+			var path pathOf
+
+			mux := http.NewServeMux()
+			mux.Handle("GET /stats", stubMux(everyFeature, nil))
+			mux.HandleFunc("POST /reload", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+			mux.HandleFunc("GET /secrets/{name}", fileBackedRead(t, path.get, tc.reported))
+
+			stub := newStubServer(t, mux)
+			files := filesBehind(t, stub.addr, retiringBlock("alice", older, rfc3339(rotateNow.Add(2*time.Second))))
+			path.set(files.path)
+
+			res := runRotate(t, RotateSecret{
+				ConfigPath: files.path, Name: "alice", Overlap: "0", Reload: true,
+				now: steppingClock(rotateNow, rotateNow.Add(time.Second), rotateNow.Add(3*time.Second)),
+			})
+			requireQuiet(t, res, append(files.old(), older)...)
+
+			renewed := newValue(t, res)
+			requireQuiet(t, res, renewed)
+
+			if tc.want == "" {
+				require.NoError(t, res.err)
+
+				return
+			}
+
+			require.Error(t, res.err)
+			assert.Equal(t, tc.want, res.err.Error())
+		})
+	}
+}
+
+// Task 10's review, M-3: with --force past a missing secret-rotation, the
+// checks still run and name the binary as the likely cause; a binary that does
+// not serve GET /secrets/{name} at all (no secret-read) is said to be one,
+// rather than blamed on a SECRET environment variable.
+func TestAForcedReloadOfAnOlderBinaryNamesIt(t *testing.T) {
+	t.Run("a binary that reads a secret back but ignores the table", func(t *testing.T) {
+		var path pathOf
+
+		mux := http.NewServeMux()
+		mux.Handle("GET /stats", stubMux([]string{mtglib.FeatureSecretRead, mtglib.FeatureSecretsAPI}, nil))
+		mux.HandleFunc("POST /reload", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+		mux.HandleFunc("GET /secrets/{name}", fileBackedRead(t, path.get, 0))
+
+		stub := newStubServer(t, mux)
+		files := filesBehind(t, stub.addr)
+		path.set(files.path)
+
+		res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h", Reload: true, Force: true})
+		requireQuiet(t, res, files.old()...)
+
+		renewed := newValue(t, res)
+		requireQuiet(t, res, renewed)
+		require.Error(t, res.err)
+
+		assert.Equal(t, strings.Join([]string{
+			notServing + `retiring_keys of "alice" differs (1 vs 0); likely: ` + wantForcedCause + retiringCauses,
+			notServing + `retiring_until of "alice" differs (` + rotateUntil + ` or later vs none); likely: ` +
+				wantForcedCause + retiringCauses,
+		}, "\n"), res.err.Error())
+	})
+
+	for _, tc := range []struct {
+		name     string
+		routes   func(mux *http.ServeMux)
+		reported string
+	}{
+		{
+			name: "a binary without GET /secrets/{name}, which answers 405",
+			routes: func(mux *http.ServeMux) {
+				mux.HandleFunc("DELETE /secrets/{name}", func(w http.ResponseWriter, _ *http.Request) {
+					w.WriteHeader(http.StatusOK)
+				})
+			},
+			reported: "405 Method Not Allowed",
+		},
+		{
+			name:     "a binary without any /secrets route, which answers 404",
+			routes:   func(*http.ServeMux) {},
+			reported: "no secret of that name",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.Handle("GET /stats", stubMux([]string{mtglib.FeatureSecretsAPI}, nil))
+			mux.HandleFunc("POST /reload", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+			tc.routes(mux)
+
+			stub := newStubServer(t, mux)
+			files := filesBehind(t, stub.addr)
+
+			res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h", Reload: true, Force: true})
+			requireQuiet(t, res, files.old()...)
+
+			renewed := newValue(t, res)
+			requireQuiet(t, res, renewed)
+			require.Error(t, res.err)
+
+			assert.Equal(t, notServing+`the primary of "alice" differs (the written key, ee for old.example.com vs `+
+				tc.reported+`); likely: `+noReadCause, res.err.Error())
+		})
+	}
+}
+
 // stubAPI is a management API that answers as a test says, and records what it
 // was asked and with which credentials.
 type stubAPI struct {
@@ -513,11 +759,12 @@ func (s *stubAPI) asked() ([]string, []string) {
 // everyFeature is what a binary with secret-rotation advertises.
 var everyFeature = []string{mtglib.FeatureSecretRead, mtglib.FeatureSecretRotation, mtglib.FeatureSecretsAPI}
 
-// filesBehind is newRotateFiles with the management API at addr.
-func filesBehind(t *testing.T, addr string) rotateFiles {
+// filesBehind is newRotateFiles, with its blocks, and the management API at
+// addr.
+func filesBehind(t *testing.T, addr string, blocks ...string) rotateFiles {
 	t.Helper()
 
-	files := newRotateFiles(t)
+	files := newRotateFiles(t, blocks...)
 
 	data, err := os.ReadFile(files.path)
 	require.NoError(t, err)
@@ -566,22 +813,19 @@ func TestTheReloadPreCheckRefusesBeforeWriting(t *testing.T) {
 		assert.Equal(t, []string{"Bearer " + reloadToken}, auth, "the token is the config's")
 	})
 
-	t.Run("an API that cannot be reached", func(t *testing.T) {
-		closed := httptest.NewServer(http.NotFoundHandler())
-		addr := strings.TrimPrefix(closed.URL, "http://")
-		closed.Close()
+	// Port 1 on loopback, which the loop harness relies on too: nothing
+	// listens there, and no other process takes it in the meantime, as one
+	// could take a port a test has just closed.
+	const unreachable = "127.0.0.1:1"
 
-		refusedBy(t, filesBehind(t, addr), RotateSecret{Name: "alice", Overlap: "24h"},
-			"--reload: the proxy's management API at "+addr+" cannot be reached: ")
+	t.Run("an API that cannot be reached", func(t *testing.T) {
+		refusedBy(t, filesBehind(t, unreachable), RotateSecret{Name: "alice", Overlap: "24h"},
+			"--reload: the proxy's management API at "+unreachable+" cannot be reached: ")
 	})
 
 	t.Run("an API that cannot be reached, with --force", func(t *testing.T) {
-		closed := httptest.NewServer(http.NotFoundHandler())
-		addr := strings.TrimPrefix(closed.URL, "http://")
-		closed.Close()
-
-		refusedBy(t, filesBehind(t, addr), RotateSecret{Name: "alice", Overlap: "24h", Force: true},
-			"--reload: the proxy's management API at "+addr+" cannot be reached: ")
+		refusedBy(t, filesBehind(t, unreachable), RotateSecret{Name: "alice", Overlap: "24h", Force: true},
+			"--reload: the proxy's management API at "+unreachable+" cannot be reached: ")
 	})
 
 	t.Run("a token the API refuses", func(t *testing.T) {
@@ -775,32 +1019,44 @@ func rotateWithin(t *testing.T, bound time.Duration, run RotateSecret) rotateRes
 	}
 }
 
+// stall is a handler that first runs during -- once, whatever number of
+// requests reach it: a second interrupt would block on the run's one-slot
+// channel -- and then holds its request until the run gives it up, or the test
+// ends.
+func stall(t *testing.T, during func(w http.ResponseWriter)) http.HandlerFunc {
+	t.Helper()
+
+	released := make(chan struct{})
+	t.Cleanup(func() { close(released) })
+
+	var once sync.Once
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { during(w) })
+
+		select {
+		case <-r.Context().Done():
+		case <-released:
+		}
+	}
+}
+
+// interruptingAt is stall's during for an interrupt as the request arrives.
+func interruptingAt(interrupt func()) func(http.ResponseWriter) {
+	return func(http.ResponseWriter) { interrupt() }
+}
+
 // Task 9b's carry: the first interrupt, which the run already catches, ends a
 // wait on the network too. Before the rename nothing is written; after it the
 // rotation is complete in the file, the run says the reload was not finished,
-// and exits 0, as an interrupt after the rename always does.
+// and exits 0, as an interrupt after the rename always does -- the body of an
+// answer being read included (Task 10's review, M-4).
 func TestAnInterruptEndsAStalledReload(t *testing.T) {
-	stall := func(t *testing.T, interrupt func()) http.HandlerFunc {
-		t.Helper()
-
-		released := make(chan struct{})
-		t.Cleanup(func() { close(released) })
-
-		return func(_ http.ResponseWriter, r *http.Request) {
-			interrupt()
-
-			select {
-			case <-r.Context().Done():
-			case <-released:
-			}
-		}
-	}
-
 	t.Run("in the pre-check", func(t *testing.T) {
 		interrupt := interruptSeam(t)
 		generated := recordGenerations(t, nil)
 
-		stub := newStubServer(t, stall(t, interrupt))
+		stub := newStubServer(t, stall(t, interruptingAt(interrupt)))
 		files := filesBehind(t, stub.addr)
 		before := listing(t, files.dir)
 
@@ -814,10 +1070,10 @@ func TestAnInterruptEndsAStalledReload(t *testing.T) {
 		assert.Equal(t, before, listing(t, files.dir))
 	})
 
-	t.Run("in the reload, after the rename", func(t *testing.T) {
-		interrupt := interruptSeam(t)
+	afterTheRename := func(t *testing.T, handler http.Handler) {
+		t.Helper()
 
-		stub := newStubAPI(t, everyFeature, stall(t, interrupt))
+		stub := newStubServer(t, handler)
 		files := filesBehind(t, stub.addr)
 
 		res := rotateWithin(t, 10*time.Second, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h", Reload: true})
@@ -833,5 +1089,111 @@ func TestAnInterruptEndsAStalledReload(t *testing.T) {
 		assert.NotContains(t, res.stderr, "reloaded the proxy")
 		assert.True(t, readSecrets(t, files.path).Secrets["alice"] == renewed, "the file is not rotated")
 		assert.Equal(t, []string{"config.toml"}, names(listing(t, files.dir)), "the lock or a temporary file is left")
+	}
+
+	t.Run("in the reload, after the rename", func(t *testing.T) {
+		afterTheRename(t, stubMux(everyFeature, stall(t, interruptingAt(interruptSeam(t)))))
 	})
+
+	// The read-back's answer has begun -- its headers and part of its body --
+	// when the interrupt arrives (the reviewer's probe). The pause lets the
+	// run take the headers and start on the body first: an interrupt that
+	// beat the headers would be the case above.
+	t.Run("in the body of a read-back answer", func(t *testing.T) {
+		interrupt := interruptSeam(t)
+
+		mux := http.NewServeMux()
+		mux.Handle("GET /stats", stubMux(everyFeature, nil))
+		mux.HandleFunc("POST /reload", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+		mux.HandleFunc("GET /secrets/{name}", stall(t, func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"name":"alice","secret":"`)) //nolint: errcheck
+			http.NewResponseController(w).Flush()         //nolint: errcheck
+
+			time.Sleep(200 * time.Millisecond)
+			interrupt()
+		}))
+
+		afterTheRename(t, mux)
+	})
+}
+
+// lockedBuffer is a writer a test can read while the run writes to it.
+type lockedBuffer struct {
+	mu   sync.Mutex
+	text strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.text.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.text.String()
+}
+
+// Task 10's review, M-5: the new value is on stdout before the reload starts,
+// so that a run killed while the API stalls -- a second interrupt, kill, a
+// closed terminal -- has printed it. Seen from inside the stalled POST.
+func TestTheNewValueIsPrintedBeforeTheReload(t *testing.T) {
+	interrupt := interruptSeam(t)
+
+	var stdout, stderr lockedBuffer
+
+	printed := make(chan string, 1)
+
+	stub := newStubServer(t, stubMux(everyFeature, stall(t, func(http.ResponseWriter) {
+		printed <- stdout.String()
+
+		interrupt()
+	})))
+	files := filesBehind(t, stub.addr)
+
+	done := make(chan error, 1)
+
+	go func() {
+		r := RotateSecret{
+			ConfigPath: files.path, Name: "alice", Overlap: "24h", Reload: true,
+			out: &stdout, errOut: &stderr, now: func() time.Time { return rotateNow },
+		}
+		done <- r.Run(nil, "test")
+	}()
+
+	var err error
+
+	select {
+	case err = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run did not end: a stalled API holds it")
+	}
+
+	res := rotateResult{stdout: stdout.String(), stderr: stderr.String(), err: err}
+	requireQuiet(t, res, files.old()...)
+
+	renewed := newValue(t, res)
+	requireQuiet(t, res, renewed)
+	require.NoError(t, res.err)
+
+	select {
+	case during := <-printed:
+		assert.True(t, during == res.stdout, "the value was not on stdout, alone, when the reload was sent")
+	default:
+		t.Fatal("the reload was never sent")
+	}
+}
+
+// statusLine prints a code with no standard text without a trailing space
+// (Task 10's review, N-6).
+func TestTheStatusLineIsTheCodeAndItsText(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "500 Internal Server Error", statusLine(http.StatusInternalServerError))
+	assert.Equal(t, "599", statusLine(599))
 }
