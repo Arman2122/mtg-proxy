@@ -26,13 +26,23 @@ import (
 //     file would admit, for a moment, a handle with WRITE_DAC or WRITE_OWNER
 //     -- rights no sharing mode refuses -- through which the config's list
 //     could be rewritten after the rename.
+//   - Its mandatory label is the runner's own integrity level, no-write-up,
+//     no-read-up and no-execute-up (I-C of the fourth review), in place of
+//     the directory's: in a directory whose new files get a Low label, a
+//     low-integrity process of the runner's own user would otherwise open
+//     WRITE_DAC or WRITE_OWNER on it in that moment, and later relabel and
+//     read the config its label kept it from.
 //   - Share mode 0 (I-A of the second review): no handle with data access can
 //     be opened on it while it is written.
 //
 // The runner's full control also keeps the file deletable on every failure
-// path until the config's list is copied on. CREATE_NEW is O_EXCL, and the
-// handle is not inherited by child processes, as Go's are not. On a file
-// system with no security (FAT) the list is ignored.
+// path until the config's list is copied on -- except when the token's user
+// SID is deny-only (a restricted token): the run then cannot set the list,
+// refuses, and may leave a named leftover, narrower than the config. CREATE_NEW
+// is O_EXCL, and the handle is not inherited by child processes, as Go's are
+// not. On a file system with no security (FAT) the descriptor is ignored; a
+// file system that rejects a label at creation (some SMB servers, ReFS or FAT
+// configurations; not tried here) fails the create, and the run refuses.
 func openTemp(path string) (tempFile, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
@@ -62,14 +72,48 @@ func openTemp(path string) (tempFile, error) {
 }
 
 // privateDescriptor is a protected list granting the process token's user
-// full control, and no one else anything.
+// full control, and no one else anything, with a mandatory label at the
+// token's own integrity level that refuses lower levels every access.
 func privateDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	token := windows.GetCurrentProcessToken()
+
+	user, err := token.GetTokenUser()
 	if err != nil {
 		return nil, err //nolint: wrapcheck // worded by the caller
 	}
 
-	return windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + user.User.Sid.String() + ")") //nolint: wrapcheck
+	level, err := integrityLevel(token)
+	if err != nil {
+		return nil, err
+	}
+
+	return windows.SecurityDescriptorFromString( //nolint: wrapcheck // worded by the caller
+		"D:P(A;;FA;;;" + user.User.Sid.String() + ")S:(ML;;NWNRNX;;;" + level + ")")
+}
+
+// integrityLevel is token's integrity level, as a SID string.
+func integrityLevel(token windows.Token) (string, error) {
+	size := uint32(64)
+
+	for {
+		buf := make([]byte, size)
+		needed := size
+
+		err := windows.GetTokenInformation(token, windows.TokenIntegrityLevel, &buf[0], size, &needed)
+		if err == nil {
+			// The buffer holds a TOKEN_MANDATORY_LABEL and the SID it points
+			// into, read as x/sys reads its own token structures.
+			label := (*windows.Tokenmandatorylabel)(unsafe.Pointer(&buf[0])) //nolint: gosec // see above
+
+			return label.Label.Sid.String(), nil
+		}
+
+		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) || needed <= size {
+			return "", err //nolint: wrapcheck // worded by the caller
+		}
+
+		size = needed
+	}
 }
 
 // checkReplaceable refuses, before anything is created:
@@ -120,7 +164,7 @@ func encryptedRefusal(target string, attributes uint32) error {
 	}
 
 	return fmt.Errorf(`rotate-secret cannot keep a file encrypted with EFS; decrypt it with cipher /d "%s", `+
-		"rotate, and encrypt it again", target)
+		`rotate, and encrypt it again with cipher /e "%s"`, target, target)
 }
 
 // keepPermissions gives the temporary file the target's read-only attribute
@@ -146,9 +190,12 @@ func keepPermissions(file tempFile, tmp, target string, info fs.FileInfo) error 
 	return keepSecurity(tmp, target)
 }
 
-// keepSecurity copies the target's DACL, and its mandatory label when it has
-// one, onto tmp exactly: the entries as they are, the inherited ones
-// included, and protected or not as the target's are. The low-level
+// keepSecurity copies the target's DACL and its mandatory label onto tmp
+// exactly: the entries as they are, the inherited ones included, and
+// protected or not as the target's are. The label is always set: a target
+// without one gives the temporary file none, removing the label it was born
+// with (m-E of the fourth review: an unlabelled config in a directory that
+// labels new files, which a Low label would otherwise make wider). The low-level
 // SetKernelObjectSecurity does that; the high-level SetNamedSecurityInfo
 // would recompute the inherited entries from this directory, which differ for
 // a config moved here from another one, or one created by another user under
@@ -202,42 +249,38 @@ func keepSecurity(tmp, target string) error {
 		}
 	}
 
-	if err := setSecurity(tmp, target, sd, hasLabel(sd)); err != nil {
+	if err := setSecurity(tmp, target, sd); err != nil {
 		return err
 	}
 
 	return sameSecurity(tmp, target, want)
 }
 
-// hasLabel reports whether sd carries a mandatory label.
-func hasLabel(sd *windows.SECURITY_DESCRIPTOR) bool {
-	sacl, _, err := sd.SACL()
-
-	return err == nil && sacl != nil && sacl.AceCount > 0
-}
-
 // setKernelObjectSecurity is windows.SetKernelObjectSecurity, a variable so
 // that a test can make the copy fail, or come out different.
 var setKernelObjectSecurity = windows.SetKernelObjectSecurity
 
-// setSecurity sets sd's DACL, and its label when label is true, on tmp through
-// a handle of its own that asks for READ_CONTROL, WRITE_DAC and (for the
-// label) WRITE_OWNER: the born-private list grants them to the runner, and
-// sharing does not govern them, so the exclusive handle the file is written
-// through does not stand in the way. Rights granted when a handle is opened
-// stay with it, so the label is set whatever the copied list says.
-func setSecurity(tmp, target string, sd *windows.SECURITY_DESCRIPTOR, label bool) error {
-	access := uint32(windows.READ_CONTROL | windows.WRITE_DAC)
-	if label {
-		access |= windows.WRITE_OWNER
-	}
-
+// setSecurity sets sd's DACL, then its label, on tmp through a handle of its
+// own that asks for READ_CONTROL, WRITE_DAC and WRITE_OWNER: the born-private
+// list grants them to the runner, and sharing does not govern them, so the
+// exclusive handle the file is written through does not stand in the way.
+// Rights granted when a handle is opened stay with it, so the label is set
+// whatever the copied list says.
+//
+// The order, the list first, keeps the file at least as narrow as both its
+// birth and its end at every step: between the two calls it has the
+// config's list under the born label -- the runner's own integrity,
+// refusing every lower one -- which no lower process can open, and the
+// config's list admits no one the config does not. (The label first would do
+// as well; it is pinned by what a low-integrity process can open, not by the
+// order.)
+func setSecurity(tmp, target string, sd *windows.SECURITY_DESCRIPTOR) error {
 	name, err := windows.UTF16PtrFromString(tmp)
 	if err != nil {
 		return aclRefusal(target, err)
 	}
 
-	handle, err := windows.CreateFile(name, access,
+	handle, err := windows.CreateFile(name, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, 0, 0)
 	if err != nil {
 		return aclRefusal(target, err)
@@ -247,10 +290,6 @@ func setSecurity(tmp, target string, sd *windows.SECURITY_DESCRIPTOR, label bool
 
 	if err := setKernelObjectSecurity(handle, windows.DACL_SECURITY_INFORMATION, sd); err != nil {
 		return aclRefusal(target, err)
-	}
-
-	if !label {
-		return nil
 	}
 
 	if err := setKernelObjectSecurity(handle, windows.LABEL_SECURITY_INFORMATION, sd); err != nil {
@@ -273,9 +312,12 @@ func aclRefusal(target string, err error) error {
 // flag -- the high-level reading of the target adds an owner and a group that
 // were not asked for and reports the list protected, and the new file is
 // stored protected, "D:P(...)" where the original was "D:(...)", with
-// identical access. The label ("S:") must be the same too. The message says
-// what is known -- the copy came out different -- and the remedy that gives
-// the file the simplest list to copy: its own entries, protected.
+// identical access. The label ("S:") must be the same too; a label part with
+// no entry -- what removing a label leaves, "S:NO_ACCESS_CONTROL" -- is no
+// label. The message says what is known -- the copy came out different --
+// and the remedy for what differs: for the list, its own entries, protected
+// (the simplest list to copy); for the label, the file's own label, at the
+// level the config has (Medium, the default, when it has none).
 func sameSecurity(tmp, target, want string) error {
 	got, err := windows.GetNamedSecurityInfo(tmp, windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.LABEL_SECURITY_INFORMATION)
@@ -290,12 +332,31 @@ func sameSecurity(tmp, target, want string) error {
 		gotDACL, gotLabel = sddlParts(got.String())
 	}
 
-	if wantDACL == "" || gotDACL != wantDACL || gotLabel != wantLabel {
+	if wantDACL == "" || gotDACL != wantDACL {
 		return fmt.Errorf("the new file would not get the access control list of %s: the copy differs from the original; "+
 			`give the file a list of its own with icacls "%s" /inheritance:d, and retry`, target, target)
 	}
 
+	if gotLabel != wantLabel {
+		return fmt.Errorf("the new file would not get the integrity label of %s: the copy differs from the original; "+
+			`give the file its own label with icacls "%s" /setintegritylevel %s, and retry`,
+			target, target, labelLevel(wantLabel))
+	}
+
 	return nil
+}
+
+// labelLevel is the icacls level letter of a label's SDDL: L, M or H; M, the
+// default, for no label or one icacls cannot name.
+func labelLevel(label string) string {
+	switch {
+	case strings.Contains(label, ";LW)"):
+		return "L"
+	case strings.Contains(label, ";HI)"), strings.Contains(label, ";SI)"):
+		return "H"
+	default:
+		return "M"
+	}
 }
 
 // sddlParts is a descriptor's SDDL cut into its DACL ("D:" up to any "S:")
@@ -307,6 +368,12 @@ func sddlParts(sddl string) (string, string) {
 
 	if at := strings.Index(sddl, "S:"); at >= 0 {
 		sddl, label = sddl[:at], sddl[at:]
+	}
+
+	// A label part with no entry ("S:NO_ACCESS_CONTROL", what removing a
+	// label leaves) is no label.
+	if !strings.Contains(label, "(") {
+		label = ""
 	}
 
 	if at := strings.Index(sddl, "D:"); at >= 0 {

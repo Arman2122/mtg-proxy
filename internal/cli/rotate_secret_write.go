@@ -74,10 +74,9 @@ const (
 
 // checkWritable is §7.4 step 2 for the file: it must be a regular file that
 // can be opened for writing, and (on Windows) one this user can replace and
-// that is not encrypted with EFS. A
-// read-only config is a statement, so this holds even where a rename would
-// succeed. The file is closed at once: an open handle would stop the rename
-// on Windows.
+// that is not encrypted with EFS. A read-only config is a statement, so this
+// holds even where a rename would succeed. The file is closed at once: an
+// open handle would stop the rename on Windows.
 func checkWritable(target string) (fs.FileInfo, error) {
 	info, err := os.Stat(target)
 	if err != nil {
