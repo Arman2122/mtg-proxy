@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/internal/config"
@@ -54,6 +56,17 @@ var generateSecret = mtglib.GenerateSecretMode
 // nothingWritten ends every refusal, and every failure before the rename (§7.7).
 const nothingWritten = "nothing was written"
 
+// notifySignals and stopSignals are signal.Notify and signal.Stop, variables
+// so that a test can deliver an interrupt at a chosen point of a run.
+var (
+	notifySignals = signal.Notify
+	stopSignals   = signal.Stop
+)
+
+// errInterrupted is an interrupt that arrived before the rename: the run
+// stops there, and its defers remove the temporary file and the lock.
+var errInterrupted = errors.New("interrupted; nothing was written")
+
 // errOverlapMissing is a rotation without --overlap: for a security action the
 // grant must be stated (D32).
 var errOverlapMissing = errors.New("say how long the previous key stays accepted: " +
@@ -83,6 +96,13 @@ func (r *RotateSecret) Run(_ *CLI, _ string) error {
 
 	if r.now == nil {
 		r.now = time.Now
+	}
+
+	if signals := pipeSignals(); len(signals) > 0 {
+		pipe := make(chan os.Signal, 1)
+
+		notifySignals(pipe, signals...)
+		defer stopSignals(pipe)
 	}
 
 	written, err := r.run()
@@ -139,6 +159,29 @@ func (r *RotateSecret) run() (bool, error) {
 	info, err := checkWritable(target)
 	if err != nil {
 		return false, err
+	}
+
+	names := linkCount(target, info)
+
+	// From here an interrupt (Ctrl-C, SIGTERM) does not kill the process: it
+	// is noted, the run stops cleanly at the rename if it came before it, and
+	// the defers below -- the lock's removal first -- run either way. No
+	// cleanup is done inside a signal handler. The run is milliseconds of
+	// local file work.
+	interrupts := make(chan os.Signal, 1)
+
+	notifySignals(interrupts, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals(interrupts)
+
+	caught := false
+	interrupted := func() bool {
+		select {
+		case <-interrupts:
+			caught = true
+		default:
+		}
+
+		return caught
 	}
 
 	// 5. The lock, held until the run ends.
@@ -225,8 +268,17 @@ func (r *RotateSecret) run() (bool, error) {
 		return false, err
 	}
 
-	// 10, 11. The hash check, just before the rename, and the atomic write.
-	if err := writeAtomically(target, info, edited, readSum); err != nil {
+	// 10, 11. The atomic write; just before its rename, an interrupt stops
+	// the run and the hash check aborts on another writer.
+	beforeRename := func() error {
+		if interrupted() {
+			return errInterrupted
+		}
+
+		return nil
+	}
+
+	if err := writeAtomically(target, info, edited, readSum, beforeRename); err != nil {
 		return false, err
 	}
 
@@ -238,6 +290,20 @@ func (r *RotateSecret) run() (bool, error) {
 	for _, line := range report(done) {
 		r.say("%s", line)
 	}
+
+	if names > 1 {
+		r.say("warning: the config has %d names (hard links); the others keep the previous file: replace them by hand",
+			names)
+	}
+
+	// An interrupt after the rename stops nothing: the rotation is complete,
+	// and exiting non-zero would invite a second one. It is said, and the run
+	// ends as the success it is.
+	defer func() {
+		if interrupted() {
+			r.say("warning: interrupted after the file was written; the rotation is complete")
+		}
+	}()
 
 	if !rotate {
 		return true, nil
@@ -287,6 +353,9 @@ func (r *RotateSecret) checkFlags() (time.Duration, error) {
 			"or 0 to retire it at once")
 	case overlap > mtglib.MaxRetiringOverlap:
 		return 0, errors.New("--overlap is at most 720h: an overlap is a migration window, not a second key")
+	case overlap > 0 && overlap < time.Second:
+		return 0, errors.New("--overlap below 1s cannot be written: an until is whole seconds; " +
+			"give at least 1s, or 0 to retire the key at once")
 	}
 
 	return overlap, nil

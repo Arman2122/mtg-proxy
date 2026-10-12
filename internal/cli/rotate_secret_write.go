@@ -7,8 +7,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -18,8 +22,30 @@ import (
 // old inode is never written through, and no copy of the old file is ever
 // made -- a backup would be a second file holding every secret with the leaked
 // key as the primary (M3 of the review), and restoring it would revive that
-// key. A temporary file is removed on every failure before the rename; only a
-// crash can leave one behind.
+// key. A temporary file is removed on every failure before the rename, and a
+// removal that fails is said; only a crash can leave one behind unsaid.
+
+// tempFile is what the run writes the new file through: an *os.File, behind
+// an interface so that a test can make each step fail.
+type tempFile interface {
+	io.Writer
+	Chmod(mode fs.FileMode) error
+	Chown(uid, gid int) error
+	Stat() (fs.FileInfo, error)
+	Sync() error
+	Close() error
+}
+
+// createTemp creates the temporary file, 0600 and exclusively. A variable so
+// that a test can see the mode it is created with, and hand back a file whose
+// write, sync or close fails.
+var createTemp = func(path string) (tempFile, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+}
+
+// removeTemp removes the temporary file after a failure: os.Remove, a
+// variable so that a test can make it fail.
+var removeTemp = os.Remove
 
 // renameFile replaces the target with the written temporary file: os.Rename,
 // a variable so that a test can make it fail as a mount point does.
@@ -57,14 +83,26 @@ func checkWritable(target string) (fs.FileInfo, error) {
 
 	file, err := os.OpenFile(target, os.O_WRONLY, 0)
 	if err != nil {
-		return nil, fmt.Errorf("the config file is not writable: %w", err)
+		return nil, notWritable(err)
 	}
 
 	if err := file.Close(); err != nil {
-		return nil, fmt.Errorf("the config file is not writable: %w", err)
+		return nil, notWritable(err)
 	}
 
 	return info, nil
+}
+
+// notWritable is the refusal for a file that cannot be opened for writing. A
+// read-only file system is most often the documented Docker form, a
+// single-file bind mount with :ro, so it gets §7.4's remedy.
+func notWritable(err error) error {
+	if errors.Is(err, syscall.EROFS) {
+		return fmt.Errorf("the config file is not writable: %w (a read-only mount? run rotate-secret on the host, "+
+			"and mount the config's directory into the container)", err)
+	}
+
+	return fmt.Errorf("the config file is not writable: %w", err)
 }
 
 // takeLock is §7.4 step 3: <target>.rotate.lock, created with O_EXCL, holding
@@ -79,7 +117,7 @@ func takeLock(target string, now time.Time) (string, error) {
 
 	switch {
 	case errors.Is(err, fs.ErrExist):
-		return "", lockHeld(lock, now)
+		return "", lockHeld(target, lock, now)
 	case err != nil:
 		return "", fmt.Errorf("the config's directory cannot take a new file: %w", err)
 	}
@@ -97,31 +135,73 @@ func takeLock(target string, now time.Time) (string, error) {
 }
 
 // lockHeld is the refusal for a lock that exists. Its age is from its own
-// modification time, which is its creation: the file is written once.
-func lockHeld(lock string, now time.Time) error {
+// modification time, which is its creation: the file is written once. A
+// temporary file beside the target is named too: a run that held the lock and
+// died left it, and it holds every secret of the config.
+func lockHeld(target, lock string, now time.Time) error {
 	age := "an unknown time"
 
 	if info, err := os.Stat(lock); err == nil {
 		age = max(now.Sub(info.ModTime()).Round(time.Second), 0).String()
 	}
 
-	return fmt.Errorf("another rotate-secret holds %s (started %s ago); if none is running, remove it and retry",
-		lock, age)
+	var leftovers strings.Builder
+
+	for _, tmp := range leftoverTemps(target) {
+		fmt.Fprintf(&leftovers, "; %s was left by a crashed run and holds the config's secrets: delete it", tmp)
+	}
+
+	return fmt.Errorf("another rotate-secret holds %s (started %s ago); if none is running, remove it and retry%s",
+		lock, age, leftovers.String())
+}
+
+// leftoverTemps are the temporary files beside target, by the name the run
+// gives them, in order.
+func leftoverTemps(target string) []string {
+	entries, err := os.ReadDir(filepath.Dir(target))
+	if err != nil {
+		return nil
+	}
+
+	prefix := filepath.Base(target) + tempInfix
+
+	var found []string
+
+	for _, entry := range entries {
+		random, ok := strings.CutPrefix(entry.Name(), prefix)
+		if !ok {
+			continue
+		}
+
+		random, ok = strings.CutSuffix(random, tempSuffix)
+		if _, err := hex.DecodeString(random); ok && err == nil && len(random) == 8 {
+			found = append(found, filepath.Join(filepath.Dir(target), entry.Name()))
+		}
+	}
+
+	slices.Sort(found)
+
+	return found
 }
 
 // writeAtomically is §7.4 steps 4 and 5: a temporary file beside the target,
-// created 0600, written, given the target's permission bits and (on Unix) its
-// owner, synced and closed; then the target is read again, and if it no
-// longer hashes to readSum -- another writer, an editor or the panel, changed
-// it since the run read it -- nothing is replaced; otherwise the temporary
-// file is renamed over it. Any failure removes the temporary file.
-func writeAtomically(target string, info fs.FileInfo, data []byte, readSum [sha256.Size]byte) error {
+// created 0600 and given the target's permissions -- on Unix its owner, then
+// its mode bits; on Windows its access control list -- before a byte of the
+// new file is in it; then written, synced and closed. Just before the rename,
+// beforeRename may stop the run (an interrupt), and the target is read again:
+// if it no longer hashes to readSum -- another writer, an editor or the panel,
+// changed it since the run read it -- nothing is replaced. Otherwise the
+// temporary file is renamed over it. Any failure removes the temporary file,
+// and a removal that fails is added to the error.
+func writeAtomically(target string, info fs.FileInfo, data []byte, readSum [sha256.Size]byte,
+	beforeRename func() error,
+) (err error) {
 	tmp, err := tempPath(target)
 	if err != nil {
 		return err
 	}
 
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := createTemp(tmp)
 	if err != nil {
 		return fmt.Errorf("cannot create the temporary file %s: %w", tmp, err)
 	}
@@ -134,24 +214,24 @@ func writeAtomically(target string, info fs.FileInfo, data []byte, readSum [sha2
 			file.Close() //nolint: errcheck // a failure is already being returned
 		}
 
-		if !renamed {
-			os.Remove(tmp) //nolint: errcheck // nothing more can be done about it
+		if renamed {
+			return
+		}
+
+		if rmErr := removeTemp(tmp); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("the temporary file %s could not be removed (%w): "+
+				"delete it (it holds the config's secrets)", tmp, rmErr))
 		}
 	}()
+
+	if err := keepPermissions(file, tmp, target, info); err != nil {
+		return err
+	}
 
 	if _, err := file.Write(data); err != nil {
 		return fmt.Errorf("cannot write the temporary file %s: %w", tmp, err)
 	}
 
-	if err := file.Chmod(info.Mode().Perm()); err != nil {
-		return fmt.Errorf("cannot give the temporary file %s the permissions of %s: %w", tmp, target, err)
-	}
-
-	if err := keepOwner(file, target, info); err != nil {
-		return err
-	}
-
-	// After the mode and the owner, so that they are durable too.
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("cannot sync the temporary file %s: %w", tmp, err)
 	}
@@ -160,6 +240,10 @@ func writeAtomically(target string, info fs.FileInfo, data []byte, readSum [sha2
 
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("cannot close the temporary file %s: %w", tmp, err)
+	}
+
+	if err := beforeRename(); err != nil {
+		return err
 	}
 
 	current, err := os.ReadFile(target)
@@ -172,22 +256,29 @@ func writeAtomically(target string, info fs.FileInfo, data []byte, readSum [sha2
 	}
 
 	if err := renameFile(tmp, target); err != nil {
-		if errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EXDEV) {
-			return fmt.Errorf("cannot replace %s: it is a mount point (a single-file bind mount?); "+
-				"run rotate-secret on the host, and mount the config's directory into the container", target)
-		}
-
-		// The paths are in the message already.
-		if linkErr := (*os.LinkError)(nil); errors.As(err, &linkErr) {
-			err = linkErr.Err
-		}
-
-		return fmt.Errorf("cannot replace %s: %w", target, err)
+		return replaceRefusal(target, err)
 	}
 
 	renamed = true
 
 	return nil
+}
+
+// replaceRefusal is a failed rename in words: a mount point (EBUSY, EXDEV) is
+// §7.4's message; anything else is the error itself, with the platform's hint
+// (on Windows, a file another program holds open).
+func replaceRefusal(target string, err error) error {
+	if errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EXDEV) {
+		return fmt.Errorf("cannot replace %s: it is a mount point (a single-file bind mount?); "+
+			"run rotate-secret on the host, and mount the config's directory into the container", target)
+	}
+
+	// The paths are in the message already.
+	if linkErr := (*os.LinkError)(nil); errors.As(err, &linkErr) {
+		err = linkErr.Err
+	}
+
+	return fmt.Errorf("cannot replace %s: %w%s", target, err, renameHint(err))
 }
 
 // tempPath is <target>.rotate-<8 random hex>.tmp, beside the target.

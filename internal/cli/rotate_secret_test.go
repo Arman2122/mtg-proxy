@@ -333,9 +333,17 @@ func TestTheLockIsHeldWhileTheRunWorks(t *testing.T) {
 	var (
 		held   []byte
 		second rotateResult
+		nested bool
 	)
 
 	recordGenerations(t, func() {
+		// Once: a lock that did not stop the second run would bring it here
+		// too, and every run after it, without end.
+		if nested {
+			return
+		}
+
+		nested = true
 		held, _ = os.ReadFile(lock)
 		second = runRotate(t, RotateSecret{ConfigPath: files.path, Name: "bob", Overlap: "1h"})
 	})
@@ -709,21 +717,28 @@ func TestADryRunWritesNothingAndGeneratesNoKey(t *testing.T) {
 func TestRotateSecretRefuses(t *testing.T) {
 	const overlapMissing = "say how long the previous key stays accepted: --overlap 24h, or --overlap 0 to retire it at once"
 
-	fourBlocks := func(t *testing.T) []string {
+	// The blocks, and the retiring values they hold: no message may print
+	// those either.
+	fourBlocks := func(t *testing.T) ([]string, []mtglib.Secret) {
 		t.Helper()
 
-		var blocks []string
+		var (
+			blocks []string
+			values []mtglib.Secret
+		)
+
 		for i := range 4 {
-			blocks = append(blocks, retiringBlock("alice", mustGenerate(t, mtglib.SecretModeFakeTLS, "older.example.com"),
-				rfc3339(rotateNow.Add(time.Duration(i+1)*time.Hour))))
+			value := mustGenerate(t, mtglib.SecretModeFakeTLS, "older.example.com")
+			blocks = append(blocks, retiringBlock("alice", value, rfc3339(rotateNow.Add(time.Duration(i+1)*time.Hour))))
+			values = append(values, value)
 		}
 
-		return blocks
+		return blocks, values
 	}
 
 	for _, tc := range []struct {
 		name   string
-		blocks func(t *testing.T) []string
+		blocks func(t *testing.T) ([]string, []mtglib.Secret)
 		run    RotateSecret
 		want   string
 	}{
@@ -733,6 +748,8 @@ func TestRotateSecretRefuses(t *testing.T) {
 		{name: "an overlap over 720h", run: RotateSecret{Name: "alice", Overlap: "720h1s"}, want: "--overlap is at most 720h"},
 		{name: "an overlap of 31 days", run: RotateSecret{Name: "alice", Overlap: "744h"}, want: "--overlap is at most 720h"},
 		{name: "a negative overlap", run: RotateSecret{Name: "alice", Overlap: "-1h"}, want: "--overlap cannot be negative"},
+		{name: "an overlap below 1s", run: RotateSecret{Name: "alice", Overlap: "500ms"}, want: "--overlap below 1s cannot be written"},
+		{name: "an overlap of 1ns", run: RotateSecret{Name: "alice", Overlap: "1ns"}, want: "--overlap below 1s cannot be written"},
 		{name: "an overlap that is not a duration", run: RotateSecret{Name: "alice", Overlap: "a day"}, want: "--overlap takes a Go duration"},
 		{
 			name: "--overlap with --end-overlap",
@@ -771,9 +788,13 @@ func TestRotateSecretRefuses(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			generated := recordGenerations(t, nil)
 
-			var blocks []string
+			var (
+				blocks   []string
+				retiring []mtglib.Secret
+			)
+
 			if tc.blocks != nil {
-				blocks = tc.blocks(t)
+				blocks, retiring = tc.blocks(t)
 			}
 
 			files := newRotateFiles(t, blocks...)
@@ -783,7 +804,8 @@ func TestRotateSecretRefuses(t *testing.T) {
 			run.ConfigPath = files.path
 
 			res := runRotate(t, run)
-			require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
+			require.Empty(t, retiringLeaks(res.printed(), append(files.old(), retiring...)...),
+				"the refusal carries an old value")
 			require.Error(t, res.err)
 
 			assert.Contains(t, res.err.Error(), tc.want)
@@ -1121,4 +1143,285 @@ func TestTheRotateSecretCommandParses(t *testing.T) {
 	assert.Equal(t, RotateSecret{ConfigPath: path, Name: "alice", EndOverlap: true, Reload: true},
 		parse(t, path, "alice", "--end-overlap", "--reload"))
 	assert.Equal(t, RotateSecret{ConfigPath: path, Prune: true}, parse(t, path, "--prune"))
+}
+
+// R4: the lock is held up to the rename, not only while the key is made.
+func TestTheLockIsHeldAtTheRename(t *testing.T) {
+	files := newRotateFiles(t)
+	lock := resolved(t, files.path) + ".rotate.lock"
+
+	var held []bool
+
+	replaceRename(t, func(oldpath, newpath string) error {
+		_, err := os.Stat(lock)
+		held = append(held, err == nil)
+
+		return os.Rename(oldpath, newpath)
+	})
+
+	res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+	require.Empty(t, retiringLeaks(res.printed(), files.old()...), "stderr carries an old value")
+	require.NoError(t, res.err)
+
+	assert.Equal(t, []bool{true}, held, "the lock was not held at the rename")
+	assert.NoFileExists(t, lock)
+}
+
+// failingTemp is a temporary file one of whose steps fails.
+type failingTemp struct {
+	tempFile
+
+	fail string // "write", "sync" or "close"
+}
+
+func (f failingTemp) Write(p []byte) (int, error) {
+	if f.fail == "write" {
+		return 0, errors.New("the write is refused by the test")
+	}
+
+	return f.tempFile.Write(p)
+}
+
+func (f failingTemp) Sync() error {
+	if f.fail == "sync" {
+		return errors.New("the sync is refused by the test")
+	}
+
+	return f.tempFile.Sync()
+}
+
+func (f failingTemp) Close() error {
+	err := f.tempFile.Close()
+	if f.fail == "close" {
+		return errors.New("the close is refused by the test")
+	}
+
+	return err
+}
+
+// R6: a temporary file whose write, sync or close fails is closed, then
+// removed -- Windows cannot remove an open file -- and nothing is written.
+func TestATempFileThatFailsIsRemoved(t *testing.T) {
+	for _, tc := range []struct{ fail, want string }{
+		{fail: "write", want: "cannot write the temporary file"},
+		{fail: "sync", want: "cannot sync the temporary file"},
+		{fail: "close", want: "cannot close the temporary file"},
+	} {
+		t.Run(tc.fail, func(t *testing.T) {
+			files := newRotateFiles(t)
+			before := listing(t, files.dir)
+
+			var created []string
+
+			original := createTemp
+
+			t.Cleanup(func() { createTemp = original })
+
+			createTemp = func(path string) (tempFile, error) {
+				created = append(created, path)
+
+				file, err := original(path)
+				if err != nil {
+					return nil, err
+				}
+
+				return failingTemp{tempFile: file, fail: tc.fail}, nil
+			}
+
+			res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+			require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
+			require.Error(t, res.err)
+
+			assert.Contains(t, res.err.Error(), tc.want)
+			assert.Contains(t, res.err.Error(), "refused by the test")
+			assert.Contains(t, res.err.Error(), "nothing was written")
+			assert.NotContains(t, res.err.Error(), "could not be removed")
+			assert.Empty(t, res.stdout)
+
+			require.Len(t, created, 1)
+			assert.NoFileExists(t, created[0], "the temporary file is left behind")
+			assert.Equal(t, before, listing(t, files.dir))
+		})
+	}
+}
+
+// M-7 of the review: a temporary file that cannot be removed is named, with
+// what it holds, and left for the operator.
+func TestATempFileThatCannotBeRemovedIsNamed(t *testing.T) {
+	files := newRotateFiles(t)
+
+	var tmp string
+
+	replaceRename(t, func(oldpath, newpath string) error {
+		tmp = oldpath
+
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.EBUSY}
+	})
+
+	original := removeTemp
+
+	t.Cleanup(func() { removeTemp = original })
+
+	removeTemp = func(string) error { return errors.New("the removal is refused by the test") }
+
+	res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+	require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
+	require.Error(t, res.err)
+
+	t.Cleanup(func() { os.Remove(tmp) })
+
+	assert.Contains(t, res.err.Error(), "it is a mount point")
+	assert.Contains(t, res.err.Error(), "the temporary file "+tmp+" could not be removed (the removal is refused by the test): "+
+		"delete it (it holds the config's secrets)")
+	assert.Contains(t, res.err.Error(), "nothing was written")
+	assert.FileExists(t, tmp)
+	assert.Empty(t, res.stdout)
+}
+
+// M-1 (c) of the review: a lock refusal names a temporary file a crashed run
+// left beside the target, which holds every secret; it is not removed.
+func TestALeftoverTempIsNamedOnALockRefusal(t *testing.T) {
+	t.Parallel()
+
+	files := newRotateFiles(t)
+	target := resolved(t, files.path)
+	leftover := target + ".rotate-0123abcd.tmp"
+
+	require.NoError(t, os.WriteFile(target+".rotate.lock", []byte("pid 1\n"), 0o600))
+	require.NoError(t, os.WriteFile(leftover, []byte("left by a crash\n"), 0o600))
+	require.NoError(t, os.WriteFile(target+".rotate-nothex!.tmp", []byte("not ours\n"), 0o600))
+	require.NoError(t, os.WriteFile(target+".rotate-0123abcd.tmp.old", []byte("not ours\n"), 0o600))
+
+	before := listing(t, files.dir)
+
+	res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+	require.Empty(t, retiringLeaks(res.printed(), files.old()...), "the refusal carries an old value")
+	require.Error(t, res.err)
+
+	assert.Contains(t, res.err.Error(), "another rotate-secret holds ")
+	assert.Contains(t, res.err.Error(), "; "+leftover+" was left by a crashed run and holds the config's secrets: delete it")
+	assert.NotContains(t, res.err.Error(), "nothex")
+	assert.NotContains(t, res.err.Error(), ".tmp.old")
+	assert.Equal(t, before, listing(t, files.dir), "a refused run removed or wrote something")
+}
+
+// M-1 (b) of the review: an interrupt does not kill a run that holds the lock.
+// Before the rename it stops the run there, with nothing written and the
+// temporary file and the lock removed; after the rename the rotation is
+// complete, said, and a success. Either way the interrupts are let go only
+// after the lock is removed. Delivered through the notifySignals seam.
+func TestAnInterruptStopsTheRunCleanly(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		after bool // the interrupt comes after the rename
+	}{
+		{name: "before the rename"},
+		{name: "after the rename", after: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := newRotateFiles(t)
+			lock := resolved(t, files.path) + ".rotate.lock"
+			before := listing(t, files.dir)
+
+			var (
+				interrupts     chan<- os.Signal
+				stoppedAt      []bool // whether the lock existed when the interrupts were let go
+				notify, stop   = notifySignals, stopSignals
+				originalSyncer = syncDir
+			)
+
+			t.Cleanup(func() { notifySignals, stopSignals, syncDir = notify, stop, originalSyncer })
+
+			notifySignals = func(c chan<- os.Signal, signals ...os.Signal) {
+				if slices.Contains(signals, os.Interrupt) {
+					interrupts = c
+				}
+			}
+
+			stopSignals = func(c chan<- os.Signal) {
+				if c == interrupts {
+					_, err := os.Stat(lock)
+					stoppedAt = append(stoppedAt, err == nil)
+				}
+			}
+
+			interrupt := func() { interrupts <- os.Interrupt }
+
+			if tc.after {
+				syncDir = func(dir string) error {
+					interrupt()
+
+					return originalSyncer(dir)
+				}
+			} else {
+				recordGenerations(t, interrupt)
+			}
+
+			res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+			require.Empty(t, retiringLeaks(res.printed(), files.old()...), "a message carries an old value")
+
+			assert.Equal(t, []bool{false}, stoppedAt, "the interrupts were let go before the lock was removed")
+			assert.NoFileExists(t, lock)
+
+			if !tc.after {
+				require.Error(t, res.err)
+				assert.Contains(t, res.err.Error(), "interrupted; nothing was written")
+				assert.Empty(t, res.stdout)
+				assert.Equal(t, before, listing(t, files.dir), "an interrupted run changed the directory")
+
+				return
+			}
+
+			require.NoError(t, res.err, "a rotation the interrupt came too late to stop is a success")
+
+			_, oneLine := res.oneLine()
+			assert.True(t, oneLine, "the new value is not printed")
+			assert.Contains(t, res.stderr, "warning: interrupted after the file was written; the rotation is complete\n")
+			assert.Equal(t, []string{"config.toml"}, names(listing(t, files.dir)))
+		})
+	}
+}
+
+// M-4 of the review: a config with another name (a hard link) keeps the old
+// file under that name, the leaked key as its primary; the run says so.
+func TestAHardLinkedConfigIsWarnedAbout(t *testing.T) {
+	t.Parallel()
+
+	files := newRotateFiles(t)
+	other := filepath.Join(files.dir, "other-name.toml")
+
+	if err := os.Link(files.path, other); err != nil {
+		t.Skipf("this system does not make a hard link here: %v", err)
+	}
+
+	original, err := os.ReadFile(files.path)
+	require.NoError(t, err)
+
+	res := runRotate(t, RotateSecret{ConfigPath: files.path, Name: "alice", Overlap: "24h"})
+	require.Empty(t, retiringLeaks(res.printed(), files.old()...), "stderr carries an old value")
+	require.NoError(t, res.err)
+
+	assert.Contains(t, res.stderr,
+		"warning: the config has 2 names (hard links); the others keep the previous file: replace them by hand\n")
+
+	held, err := os.ReadFile(other)
+	require.NoError(t, err)
+	assert.True(t, bytes.Equal(original, held), "the other name does not hold the previous file")
+}
+
+// M-2 of the review: a read-only file system -- the documented Docker form, a
+// :ro single-file bind mount -- gets §7.4's remedy; another refusal does not.
+func TestAReadOnlyMountIsNamed(t *testing.T) {
+	t.Parallel()
+
+	const hint = "(a read-only mount? run rotate-secret on the host, and mount the config's directory into the container)"
+
+	readOnly := notWritable(&fs.PathError{Op: "open", Path: "/config/config.toml", Err: syscall.EROFS})
+	assert.Contains(t, readOnly.Error(), "the config file is not writable: ")
+	assert.Contains(t, readOnly.Error(), hint)
+	assert.ErrorIs(t, readOnly, syscall.EROFS)
+
+	denied := notWritable(&fs.PathError{Op: "open", Path: "/config/config.toml", Err: syscall.EACCES})
+	assert.Contains(t, denied.Error(), "the config file is not writable: ")
+	assert.NotContains(t, denied.Error(), "read-only mount")
 }
