@@ -940,6 +940,11 @@ retiring admission, and none is an address (not gated):
   the number fall.
 - **`retiring_last_seen` (D31)** is an `atomic.Int64` on `secretStats`, stamped in `admit` when
   `ctx.retiringUntil` is set. It answers "has anyone used the old link lately".
+  **Reset (revision 4, Task 7's review):** the stamp is cleared when a name gets its FIRST
+  unexpired retiring entry in a new set (it had none in the set being replaced), so a second
+  rotation never shows the previous overlap's last admission and invites an early
+  `--end-overlap`. The reset runs in the swap between the build and the `Swap` of the new set
+  (not after it: an admission through the new set's entry must not be wiped).
 - **Feature string:** `secret-rotation`, inserted sorted between `secret-read` and
   `secrets-api`. It means that `[[retiring-secret]]` is honoured, the four fields may appear,
   and the binary has `rotate-secret`. The pinned lists in `proxy_stats_features_test.go` are
