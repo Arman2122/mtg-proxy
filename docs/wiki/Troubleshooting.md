@@ -300,8 +300,10 @@ startup warning at all, which is another reason to run `doctor` deliberately.
 
 A FakeTLS ClientHello carries an encrypted timestamp. The proxy decrypts it and, if the
 difference from its own clock exceeds `tolerate-time-skewness`, treats the secret as
-unmatched — so the connection is fronted, exactly like a wrong secret. The default
-tolerance is **3 seconds**. (`example.config.toml` shows `5s`; that file demonstrates
+unmatched — so the connection is fronted, exactly like a wrong secret. A skewed
+clock also shows as `faketls_handshake.unmatched` climbing on `/stats`, and each
+such hello is charged to its address's scan bucket like any other no-match. The
+default tolerance is **3 seconds**. (`example.config.toml` shows `5s`; that file demonstrates
 options with sample values, and this is one where the sample is not the default.)
 
 Typical symptoms: nobody can connect after a host migration or a VM restore, or

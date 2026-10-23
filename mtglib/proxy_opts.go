@@ -267,6 +267,81 @@ type ProxyOpts struct {
 	// This is an optional setting.
 	TrackClientIPs bool
 
+	// HandshakeHints makes the FakeTLS door remember, per client address (an
+	// IPv4 address or an IPv6 /64), the names of up to 16 secrets that recently
+	// completed a handshake from it, and verify a hello from that address
+	// against those first. A returning client then costs one HMAC instead of a
+	// scan over every hosted secret. A hint is only an order to try things in:
+	// every hinted secret passes the same verification, so it never makes a
+	// wrong secret match, and a hello that matches nothing can neither read nor
+	// plant one. Loopback, private, link-local, unspecified and multicast
+	// addresses get none -- behind a carrier that does not forward the client
+	// address they would be one shared key, and a multicast address is no
+	// client at all.
+	//
+	// nil follows TrackClientIPs, and that default is the point: the cache holds
+	// address -> secret name in memory for 30 to 60 minutes after the last
+	// successful handshake, so it is on exactly when the operator has already
+	// chosen to keep client addresses past a connection. A non-nil value
+	// overrides it either way. Nothing here is logged, exported or written to
+	// disk.
+	//
+	// This is an optional setting.
+	HandshakeHints *bool
+
+	// HandshakeBudgetMode is what the FakeTLS door does with a hello it would
+	// have to scan every hosted secret for (one no hint matched) when that scan
+	// is over its CPU budget, or when the hello is above the scan cap of 128
+	// SHA-256 blocks (about 8 KiB; a real client sends 0.5 to 2 KiB):
+	//
+	//   - "enforce" (or empty, the default) lets a scan the budget can pay for
+	//     within 150 ms wait for it and run, and fronts any other hello at once to
+	//     the cover site exactly as a hello that matched nothing is fronted --
+	//     never closes it;
+	//   - "observe" keeps the same accounting but never waits and never refuses:
+	//     it counts what enforce would have refused, and the refused hellos that
+	//     then matched a secret, and scans anyway;
+	//   - "off" has no budget and no scan cap.
+	//
+	// The budget is in real CPU: the cost of a SHA-256 block on this machine is
+	// measured once per process. Under enforce a legitimate client with no hint
+	// can be fronted while a flood keeps the budget spent; it retries. With
+	// hints on (HandshakeHints), a client whose address matched a secret
+	// recently has its hinted candidates tried before, and outside, the budget;
+	// a hint miss falls through to a scan that is charged like any other.
+	//
+	// The zero values of this and the next two settings are the defaults:
+	// enforce, 50 ms per address, 25% of the cores.
+	//
+	// This is an optional setting.
+	HandshakeBudgetMode string
+
+	// HandshakeBudgetPerIPMillis is the scan CPU one client address (an IPv4
+	// address or an IPv6 /64) may spend per second, in milliseconds, with a
+	// burst of four seconds' worth. Loopback, private, link-local and other
+	// addresses that do not stand for one place have no bucket of their own;
+	// they share the process-wide one.
+	//
+	// nil is 50. 0 disables the per-address bucket, leaving only the
+	// process-wide one -- which is what peers behind a carrier that does not
+	// forward client addresses get anyway, since they all arrive from a loopback
+	// or private address. A front proxy on a public address that sends no PROXY
+	// header is the opposite case: every client arrives from that one address
+	// and shares one bucket, so 0 is what it wants. Above 1000 is invalid.
+	//
+	// This is an optional setting.
+	HandshakeBudgetPerIPMillis *uint
+
+	// HandshakeBudgetCPUPercent is the share of the cores (GOMAXPROCS, read
+	// once at start) the whole process may spend scanning, with a burst of one
+	// second's worth. This is the bound that holds against many addresses and
+	// against forged ones.
+	//
+	// 0 is 25. Above 100 is invalid.
+	//
+	// This is an optional setting.
+	HandshakeBudgetCPUPercent uint
+
 	// AllowFallbackOnUnknownDC defines how proxy behaves if unknown DC was
 	// requested. If this setting is set to false, then such connection will be
 	// rejected. Otherwise, proxy will chose any DC.
@@ -460,6 +535,19 @@ func (p ProxyOpts) valid() error {
 		return fmt.Errorf("invalid doppelganger shaping: %w", err)
 	}
 
+	if _, err := parseBudgetMode(p.HandshakeBudgetMode); err != nil {
+		return fmt.Errorf("invalid handshake budget: %w", err)
+	}
+
+	if ms := p.HandshakeBudgetPerIPMillis; ms != nil && *ms > maxBudgetPerIPMillis {
+		return fmt.Errorf("invalid handshake budget: %d ms per address is above %d", *ms, maxBudgetPerIPMillis)
+	}
+
+	if p.HandshakeBudgetCPUPercent > maxBudgetCPUPercent {
+		return fmt.Errorf("invalid handshake budget: %d%% of the cores is above %d%%",
+			p.HandshakeBudgetCPUPercent, maxBudgetCPUPercent)
+	}
+
 	secrets := p.getSecrets()
 	if len(secrets) == 0 {
 		return ErrSecretInvalid
@@ -486,6 +574,37 @@ func (p ProxyOpts) getSecrets() map[string]Secret {
 	}
 
 	return nil
+}
+
+// handshakeHints is whether the FakeTLS door keeps a hint cache: HandshakeHints
+// when set, otherwise whatever TrackClientIPs is.
+func (p ProxyOpts) handshakeHints() bool {
+	if p.HandshakeHints != nil {
+		return *p.HandshakeHints
+	}
+
+	return p.TrackClientIPs
+}
+
+// handshakeBudget is the budget the three HandshakeBudget settings describe,
+// for this process's block cost and core count, which NewProxy supplies.
+// valid() has checked the mode.
+func (p ProxyOpts) handshakeBudget(nsPerBlock float64, procs int) scanBudgetConfig {
+	mode, _ := parseBudgetMode(p.HandshakeBudgetMode)
+
+	cfg := scanBudgetConfig{
+		Mode:       mode,
+		CPUPercent: p.HandshakeBudgetCPUPercent,
+		Procs:      procs,
+		NsPerBlock: nsPerBlock,
+	}
+
+	if ms := p.HandshakeBudgetPerIPMillis; ms != nil {
+		cfg.PerIPMillis = *ms
+		cfg.PerIPDisabled = *ms == 0
+	}
+
+	return cfg
 }
 
 func (p ProxyOpts) getConcurrency() int {

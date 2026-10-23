@@ -282,7 +282,7 @@ curl http://127.0.0.1:9090/stats
   "started_at": "2026-03-29T10:30:00Z",
   "uptime_seconds": 3600,
   "total_connections": 15,
-  "features": ["client-ips", "faketls", "listeners", "quota-reset", "secret-modes", "secrets-api"],
+  "features": ["client-ips", "faketls", "handshake-budget", "listeners", "quota-reset", "secret-modes", "secrets-api"],
   "listeners": [
     { "bind": "0.0.0.0:443", "accept": ["ee"], "public": true },
     { "bind": "127.0.0.1:2398", "accept": ["dd", "plain"], "public": false }
@@ -293,6 +293,17 @@ curl http://127.0.0.1:9090/stats
     "denied": 7,
     "draining": 0,
     "rate_limited": 0
+  },
+  "faketls_handshake": {
+    "hinted": 3120,
+    "scanned": 842,
+    "unmatched": 29,
+    "denied_ip": 0,
+    "denied_global": 0,
+    "oversized": 0,
+    "over_budget_matched": 0,
+    "enforced": true,
+    "ns_per_block": 33.8
   },
   "users": {
     "alice": {
@@ -329,6 +340,16 @@ design, the second is an outage, apart from a few in the seconds after a restart
 while the middle-proxy config loads — see
 [Sponsored channel](#sponsored-channel-ad-tag).
 
+`faketls_handshake` appears once the FakeTLS door has counted something, and it is
+a top-level object, never under `users`. `hinted` and `scanned` are hellos matched
+to a secret (by an address's earlier match, or by the scan), `unmatched` matched
+none, and, under `enforce`, `denied_ip`, `denied_global` and `oversized` were
+turned away by the handshake budget, whose `[defense.handshake-budget]` table is
+on by default (under `observe` they count what would have been).
+`enforced` says whether a refusal is acted on, `over_budget_matched` is the
+number to watch while running it in `observe` mode, and `ns_per_block` is what
+the budget believes one SHA-256 block costs on this machine.
+
 `features` is a sorted list of capability names this build supports, meant to be
 read before a capability is used — it is how a panel can tell an older binary
 from a newer one without parsing version strings. Names are a public contract:
@@ -360,7 +381,10 @@ server. `connected_ips` adds no retention — those addresses are already held f
 the life of the connection — but `last_ip` outlives the connection it came from,
 so a deployment that never asks for either never accumulates one. Neither is
 written to disk in any form; `usage-state-file` persists quota counters alone, so
-no address survives a restart.
+no address survives a restart. (That is about these two fields: the ee handshake
+budget keeps a separate anonymous per-address bucket in memory whatever
+`track-client-ips` says, as the wiki's Security page explains under *Client
+addresses*.)
 
 Behind a front proxy, both report what the PROXY header carried — the client's
 real address — which is what makes them useful for a WEB deployment. See

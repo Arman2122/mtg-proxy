@@ -104,6 +104,7 @@ and one user with limits:
 | `throttle` | Present only when `[throttle] max-connections` is set. |
 | `listeners` | Present only when at least one `[[listener]]` is configured. |
 | `obfuscated` | Same condition as `listeners`. |
+| `faketls_handshake` | Present once the FakeTLS door has counted something: one `ee` hello that got past the hostname check. A proxy nobody has connected to yet does not show it. See below. |
 | `users` | Always present, keyed by secret name. |
 
 `features` is a public contract, not a version string. A panel reads it to find
@@ -137,6 +138,75 @@ unhonoured transport, a replayed frame, a rate-limited peer and a
 disabled/expired/over-quota user all take the same exit, because none of them
 may be distinguishable to the peer either. A counter that separated them would
 describe the oracle that exit exists to avoid building.
+
+### The FakeTLS handshake counters
+
+`faketls_handshake` describes what the FakeTLS door decided about each `ee` hello
+that got past the hostname check, and the budget that bounds the CPU spent
+answering them (see [[Configuration]], `[defense.handshake-budget]`). It is a
+top-level object beside `users`, never inside it: nothing about the door is a
+client, and a panel that bills every key under `users` must not see one. It is
+omitted until the door has counted something, and every count is a total since
+the process started.
+
+| Field | Meaning |
+|---|---|
+| `hinted` | Hellos matched by one of the secrets the client's address had matched before: usually one HMAC, at most 16, outside the budget. Only with `hints` on. |
+| `scanned` | Hellos matched by the scan over the hosted secrets. |
+| `unmatched` | Hellos the scan found no secret for. They were fronted to the cover site. |
+| `denied_ip` | Hellos refused because the client address's own bucket could not pay for a scan. Checked before the process-wide bucket. |
+| `denied_global` | Hellos refused because the process-wide bucket could not pay. |
+| `oversized` | Hellos above the scan cap of 128 SHA-256 blocks (about 8 KiB). Under `enforce` they are never scanned; `observe` counts them and scans them anyway. Always `0` under `off`, which has no cap. |
+| `over_budget_matched` | `observe` mode only: hellos the budget would have refused that then matched a real secret. Always `0` under `enforce`. |
+| `enforced` | Whether the budget acts on a refusal. `true` in `enforce` mode, `false` in `observe` and `off`. |
+| `ns_per_block` | What the budget believes one SHA-256 block costs on this machine, in nanoseconds: the reading taken once at start, which every cost in the budget is divided by. About 30 on a CPU with SHA extensions, several hundred on one without. |
+
+In `enforce` mode every hello that gets past the hostname check increments
+exactly one of the first six. A replay, or a disabled or over-quota user, after a
+match counts as its match: the counter says how the secret was found, not what
+happened to the connection after. A hello that cannot be read, or whose hostname
+matches no secret, is not counted here at all, and neither is one still waiting
+for budget when the proxy shuts down: nothing was decided about it. In `observe` mode `denied_ip`,
+`denied_global` and `oversized` count what `enforce` would have refused, and
+each moves together with the `scanned` or `unmatched` of the scan that went ahead
+anyway, so the first six no longer add up to the hellos. Under `off` the three
+`denied`/`oversized` counters stay at zero.
+
+With hints on, a deployment's returning clients show up as `hinted` and only
+strangers (and clients whose address changed) as `scanned`. With hints off, every
+match is `scanned`.
+
+Besides the counters, each refusal is logged at info level with its reason
+(`denied_ip`, `denied_global` or `oversized`), which the default warn level does
+not show; `debug = true` does.
+
+#### Running `observe` as a canary
+
+Turning the budget on in front of real users is the one step that can front a
+legitimate client, so watch first:
+
+1. Set `mode = "observe"` under `[defense.handshake-budget]` and restart (the
+   table is read at start). Nothing is refused and nothing waits: every hello is
+   scanned as before, while the budget keeps its books exactly as `enforce` would.
+2. Let real traffic run for a while, floods included if you get them, and read
+   `faketls_handshake` from `/stats`.
+3. `denied_ip`, `denied_global` and `oversized` are what `enforce` would have
+   fronted. They include every probing hello that would have matched nothing, so
+   they can be large during a flood, and that is expected.
+4. `over_budget_matched` is the number that decides it: hellos the budget would
+   have refused that nevertheless matched a real secret, which is the legitimate
+   traffic `enforce` would have fronted. **If it stays at or near zero while
+   real clients are connecting, enforcing would not have refused them.** Remove
+   the key (or set `"enforce"`) and restart.
+5. If it climbs, enforcing would have fronted real users. Raise `cpu-percent`
+   (the process-wide bucket), raise `per-ip-ms` or set it to `0` if many clients
+   share an address, or turn `hints` on so returning clients skip the scan, then
+   watch again.
+
+`over_budget_matched` exists only in `observe`: under `enforce` a refused hello is
+never scanned, so nothing can say whether it would have matched. Under `enforce`
+the signals are `denied_ip` and `denied_global` rising, and users reporting that
+a client had to retry.
 
 ### Per-user fields
 
@@ -210,7 +280,9 @@ by compromise, or by a backup that went somewhere it should not have.
 `connected_ips` adds no retention, because those addresses are already held for
 the life of the connection and vanish with it. `last_ip` does add retention,
 because it survives the connection it came from. A deployment that never asks
-for either never accumulates one.
+for either never accumulates one. (That is about these two fields. The ee
+handshake budget keeps a separate anonymous per-address bucket in memory whatever
+`track-client-ips` says; see *Client addresses* in [[Security]].)
 
 Neither field is written to disk in any form. `usage-state-file` persists quota
 counters alone, so no address survives a restart.
@@ -497,6 +569,16 @@ Lines worth knowing, all at warn level unless noted:
   take the public port down.
 - `SNI-DNS mismatch: ...` — the secret's fronting hostname does not resolve to
   this server's public IP. See [[Troubleshooting]].
+- `ee handshake budget calibrated` with `ns_per_block` — info, so debug only. The
+  reading the scan budget divides every cost by, taken once when the first proxy
+  in the process starts; `/stats` carries the same number.
+- `ee hello refused by the scan budget` with `reason` — info, so debug only, and
+  one per refused hello, so verbose under a flood. `reason` is `denied_ip`,
+  `denied_global` or `oversized`. The `/stats` counters of the same names are the
+  way to watch it at the default level. The line carries the stream's `stream-id`
+  and `client-ip` like every stream line (the `Stream has been started` line
+  already logs the address of every connection at that level). The per-address
+  bucket is never logged; the stream logger is separate from it.
 - `web relay reload: ...` — one line per refused reload, each saying which
   profiles were kept, with `trigger=file` or `trigger=signal` for where it came
   from.
@@ -519,6 +601,16 @@ On the proxy, from `GET /stats`:
 - `obfuscated.draining` sitting high. It is a gauge of connections being drained
   right now, so a persistently large value means the drain is where your
   connections are going.
+- `faketls_handshake.denied_global` climbing. The process-wide scan budget is
+  spent: someone is making the proxy try hellos that match nothing (compare
+  `unmatched` and `oversized`), or the proxy hosts so many secrets that real
+  clients cannot be paid for (check `ns_per_block` against `cpu-percent`). Under
+  `enforce`, clients with no hint are being fronted and retrying. `denied_ip`
+  climbing alone points at one place, or many users behind one address, spending
+  its own bucket.
+- `faketls_handshake.over_budget_matched` above zero while running
+  `mode = "observe"`. Those are real clients `enforce` would have fronted; see
+  the canary steps above before you switch.
 - `throttle.active` true for more than a moment, or a user appearing in
   `throttle.caps` and staying there. See [[Limits-and-Quotas]].
 - Per user, `quota_remaining` approaching zero or `expires_at` approaching. Both

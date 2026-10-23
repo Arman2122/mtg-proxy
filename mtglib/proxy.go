@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -66,6 +67,7 @@ type Proxy struct {
 	stats         *ProxyStats
 	obfsStats     obfuscatedCounters
 	obfsLimiter   *obfuscatedLimiter
+	fakeStats     fakeTLSCounters
 	listeners     []ListenerJSON
 	listenerModes ModeSet
 	secrets       atomic.Pointer[secretSet]
@@ -73,6 +75,17 @@ type Proxy struct {
 	reloadMu      sync.Mutex
 	liveMu        sync.Mutex
 	liveConns     map[string]map[*streamContext]struct{}
+
+	// hints is the FakeTLS door's address -> recently matched secret names
+	// cache. nil is "hints off": NewProxy builds it only when HandshakeHints (or
+	// TrackClientIPs, which it follows by default) asks for it, and a Proxy{}
+	// literal in a test has none.
+	hints *matchHints
+
+	// scanBudget bounds the CPU the FakeTLS door spends scanning hellos that no
+	// hint matched. nil is "budget off": NewProxy always builds one, and a
+	// Proxy{} literal in a test has none.
+	scanBudget *scanBudget
 
 	// addresses is each user's counted-address ledger, guarded by liveMu so
 	// that the address-limit check and the registration of a stream are one
@@ -225,6 +238,25 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	// The limiter's bucket aging runs under the proxy's own context, so it stops
 	// with Shutdown.
 	proxy.obfsLimiter = newObfuscatedLimiter(ctx)
+
+	// So does the hint cache's rotation. Off unless asked for: it keeps client
+	// addresses past their connection.
+	if opts.handshakeHints() {
+		proxy.hints = newMatchHints(ctx)
+	}
+
+	// The scan budget is in real CPU, so it needs what a SHA-256 block costs
+	// here: measured once per process, by whichever proxy is built first, and
+	// logged then so an operator can see what the budget believes.
+	nsPerBlock, measured := processCalibration.value()
+	if measured {
+		logger.BindStr("ns_per_block", strconv.FormatFloat(nsPerBlock, 'f', 1, 64)).
+			Info("ee handshake budget calibrated")
+	}
+
+	proxy.scanBudget = newScanBudget(opts.handshakeBudget(nsPerBlock, runtime.GOMAXPROCS(0)), time.Now)
+
+	go proxy.scanBudget.run(ctx)
 
 	// W1: a hostless secret with no door is stored, valid and unreachable. It is
 	// deliberately a warning and not an error -- one odd client must never take

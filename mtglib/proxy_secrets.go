@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Arman2122/mtg-proxy/mtglib/internal/doppel"
+	"github.com/Arman2122/mtg-proxy/mtglib/internal/tls/fake"
 )
 
 // The secret set: the immutable snapshot every handshake reads, how it is
@@ -32,11 +33,27 @@ type secretSet struct {
 	// secrets[i]; the zero value means the secret is unrestricted.
 	limits []SecretLimits
 
-	// hosted holds the indices of ee secrets, in name order. It is the FakeTLS
-	// HMAC candidate list: a hostless secret has no hostname a client could put
-	// in SNI, and admitting its key on that path would let a client borrow
-	// ANOTHER secret's hostname to authenticate with it.
+	// hosted holds the indices of ee secrets, in name order. They are the only
+	// secrets the FakeTLS door may try, and cands is built from them: a hostless
+	// secret has no hostname a client could put in SNI, and admitting its key on
+	// that path would let a client borrow ANOTHER secret's hostname to
+	// authenticate with it.
 	hosted []int
+
+	// cands is what the FakeTLS door verifies a ClientHello against, built once
+	// with the set: one Candidate per hosted secret, in name order, minus any
+	// whose key an earlier hosted secret already has (the earlier one wins a
+	// match, as it always did, so a repeat could never be the first to match).
+	// candIdx[i] is the index into secrets, names, limits and adTags of the secret
+	// cands[i] stands for -- the match position is NOT an index into secrets.
+	// candByName maps names[candIdx[i]] to i; a name that is not a candidate (a
+	// hostless secret, a dropped repeat) is absent, so look it up with the
+	// two-value form: a missing name reads as 0, which is a position. All three
+	// are nil on a set that was not built by buildSecretSet, which has no
+	// candidates.
+	cands      []*fake.Candidate
+	candIdx    []int
+	candByName map[string]int
 
 	// frontHost is the domain-fronting fallback: the first non-empty Host in
 	// name order, or "" when no ee secret is configured. It replaces
@@ -151,6 +168,8 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 
 	sort.Strings(hostnames)
 
+	cands, candIdx, candByName := buildCandidates(secretsList, names, hosted)
+
 	return &secretSet{
 		secrets:     secretsList,
 		names:       names,
@@ -159,8 +178,42 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 		globalAdTag: global,
 		limits:      limits,
 		hosted:      hosted,
+		cands:       cands,
+		candIdx:     candIdx,
+		candByName:  candByName,
 		frontHost:   frontHost,
 	}
+}
+
+// buildCandidates makes the FakeTLS candidates for the hosted secrets (indices
+// into secrets, in name order): one Candidate each, with its key's pads hashed
+// here, once per set, instead of once per handshake. A later secret whose key an
+// earlier hosted one already has is left out. It could only ever match when the
+// earlier one does, and the earlier one is tried first, so dropping it changes
+// no answer and saves a verification per hello that reaches it. Only HOSTED
+// keys count as seen: a dd secret that sorts first and shares a key with an ee
+// secret does not shadow it.
+func buildCandidates(secrets []Secret, names []string, hosted []int) ([]*fake.Candidate, []int, map[string]int) {
+	cands := make([]*fake.Candidate, 0, len(hosted))
+	candIdx := make([]int, 0, len(hosted))
+	candByName := make(map[string]int, len(hosted))
+	seen := make(map[[SecretKeyLength]byte]struct{}, len(hosted))
+
+	for _, i := range hosted {
+		key := secrets[i].Key
+
+		if _, repeat := seen[key]; repeat {
+			continue
+		}
+
+		seen[key] = struct{}{}
+
+		candByName[names[i]] = len(cands)
+		cands = append(cands, fake.NewCandidate(key[:]))
+		candIdx = append(candIdx, i)
+	}
+
+	return cands, candIdx, candByName
 }
 
 // ReloadSecrets re-reads the secret set through the configured reloader and

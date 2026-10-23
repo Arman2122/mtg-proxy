@@ -2,15 +2,11 @@ package fake
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"time"
 )
 
@@ -68,73 +64,28 @@ func ReadClientHello(
 // It tries each secret until one validates the HMAC. On success it returns
 // the ClientHello, the index of the matched secret, and the SNI hostname that
 // matched one of the allowed hostnames.
+//
+// It is ParseClientHelloFor, then a plain Verify per secret in order.
 func ReadClientHelloMulti(
 	conn net.Conn,
 	secrets [][]byte,
 	hostnames []string,
 	tolerateTimeSkewness time.Duration,
 ) (*ReadClientHelloResult, error) {
-	clientHelloCopy, handshakeReader, err := parseClientHello(conn)
+	parsed, err := ParseClientHelloFor(conn, hostnames)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read client hello: %w", err)
+		return nil, err
 	}
-
-	hello, err := parseHandshake(handshakeReader)
-	if err != nil {
-		return nil, fmt.Errorf("cannot parse handshake: %w", err)
-	}
-
-	sniHostnames, err := parseSNI(handshakeReader)
-	if err != nil {
-		return nil, fmt.Errorf("cannot parse SNI: %w", err)
-	}
-
-	var matchedHost string
-
-	for _, h := range hostnames {
-		if slices.Contains(sniHostnames, h) {
-			matchedHost = h
-
-			break
-		}
-	}
-
-	if matchedHost == "" {
-		return nil, fmt.Errorf("cannot find any of %v in %v", hostnames, sniHostnames)
-	}
-
-	// Save the full client hello bytes so we can replay them for each secret.
-	handshakeBytes := clientHelloCopy.Bytes()
 
 	for idx, secret := range secrets {
-		digest := hmac.New(sha256.New, secret)
-
-		// Write the handshake with client random all nullified.
-		digest.Write(handshakeBytes[:RandomOffset])
-		digest.Write(emptyRandom[:])
-		digest.Write(handshakeBytes[RandomOffset+RandomLen:])
-
-		computed := digest.Sum(nil)
-
-		for i := range RandomLen {
-			computed[i] ^= hello.Random[i]
-		}
-
-		if subtle.ConstantTimeCompare(emptyRandom[:RandomLen-4], computed[:RandomLen-4]) != 1 {
-			continue
-		}
-
-		timestamp := int64(binary.LittleEndian.Uint32(computed[RandomLen-4:]))
-		createdAt := time.Unix(timestamp, 0)
-
-		if tdiff := time.Since(createdAt).Abs(); tdiff > tolerateTimeSkewness {
+		if !parsed.Verify(NewPlainCandidate(secret), tolerateTimeSkewness) {
 			continue
 		}
 
 		return &ReadClientHelloResult{
-			Hello:        hello,
+			Hello:        parsed.Hello,
 			MatchedIndex: idx,
-			MatchedHost:  matchedHost,
+			MatchedHost:  parsed.MatchedHost,
 		}, nil
 	}
 
@@ -143,7 +94,7 @@ func ReadClientHelloMulti(
 	// a valid SNI but garbage payload).
 	return &ReadClientHelloResult{
 		MatchedIndex: -1,
-		MatchedHost:  matchedHost,
+		MatchedHost:  parsed.MatchedHost,
 	}, ErrBadDigest
 }
 
