@@ -82,7 +82,7 @@ func makeNetwork(conf *config.Config, version string) (mtglib.Network, error) {
 	for idx, v := range conf.Network.Proxies {
 		value, err := network.NewProxyNetwork(base, v.Get(nil))
 		if err != nil {
-			return nil, fmt.Errorf("cannot use %v for proxy url: %w", v.Get(nil), err)
+			return nil, fmt.Errorf("cannot use %s for proxy url: %w", v.Redacted(), err)
 		}
 		proxyDialers[idx] = value
 	}
