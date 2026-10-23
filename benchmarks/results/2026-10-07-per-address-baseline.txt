@@ -1,0 +1,102 @@
+# Per-address governance: data-path baseline, 2026-10-07
+#
+# Binary:   mtglib test binary built from commit 4024026 (feat/client-governance, before any
+#           per-address code on the data path), GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c
+# Box:      5.75.199.10 (2 vCPU Skylake, no SHA-NI), quiet at the start (load 0.06), run from /root/mtg-bench
+# Command:  ulimit -n 65536; TMPDIR=/root/mtg-bench/tmp ./old.test -test.run '^$' \
+#             -test.bench '^(BenchmarkCountingConn|BenchmarkCountingConnParallel|BenchmarkDoorBulk)$' \
+#             -test.benchtime 1s -test.count 6 -test.cpu 2
+#
+# What this file is for: it proves the 13 rows run on the box under its rules and records their
+# order of magnitude. It is NOT the "before" of any comparison: a number from one box session is
+# not comparable with a number from another (the unchanged dd door moved 40% between two sessions
+# in piece A). Every before/after claim for this branch comes from a same-session A/B with the old
+# and new binaries alternated; see the report that lands with the branch.
+#
+# Spread inside this one session: wrapper rows within about 5% (the parallel read row has one
+# 106 ns outlier among 120-128), door rows within about 10% (one plain/conns=16 run at 28.4 ms
+# against 21-23 ms for the others).
+#
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+BenchmarkCountingConn/read/noentry-2         	10709328	       106.6 ns/op	153619.42 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/noentry-2         	11842849	       102.9 ns/op	159213.60 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/noentry-2         	10879372	       103.5 ns/op	158308.12 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/noentry-2         	11778621	       104.2 ns/op	157200.61 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/noentry-2         	10707552	       107.0 ns/op	153027.62 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/read/noentry-2         	10052898	       106.0 ns/op	154473.92 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10184248	       114.0 ns/op	143737.51 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10557787	       114.9 ns/op	142596.90 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10381737	       113.3 ns/op	144594.11 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10233925	       112.7 ns/op	145307.24 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10898674	       111.6 ns/op	146773.62 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConn/write/noentry-2        	10906281	       111.3 ns/op	147159.86 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11296778	       124.1 ns/op	131950.81 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	12239847	       127.9 ns/op	128023.56 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	12084915	       128.0 ns/op	128008.96 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	12582996	       120.1 ns/op	136405.06 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	12636106	       106.2 ns/op	154173.70 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/read/noentry-2 	11868066	       122.7 ns/op	133511.68 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	11803119	       101.1 ns/op	162037.30 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12190150	       103.1 ns/op	158901.19 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12034640	       102.0 ns/op	160647.36 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12244774	        97.95 ns/op	167219.23 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	10394602	        98.88 ns/op	165652.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkCountingConnParallel/write/noentry-2         	12667063	       101.7 ns/op	161042.02 MB/s	       0 B/op	       0 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2   	     632	   1992460 ns/op	 526.27 MB/s	    6394 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2   	     570	   2154504 ns/op	 486.69 MB/s	    5506 B/op	      75 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2   	     566	   2147221 ns/op	 488.34 MB/s	    5086 B/op	      76 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2   	     566	   2243895 ns/op	 467.30 MB/s	    6056 B/op	      76 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2   	     592	   1871507 ns/op	 560.28 MB/s	    5128 B/op	      74 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=1/addr=stamped-2   	     564	   2088829 ns/op	 501.99 MB/s	    7802 B/op	      75 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2  	      48	  23960281 ns/op	 700.21 MB/s	  670527 B/op	    1135 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2  	      50	  24484630 ns/op	 685.21 MB/s	  577416 B/op	    1129 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2  	      46	  25640703 ns/op	 654.32 MB/s	  721336 B/op	    1131 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2  	      50	  23312129 ns/op	 719.68 MB/s	  622182 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2  	      49	  23761063 ns/op	 706.08 MB/s	  633991 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=stamped-2  	      50	  23216937 ns/op	 722.63 MB/s	  545640 B/op	    1130 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2   	      49	  23690667 ns/op	 708.18 MB/s	  701008 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2   	      48	  23782360 ns/op	 705.45 MB/s	  704149 B/op	    1132 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2   	      45	  24784552 ns/op	 676.92 MB/s	  725185 B/op	    1134 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2   	      52	  22761694 ns/op	 737.08 MB/s	  535217 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2   	      48	  24256219 ns/op	 691.67 MB/s	  727358 B/op	    1133 allocs/op
+BenchmarkDoorBulk/ee-unpaced/conns=16/addr=shared-2   	      50	  23183132 ns/op	 723.68 MB/s	  611330 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2           	     476	   2603220 ns/op	 402.80 MB/s	    1322 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2           	     445	   2671407 ns/op	 392.52 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2           	     494	   2579975 ns/op	 406.43 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2           	     475	   2768753 ns/op	 378.72 MB/s	    1372 B/op	      76 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2           	     460	   2621317 ns/op	 400.02 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=1/addr=stamped-2           	     447	   2584719 ns/op	 405.68 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2          	      55	  21416592 ns/op	 783.37 MB/s	   22527 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2          	      54	  22058578 ns/op	 760.58 MB/s	   22599 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2          	      58	  22024697 ns/op	 761.75 MB/s	   22382 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2          	      54	  22577216 ns/op	 743.10 MB/s	   22576 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2          	      49	  21466284 ns/op	 781.56 MB/s	   22874 B/op	    1130 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=stamped-2          	      58	  21788900 ns/op	 769.99 MB/s	   22386 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2           	      57	  21722612 ns/op	 772.34 MB/s	   22416 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2           	      58	  21182804 ns/op	 792.02 MB/s	   22420 B/op	    1129 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2           	      57	  23044532 ns/op	 728.03 MB/s	   22724 B/op	    1128 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2           	      46	  21958899 ns/op	 764.03 MB/s	   23035 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2           	      58	  21645557 ns/op	 775.09 MB/s	   22397 B/op	    1127 allocs/op
+BenchmarkDoorBulk/dd/conns=16/addr=shared-2           	      55	  21202350 ns/op	 791.29 MB/s	   22645 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2        	     441	   2617336 ns/op	 400.63 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2        	     439	   2554013 ns/op	 410.56 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2        	     453	   2601499 ns/op	 403.07 MB/s	    1304 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2        	     452	   2893179 ns/op	 362.43 MB/s	    1355 B/op	      76 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2        	     517	   2651461 ns/op	 395.47 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=1/addr=stamped-2        	     447	   2645853 ns/op	 396.31 MB/s	    1305 B/op	      74 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2       	      49	  22393491 ns/op	 749.20 MB/s	   22923 B/op	    1132 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2       	      49	  23431049 ns/op	 716.02 MB/s	   22908 B/op	    1131 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2       	      49	  23099937 ns/op	 726.29 MB/s	   22824 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2       	      43	  28418984 ns/op	 590.35 MB/s	   23243 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2       	      57	  23317146 ns/op	 719.52 MB/s	   22489 B/op	    1130 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=stamped-2       	      50	  21607933 ns/op	 776.44 MB/s	   22773 B/op	    1128 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2        	      58	  21261193 ns/op	 789.10 MB/s	   22398 B/op	    1127 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2        	      52	  21379021 ns/op	 784.75 MB/s	   22728 B/op	    1131 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2        	      57	  21530003 ns/op	 779.25 MB/s	   22448 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2        	      57	  23186420 ns/op	 723.58 MB/s	   22572 B/op	    1126 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2        	      54	  21072634 ns/op	 796.16 MB/s	   23237 B/op	    1129 allocs/op
+BenchmarkDoorBulk/plain/conns=16/addr=shared-2        	      60	  21471314 ns/op	 781.38 MB/s	   22375 B/op	    1131 allocs/op
+PASS

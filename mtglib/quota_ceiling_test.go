@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,47 +39,67 @@ func quotaPair(t *testing.T, quota, used int64) (*countingConn, net.Conn, *Proxy
 	return newCountingConn(context.Background(), nil, essentials.WrapNetConn(near), stats, "alice"), far, stats
 }
 
+// stopCounter is a stream's stop that counts how often it was called.
+func stopCounter(conn *countingConn) *atomic.Int32 {
+	stops := new(atomic.Int32)
+	conn.stop = func() { stops.Add(1) }
+
+	return stops
+}
+
 // The ceiling is exact in the write direction: a write that would cross it
-// delivers exactly up to the cap and ends the stream there, and the next
-// write from any stream of that user ends at once.
+// delivers exactly up to the cap and ends the stream there, once, and the next
+// write from any stream of that user ends at once. On every path a stream
+// takes to the user's quota (governedCases).
 func TestQuotaCeilingEndsAWriteAtTheCap(t *testing.T) {
 	t.Parallel()
 
 	const quota = 10 << 10
 
-	conn, far, stats := quotaPair(t, quota, 0)
+	for _, gc := range governedCases() {
+		t.Run(gc.name, func(t *testing.T) {
+			t.Parallel()
 
-	received := make(chan int, 1)
+			conn, far, stats := quotaPair(t, quota, 0)
+			conn = gc.govern(t, conn)
+			stops := stopCounter(conn)
 
-	go func() {
-		n, _ := io.Copy(io.Discard, far)
-		received <- int(n)
-	}()
+			received := make(chan int, 1)
 
-	n, err := conn.Write(make([]byte, 4<<10))
-	require.NoError(t, err)
-	assert.Equal(t, 4<<10, n)
+			go func() {
+				n, _ := io.Copy(io.Discard, far)
+				received <- int(n)
+			}()
 
-	// 4 KiB more than the cap: the write stops at the byte that reaches it.
-	n, err = conn.Write(make([]byte, 10<<10))
-	require.ErrorIs(t, err, errQuotaExhausted)
-	assert.Equal(t, 6<<10, n, "exactly what was left")
-	assert.EqualValues(t, quota, stats.getOrCreate("alice").quotaUsed.Load(), "not a byte past the cap")
+			n, err := conn.Write(make([]byte, 4<<10))
+			require.NoError(t, err)
+			assert.Equal(t, 4<<10, n)
+			assert.Zero(t, stops.Load(), "a write inside the quota ends nothing")
 
-	// Another stream of the same user, on its first byte.
-	other, _, _ := quotaPair(t, quota, quota)
+			// 4 KiB more than the cap: the write stops at the byte that reaches it.
+			n, err = conn.Write(make([]byte, 10<<10))
+			require.ErrorIs(t, err, errQuotaExhausted)
+			assert.Equal(t, 6<<10, n, "exactly what was left")
+			assert.EqualValues(t, quota, stats.getOrCreate("alice").quotaUsed.Load(), "not a byte past the cap")
 
-	n, err = other.Write([]byte("x"))
-	require.ErrorIs(t, err, errQuotaExhausted)
-	assert.Zero(t, n)
+			// Another stream of the same user, on its first byte.
+			other, _, _ := quotaPair(t, quota, quota)
 
-	// Counted once for this stream, however often it hits the ceiling.
-	_, err = conn.Write([]byte("x"))
-	require.ErrorIs(t, err, errQuotaExhausted)
-	assert.EqualValues(t, 1, stats.getOrCreate("alice").quotaCutoffs.Load())
+			n, err = other.Write([]byte("x"))
+			require.ErrorIs(t, err, errQuotaExhausted)
+			assert.Zero(t, n)
 
-	require.NoError(t, conn.Close())
-	assert.Equal(t, quota, <-received, "the far end got exactly the quota")
+			// Counted once for this stream, and the stream ended once, however
+			// often it hits the ceiling.
+			_, err = conn.Write([]byte("x"))
+			require.ErrorIs(t, err, errQuotaExhausted)
+			assert.EqualValues(t, 1, stats.getOrCreate("alice").quotaCutoffs.Load())
+			assert.EqualValues(t, 1, stops.Load(), "the stream is ended once, in both directions")
+
+			require.NoError(t, conn.Close())
+			assert.Equal(t, quota, <-received, "the far end got exactly the quota")
+		})
+	}
 }
 
 // The same in the read direction: an upload is read up to the cap and no
@@ -88,35 +109,44 @@ func TestQuotaCeilingEndsAReadAtTheCap(t *testing.T) {
 
 	const quota = 10 << 10
 
-	conn, far, stats := quotaPair(t, quota, 0)
+	for _, gc := range governedCases() {
+		t.Run(gc.name, func(t *testing.T) {
+			t.Parallel()
 
-	go func() {
-		far.Write(make([]byte, 16<<10)) //nolint: errcheck
-	}()
+			conn, far, stats := quotaPair(t, quota, 0)
+			conn = gc.govern(t, conn)
+			stops := stopCounter(conn)
 
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+			go func() {
+				far.Write(make([]byte, 16<<10)) //nolint: errcheck
+			}()
 
-	var got int
+			require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 
-	buf := make([]byte, 64<<10)
+			var got int
 
-	for {
-		n, err := conn.Read(buf)
-		got += n
+			buf := make([]byte, 64<<10)
 
-		if err != nil {
-			require.ErrorIs(t, err, errQuotaExhausted)
+			for {
+				n, err := conn.Read(buf)
+				got += n
 
-			break
-		}
+				if err != nil {
+					require.ErrorIs(t, err, errQuotaExhausted)
+
+					break
+				}
+			}
+
+			assert.Equal(t, quota, got, "read exactly up to the cap")
+			assert.EqualValues(t, quota, stats.getOrCreate("alice").quotaUsed.Load())
+			assert.EqualValues(t, 1, stats.getOrCreate("alice").quotaCutoffs.Load())
+
+			_, err := conn.Read(buf)
+			require.ErrorIs(t, err, errQuotaExhausted, "nothing more is ever read")
+			assert.EqualValues(t, 1, stops.Load(), "the stream is ended once")
+		})
 	}
-
-	assert.Equal(t, quota, got, "read exactly up to the cap")
-	assert.EqualValues(t, quota, stats.getOrCreate("alice").quotaUsed.Load())
-	assert.EqualValues(t, 1, stats.getOrCreate("alice").quotaCutoffs.Load())
-
-	_, err := conn.Read(buf)
-	require.ErrorIs(t, err, errQuotaExhausted, "nothing more is ever read")
 }
 
 // Without a quota the path is what it was: a single read, a single write,
@@ -139,39 +169,74 @@ func TestNoQuotaIsNoCeiling(t *testing.T) {
 // Through the proxy, on every door: a user whose remaining quota is smaller
 // than what Telegram sends gets exactly the remainder, the stream ends, the
 // cutoff is counted, and their next connection is refused at the door.
+//
+// The tracked runs are the same on a proxy that keeps client addresses, as a
+// panel always runs it, from a client at a documentation address: the stream
+// has a per-address entry of its own, so the relay's wrapper takes its entry
+// path, and the quota must end it at the same byte.
 func TestQuotaEndsTheStreamThatCrossesItAcrossEntries(t *testing.T) {
 	t.Parallel()
 
 	for _, ec := range govEntryCases() {
-		t.Run(ec.name, func(t *testing.T) {
-			t.Parallel()
+		for _, tracked := range []bool{false, true} {
+			name := ec.name
+			if tracked {
+				name += "/tracked"
+			}
 
-			const quota = 8 << 10
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 
-			secret := ec.secret(t)
-			h := ec.harness(t, map[string]Secret{"alice": secret},
-				map[string]SecretLimits{"alice": {QuotaBytes: quota}})
+				const quota = 8 << 10
 
-			stream := ec.connect(t, h, "alice", secret.Key)
+				secret := ec.secret(t)
+				h := ec.harness(t, map[string]Secret{"alice": secret},
+					map[string]SecretLimits{"alice": {QuotaBytes: quota}})
+				h.proxy.trackClientIPs = tracked
 
-			// Telegram sends twice what alice has left.
-			_, err := stream.upstream.Write(make([]byte, 2*quota))
-			require.NoError(t, err)
+				var (
+					upstream net.Conn
+					done     <-chan struct{}
+					entry    *clientEntry
+				)
 
-			require.True(t, govAwait(stream.done, govDenyBudget),
-				"the stream must end at the cap, not carry on past it")
+				if tracked {
+					var client net.Conn
 
-			alice := h.proxy.stats.users["alice"]
-			assert.EqualValues(t, quota, alice.quotaUsed.Load(), "not a byte past the cap")
-			assert.EqualValues(t, 1, alice.quotaCutoffs.Load())
+					client, done = dialProxyFrom(t, h, ec.policy, tcpFrom("203.0.113.51", 50001))
+					upstream = connectThrough(t, ec, h, client, "alice", secret.Key)
 
-			// And the door is shut: the next connection is refused at entry,
-			// disposed of the way this door disposes of a denied user.
-			client, done := h.dialProxy(t, ec.policy)
-			ec.openEntry(t, client, secret.Key)
-			require.True(t, govAwait(done, govDenyBudget), "an exhausted user must be refused")
-			assert.Equal(t, ec.frontingsOnEntryDeny, h.events.frontings())
-		})
+					entry = h.liveStream(t, "alice").addrEntry.Load()
+					require.NotNil(t, entry, "a keyed stream on a tracking proxy has an entry")
+					require.False(t, entry.rest, "of its own")
+				} else {
+					stream := ec.connect(t, h, "alice", secret.Key)
+					upstream, done = stream.upstream, stream.done
+				}
+
+				// Telegram sends twice what alice has left.
+				_, err := upstream.Write(make([]byte, 2*quota))
+				require.NoError(t, err)
+
+				require.True(t, govAwait(done, govDenyBudget),
+					"the stream must end at the cap, not carry on past it")
+
+				alice := h.proxy.stats.users["alice"]
+				assert.EqualValues(t, quota, alice.quotaUsed.Load(), "not a byte past the cap")
+				assert.EqualValues(t, 1, alice.quotaCutoffs.Load())
+
+				if entry != nil {
+					assert.EqualValues(t, quota, entry.bytesOut.Load(), "the bytes went through the stream's entry")
+				}
+
+				// And the door is shut: the next connection is refused at entry,
+				// disposed of the way this door disposes of a denied user.
+				client, refused := h.dialProxy(t, ec.policy)
+				ec.openEntry(t, client, secret.Key)
+				require.True(t, govAwait(refused, govDenyBudget), "an exhausted user must be refused")
+				assert.Equal(t, ec.frontingsOnEntryDeny, h.events.frontings())
+			})
+		}
 	}
 }
 

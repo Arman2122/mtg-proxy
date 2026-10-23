@@ -155,7 +155,8 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 		ctx.logger.Named("relay"),
 		connIdleTimeout{Conn: telegram, tracker: tracker},
 		newCountingConn(ctx.ctx, ctx.Close, connIdleTimeout{Conn: ctx.client(), tracker: tracker}, p.stats, ctx.secretName).
-			withActivity(&ctx.lastActiveUnix),
+			withActivity(&ctx.lastActiveUnix).
+			withClient(&ctx.addrEntry),
 	)
 }
 
@@ -176,19 +177,41 @@ func (p *Proxy) doEntry(ctx *streamContext, policy ListenerPolicy) bool {
 // and logger, then enforce the per-user governance limits. Extracted so the two
 // paths cannot drift on what "attributed" means -- quota, expiry, disable,
 // throttling and revocation-by-hot-reload all key on the name it sets.
-func (p *Proxy) attribute(ctx *streamContext, set *secretSet, i int) bool {
+//
+// It returns why it refused, or DenyNone when the stream may go on. Both doors
+// turn every reason away as they turn away a secret that matched nothing --
+// fronted on FakeTLS before the server's flight, disposed of silently on the
+// obfuscated door -- and they are handed the reason so a rule can treat one
+// differently without attribute knowing about doors: a ban is charged to the
+// obfuscated door's failure limiter, which needs the listener policy only that
+// door has.
+//
+// A ban is checked here, after the user's own limits, against the place the
+// connection comes from, and checked again when the stream registers (see
+// tryRegisterConn): this check reads the ban list without liveMu, so a ban
+// recorded a moment later is the re-check's to find. Any place with an address
+// can be banned, whether or not it stands for one place: an unkeyed address is
+// banned only by an operator who said force, and then it is to be refused.
+func (p *Proxy) attribute(ctx *streamContext, set *secretSet, i int) DenyReason {
 	ctx.matchedSecretKey = set.secrets[i].Key[:]
 	ctx.secretName = set.names[i]
 	ctx.adTag = set.effectiveAdTag(i)
 	ctx.ipLimit = set.limits[i].IPLimit
+	ctx.clientConns = set.limits[i].ClientConns
 	ctx.logger = ctx.logger.BindStr("secret_name", ctx.secretName)
 
 	allowed, reason := p.checkLimits(ctx.secretName, set.limits[i])
-	if !allowed {
-		ctx.logger.BindStr("deny_reason", reason.String()).Info("connection denied by per-user limit")
+	if allowed && p.bannedFrom(ctx.secretName, ctx.ClientIP()) {
+		allowed, reason = false, DenyBanned
 	}
 
-	return allowed
+	if allowed {
+		return DenyNone
+	}
+
+	ctx.logger.BindStr("deny_reason", reason.String()).Info("connection denied by per-user limit")
+
+	return reason
 }
 
 // admit performs the throttle check, the address-limit check and the
@@ -204,12 +227,10 @@ func (p *Proxy) admit(ctx *streamContext) bool {
 	// The address gate and the registration are one critical section, and
 	// both come before OnConnect: a refused connection must never have been
 	// counted, and two new addresses arriving together must not both read
-	// "one below the limit". The log line carries the reason and not the
-	// address, like every other refusal.
-	if !p.tryRegisterConn(ctx) {
-		ctx.logger.BindStr("deny_reason", DenyIPLimit.String()).Info("connection denied by per-user limit")
-		p.stats.OnIPLimitRefused(ctx.secretName)
-		p.eventStream.Send(ctx, NewEventIPLimited(ctx.streamID, ctx.secretName))
+	// "one below the limit". The log line adds the reason; the stream logger's
+	// own fields, client-ip among them, come with it, as on every other refusal.
+	if reason := p.tryRegisterConn(ctx); reason != DenyNone {
+		p.countAdmissionRefusal(ctx, reason)
 
 		return false
 	}
@@ -229,6 +250,51 @@ func (p *Proxy) admit(ctx *streamContext) bool {
 	}
 
 	return true
+}
+
+// bannedFrom says whether the place ip is at is banned from the named secret.
+// A connection with no address is at no place and cannot be. With no ban held
+// it answers before building the place's key, so a hello that matched a secret
+// pays nothing for the question in the common case.
+func (p *Proxy) bannedFrom(name string, ip net.IP) bool {
+	if p.bans.none() {
+		return false
+	}
+
+	key, ok := addressKeyOf(ip)
+
+	return ok && p.bannedAt(name, key)
+}
+
+// bannedAt is bannedFrom for a place whose key the caller has already built:
+// one that asks about several secrets for the same place builds the key once.
+func (p *Proxy) bannedAt(name string, key addressKey) bool {
+	return p.bans.banned(name, key)
+}
+
+// countAdmissionRefusal is the accounting of a connection tryRegisterConn
+// refused, one rule per reason. The address limit keeps its counter and its
+// event. The connection cap has a counter of its own and no event: a new event
+// type reaches the observer interface and every metric backend, and the counter
+// is what an operator reads. A ban is an operator's decision and not a limit
+// being felt, so it is logged and nothing more. Whatever the reason, the log
+// line adds it; the stream logger's own fields, client-ip among them, come with
+// it, as on every other refusal.
+//
+// A reason with no rule here is still a refusal -- admit has already said no --
+// and only goes uncounted: an unknown reason must never be let through.
+func (p *Proxy) countAdmissionRefusal(ctx *streamContext, reason DenyReason) {
+	ctx.logger.BindStr("deny_reason", reason.String()).Info("connection denied by per-user limit")
+
+	switch reason {
+	case DenyIPLimit:
+		p.stats.OnIPLimitRefused(ctx.secretName)
+		p.eventStream.Send(ctx, NewEventIPLimited(ctx.streamID, ctx.secretName))
+	case DenyClientConns:
+		p.stats.OnClientConnsRefused(ctx.secretName)
+	case DenyBanned: // the operator's own decision: logged above, not counted
+	default: // a reason nothing produces yet: logged above, not counted
+	}
 }
 
 // release undoes admit. The order is today's defer-LIFO order exactly:
@@ -411,34 +477,121 @@ func (p *Proxy) ServeWithPolicy(listener net.Listener, policy ListenerPolicy) er
 	}
 }
 
+// registerStep names a point between the steps of tryRegisterConn.
+type registerStep uint8
+
+const (
+	// stepLedgerAdmitted is after the address ledger has counted the stream and
+	// before the per-address table is asked for its entry.
+	stepLedgerAdmitted registerStep = iota + 1
+
+	// stepEntryAcquired is after the per-address table has given the stream
+	// its entry, if its secret needs one, and before the stream is entered
+	// into the registry.
+	stepEntryAcquired
+)
+
+// registerStepHook runs at each registerStep, under liveMu, and a reason other
+// than DenyNone refuses the stream at that point as a step of its own would. A
+// no-op in production. A test uses it to refuse at a later step and see that the
+// refusal gives back what an earlier step took, which nothing in production can
+// do yet. A variable so it can be replaced; a test that does must restore it and
+// must not run in parallel, and the hook must not take liveMu.
+var registerStepHook = func(registerStep, *streamContext) DenyReason { return DenyNone }
+
 // tryRegisterConn admits a stream into the live registry and into its user's
-// address ledger in one critical section, or refuses it because the user is
-// at their address limit. The address is resolved before the lock is taken:
-// ClientIP takes a lock of its own, and liveMu sits on the connect and
-// disconnect path of every stream.
+// address ledger in one critical section, or refuses it and says why: DenyNone
+// is admitted. The address is resolved before the lock is taken: ClientIP takes
+// a lock of its own, and liveMu sits on the connect and disconnect path of
+// every stream.
+//
+// The steps run in a fixed order, and a refusal at any of them leaves the
+// ledger, and the per-address table, exactly as it was found: the ban
+// re-check, then the per-address connection cap, then the address limit (the
+// ledger's admit), then the per-address table entry, then the registration.
+// Every refusal comes before the table is asked for an entry, so a refused
+// address never holds one, and a step that refuses does so through refuse,
+// which gives back what the steps before it took.
+//
+// The ban re-check is first because it is the one that closes a race:
+// attribute checked the ban without liveMu, and a ban is recorded, and the
+// streams it ends are found, under liveMu. A stream that passed attribute
+// before a ban was recorded is either registered before the ban takes the lock,
+// and closed by it, or meets the ban here. On the FakeTLS door the server's
+// flight has gone out by now, so a refusal here is a close after the
+// handshake, as an address-limit refusal is; it takes a ban recorded in the
+// moments between the two checks.
+//
+// The cap reads the ledger's count of the address's live connections, which
+// the ledger keeps for every stream whatever else is configured, so it counts
+// the streams that were open before the cap was set and it holds when the
+// table has no room for the address. It reads the count BEFORE the admit, which
+// increments it: reading after would refuse the cap-th connection instead of
+// the one past it. An address that does not stand for one place is not capped.
 //
 // A limit with no address to count against fails closed. The only way a TCP
 // listener yields no address is a PROXY header that declared a non-TCP
 // source, and admitting such a connection uncounted would make that header
 // the way around the limit.
-func (p *Proxy) tryRegisterConn(ctx *streamContext) bool {
-	key, hasKey := addressKeyOf(ctx.ClientIP())
+func (p *Proxy) tryRegisterConn(ctx *streamContext) DenyReason {
+	ip := ctx.ClientIP()
+	key, hasKey := addressKeyOf(ip)
+	keyed := hasKey && clientKeyed(ip)
 	now := time.Now()
 
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
 
+	// counted is what the ledger holds for this stream so far, and entry what
+	// the per-address table gave it. The stream itself is marked, and handed
+	// its entry, only once every step has passed, so a refusal never leaves it
+	// looking counted or governed.
+	var (
+		counted bool
+		entry   *clientEntry
+	)
+
+	refuse := func(reason DenyReason) DenyReason {
+		p.clients.release(entry)
+
+		if counted {
+			p.releaseAddressLocked(ctx.secretName, key, now)
+		} else {
+			// ledgerLocked creates a ledger on first use, so even an admit that
+			// refused can have made one.
+			p.dropLedgerIfIdleLocked(ctx.secretName, now)
+		}
+
+		return reason
+	}
+
+	if hasKey && p.bans.banned(ctx.secretName, key) {
+		return refuse(DenyBanned)
+	}
+
+	if keyed && ctx.clientConns > 0 && p.addresses[ctx.secretName].live(key) >= ctx.clientConns {
+		return refuse(DenyClientConns)
+	}
+
 	switch {
 	case hasKey:
 		if !p.ledgerLocked(ctx.secretName).admit(key, ctx.ipLimit, now) {
-			p.dropLedgerIfIdleLocked(ctx.secretName, now)
-
-			return false
+			return refuse(DenyIPLimit)
 		}
 
-		ctx.addrKey, ctx.addrCounted = key, true
+		counted = true
 	case ctx.ipLimit > 0:
-		return false
+		return refuse(DenyIPLimit)
+	}
+
+	if reason := registerStepHook(stepLedgerAdmitted, ctx); reason != DenyNone {
+		return refuse(reason)
+	}
+
+	entry = p.acquireClientLocked(ctx.secretName, key, keyed)
+
+	if reason := registerStepHook(stepEntryAcquired, ctx); reason != DenyNone {
+		return refuse(reason)
 	}
 
 	conns := p.liveConns[ctx.secretName]
@@ -449,7 +602,63 @@ func (p *Proxy) tryRegisterConn(ctx *streamContext) bool {
 
 	conns[ctx] = struct{}{}
 
-	return true
+	if counted {
+		ctx.addrKey, ctx.addrCounted = key, true
+	}
+
+	ctx.addrKeyed = keyed
+
+	if entry != nil {
+		ctx.addrEntry.Store(entry)
+	}
+
+	return DenyNone
+}
+
+// clientEntriesWanted is decision 3 of the per-address design: a secret's
+// streams take entries in the per-address table only when the proxy keeps
+// client addresses (track-client-ips, which a panel always sets) or the secret
+// has a per-address control. Otherwise there is no entry, and the data path
+// reads a nil pointer. This is the one place that decides it, for admission and
+// for a reload's backfill alike; clientEntriesWantedBy asks it of a whole set.
+func (p *Proxy) clientEntriesWanted(lim SecretLimits) bool {
+	return p.trackClientIPs || lim.hasClientControl()
+}
+
+// clientEntriesWantedBy is clientEntriesWanted for every secret of a set at
+// once, answered without looking a secret up: false exactly when no secret of
+// the set wants entries -- the proxy keeps no addresses and no secret has a
+// per-address control -- which is the common case, and then admission and a
+// reload's backfill do no table work at all. Both ask it, and nothing else
+// writes the shortcut out; a reason added to clientEntriesWanted belongs here
+// too, and a test holds the two to the same answer.
+func (p *Proxy) clientEntriesWantedBy(set *secretSet) bool {
+	return p.trackClientIPs || set.anyClientControl()
+}
+
+// acquireClientLocked takes the per-address entry a stream of the named secret
+// is governed by, or nil when there is no table or the secret needs none. The
+// limits are read from the secret set as it is now, under liveMu: a reload
+// swaps the set before it takes liveMu to re-rate and backfill, so an entry
+// made here is either made from the new set or reached by that reload. A
+// secret the set no longer has gets no entry; its stream is about to be
+// closed. Caller holds liveMu.
+func (p *Proxy) acquireClientLocked(name string, key addressKey, keyed bool) *clientEntry {
+	if p.clients == nil {
+		return nil
+	}
+
+	set := p.secrets.Load()
+	if !p.clientEntriesWantedBy(set) {
+		return nil
+	}
+
+	lim, ok := set.limitsOf(name)
+	if !ok || !p.clientEntriesWanted(lim) {
+		return nil
+	}
+
+	return p.clients.acquire(name, key, keyed, entryInitOf(lim))
 }
 
 // connectedIPs snapshots the distinct client addresses holding a live
@@ -472,17 +681,19 @@ func (p *Proxy) connectedIPs() map[string][]string {
 	return rv
 }
 
-// unregisterConn undoes tryRegisterConn: the stream leaves the registry and
-// its address is released from the ledger, in the same critical section.
+// unregisterConn undoes tryRegisterConn: the stream leaves the registry, its
+// address is released from the ledger and its per-address entry is given back,
+// in the same critical section. The entry stays in the table, for the address
+// to find again when it reconnects.
 func (p *Proxy) unregisterConn(ctx *streamContext) {
 	p.liveMu.Lock()
 	defer p.liveMu.Unlock()
 
+	// Swapped out, so that a stream can never give its entry back twice.
+	p.clients.release(ctx.addrEntry.Swap(nil))
+
 	if ctx.addrCounted {
-		if ledger := p.addresses[ctx.secretName]; ledger != nil {
-			ledger.release(ctx.addrKey)
-			p.dropLedgerIfIdleLocked(ctx.secretName, time.Now())
-		}
+		p.releaseAddressLocked(ctx.secretName, ctx.addrKey, time.Now())
 
 		ctx.addrCounted = false
 	}

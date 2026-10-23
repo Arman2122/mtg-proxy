@@ -210,9 +210,10 @@ func (p *Proxy) completeFakeTLS(
 	}
 
 	// Enforce per-user governance limits before we speak TLS back. A denied
-	// user (disabled, expired, or over quota) is routed to the cover site just
-	// like a wrong secret, so the outcome is indistinguishable to a prober.
-	if !p.attribute(ctx, set, idx) {
+	// user (disabled, expired, or over quota) or a banned place is routed to the
+	// cover site just like a wrong secret, so the outcome is indistinguishable
+	// to a prober: the cover site gets the client's own bytes either way.
+	if reason := p.attribute(ctx, set, idx); reason != DenyNone {
 		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
 
 		return false
@@ -260,19 +261,48 @@ func (p *Proxy) scanCandidates(parsed *fake.Parsed, set *secretSet, skip func(po
 // is, so a reload between the write and now cannot misdirect it: a name the set
 // no longer holds as a candidate is skipped, a re-keyed name is tried under its
 // new key, and a re-sorted name is found where it is now.
+//
+// A name the place is banned from is skipped too. A ban forgets the place's
+// hint for it, but a stream admitted a moment before the ban writes its hint
+// after admission, outside any lock a ban takes, and could write it back; a
+// banned place verified against its hint first would go round the scan budget
+// the ban leaves it to.
 func (p *Proxy) hintedPositions(ctx *streamContext, parsed *fake.Parsed, set *secretSet) []int {
 	if p.hints == nil || parsed.Blocks() > maxScanBlocks {
 		return nil
 	}
 
-	names := p.hints.recall(ctx.ClientIP())
+	ip := ctx.ClientIP()
+
+	names := p.hints.recall(ip)
 	if len(names) == 0 {
 		return nil
 	}
 
 	positions := make([]int, 0, len(names))
 
+	// The place's key is built at most once for all the hinted names, and only
+	// once a ban is held: with none held, the common case, a hinted hello pays
+	// nothing for the question, as with bannedFrom. Whether a ban is held is
+	// still asked for each name, as bannedFrom asks it, so a ban that lands
+	// during the loop is seen by the names after it.
+	var (
+		place         addressKey
+		placed, built bool
+	)
+
 	for _, name := range names {
+		if !p.bans.none() {
+			if !built {
+				place, placed = addressKeyOf(ip)
+				built = true
+			}
+
+			if placed && p.bannedAt(name, place) {
+				continue
+			}
+		}
+
 		if pos, ok := set.candByName[name]; ok && !slices.Contains(positions, pos) {
 			positions = append(positions, pos)
 		}
@@ -387,7 +417,16 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 		return p.denyObfuscated(ctx, policy)
 	}
 
-	if !p.attribute(ctx, set, res.Index) {
+	if reason := p.attribute(ctx, set, res.Index); reason != DenyNone {
+		// A banned client is charged like a frame that matched nothing, so one
+		// that keeps reconnecting is soon refused before the trial loop rather
+		// than costing a trial decryption every time. The budget is keyed by
+		// address alone, so the storm also spends that address's budget on this
+		// listener for the other secrets it might use; accepted.
+		if reason == DenyBanned {
+			p.obfsLimiter.Fail(policy, ctx.ClientIP())
+		}
+
 		return p.denyObfuscated(ctx, policy)
 	}
 
@@ -401,8 +440,8 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 
 // denyObfuscated disposes of a connection the obfuscated entry refused: no
 // secret matched, the tag is not honoured on this listener, the frame is a
-// replay, the user is disabled, expired or over quota, or the user is
-// throttled. Every one of those takes the SAME exit, so none is
+// replay, the user is disabled, expired or over quota, the place is banned, or
+// the user is throttled. Every one of those takes the SAME exit, so none is
 // distinguishable from the others. (A rate-limited peer is the one deliberate
 // exception -- see denyRateLimited.)
 //

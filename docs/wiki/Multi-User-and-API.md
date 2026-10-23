@@ -16,6 +16,9 @@ change.
 - [The features array](#the-features-array)
 - [Client addresses](#client-addresses)
 - [Managing secrets at runtime](#managing-secrets-at-runtime)
+  - [Per-address usage](#per-address-usage-get-secretsnameclients)
+  - [Bans](#bans-secretsnamebans)
+  - [Kick, ban or re-key](#kick-ban-or-re-key)
 - [The ad-tag routes](#the-ad-tag-routes)
 - [Errors and status codes](#errors-and-status-codes)
 - [Hot reload](#hot-reload)
@@ -185,14 +188,24 @@ Per user:
 | `expires_at` | when an expiry is set | RFC3339. |
 | `disabled` | when true | Omitted when false. |
 | `speed_limit` | when a speed limit is set | Bytes per second. |
-| `throttled_ms` | when non-zero | Milliseconds this user's connections have spent held to their speed limit. See [[Limits-and-Quotas]]. |
+| `throttled_ms` | when non-zero | Milliseconds this user's connections have spent held to their speed limits, and to the per-address limits (`client-speed`, `client-fair`) of the addresses they came from. See [[Limits-and-Quotas]]. |
 | `ip_limit` | when an address limit is set | How many places the user may be at once. |
 | `active_ips` | when non-zero | How many places the user counts as being in right now: the addresses of their live connections here plus any reported from elsewhere. A count, never gated. |
 | `ip_limit_refused` | when non-zero | Connections turned away for arriving from one place too many. |
+| `client_conns` | when `client-conns` is set | How many live connections one address may hold to this secret. |
+| `client_conns_refused` | when non-zero | Connections turned away for arriving from an address that already held `client_conns` of them. |
+| `client_speed_limit` | when `client-speed` is set | The per-address ceiling, in bytes per second. |
+| `client_fair` | when true | The user's speed limits are divided among the addresses they connect from. |
+| `clients` | when non-zero | How many addresses the per-address table holds an entry for, live and idle, the shared rest entry not counted. A count, never gated. The addresses are on [`GET /secrets/{name}/clients`](#per-address-usage-get-secretsnameclients). |
+| `clients_overflow` | when non-zero | Connections sent to the rest entry because the table had no room for their address. |
 | `ad_tag_skipped` | when non-zero | Ad-tagged streams that took the direct path because their transport has no middle-proxy reframer. By design. |
 | `ad_tag_failed` | when non-zero | Ad-tagged streams that took the direct path because the middle proxy could not be reached or refused them. Not by design: this is the sponsored channel going missing — except for a few right after a restart, while the middle-proxy config loads. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` | See below. |
 | `external_ips`, `external_expires_at` | only with `track-client-ips` | The addresses a panel reported the user present at elsewhere, and when that report lapses. See [external addresses](#external-addresses-secretsnameexternal-ips). |
+
+The per-address fields are scalars inside the user object. Nothing per-address
+is ever a key under `users`, which a panel bills as one client per key; the
+addresses themselves are on their own endpoint.
 
 Two behaviours that catch people out:
 
@@ -212,13 +225,16 @@ Cross-reference: [[Limits-and-Quotas]] for what the quota fields mean,
 `features` is a sorted list of capability names the **binary** supports:
 
 ```text
-client-ip-activity  client-ips  faketls  handshake-budget  ip-limits  kick  listeners  quota-ceiling  quota-reset  secret-modes  secret-read  secrets-api  speed-directions  speed-limits  web-relay  web-relay-watch
+client-bans  client-ip-activity  client-ips  client-limits  client-stats  faketls  handshake-budget  ip-limits  kick  listeners  quota-ceiling  quota-reset  secret-modes  secret-read  secrets-api  speed-directions  speed-limits  web-relay  web-relay-watch
 ```
 
 | Name | Means |
 |---|---|
+| `client-bans` | `POST` and `GET /secrets/{name}/bans` and `DELETE /secrets/{name}/bans/{address}` are served, a banned address is turned away at every door as a wrong secret is, and `/clients` rows carry `banned_until`. |
 | `client-ip-activity` | `connected_ips_last_seen` accompanies `connected_ips` wherever it appears: when each address last moved a byte, gated exactly as the addresses are. |
 | `client-ips` | The binary understands `track-client-ips`, and `connected_ips`/`last_ip` may appear when it is on. |
+| `client-limits` | `client-conns`, `client-speed` and `client-fair` are honoured in `[secret-limits.<name>]`, and as `client_conns`, `client_speed` and `client_fair` on the secrets API. `/stats` reads them back as `client_conns`, `client_speed_limit` and `client_fair`, and counts `client_conns_refused`. |
+| `client-stats` | `GET /secrets/{name}/clients` is served, and `/stats` carries `clients` and `clients_overflow` inside the user object. |
 | `faketls` | The FakeTLS handshake is served. |
 | `handshake-budget` | The FakeTLS door bounds the CPU it spends scanning hellos no hint matched, `[defense.handshake-budget]` is honoured, and `/stats` reports the door's counters as the top-level `faketls_handshake` object once it has counted something. |
 | `ip-limits` | `ip_limit` is accepted on `[secret-limits.<name>]` and the secrets API, `/stats` reports `ip_limit`, `active_ips` and `ip_limit_refused`, and `/secrets/{name}/external-ips` is served. |
@@ -296,6 +312,14 @@ either never accumulates one. (That is about these two fields: the ee handshake
 budget keeps a separate anonymous per-address bucket in memory whatever
 `track-client-ips` says; see *Client addresses* in [[Security]].)
 
+With tracking on, the proxy also keeps every address a secret is used from in
+its per-address table, with what that address moved, until ten minutes after
+its last connection closes, and lists it on
+[`GET /secrets/{name}/clients`](#per-address-usage-get-secretsnameclients) for up
+to about eleven minutes. That reaches further back than `connected_ips`. A
+secret with a per-address control keeps such entries even with tracking off,
+and then reports only counts.
+
 Nothing here is written to disk in any form. `usage-state-file` persists quota
 counters only, so no address survives a restart. Turn this on for a specific,
 time-boxed reason — chasing an abuse report, debugging a NAT — and turn it back
@@ -326,6 +350,11 @@ where every connection otherwise arrives from `127.0.0.1`. See
 | `GET /secrets/{name}/external-ips` | That user's address view: limit, count, and the addresses when tracking is on. |
 | `PUT /secrets/{name}/external-ips` | Report the addresses the user holds on other systems, so the address limit spans them. |
 | `DELETE /secrets/{name}/external-ips` | Clear that report. |
+| `POST /secrets/{name}/kick` | Close that user's live streams from the named places. |
+| `GET /secrets/{name}/clients` | Per-address usage of one secret: counts always, the addresses only with `track-client-ips`. |
+| `POST /secrets/{name}/bans` | Ban places from one secret for a while, closing their live streams. |
+| `GET /secrets/{name}/bans` | That secret's bans: a count always, the addresses only with `track-client-ips`. |
+| `DELETE /secrets/{name}/bans/{address}` | Lift one ban. |
 
 ### GET /secrets
 
@@ -378,6 +407,9 @@ The list is sorted by name.
 | `speed_limit` | when a speed limit is set (v1.6.0) | Bytes per second; set as `speed` with a human spelling. |
 | `ip_limit` | when an address limit is set (v1.7.0) | How many places the user may be at once; set as `ip_limit`, an integer. |
 | `active_ips` | when non-zero (v1.7.0) | How many places the user counts as being in right now. Never gated. |
+| `client_conns` | when `client-conns` is set (`client-limits`) | How many live connections one address may hold to this secret; set as `client_conns`, an integer. |
+| `client_speed_limit` | when `client-speed` is set (`client-limits`) | The per-address ceiling in bytes per second; set as `client_speed` with a human spelling. |
+| `client_fair` | when true (`client-limits`) | The secret's speed limits are divided among its addresses; set as `client_fair`. |
 | `connections` | always (v1.3.0) | Live connections. `0` for a secret nobody has used. |
 | `last_seen` | always (v1.3.0) | `null` when never connected. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` (v1.3.0) | Same gate as `/stats`. |
@@ -415,9 +447,21 @@ reaches the user's live connections at once. `ip_limit` is an integer, how many
 places the user may be at once; zero or absent is unlimited, and a negative
 value is `400`. Both are explained on [[Limits-and-Quotas]].
 
+The per-address controls (feature `client-limits`) are three more optional
+fields. `client_conns` is an integer, how many live connections one address may
+hold to the secret; zero or absent is no cap, and a negative value is `400`.
+`client_speed` is a rate in the same spelling as `speed`, a ceiling on one
+address; absent is no ceiling, and `"0"` or a value under `64kbit` is `400`.
+`client_fair` is `true` or `false`, and `true` needs `speed`, `speed_up` or
+`speed_down` in the same request, or the request is `400`: this route replaces
+every limit, so a speed set earlier is gone by the time it applies. They are
+read back as `client_conns`, `client_speed_limit` and `client_fair`. What they
+do is on [[Configuration]], under *Per-address controls*.
+
 **This route replaces the whole entry, it does not merge.** Re-posting `carol`
-without `quota` clears her quota; without `ad_tag`, clears her ad-tag override.
-Send the complete desired state every time, or read `GET /secrets` first.
+without `quota` clears her quota; without `ad_tag`, clears her ad-tag override;
+without `client_conns`, `client_speed` or `client_fair`, clears those. Send the
+complete desired state every time, or read `GET /secrets` first.
 
 Note the asymmetry between what you send and what you read back: `quota` goes in
 as a string and comes out as an integer byte count, `speed` goes in as a string
@@ -439,10 +483,12 @@ truth renders the full roster anyway; use `POST` for incremental edits.
 
 Every per-secret limit travels in the same object as the secret, under the JSON
 spelling of its config key: `quota`, `quota_reset`, `expires`, `disabled`,
-`speed`, `speed_up`, `speed_down` and `ip_limit`. A limit absent from the body is
+`speed`, `speed_up`, `speed_down`, `ip_limit`, `client_conns`, `client_speed`
+and `client_fair`. A limit absent from the body is
 absent from the proxy after the swap — this route replaces, it does not merge —
 so a panel that sets a speed through the file must send it here too. Speeds and
-the quota are strings in the config file's grammar; `ip_limit` is a number.
+the quota are strings in the config file's grammar; `ip_limit` and
+`client_conns` are numbers, `client_fair` a boolean.
 
 ### DELETE and reset-quota
 
@@ -484,6 +530,12 @@ and an unknown user `404`. The kicked client sees its connection drop and will
 reconnect; whether that reconnect is admitted is the address limit's business,
 not the kick's.
 
+Kick takes addresses, not prefixes. To kick an IPv6 row of
+[`GET /secrets/{name}/clients`](#per-address-usage-get-secretsnameclients),
+which is spelled as a /64 (`2001:db8:1:2::/64`), send its prefix address without
+the `/64` (`2001:db8:1:2::`), or any address inside it; the `/64` form itself is
+`400`. To keep a place out after the kick, ban it instead (below).
+
 ### External addresses: `/secrets/{name}/external-ips`
 
 New in v1.7.0, for a panel that enforces one address limit across several
@@ -510,6 +562,219 @@ the log, and read back only with `track-client-ips`, exactly as `connected_ips`
 is; the counts always come back. What counts as a place, and how the limit
 behaves when a device changes networks, is on [[Limits-and-Quotas]].
 
+### Per-address usage: `GET /secrets/{name}/clients`
+
+New with the `client-stats` feature. One secret's usage per source address: what
+each address moved, how many connections it holds and the per-address rates in
+force on it. It is an endpoint of its own because `/stats` cannot carry it:
+every key under `users` there is billed as a client.
+
+```bash
+curl -s -H "Authorization: Bearer a-long-random-string" "http://127.0.0.1:9090/secrets/alice/clients?limit=50"
+```
+
+With `track-client-ips` on, for a secret with `client-speed = "2mbit"`:
+
+```json
+{
+  "total": 3,
+  "overflow": 0,
+  "tracking": true,
+  "rest": {
+    "connections": 2,
+    "bytes_in": 81920,
+    "bytes_out": 1572864,
+    "first_seen": "2026-10-07T08:02:11Z",
+    "last_seen": "2026-10-07T10:42:05Z"
+  },
+  "clients": [
+    {
+      "address": "203.0.113.44",
+      "connections": 6,
+      "bytes_in": 10485760,
+      "bytes_out": 734003200,
+      "throttled_ms": 412000,
+      "first_seen": "2026-10-07T09:30:02Z",
+      "last_seen": "2026-10-07T10:42:03Z",
+      "speed_limit": 250000
+    },
+    {
+      "address": "2001:db8:1:2::/64",
+      "connections": 0,
+      "bytes_in": 2097152,
+      "bytes_out": 52428800,
+      "first_seen": "2026-10-07T10:01:40Z",
+      "last_seen": "2026-10-07T10:38:51Z",
+      "speed_limit": 250000,
+      "banned_until": "2026-10-07T11:38:51Z"
+    },
+    {
+      "address": "198.51.100.7",
+      "connections": 3,
+      "bytes_in": 524288,
+      "bytes_out": 4194304,
+      "first_seen": "2026-10-07T10:20:13Z",
+      "last_seen": "2026-10-07T10:42:01Z",
+      "speed_limit": 250000
+    }
+  ]
+}
+```
+
+With tracking off the answer is the counts and nothing else, whatever the
+proxy holds:
+
+```json
+{"total": 3, "overflow": 0, "tracking": false}
+```
+
+| Field | Notes |
+|---|---|
+| `total` | How many addresses the secret holds an entry for, live and idle, the rest entry not counted. Every entry, not the page. Never gated. |
+| `overflow` | Connections sent to the rest entry because the per-address table had no room for their address. Never gated. |
+| `tracking` | Whether the proxy lists addresses at all (`track-client-ips`). |
+| `rest` | Only with tracking, and only while the secret has a rest entry: the one entry shared by every peer that does not stand for one place (loopback, private and the like) and every address the table had no room for. No address, no ceiling. |
+| `clients` | Only with tracking: one row per address, most bytes first (`bytes_in` plus `bytes_out`), ties by address. An empty array when there is none. |
+
+Each row, and the `rest` object without its address:
+
+| Field | Notes |
+|---|---|
+| `address` | An IPv4 address, or an IPv6 /64 in prefix form. |
+| `connections` | Live connections from that address right now, from the same count `ip-limit` and `client-conns` read. For `rest`, the streams the rest entry governs. |
+| `bytes_in`, `bytes_out` | What the address moved, from the client's side: `in` is what it sent. |
+| `throttled_ms` | Milliseconds its streams spent held to its own per-address limits, the ceiling included. Absent when none. |
+| `first_seen`, `last_seen` | When the entry was made, and the last second a connection from it opened or closed or a byte moved. UTC, whole seconds. |
+| `speed_limit` | The tighter of its `client-speed` ceiling and its fair share of `speed`, in bytes per second. Absent when there is neither. |
+| `speed_limit_up`, `speed_limit_down` | Its fair shares of `speed-up` and `speed-down`. Absent when there is none. |
+| `banned_until` | When a ban of the address from this secret lapses (feature `client-bans`). Absent when it has none. |
+
+`limit` is how many rows to return: 100 when absent, at most 1,000 whatever is
+asked for, and `400` when it is not a whole number above zero. The rows are the
+ones that moved the most, sorted before they are cut. An unknown secret is
+`404`; a bad `limit` is `400` first.
+
+How to read the list, and what it does and does not mean, is on [[Monitoring]].
+
+### Bans: `/secrets/{name}/bans`
+
+New with the `client-bans` feature. A ban refuses a place one secret for a
+while and ends the streams the place holds now. It lives in memory only.
+
+| Method | Body | Answer |
+|---|---|---|
+| `POST /secrets/{name}/bans` | `{"ips":["203.0.113.44"],"ttl":"1h","force":false}` | `{"banned":N,"closed":M}`, plus `addresses` with `track-client-ips`. |
+| `GET /secrets/{name}/bans` | | `{"total":N,"tracking":false}`, or with `track-client-ips` the bans themselves. |
+| `DELETE /secrets/{name}/bans/{address}` | | `{"removed":1}`, or `{"removed":0}` when the place had no ban. |
+
+Ban two places from alice's secret for six hours:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer a-long-random-string" -H "Content-Type: application/json" -d '{"ips":["203.0.113.44","2001:db8:1:2::5"],"ttl":"6h"}' http://127.0.0.1:9090/secrets/alice/bans
+```
+
+```json
+{"banned": 2, "closed": 6, "addresses": ["2001:db8:1:2::/64", "203.0.113.44"]}
+```
+
+List them:
+
+```bash
+curl -s -H "Authorization: Bearer a-long-random-string" http://127.0.0.1:9090/secrets/alice/bans
+```
+
+```json
+{
+  "total": 2,
+  "tracking": true,
+  "bans": [
+    {"address": "2001:db8:1:2::/64", "expires_at": "2026-10-07T16:42:10Z"},
+    {"address": "203.0.113.44", "expires_at": "2026-10-07T16:42:10Z"}
+  ]
+}
+```
+
+Lift one, by the /64 the listing shows or by any address inside it:
+
+```bash
+curl -s -X DELETE -H "Authorization: Bearer a-long-random-string" http://127.0.0.1:9090/secrets/alice/bans/2001:db8:1:2::/64
+```
+
+```json
+{"removed": 1}
+```
+
+What a ban request takes:
+
+- `ips`: 1 to 4,096 entries. Each is a literal IP address with no zone, or an
+  IPv6 /64 in prefix form, the way `/clients` and `GET /bans` spell it. Any other
+  prefix is `400`.
+- `ttl`: a Go duration in `(0, 720h]`; absent is `1h`. Days are not a unit:
+  `"30d"` is `400`, write `"720h"`.
+- `force`: needed to ban an address that does not stand for one place —
+  loopback, private, link-local, unspecified, multicast — or the one IPv6 /64
+  that holds some (`::/64`). Without it such a request is `400` and says so.
+  Behind a carrier on loopback that sends no PROXY header every client is
+  `127.0.0.1`, so banning it with `force` bans every client from the secret.
+
+What a ban does:
+
+- **It is held per place and per secret.** A place is an IPv4 address (a
+  v4-mapped address is its IPv4 address) or an IPv6 /64, as for `kick`, so
+  banning `2001:db8:1:2::5` bans the whole `2001:db8:1:2::/64`. Alice's ban does
+  not touch bob.
+- **It ends the place's live streams of that secret**, and it is recorded and
+  the streams are found in one step, under the lock admission uses, so no stream
+  gets in between the ban and the close. It also forgets that secret's handshake
+  hint for the place.
+- **At the doors a banned place is turned away as a wrong secret is.** On
+  FakeTLS it is fronted to the cover site before the server answers, and the
+  cover site receives exactly what it would for a wrong secret. On an obfuscated
+  `[[listener]]` it takes the same exit as every other refusal there, and on a
+  `public = true` listener the attempt is charged to that address's
+  `handshakes-per-ip` budget like a frame that matched nothing. A ban recorded in
+  the moment between a stream's secret matching and the stream registering is
+  caught by a second check, which closes the stream after the handshake; that
+  late refusal is not charged to the budget.
+- **Banning a place that is already banned sets a new expiry**, shorter or
+  longer: the latest request wins. It takes no new slot.
+- **At most 4,096 bans are held across every secret.** A request that would go
+  past that is refused whole with `409` `ban list full`. Lapsed bans hold no
+  slot.
+- **`banned` counts the distinct places in the request**, already-banned ones
+  included; `closed` counts the streams closed. `addresses`, the places in the
+  unit they are held at, is echoed only with `track-client-ips`, so with tracking
+  off nothing in the answer shows that an IPv6 address was banned as its /64.
+- **It lives in memory only.** It survives `POST /reload` and a re-key of the
+  secret. It goes when the secret is removed, and with the process on restart.
+- **It is not counted on its own.** No `/stats` field, event or metric of its
+  own counts banned attempts; on an obfuscated listener they are inside
+  `obfuscated.denied` with every other refusal. The API logs
+  `addresses banned through the API` with the secret name and the two counts and
+  no address. A refused attempt logs `connection denied by per-user limit` with
+  `deny_reason` `banned`, carrying the stream's `client-ip` as every stream line
+  does. Both are at info level, which only `debug = true` shows.
+
+`GET /bans` is gated as `external_ips` is: `total` is always there, and `bans`
+— each with `address` and `expires_at`, UTC, sorted by address — only with
+`track-client-ips`. `DELETE` takes the address as a literal IP or as the /64
+form, needs no `force`, and is idempotent. A malformed request is `400` even for
+an unknown secret; a well-formed one for an unknown secret is `404`.
+
+### Kick, ban or re-key
+
+| | What it does | How long | Use it for |
+|---|---|---|---|
+| `kick` | Closes the streams one place holds on one secret. The device reconnects at once. | A moment | A device that is one too many, when `ip-limit` should decide whether it comes back |
+| ban | Closes them and refuses the place that secret until the ban lapses | Up to `720h`, in memory; lost on restart | Short-term abuse from one place |
+| re-key | Gives the secret a new key (`POST /secrets` with a new `secret`, or the file and a reload). Every live connection of the secret closes and every holder needs a new link | Permanent | A leaked link |
+
+A ban is a refusal, not concealment. Someone who holds the secret and connects
+from a banned place can tell from the timing that the key matched, and can come
+back from another place. For a leaked link, re-key the secret. Rotation with an
+overlap period, which would let holders move to a new key without a gap, is not
+part of this release. See [[Security]] for what a ban does and does not hide.
+
 ### What a mutation does to live connections
 
 `POST`, `PUT` and `DELETE` all go through the same atomic swap as a file reload:
@@ -524,6 +789,11 @@ behaves when a device changes networks, is on [[Limits-and-Quotas]].
 - a **quota** lowered to or below what the user has already used closes their
   live connections too, and a quota reached mid-stream ends the stream at the
   byte that reaches it (v1.8.0; before, a quota was checked only at admission);
+- a changed **per-address limit** reaches open connections without closing any:
+  a lowered `client_conns` binds the next connection, and a ceiling or a fair
+  share is re-rated in place;
+- **bans** carry over, a re-keyed secret's included; a removed secret's bans go
+  with it;
 - every other user stays connected, and all counters carry over.
 
 `reset-quota` is the exception: it touches one counter and no connection at all.
@@ -541,7 +811,10 @@ is precisely the distinguisher domain fronting exists to remove. See
 Nothing these routes do is written back to the config file. A later
 `POST /reload`, or a restart, re-reads the file and overrides them. Treat the
 file as the source of truth and the API as a live override; a panel that owns
-the roster should write the file first and then call `/reload`.
+the roster should write the file first and then call `/reload`. Bans are the
+exception: the file has no place for them, so a reload leaves them alone. They
+end when they lapse, when they are lifted, when their secret is removed, or when
+the process restarts.
 
 One practical consequence: `mtg-proxy access` reads the config file, not the
 API. A user added only through `POST /secrets` gets no link from `access` until
@@ -579,11 +852,11 @@ field of the `/secrets` routes.
 
 | Status | When |
 |---|---|
-| `400` | Malformed JSON, an unknown JSON field, an invalid secret, a bad ad-tag, an unparseable quota, speed or expiry, a kick naming no valid address, or a swap that would leave nothing to front. |
+| `400` | Malformed JSON, an unknown JSON field, an invalid secret, a bad ad-tag, an unparseable quota, speed or expiry, a kick naming no valid address, or a swap that would leave nothing to front. Also: a negative `client_conns`; a `client_speed` that is zero, under `64kbit` or not a rate; `client_fair` without `speed`, `speed_up` or `speed_down` beside it; a `/clients` `limit` that is not a whole number above zero; a ban naming no place, more than 4,096 places, something that is not an IP address or an IPv6 /64, or an address that does not stand for one place without `force`; a ban `ttl` outside `(0, 720h]`; an unban address that is not an IP address or an IPv6 /64. These are answered before a `404`. |
 | `401` | `api-token` is set and the `Authorization` header is missing or wrong. |
-| `404` | Unknown secret name on `GET` or `DELETE /secrets/{name}`, `/reset-quota`, `/kick` or `/external-ips`; unknown path. |
+| `404` | Unknown secret name on `GET` or `DELETE /secrets/{name}`, `/reset-quota`, `/kick`, `/external-ips`, `/clients` or `/bans`; unknown path. |
 | `405` | Wrong method — `POST /stats`, or anything but `POST` on `/reload`. |
-| `409` | `DELETE /secrets/{name}` would remove the last secret. |
+| `409` | `DELETE /secrets/{name}` would remove the last secret, or a ban would take the ban list past 4,096 (`ban list full`). |
 | `500` | `POST /reload` could not read, parse or validate the config file. |
 | `503` | `POST /reload` on a proxy started without a config file. |
 

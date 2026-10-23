@@ -165,6 +165,39 @@ func (h *matchHints) recall(ip net.IP) []string {
 	return slices.Clone(entry.names)
 }
 
+// forget drops name from the hints of ip's place, in both generations, and the
+// place with its last name: a ban of the place from that secret, which no
+// handshake can earn back while it lasts. The key is hintKey's, so every
+// spelling of the place -- another host of an IPv6 /64, the v4-mapped form of
+// an IPv4 address -- forgets the same entry; an unkeyed address has none. The
+// names the place holds for other secrets are earned and stay.
+func (h *matchHints) forget(ip net.IP, name string) {
+	if h == nil {
+		return
+	}
+
+	key, ok := hintKey(ip)
+	if !ok {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for _, generation := range []map[netip.Addr]*hintEntry{h.current, h.previous} {
+		entry, ok := generation[key]
+		if !ok {
+			continue
+		}
+
+		entry.names = slices.DeleteFunc(entry.names, func(held string) bool { return held == name })
+
+		if len(entry.names) == 0 {
+			delete(generation, key)
+		}
+	}
+}
+
 // remember records that name just completed a handshake from ip's place. An
 // address already held is always updated (and moved to the current generation
 // if it was in the older one); a new address is dropped when the two

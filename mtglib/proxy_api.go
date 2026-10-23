@@ -49,6 +49,20 @@ type SecretInfo struct {
 	IPLimit   int `json:"ip_limit,omitempty"`
 	ActiveIPs int `json:"active_ips,omitempty"`
 
+	// ClientConns is how many live connections one address may hold to this
+	// secret at once, or absent for unlimited. A limit, not an address.
+	ClientConns int `json:"client_conns,omitempty"`
+
+	// ClientSpeedLimit is the per-address ceiling in bytes per second, set as
+	// client_speed with a human spelling and read back as a number, the way
+	// speed is read back as speed_limit; absent for unlimited.
+	ClientSpeedLimit int64 `json:"client_speed_limit,omitempty"`
+
+	// ClientFair is whether the secret's speed limits are divided among its
+	// addresses, client_fair; absent when they are not. A switch, not an
+	// address.
+	ClientFair bool `json:"client_fair,omitempty"`
+
 	// Mode is the wire form this secret serialises to: "ee", "dd" or "plain".
 	Mode string `json:"mode"`
 
@@ -172,6 +186,9 @@ func fillLimitInfo(info *SecretInfo, lim SecretLimits, used int64) {
 	info.SpeedLimitUp = lim.SpeedUpBytesPerSecond
 	info.SpeedLimitDown = lim.SpeedDownBytesPerSecond
 	info.IPLimit = lim.IPLimit
+	info.ClientConns = lim.ClientConns
+	info.ClientSpeedLimit = lim.ClientSpeedBytesPerSecond
+	info.ClientFair = lim.ClientFair
 }
 
 // ReplaceSecrets swaps the entire secret configuration (secrets + advertising
@@ -228,9 +245,10 @@ func (p *Proxy) PutSecret(name string, s Secret, adTag *[AdTagLength]byte, limit
 	return p.swapSecretConfigLocked(cfg)
 }
 
-// DeleteSecret removes a single secret and its advertising override. It returns
-// ErrSecretNotFound for an unknown name and ErrLastSecret if the removal would
-// empty the set. The removed secret's live connections are closed.
+// DeleteSecret removes a single secret, its advertising override and its
+// limits. It returns ErrSecretNotFound for an unknown name and ErrLastSecret if
+// the removal would empty the set. The removed secret's live connections are
+// closed.
 func (p *Proxy) DeleteSecret(name string) error {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
@@ -245,10 +263,21 @@ func (p *Proxy) DeleteSecret(name string) error {
 		return ErrLastSecret
 	}
 
-	delete(cfg.Secrets, name)
-	delete(cfg.SecretAdTags, name)
+	cfg.forget(name)
 
 	return p.swapSecretConfigLocked(cfg)
+}
+
+// forget removes everything cfg files under name: the secret, its advertising
+// override and its limits. A set is built from the names in Secrets alone, so
+// an override or limits left behind would never be read; they go all the same,
+// so that the config handed to the swap says what the set will hold. Deleting
+// from a nil map does nothing, so a config with no overrides or no limits needs
+// no check.
+func (c *SecretConfig) forget(name string) {
+	delete(c.Secrets, name)
+	delete(c.SecretAdTags, name)
+	delete(c.Limits, name)
 }
 
 // GlobalAdTag returns the currently active global advertising tag, or nil when
@@ -390,6 +419,10 @@ func (p *Proxy) buildAPIHandler(token string) http.Handler {
 	mux.HandleFunc("DELETE /secrets/{name}", p.handleDeleteSecret)
 	mux.HandleFunc("POST /secrets/{name}/reset-quota", p.handleResetQuota)
 	mux.HandleFunc("POST /secrets/{name}/kick", p.handleKick)
+	mux.HandleFunc("GET /secrets/{name}/clients", p.handleGetClients)
+	mux.HandleFunc("POST /secrets/{name}/bans", p.handleBan)
+	mux.HandleFunc("GET /secrets/{name}/bans", p.handleGetBans)
+	mux.HandleFunc("DELETE /secrets/{name}/bans/{address...}", p.handleUnban)
 	mux.HandleFunc("GET /secrets/{name}/external-ips", p.handleGetExternalIPs)
 	mux.HandleFunc("PUT /secrets/{name}/external-ips", p.handlePutExternalIPs)
 	mux.HandleFunc("DELETE /secrets/{name}/external-ips", p.handleDeleteExternalIPs)
@@ -480,6 +513,23 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		resp.Users[name] = user
 	}
 
+	// The per-address table's counts are scalars inside the user object, and
+	// the overlay only ever fills a user that is already there: a name the table
+	// holds and the counters do not is skipped, never added, because every key
+	// under Users is billed as a client. A count is not an address, so neither
+	// is gated on track-client-ips. The table's lock is taken alone, after
+	// liveMu was let go above.
+	for name, counts := range p.clients.counts() {
+		user, ok := resp.Users[name]
+		if !ok {
+			continue
+		}
+
+		user.Clients = counts.clients
+		user.ClientsOverflow = counts.overflow
+		resp.Users[name] = user
+	}
+
 	set := p.secrets.Load()
 	for i, name := range set.names {
 		user, ok := resp.Users[name]
@@ -514,6 +564,9 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		user.SpeedLimitUp = lim.SpeedUpBytesPerSecond
 		user.SpeedLimitDown = lim.SpeedDownBytesPerSecond
 		user.IPLimit = lim.IPLimit
+		user.ClientConns = lim.ClientConns
+		user.ClientSpeedLimit = lim.ClientSpeedBytesPerSecond
+		user.ClientFair = lim.ClientFair
 
 		resp.Users[name] = user
 	}
@@ -650,23 +703,34 @@ func (p *Proxy) hasSecret(name string) bool {
 // clears the corresponding limit. Quota accepts human sizes ("10GB"), expires
 // accepts RFC3339 or YYYY-MM-DD, quota_reset is "none" or "monthly", and speed
 // accepts a rate ("5mbit", "1MB/s") -- the same spellings the config file
-// takes, from the same parsers -- and ip_limit is a count of addresses.
+// takes, from the same parsers -- ip_limit is a count of addresses,
+// client_conns a count of one address's live connections, client_speed one
+// address's ceiling, spelled as speed is, and client_fair the switch that
+// divides the secret's speed among its addresses.
 type limitFields struct {
-	Quota      string `json:"quota,omitempty"`
-	QuotaReset string `json:"quota_reset,omitempty"`
-	Expires    string `json:"expires,omitempty"`
-	Disabled   bool   `json:"disabled,omitempty"`
-	Speed      string `json:"speed,omitempty"`
-	SpeedUp    string `json:"speed_up,omitempty"`
-	SpeedDown  string `json:"speed_down,omitempty"`
-	IPLimit    int    `json:"ip_limit,omitempty"`
+	Quota       string `json:"quota,omitempty"`
+	QuotaReset  string `json:"quota_reset,omitempty"`
+	Expires     string `json:"expires,omitempty"`
+	Disabled    bool   `json:"disabled,omitempty"`
+	Speed       string `json:"speed,omitempty"`
+	SpeedUp     string `json:"speed_up,omitempty"`
+	SpeedDown   string `json:"speed_down,omitempty"`
+	IPLimit     int    `json:"ip_limit,omitempty"`
+	ClientConns int    `json:"client_conns,omitempty"`
+	ClientSpeed string `json:"client_speed,omitempty"`
+	ClientFair  bool   `json:"client_fair,omitempty"`
 }
 
 // parse turns the raw string fields into a SecretLimits, returning an error for
-// a malformed quota, reset policy, expiry, speed or ip limit.
+// a malformed quota, reset policy, expiry, speed, ip limit, connection cap or
+// per-address ceiling.
 func (l limitFields) parse() (SecretLimits, error) {
 	if l.IPLimit < 0 {
 		return SecretLimits{}, fmt.Errorf("%w: ip_limit must not be negative (%d)", ErrSecretInvalid, l.IPLimit)
+	}
+
+	if l.ClientConns < 0 {
+		return SecretLimits{}, fmt.Errorf("%w: client_conns must not be negative (%d)", ErrSecretInvalid, l.ClientConns)
 	}
 
 	quota, err := ParseQuotaBytes(l.Quota)
@@ -699,16 +763,44 @@ func (l limitFields) parse() (SecretLimits, error) {
 		return SecretLimits{}, fmt.Errorf("speed_down: %w", err)
 	}
 
+	clientSpeed, err := ParseSpeed(l.ClientSpeed)
+	if err != nil {
+		return SecretLimits{}, fmt.Errorf("client_speed: %w", err)
+	}
+
 	return SecretLimits{
-		QuotaBytes:              quota,
-		QuotaReset:              reset,
-		ExpiresAt:               expires,
-		Disabled:                l.Disabled,
-		SpeedBytesPerSecond:     speed,
-		SpeedUpBytesPerSecond:   speedUp,
-		SpeedDownBytesPerSecond: speedDown,
-		IPLimit:                 l.IPLimit,
+		QuotaBytes:                quota,
+		QuotaReset:                reset,
+		ExpiresAt:                 expires,
+		Disabled:                  l.Disabled,
+		SpeedBytesPerSecond:       speed,
+		SpeedUpBytesPerSecond:     speedUp,
+		SpeedDownBytesPerSecond:   speedDown,
+		IPLimit:                   l.IPLimit,
+		ClientConns:               l.ClientConns,
+		ClientSpeedBytesPerSecond: clientSpeed,
+		ClientFair:                l.ClientFair,
 	}, nil
+}
+
+// limits is parse, and then what no one field can say on its own: client_fair
+// divides the secret's speed, so it needs speed, speed_up or speed_down in the
+// same request. A POST replaces every limit of its secret and a PUT every
+// secret, so a speed set before the request is gone by the time it applies.
+// The per-address ceiling is not a speed fair share divides. Both handlers
+// that take limits read them through here.
+func (l limitFields) limits() (SecretLimits, error) {
+	lim, err := l.parse()
+	if err != nil {
+		return SecretLimits{}, err
+	}
+
+	if lim.ClientFair && lim.fairTotals() == (fairTotals{}) {
+		return SecretLimits{}, fmt.Errorf(
+			"%w: client_fair divides the secret's speed and needs speed, speed_up or speed_down", ErrSecretInvalid)
+	}
+
+	return lim, nil
 }
 
 type secretEntry struct {
@@ -755,7 +847,7 @@ func (p *Proxy) handlePutSecrets(w http.ResponseWriter, r *http.Request) {
 			cfg.SecretAdTags[name] = *tag
 		}
 
-		limits, err := entry.parse()
+		limits, err := entry.limits()
 		if err != nil {
 			httpError(w, http.StatusBadRequest, fmt.Errorf("invalid limits for %q: %w", name, err))
 
@@ -817,7 +909,7 @@ func (p *Proxy) handlePostSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limits, err := req.parse()
+	limits, err := req.limits()
 	if err != nil {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("invalid limits: %w", err))
 
@@ -922,13 +1014,14 @@ func (p *Proxy) handleDeleteAdTag(w http.ResponseWriter, _ *http.Request) {
 var statusOK = map[string]string{"status": "ok"}
 
 // secretMutationStatus maps a mutation error to an HTTP status: 404 for an
-// unknown secret, 409 when a delete would empty the set, and 400 for every
-// validation failure (invalid secret, invalid/oversized adtag, empty set).
+// unknown secret, 409 when a delete would empty the set or a ban would take the
+// ban list past its bound, and 400 for every validation failure (invalid
+// secret, invalid/oversized adtag, empty set).
 func secretMutationStatus(err error) int {
 	switch {
 	case errors.Is(err, ErrSecretNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, ErrLastSecret):
+	case errors.Is(err, ErrLastSecret), errors.Is(err, ErrBanListFull):
 		return http.StatusConflict
 	default:
 		return http.StatusBadRequest

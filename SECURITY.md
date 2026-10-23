@@ -125,9 +125,9 @@ address deserves to know what it gives away.
 **A rate-limited peer is closed, never drained.** Every refusal on this
 listener otherwise takes one exit: the 64-byte frame is read, nothing is
 written back, and the connection is disposed of by `on-unknown-secret` — so an
-unknown secret, an unhonoured transport, a replayed frame, a throttled user and
-a disabled, expired or over-quota one are all indistinguishable from each
-other. A peer that has exhausted its `handshakes-per-ip` budget is the one
+unknown secret, an unhonoured transport, a replayed frame, a throttled user, a
+disabled, expired or over-quota one and an address banned from the secret are
+all indistinguishable from each other. A peer that has exhausted its `handshakes-per-ip` budget is the one
 exception: it is read from identically, but it is closed even where the
 listener is set to `drain`. The drain is the longest hold the listener offers,
 and handing it to a peer whose budget is already gone would make the budget a
@@ -139,7 +139,8 @@ is the opt-in for a public listener, and this is its cost.
 **A matched-then-denied frame returns faster than a miss.** Trial decryption
 stops at the first key that decrypts the transport tag to something the
 listener honours, so a frame that matches a secret and is then refused (a
-replay, or a disabled, expired, over-quota or throttled user) short-circuits
+replay, a disabled, expired, over-quota or throttled user, or an address banned
+from that secret) short-circuits
 the candidate loop, while a frame no secret matches runs all N candidates. The
 difference is bounded by N times the per-candidate cost — one SHA-256
 compression, one AES key expansion and one AES block, on the order of half a
@@ -161,3 +162,11 @@ handshake budget on the `bind-to` port fronts a hello it refuses or finds
 oversized at once, while a hello that matches no secret is fronted after its
 scan, so the time to the first fronted byte can differ even though the bytes the
 cover site receives are the same. The Security page of the wiki has the detail.
+
+**A banned address can tell that its key matched.** An address an operator has
+banned from a secret is fronted like a wrong secret, with the same bytes to the
+cover site, but only after its secret matched, so a holder of that key who times
+it can tell the key is valid and the address is refused. Someone without the key
+learns nothing. A ban is a refusal, not concealment: for a leaked link, re-key
+the secret. The Security page of the wiki, under *Per-address controls and
+bans*, has the detail.

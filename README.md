@@ -29,6 +29,9 @@ hard to block in the first place. See [Credits](#credits).
 - **Per-user quotas, speed, addresses, expiry & disable** — data caps (with
   optional monthly reset), a speed limit, a limit on how many places a user may
   be at once, a validity deadline, and an on/off switch, persisted across restarts.
+- **Per-address controls inside a shared secret** — a connection cap and a speed
+  ceiling per source address, a fair share of the secret's speed, per-address
+  usage on its own endpoint, and temporary bans.
 - **WEB proxy transport** — the connection type Telegram Desktop 7.1
   added: a page on your hostname carries MTProto over a WebSocket, so a
   network in between sees a browser visiting a website.
@@ -76,6 +79,7 @@ for questions. **[Contributing](CONTRIBUTING.md)** if you want to send a change.
   - [Sponsored channel (ad-tag)](#sponsored-channel-ad-tag)
   - [Connection throttling](#connection-throttling)
   - [Per-user quotas, expiry & disable](#per-user-quotas-expiry--disable)
+  - [Per-address controls](#per-address-controls)
   - [WEB proxy transport](#web-proxy-transport)
   - [Public IP override](#public-ip-override)
   - [Environment variables](#environment-variables)
@@ -324,7 +328,10 @@ user's `quota`, `quota_remaining`, `quota_reset`, `expires_at`, `disabled`,
 corresponding [limit](#per-user-quotas-expiry--disable) set, and `throttled_ms`
 — the time a user's connections have spent held to their speed limit —
 `active_ips` — how many places they are in right now — and `ip_limit_refused`
-only once they are non-zero.
+only once they are non-zero. The [per-address controls](#per-address-controls)
+add `client_conns`, `client_speed_limit` and `client_fair` when set, and
+`client_conns_refused`, `clients` and `clients_overflow` once non-zero, all
+inside the user object.
 
 `listeners` and `obfuscated` appear only when at least one
 [`[[listener]]`](#extra-listeners-listener) is configured — a deployment that
@@ -384,7 +391,10 @@ written to disk in any form; `usage-state-file` persists quota counters alone, s
 no address survives a restart. (That is about these two fields: the ee handshake
 budget keeps a separate anonymous per-address bucket in memory whatever
 `track-client-ips` says, as the wiki's Security page explains under *Client
-addresses*.)
+addresses*.) With tracking on, every secret's addresses are also kept in memory,
+with what each moved, until ten minutes after its last connection, and
+`GET /secrets/{name}/clients` lists them for up to about eleven minutes: further
+back than `connected_ips`.
 
 Behind a front proxy, both report what the PROXY header carried — the client's
 real address — which is what makes them useful for a WEB deployment. See
@@ -428,15 +438,19 @@ at runtime, without editing the file or restarting:
 
 | Method & path | Action |
 |---|---|
-| `GET /secrets` | List secrets (`name`, `secret`, `host`, `mode`, `ad_tag`, `effective_ad_tag`, plus `unserved` and `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled`/`speed_limit`/`ip_limit` when set). |
-| `POST /secrets` | Add or update one: `{"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?}`. |
-| `PUT /secrets` | Replace the whole set: `{"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?,ip_limit?}},"ad_tag"?}`. |
+| `GET /secrets` | List secrets (`name`, `secret`, `host`, `mode`, `ad_tag`, `effective_ad_tag`, plus `unserved` and `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled`/`speed_limit`/`ip_limit`/`client_conns`/`client_speed_limit`/`client_fair` when set). |
+| `POST /secrets` | Add or update one: `{"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?,"client_conns"?,"client_speed"?,"client_fair"?}`. |
+| `PUT /secrets` | Replace the whole set: `{"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?,ip_limit?,client_conns?,client_speed?,client_fair?}},"ad_tag"?}`. |
 | `GET /secrets/{name}` | One entry of the list above, by name, with the same live counters (`404` if unknown). |
 | `DELETE /secrets/{name}` | Remove one (`404` if unknown, `409` if it is the last one). |
 | `POST /secrets/{name}/reset-quota` | Zero the secret's used-bytes counter (`404` if unknown). |
 | `GET /secrets/{name}/external-ips` | The user's address view: `ip_limit`, `active_ips`, and the addresses when `track-client-ips` is on. |
 | `PUT /secrets/{name}/external-ips` | `{"ips":[...],"ttl":"90s"}` — report the addresses the user holds on other systems, so the address limit spans them. Expires after `ttl`. |
 | `DELETE /secrets/{name}/external-ips` | Clear that report. |
+| `GET /secrets/{name}/clients` | Per-address usage, most bytes first: `?limit=N` (default 100, at most 1,000). The counts always, the addresses only with `track-client-ips`. |
+| `POST /secrets/{name}/bans` | `{"ips":[...],"ttl":"1h","force"?}` — refuse those addresses this secret until `ttl` (at most `720h`), closing their live streams. In memory only. `409` when 4,096 bans are held. |
+| `GET /secrets/{name}/bans` | The secret's bans: a count, and the addresses only with `track-client-ips`. |
+| `DELETE /secrets/{name}/bans/{address}` | Lift one ban; an IPv6 ban may be named by its /64. |
 | `GET /adtag` | Read the global ad-tag: `{"ad_tag":"<hex>"\|null}`. |
 | `PUT /adtag` | Set the global ad-tag: `{"ad_tag":"<32 hex chars>"}`. |
 | `DELETE /adtag` | Clear the global ad-tag. |
@@ -625,6 +639,34 @@ counter resets at the start of each calendar month. Clear a user's usage
 manually with `POST /secrets/{name}/reset-quota`. Limits set through the
 management API are in-memory only and are overridden by the next reload — the
 config file remains the source of truth.
+
+### Per-address controls
+
+A secret that many people share has one speed limit, one quota and one set of
+counters, so one heavy user can drain everyone's share. Three optional keys in
+`[secret-limits.<name>]` act on each source address inside the secret, where an
+address is an IPv4 address or an IPv6 /64:
+
+```toml
+[secret-limits.shared]
+speed = "50mbit"
+ip-limit = 30
+client-conns = 16         # live connections one address may hold
+client-speed = "10mbit"   # a ceiling on one address, both directions together
+client-fair = true        # divide speed among the addresses; needs a speed
+```
+
+`GET /secrets/{name}/clients` lists what each address moved (the addresses only
+with `track-client-ips`), and `/secrets/{name}/bans` refuses an address one
+secret for up to `720h`, in memory. All of it is off by default. One address may
+be many people behind a carrier's NAT, loopback and private addresses share one
+entry that is never capped, and behind a PROXY-protocol listener the address is
+whatever the header says, so the proxy warns at start when these keys meet such
+a listener. The panel does not write these keys. The details, and what fair
+share does at scale, are in the
+[Configuration](https://github.com/Arman2122/mtg-proxy/wiki/Configuration)
+and [Security](https://github.com/Arman2122/mtg-proxy/wiki/Security) pages of
+the wiki.
 
 ### WEB proxy transport
 
