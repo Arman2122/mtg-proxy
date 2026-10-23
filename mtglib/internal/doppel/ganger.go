@@ -178,12 +178,16 @@ func (g *Ganger) unraided() []CoverHost {
 }
 
 func (g *Ganger) NewConn(conn essentials.Conn) (Conn, error) {
-	rvChan := make(chan Conn)
+	// Room for exactly the one answer, and never closed: the run loop may hold
+	// this request when the context ends and this call leaves, and its answer
+	// must then land in the buffer rather than block, or meet a closed channel
+	// and panic a goroutine nothing recovers. An answer nobody takes is a Conn
+	// on the ganger's context, which is done, so its writer ends on its own.
+	rvChan := make(chan Conn, 1)
 	req := gangerConnRequest{
 		ret:     rvChan,
 		payload: conn,
 	}
-	defer close(req.ret)
 
 	select {
 	case <-g.ctx.Done():
@@ -285,10 +289,8 @@ func (g *Ganger) run() {
 				g.runScoutRaid(scoutCollectedChan, all)
 			})
 		case req := <-g.connRequests:
-			select {
-			case <-g.ctx.Done():
-			case req.ret <- NewConn(g.ctx, req.payload, g.stats, g.shaping):
-			}
+			// Never blocks: ret has room for this one answer (see NewConn).
+			req.ret <- NewConn(g.ctx, req.payload, g.stats, g.shaping)
 		}
 	}
 }
