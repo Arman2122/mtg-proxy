@@ -52,6 +52,14 @@ type profileReloader struct {
 	// not a reload, and must not be reported as one.
 	current []mtglib.Secret
 
+	// retired is the last retired list applied: the values of the file's
+	// [[retiring-secret]] blocks that pass rule 1, whose capabilities the relay
+	// recognises without serving. It is compared by value, like current, but a
+	// file that changed only this is not a reload: the profiles are untouched,
+	// the reload count does not move, and the registry is swapped to carry the
+	// new list (a rotate-secret writes the block, a --prune removes it).
+	retired []mtglib.Secret
+
 	// The watcher's memory of the file. pending is the content seen on the
 	// previous tick, so a change is applied only once it has held still across
 	// two of them: the panel writes the file and then tells the proxy, and a
@@ -82,6 +90,7 @@ func newProfileReloader(
 		structure:  structure,
 		log:        log,
 		current:    current,
+		retired:    conf.RetiringValues(),
 	}
 }
 
@@ -204,17 +213,43 @@ func (r *profileReloader) apply(data []byte, trigger string) {
 	}
 
 	names, secrets := orderedSecrets(conf)
+	retired := conf.RetiringValues()
 
 	// A change the watcher found that leaves the profiles alone is not a
 	// reload. A signal is different: an operator who sent one is asking
 	// whether it landed, and the counter is how they find out.
 	if trigger == reloadTriggerFile && slices.Equal(secrets, r.current) {
-		log.Debug("web relay: the config changed but the profiles did not")
+		if slices.Equal(retired, r.retired) {
+			log.Debug("web relay: the config changed but the profiles did not")
+
+			return
+		}
+
+		// Only the retired list changed: the new list is swapped in with the
+		// profiles the registry already serves, and nothing else moves -- not
+		// current, not the profile names, not the reload counters. Counts only
+		// in the line: every element of the list is a credential. The count is
+		// of the values the file holds (Config.RetiringValues), before the
+		// registry trims duplicates, values equal to a live capability and any
+		// past its cap, hence the field's name.
+		if err := r.origin.SetSecretsWithRetired(r.current, retired); err != nil {
+			r.counters.OnReload(time.Now(), err)
+			log.WarningError("web relay reload: the new retired list cannot be applied, keeping the current one", err)
+
+			return
+		}
+
+		r.retired = retired
+
+		log.BindInt("retired-values", len(retired)).Debug("web relay: the retired capabilities changed, the profiles did not")
 
 		return
 	}
 
-	if err := r.origin.SetSecrets(secrets); err != nil {
+	// Always the pair, never the profiles alone: SetSecrets is the nil form of
+	// this call, and a profile change that dropped the retired list would send
+	// every old link to the cover site.
+	if err := r.origin.SetSecretsWithRetired(secrets, retired); err != nil {
 		r.counters.OnReload(time.Now(), err)
 		log.WarningError("web relay reload: the new profile set cannot be served, keeping the current one", err)
 
@@ -222,6 +257,7 @@ func (r *profileReloader) apply(data []byte, trigger string) {
 	}
 
 	r.current = secrets
+	r.retired = retired
 
 	r.counters.SetProfiles(names)
 	r.counters.OnReload(time.Now(), nil)

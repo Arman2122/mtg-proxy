@@ -1,0 +1,11 @@
+bind-to = "0.0.0.0:3128"
+secret = "eec0ffee00c0ffee00c0ffee00c0ffee0073746f726167652e676f6f676c65617069732e636f6d"
+
+[stats.prometheus]
+enabled = false
+
+[[retiring-secret]]
+# added by mtg-proxy rotate-secret at 2026-10-08T09:30:00Z
+name   = "default"
+secret = "eea1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d473746f726167652e676f6f676c65617069732e636f6d"
+until  = "2026-10-09T09:30:00Z"

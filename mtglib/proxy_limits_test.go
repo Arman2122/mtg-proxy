@@ -86,7 +86,7 @@ func TestCloseDeniedConns(t *testing.T) {
 
 	streams := map[string]*streamContext{}
 	for name := range secrets {
-		streams[name] = registerFakeStream(p, name)
+		streams[name] = registerFakeStream(t, p, name)
 	}
 
 	p.closeDeniedConns()

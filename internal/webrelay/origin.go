@@ -43,6 +43,13 @@ type OriginOptions struct {
 	// Secrets are the profiles this relay serves, in the panel's order.
 	Secrets []mtglib.Secret
 
+	// Retired are the values of keys a rotation retired, as the config lists
+	// them (Config.RetiringValues). They are recognised and never served: the
+	// holder of a retired key's WEB link is answered by the local 404, and the
+	// capability is not forwarded to the cover site. Nothing here can refuse the
+	// origin; the registry trims the list.
+	Retired []mtglib.Secret
+
 	// Signer mints and recognises the bootstrap and session tokens.
 	Signer *Signer
 
@@ -91,7 +98,8 @@ type OriginOptions struct {
 //
 //  1. Authentic and usable -- the carrier operation.
 //  2. Authentic but unusable -- expired, spent, wrong method, wrong path, a
-//     non-canonical spelling, a duplicated field. Answered LOCALLY with an
+//     non-canonical spelling, a duplicated field, or the capability of a key a
+//     rotation retired (recognised, never served). Answered LOCALLY with an
 //     uncacheable 404. Never delegated, because delegating it writes an
 //     operator's real credential into a third party's access log.
 //  3. Everything else -- the cover site, unaltered, on every path including the
@@ -104,9 +112,9 @@ type OriginOptions struct {
 type Origin struct {
 	host string
 
-	// registry is swapped whole by SetSecrets and never mutated in place, so a
-	// reload is invisible to a request already being served: every handler
-	// takes one snapshot and works from it.
+	// registry is swapped whole by SetSecretsWithRetired (SetSecrets is its nil
+	// form) and never mutated in place, so a reload is invisible to a request
+	// already being served: every handler takes one snapshot and works from it.
 	registry atomic.Pointer[Registry]
 
 	signer  *Signer
@@ -138,7 +146,7 @@ func NewOrigin(opts OriginOptions) (*Origin, error) {
 		return nil, err
 	}
 
-	registry, err := buildRegistry(host, opts.Secrets)
+	registry, err := buildRegistry(host, opts.Secrets, opts.Retired)
 	if err != nil {
 		return nil, err
 	}
@@ -185,14 +193,16 @@ func NewOrigin(opts OriginOptions) (*Origin, error) {
 
 // buildRegistry turns configured secrets into capabilities for one host. The
 // ee-to-dd re-spelling happens here rather than at either caller, so startup and
-// reload cannot derive different capabilities from the same file.
-func buildRegistry(host string, secrets []mtglib.Secret) (*Registry, error) {
+// reload cannot derive different capabilities from the same file. The retired
+// values are re-spelled the same way inside NewRegistryWithRetired, from the same
+// WebSecret.
+func buildRegistry(host string, secrets, retired []mtglib.Secret) (*Registry, error) {
 	web := make([]mtglib.Secret, 0, len(secrets))
 	for _, secret := range secrets {
 		web = append(web, WebSecret(secret))
 	}
 
-	return NewRegistry(host, web)
+	return NewRegistryWithRetired(host, web, retired)
 }
 
 // SetSecrets replaces the profile set this origin serves, atomically.
@@ -213,8 +223,25 @@ func buildRegistry(host string, secrets []mtglib.Secret) (*Registry, error) {
 // authenticates for itself: a secret revoked here is revoked there too, and the
 // proxy closes those connections. Duplicating that here would be a second
 // answer to a question already answered.
+//
+// SetSecrets is [Origin.SetSecretsWithRetired] with no retired list, and so ends
+// the recognition of every retired capability. A caller that follows a config
+// file passes the list.
 func (o *Origin) SetSecrets(secrets []mtglib.Secret) error {
-	registry, err := buildRegistry(o.host, secrets)
+	return o.SetSecretsWithRetired(secrets, nil)
+}
+
+// SetSecretsWithRetired replaces the profile set and the retired list together,
+// in one atomic swap of the registry: a rotation moves a key from the live list
+// to the retired one in a single write, and between two swaps the old link would
+// fall to the cover site -- the leak the retired list exists to close. A request
+// takes one snapshot, so it sees the old pair or the new, never a mix.
+//
+// The retired list can never refuse the swap (see [NewRegistryWithRetired]); only
+// the profiles can, and then the previous profiles and the previous retired list
+// both stay.
+func (o *Origin) SetSecretsWithRetired(secrets, retired []mtglib.Secret) error {
+	registry, err := buildRegistry(o.host, secrets, retired)
 	if err != nil {
 		return err
 	}

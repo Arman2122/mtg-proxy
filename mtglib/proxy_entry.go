@@ -53,21 +53,29 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		}
 	}
 
+	// The instant a retiring candidate's expiry is judged by: read once, and
+	// only if a retiring position is reached, so a set without retiring keys
+	// never reads the clock.
+	now := helloNow{clock: p.rotation}
+
 	// First the secrets this client's address completed a handshake with
 	// before, if any: a returning client is found here in one verification.
 	// Hinted verification is outside the budget; it is bounded by the cap.
 	hinted := p.hintedPositions(ctx, parsed, set)
 
-	pos, tried := p.verifyHinted(parsed, set, hinted)
+	pos, tried := p.verifyHinted(parsed, set, hinted, &now)
 	if pos >= 0 {
 		p.fakeStats.addVerifications(tried)
 		p.fakeStats.OnHinted()
 
-		return p.completeFakeTLS(ctx, rewind, set, parsed, set.candIdx[pos])
+		return p.completeFakeTLS(ctx, rewind, set, parsed, set.matchAt(pos))
 	}
 
 	// Then the scan, over every candidate the hints did not already try, which
-	// the budget has to pay for first.
+	// the budget has to pay for first. A retiring candidate is paid for like
+	// any other, and so is one that has expired but is still in the set, which
+	// nothing verifies: an overcharge until the swap that drops it, never an
+	// undercharge.
 	res, overBudget, ok := p.reserveScan(ctx, rewind, parsed, len(set.cands)-tried, overBudget)
 	if !ok {
 		p.fakeStats.addVerifications(tried)
@@ -75,7 +83,7 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 		return false
 	}
 
-	pos, scanned := p.scanCandidates(parsed, set, skipPositions(hinted))
+	pos, scanned := p.scanCandidates(parsed, set, skipPositions(hinted), &now)
 	p.fakeStats.addVerifications(tried + scanned)
 
 	if pos < 0 {
@@ -99,9 +107,10 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	// before that -- a replay, a denied user, a refused admission -- keeps it.
 	ctx.scanRes = res
 
-	// pos is a position in set.cands; map it back into the full secret list
-	// before anything reads names, limits or ad tags by it.
-	return p.completeFakeTLS(ctx, rewind, set, parsed, set.candIdx[pos])
+	// pos is a position in set.cands; map it back to what it matched -- the
+	// name it bills, by its index into the full secret list, and the key the
+	// client holds -- before anything reads names, limits or ad tags by it.
+	return p.completeFakeTLS(ctx, rewind, set, parsed, set.matchAt(pos))
 }
 
 // reserveScan has the budget pay for scanning remaining candidates, and waits
@@ -191,15 +200,16 @@ func waitForBudget(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// completeFakeTLS is what follows a hello that matched one secret, idx being its
-// index into set.secrets: the replay check, the per-user limits, and the
-// server's flight.
+// completeFakeTLS is what follows a hello that matched one key, m being what it
+// matched: the replay check, the per-user limits of the name m bills, and the
+// server's flight, signed with the key the client holds -- the name's primary,
+// or one of its retiring keys.
 func (p *Proxy) completeFakeTLS(
 	ctx *streamContext,
 	rewind *connRewind,
 	set *secretSet,
 	parsed *fake.Parsed,
-	idx int,
+	m secretMatch,
 ) bool {
 	if p.antiReplayCache.SeenBefore(parsed.Hello.SessionID) {
 		p.logger.Warning("replay attack has been detected!")
@@ -213,7 +223,7 @@ func (p *Proxy) completeFakeTLS(
 	// user (disabled, expired, or over quota) or a banned place is routed to the
 	// cover site just like a wrong secret, so the outcome is indistinguishable
 	// to a prober: the cover site gets the client's own bytes either way.
-	if reason := p.attribute(ctx, set, idx); reason != DenyNone {
+	if reason := p.attributeMatch(ctx, set, m); reason != DenyNone {
 		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
 
 		return false
@@ -222,7 +232,7 @@ func (p *Proxy) completeFakeTLS(
 	gangerNoise := p.doppelGanger.NoiseParamsFor(parsed.MatchedHost)
 	noiseParams := fake.NoiseParams{Mean: gangerNoise.Mean, Jitter: gangerNoise.Jitter}
 
-	if err := fake.SendServerHello(ctx.client(), set.secrets[idx].Key[:], parsed.Hello, noiseParams); err != nil {
+	if err := fake.SendServerHello(ctx.client(), m.key[:], parsed.Hello, noiseParams); err != nil {
 		p.logger.InfoError("cannot send welcome packet", err)
 		return false
 	}
@@ -236,9 +246,36 @@ func (p *Proxy) completeFakeTLS(
 // position of the first that matches, or -1; tried is how many it verified.
 // Positions skip reports true for are passed over, unverified and uncounted;
 // nil skips none. A set with no candidates is scanned for nothing: -1, 0.
-func (p *Proxy) scanCandidates(parsed *fake.Parsed, set *secretSet, skip func(pos int) bool) (pos, tried int) {
-	for at, cand := range set.cands {
+//
+// It is two loops. The first is over the primaries' candidates, and is the
+// scan as it was before retiring keys existed: it never reads the clock. The
+// second is over the retiring candidates, which come after every primary, and
+// passes over one whose until the hello's instant (now) has reached,
+// unverified and uncounted, as it passes over a skipped one. A set with no
+// retiring key has nothing for the second loop, and never reads the clock.
+func (p *Proxy) scanCandidates(parsed *fake.Parsed, set *secretSet, skip func(pos int) bool, now *helloNow) (pos, tried int) {
+	end := set.primaryEnd()
+
+	for at, cand := range set.cands[:end] {
 		if skip != nil && skip(at) {
+			continue
+		}
+
+		tried++
+
+		if parsed.Verify(cand, p.tolerateTimeSkewness) {
+			return at, tried
+		}
+	}
+
+	for j, cand := range set.cands[end:] {
+		at := end + j
+
+		if skip != nil && skip(at) {
+			continue
+		}
+
+		if retiringCandExpired(set, j, now) {
 			continue
 		}
 
@@ -252,10 +289,24 @@ func (p *Proxy) scanCandidates(parsed *fake.Parsed, set *secretSet, skip func(po
 	return -1, tried
 }
 
+// retiringCandExpired reports whether the retiring candidate j places past
+// set.primaryEnd() has reached its until at the hello's instant: an overlap
+// ends at its until, as buildRetiring and accepts say. It reads the clock
+// through now, which reads it once per hello.
+func retiringCandExpired(set *secretSet, j int, now *helloNow) bool {
+	return !now.get().Before(set.retiring[set.candRetiring[j]].until)
+}
+
 // hintedPositions resolves the names this client's address completed a
-// handshake with before into positions in set.cands, in the order to try them.
-// It is nil when hints do not apply: the cache is off, the address is unkeyed or
-// has none, or the hello is above maxScanBlocks.
+// handshake with before into positions in set.cands, in the order to try them:
+// for each name, its primary's position if it has one, then its retiring
+// keys' positions whether or not it has one -- after an ee -> dd rotation the
+// old ee link is all the name has on this door, and a client admitted under it
+// left the name as its hint. The list holds each position once and at most
+// maxHintPositions of them; positions past the cap are left to the budgeted
+// scan. It is nil when hints do not apply: the cache is off, the address is
+// unkeyed or has none, or the hello is above maxScanBlocks. It reads no clock:
+// an expired retiring position is passed over by verifyHinted.
 //
 // A hint is a name, and only the snapshot this hello met says where that name
 // is, so a reload between the write and now cannot misdirect it: a name the set
@@ -292,6 +343,10 @@ func (p *Proxy) hintedPositions(ctx *streamContext, parsed *fake.Parsed, set *se
 	)
 
 	for _, name := range names {
+		if len(positions) >= maxHintPositions {
+			break
+		}
+
 		if !p.bans.none() {
 			if !built {
 				place, placed = addressKeyOf(ip)
@@ -306,15 +361,35 @@ func (p *Proxy) hintedPositions(ctx *streamContext, parsed *fake.Parsed, set *se
 		if pos, ok := set.candByName[name]; ok && !slices.Contains(positions, pos) {
 			positions = append(positions, pos)
 		}
+
+		// nil, and nothing to do, on a set without retiring keys.
+		for _, pos := range set.retiringCands[name] {
+			if len(positions) >= maxHintPositions {
+				break
+			}
+
+			if !slices.Contains(positions, pos) {
+				positions = append(positions, pos)
+			}
+		}
 	}
 
 	return positions
 }
 
 // verifyHinted verifies parsed against the candidates at positions, in order,
-// and returns the first that matches, or -1; tried is how many it verified.
-func (p *Proxy) verifyHinted(parsed *fake.Parsed, set *secretSet, positions []int) (pos, tried int) {
+// and returns the first that matches, or -1; tried is how many it verified. A
+// retiring position (from set.primaryEnd() on) whose until the hello's instant
+// (now) has reached is passed over, unverified and uncounted; the clock is read
+// only when a retiring position is reached.
+func (p *Proxy) verifyHinted(parsed *fake.Parsed, set *secretSet, positions []int, now *helloNow) (pos, tried int) {
+	end := set.primaryEnd()
+
 	for _, at := range positions {
+		if at >= end && retiringCandExpired(set, at-end, now) {
+			continue
+		}
+
 		tried++
 
 		if parsed.Verify(set.cands[at], p.tolerateTimeSkewness) {
@@ -323,6 +398,32 @@ func (p *Proxy) verifyHinted(parsed *fake.Parsed, set *secretSet, positions []in
 	}
 
 	return -1, tried
+}
+
+// helloNow is the instant one hello judges retiring candidates' expiry by. The
+// clock is read on the first get and that reading kept, so a hello reads it at
+// most once, and one that never reaches a retiring position never reads it.
+// doFakeTLSHandshake keeps one on its stack and hands its address to
+// verifyHinted and scanCandidates. A nil *helloNow reads time.Now on every
+// call, past the rotation clock; it is for tests only, and no production
+// caller passes one.
+type helloNow struct {
+	clock *RotationClock
+	at    time.Time
+	read  bool
+}
+
+// get is the hello's instant: the clock's reading, taken on the first call.
+func (h *helloNow) get() time.Time {
+	if h == nil {
+		return time.Now()
+	}
+
+	if !h.read {
+		h.at, h.read = h.clock.Now(), true
+	}
+
+	return h.at
 }
 
 // skipPositions is the scanCandidates skip that passes over positions already
@@ -341,6 +442,68 @@ func skipPositions(positions []int) func(pos int) bool {
 // deadline bounds it in time. Together they stop a prober from filling the
 // worker pool with connections that will never be served.
 const obfuscatedDrainBytes = 8 << 10
+
+// obfuscatedKeys is the key list the obfuscated door tries a frame against: every
+// primary's key, whatever its mode, in the set's order, then the key of each
+// retiring entry whose until the rotation clock has not reached, in the
+// entries' order. A retiring key of any mode is tried here, as every primary is;
+// only an ee one is also a FakeTLS candidate. Primaries come first, as on the
+// FakeTLS door. No retiring key equals a primary's or another entry's (the
+// build drops it), so the order of the retiring part changes no attribution,
+// only how far the trial loop runs; two primaries may share a key, as they can
+// today, and the first in the set's order wins.
+//
+// keyRetiring[j] is the index into set.retiring of the entry whose key is
+// keys[len(set.secrets)+j], and is how obfuscatedMatch maps a match back to it.
+// The clock is read once, for the whole list, and only when the set holds an
+// entry. A set with no retiring entry gets its primaries' list, a nil
+// keyRetiring and no clock read.
+//
+// That list is returned, so it escapes and costs one allocation at any size. The
+// list the door built inline before rotation existed costs one at two secrets
+// and up and nothing at one: it does not escape, and the compiler keeps a
+// one-secret list (24 bytes) on the stack. That is why the door still builds the
+// no-entry list itself and calls this only for a set that holds entries, and why
+// the two must stay the same list, which TestTheTwoKeyListPathsAgree pins.
+func obfuscatedKeys(set *secretSet, clock *RotationClock) (keys [][]byte, keyRetiring []int) {
+	keys = make([][]byte, len(set.secrets), len(set.secrets)+len(set.retiring))
+	for i := range set.secrets {
+		keys[i] = set.secrets[i].Key[:]
+	}
+
+	if len(set.retiring) == 0 {
+		return keys, nil
+	}
+
+	now := clock.Now()
+
+	for r := range set.retiring {
+		if !now.Before(set.retiring[r].until) {
+			continue
+		}
+
+		if keyRetiring == nil {
+			keyRetiring = make([]int, 0, len(set.retiring))
+		}
+
+		keys = append(keys, set.retiring[r].secret.Key[:])
+		keyRetiring = append(keyRetiring, r)
+	}
+
+	return keys, keyRetiring
+}
+
+// obfuscatedMatch is the match of the key at index in the list obfuscatedKeys
+// built with keyRetiring: an index below len(s.secrets) is that primary, and
+// index len(s.secrets)+j is the retiring entry keyRetiring[j]. keyRetiring is
+// never read for a primary, so a door that built no retiring list can pass nil.
+func (s *secretSet) obfuscatedMatch(index int, keyRetiring []int) secretMatch {
+	if index < len(s.secrets) {
+		return s.primaryMatch(index)
+	}
+
+	return s.retiringMatch(keyRetiring[index-len(s.secrets)])
+}
 
 // doObfuscatedEntry identifies a stream that arrived on a plaintext
 // obfuscated2 listener: the secret is unknown until the 64-byte frame is
@@ -374,12 +537,26 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 	// index.
 	set := p.secrets.Load()
 
-	var keys [][]byte
+	var (
+		keys        [][]byte
+		keyRetiring []int
+	)
 
 	if allowed {
-		keys = make([][]byte, len(set.secrets))
-		for i := range set.secrets {
-			keys[i] = set.secrets[i].Key[:]
+		if len(set.retiring) == 0 {
+			// The build this door always had, kept in the door: the list does not
+			// escape, so a one-secret door's 24-byte list stays on the stack as it
+			// always has, which a list returned by obfuscatedKeys cannot. No entry
+			// means no clock read, no keyRetiring and no allocation of its own.
+			// TestTheObfuscatedDoorAllocatesAsBefore pins the allocations, and
+			// TestTheTwoKeyListPathsAgree that this is the list obfuscatedKeys
+			// builds, primary for primary.
+			keys = make([][]byte, len(set.secrets))
+			for i := range set.secrets {
+				keys[i] = set.secrets[i].Key[:]
+			}
+		} else {
+			keys, keyRetiring = obfuscatedKeys(set, p.rotation)
 		}
 
 		p.obfsStats.OnObfuscatedTrial()
@@ -417,7 +594,7 @@ func (p *Proxy) doObfuscatedEntry(ctx *streamContext, policy ListenerPolicy) boo
 		return p.denyObfuscated(ctx, policy)
 	}
 
-	if reason := p.attribute(ctx, set, res.Index); reason != DenyNone {
+	if reason := p.attributeMatch(ctx, set, set.obfuscatedMatch(res.Index, keyRetiring)); reason != DenyNone {
 		// A banned client is charged like a frame that matched nothing, so one
 		// that keeps reconnecting is soon refused before the trial loop rather
 		// than costing a trial decryption every time. The budget is keyed by

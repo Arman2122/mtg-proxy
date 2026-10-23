@@ -50,6 +50,12 @@ type Proxy struct {
 	// the ticker starts.
 	afterFairPass func()
 
+	// staleSkipHook, when set, is told each name closeStaleConns skips whole
+	// because the old and new sets hold the same keys for it. Only tests set
+	// it, before the swap or the maintenance loop it watches starts; it runs
+	// under liveMu and must not take it.
+	staleSkipHook func(name string)
+
 	allowFallbackOnUnknownDC    bool
 	trackClientIPs              bool
 	tolerateTimeSkewness        time.Duration
@@ -114,6 +120,11 @@ type Proxy struct {
 	// lapses (proxy_bans.go). Memory only. Its lock is inner to liveMu. The zero
 	// value is an empty list, so a Proxy{} literal in a test bans nobody.
 	bans banList
+
+	// rotation is the clock retiring keys expire by: one per process, the
+	// instance ProxyOpts.RotationClock carries or one NewProxy builds. nil reads
+	// the wall clock, and a Proxy{} literal in a test has none.
+	rotation *RotationClock
 
 	network         Network
 	antiReplayCache AntiReplayCache
@@ -192,7 +203,22 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	logger := opts.getLogger("proxy")
 	updatersLogger := logger.Named("telegram-updaters")
 
-	initialSet := buildSecretSet(opts.getSecrets(), opts.SecretAdTags, opts.GlobalAdTag, opts.SecretLimits)
+	// The clock comes first: the initial build reads it, and so must be handed
+	// the one the rest of the process reads, not the wall clock.
+	clock := opts.RotationClock
+	if clock == nil {
+		clock = NewRotationClock(time.Now, func(by time.Duration) {
+			logger.BindStr("behind_by", by.String()).
+				Warning("the wall clock is behind the latest time seen; rotation overlaps are judged by the latest time")
+		})
+	}
+
+	// One read of it, as a swap makes one: the build and the start's change log
+	// judge by the same instant.
+	now := clock.Now()
+
+	initialSet, initialDrops := buildSecretSetAt(
+		opts.getSecrets(), opts.SecretAdTags, opts.GlobalAdTag, opts.SecretLimits, opts.RetiringSecrets, now)
 
 	stats := NewProxyStats()
 	for _, name := range initialSet.names {
@@ -258,7 +284,13 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 		emitTraffic:                 opts.EmitTraffic,
 		listeners:                   opts.Listeners,
 		listenerModes:               opts.ListenerModes,
+		rotation:                    clock,
 	}
+
+	// Logged only now: the lines are the proxy's, and the proxy exists. Every
+	// entry the first set keeps is new to it.
+	proxy.logRetiringDrops(initialDrops)
+	proxy.logRetiringChanges(nil, initialSet, now, nil)
 
 	// The limiter's bucket aging runs under the proxy's own context, so it stops
 	// with Shutdown.
@@ -294,8 +326,7 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	// typo that length-first parsing turns into a plain secret.
 	listenerTags := opts.ListenerModes.Tags()
 
-	for i, name := range initialSet.names {
-		secret := initialSet.secrets[i]
+	warnIfUnserved := func(name string, secret Secret) {
 		// Served means every transport a client of this form might pick is
 		// honoured, so the test is tag-set containment, not overlap: a plain
 		// listener covers a dd secret, but a dd-only listener does NOT cover a
@@ -307,6 +338,21 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 				BindStr("mode", secret.Mode.String()).
 				Warning("secret is not served by any listener; no configured listener honours this form")
 		}
+	}
+
+	for i, name := range initialSet.names {
+		warnIfUnserved(name, initialSet.secrets[i])
+	}
+
+	// A retiring dd or plain key is tried on the obfuscated door whatever its
+	// mode and is as unreachable as such a primary when no listener honours its
+	// form: one line for each entry the set kept, in the set's order, with the
+	// same words, naming the secret and the mode. An ee entry is reached on
+	// bind-to, and an entry the build dropped is not in the set.
+	for r := range initialSet.retiring {
+		entry := &initialSet.retiring[r]
+
+		warnIfUnserved(initialSet.names[entry.nameIdx], entry.secret)
 	}
 
 	// The middle-proxy manager is always available so advertising can be

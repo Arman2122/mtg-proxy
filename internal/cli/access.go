@@ -442,6 +442,13 @@ func makeWebAccess(conf *config.Config, secrets map[string]mtglib.Secret, names 
 		return nil
 	}
 
+	// A host the config refuses gets no WEB link: the relay will not start on
+	// it, and it may be a secret value pasted where the host goes (Task 10's
+	// second review, N-A). A host it accepts is printed as written, as before.
+	if _, err := conf.WebHost(); err != nil {
+		return nil
+	}
+
 	web := &accessResponseWeb{Host: host}
 
 	if len(names) > 0 {

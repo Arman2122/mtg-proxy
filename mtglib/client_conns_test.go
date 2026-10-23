@@ -520,6 +520,7 @@ func TestClientConnsAsksForEntriesAtAdmission(t *testing.T) {
 
 	bobs := probe.stream(t, tcpFrom("203.0.113.9", 50002), 0)
 	bobs.secretName = "bob"
+	attributeFromSet(t, probe.proxy, bobs)
 
 	require.Equal(t, DenyNone, probe.proxy.tryRegisterConn(bobs))
 	assert.Nil(t, bobs.addrEntry.Load(), "a secret with none holds no entry")

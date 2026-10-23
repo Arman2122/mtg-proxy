@@ -226,6 +226,49 @@ assemble your own: `contrib/sni-router` puts HAProxy and Caddy in front of the
 proxy, and `contrib/web-relay` overlays the WEB relay onto it. See
 [[WEB-Proxy-Setup]].
 
+### Rotating a secret with a container
+
+`mtg-proxy rotate-secret` (see [[Multi-User-and-API]]) replaces the config file
+by writing a new one beside it and renaming it over the old. A **single-file
+bind mount** like the one above does not follow that: the container may go on
+seeing the old file, and a `POST /reload` inside it would then re-read the old
+keys. So, to rotate:
+
+- **Mount the config's directory instead of the file.** The image runs
+  `/config/config.toml`, so mount the directory that holds a `config.toml` at
+  `/config`:
+
+  ```bash
+  docker run -d --name mtg -p 443:443 -v /etc/mtg-proxy:/config:ro ghcr.io/arman2122/mtg-proxy:<version>
+  ```
+
+  `<version>` is a release with the feature: an image whose `/stats` `features`
+  lists `secret-rotation`. An older image ignores the `[[retiring-secret]]`
+  blocks, so its reload ends every overlap at once, and `--reload` refuses it
+  unless `--force`.
+  Then run `rotate-secret` on the host against `/etc/mtg-proxy/config.toml`,
+  and reload the proxy. Everything else in that directory is visible inside
+  the container too, so keep files the proxy has no use for, such as the WEB
+  relay's key, somewhere else.
+- **Or recreate the container after each rotation**, so that it mounts the new
+  file.
+
+Run against the file through a single-file mount instead — inside the
+container, say — `rotate-secret` refuses with nothing written: `cannot replace
+<config>: it is a mount point (a single-file bind mount?); run rotate-secret on
+the host, and mount the config's directory into the container`, or, for a
+read-only mount, the same advice after `the config file is not writable`.
+
+`--reload` reaches the proxy at `api-bind-to` as the file names it (a wildcard
+address on loopback), so from the host it works only where that port is
+published there. Its read-back is what notices a container still serving the
+old file: it names `a single-file bind mount that still shows the old file`
+among the likely causes.
+
+**A config on NFS is not protected against two concurrent runs.** The lock
+`rotate-secret` takes, `<config>.rotate.lock`, is created exclusively, which is
+reliable on local file systems only.
+
 ## Building from source
 
 You need Go 1.26.10 or newer — that is the version pinned in `go.mod` and in
@@ -315,6 +358,16 @@ sudo chmod 0640 /etc/mtg-proxy/config.toml
 impersonate any of your users, which is why it is `0640` rather than `0644` and
 why `/etc/mtg-proxy` is not world-traversable — the service reads it through
 group membership, and nothing else on the box can.
+
+`mtg-proxy rotate-secret`, which gives a secret a new key (see
+[[Multi-User-and-API]]), writes a new file beside the config and renames it
+over the old one, with the same owner, group and mode. With the layout above
+that takes root — `sudo mtg-proxy rotate-secret /etc/mtg-proxy/config.toml …` —
+and a run that cannot set them is refused with nothing written. Nothing else is
+copied: set-id and sticky bits, the file's own ACL entries (`setfacl`), extended
+attributes and a non-default security label (SELinux, AppArmor) are not kept,
+so a config whose access rests on them needs them set again before the reload.
+(That is from reading the code; it has not been run on Unix.)
 
 The WEB relay's signing key is separate and stricter. `generate-web-key` writes
 32 bytes at mode `0600` and refuses to overwrite an existing file, because a key
