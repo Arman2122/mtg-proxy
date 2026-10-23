@@ -228,7 +228,7 @@ proxy, and `contrib/web-relay` overlays the WEB relay onto it. See
 
 ## Building from source
 
-You need Go 1.26.9 or newer — that is the version pinned in `go.mod` and in
+You need Go 1.26.10 or newer — that is the version pinned in `go.mod` and in
 `mise.lock`, and the release binaries are built with exactly it.
 
 ```bash
