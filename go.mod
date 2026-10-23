@@ -1,6 +1,6 @@
 module github.com/Arman2122/mtg-proxy
 
-go 1.26.8
+go 1.26.10
 
 require (
 	github.com/OneOfOne/xxhash v1.2.8
@@ -27,9 +27,9 @@ require (
 	github.com/txthinking/socks5 v0.0.0-20260601051520-339b044ab0eb
 	github.com/tylertreat/BoomFilters v0.0.0-20251117164519-53813c36cc1b
 	github.com/yl2chen/cidranger v1.0.2
-	golang.org/x/crypto v0.56.0
-	golang.org/x/net v0.57.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.48.0
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
@@ -49,7 +49,7 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/rogpeppe/go-internal v1.15.0 // indirect
 	github.com/txthinking/runnergroup v0.0.0-20250224021307-5864ffeb65ae // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

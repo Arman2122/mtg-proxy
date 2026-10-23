@@ -655,4 +655,41 @@ func redactConfigCredentials(fields map[string]any) {
 			named[name] = redactedValue
 		}
 	}
+
+	redactProxyPasswords(fields)
+}
+
+// redactProxyPasswords takes the password out of every upstream proxy URL
+// (network.proxies: socks5://user:password@host), in place. The user and the
+// address stay, because which upstream is configured is what the line is for;
+// an entry that does not parse as a URL cannot be told apart from its
+// password, so it goes whole.
+func redactProxyPasswords(fields map[string]any) {
+	network, ok := fields["network"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	proxies, ok := network["proxies"].([]any)
+	if !ok {
+		return
+	}
+
+	for idx, entry := range proxies {
+		text, ok := entry.(string)
+		if !ok {
+			proxies[idx] = redactedValue
+
+			continue
+		}
+
+		parsed, err := url.Parse(text)
+		if err != nil {
+			proxies[idx] = redactedValue
+
+			continue
+		}
+
+		proxies[idx] = parsed.Redacted()
+	}
 }
