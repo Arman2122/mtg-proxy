@@ -2,10 +2,13 @@ package doppel
 
 import (
 	"bytes"
+	"context"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/internal/testlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -106,6 +109,40 @@ func TestGanger(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &GangerTestSuite{})
+}
+
+// A NewConn that gives up because the ganger is shutting down must leave the
+// run loop nothing it can panic on. The run loop may already hold the request
+// when the caller leaves, and it answers on the request's channel: when the
+// caller closed that channel on its way out, the answer was a send on a closed
+// channel, chosen at random against the context's end, and it panicked the run
+// loop's goroutine -- which nothing recovers, so the whole process died during
+// a graceful shutdown, before the proxy flushed its usage file. CI's race
+// detector caught it on Linux in TestHandshakeIsSizedLikeTheNamedCoverSite.
+func TestNewConnRacingShutdownNeverPanics(t *testing.T) {
+	t.Parallel()
+
+	for range 200 {
+		g := NewGanger(context.Background(), nil, nil, time.Hour, 1, nil, false, ShapingRecord, false)
+		g.Run()
+
+		var callers sync.WaitGroup
+
+		for range 8 {
+			callers.Go(func() {
+				client, server := net.Pipe()
+				defer client.Close() //nolint: errcheck
+				defer server.Close() //nolint: errcheck
+
+				if conn, err := g.NewConn(essentials.WrapNetConn(server)); err == nil {
+					conn.Stop()
+				}
+			})
+		}
+
+		g.Shutdown()
+		callers.Wait()
+	}
 }
 
 // Unpace takes the wait out from between records and nothing else: the record
