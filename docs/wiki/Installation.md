@@ -271,7 +271,7 @@ reliable on local file systems only.
 
 ## Building from source
 
-You need Go 1.26.8 or newer — that is the version pinned in `go.mod` and in
+You need Go 1.26.10 or newer — that is the version pinned in `go.mod` and in
 `mise.lock`, and the release binaries are built with exactly it.
 
 ```bash

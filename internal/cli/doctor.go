@@ -241,7 +241,7 @@ func (d *Doctor) diagnose(base mtglib.Network, resolver ipLookup) (bool, error) 
 			return false, err //nolint: wrapcheck // named by the caller's own message
 		}
 
-		d.say("Validate network connectivity with proxy %s", url.Get(nil))
+		d.say("Validate network connectivity with proxy %s", url.Redacted())
 		everythingOK = d.checkNetwork(value) && everythingOK
 	}
 
