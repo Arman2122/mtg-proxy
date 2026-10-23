@@ -33,6 +33,10 @@ type Proxy struct {
 	ctxCancel       context.CancelFunc
 	streamWaitGroup sync.WaitGroup
 
+	// servingMu orders every streamWaitGroup.Add against Shutdown's Wait: see
+	// enterServing.
+	servingMu sync.Mutex
+
 	// apiWaitGroup is the management API server's shutdown, which Shutdown
 	// waits for so the socket is released by the time it returns.
 	apiWaitGroup sync.WaitGroup
@@ -121,7 +125,13 @@ func (p *Proxy) domainFrontingAddressForHost(host string) string {
 // Shutdown 'gracefully' shutdowns all connections. Please remember that it
 // does not close an underlying listener.
 func (p *Proxy) Shutdown() {
+	// Cancelled under servingMu, so an accept loop or a stream either counted
+	// itself in before this, and is waited for, or sees the cancellation and
+	// stays out.
+	p.servingMu.Lock()
 	p.ctxCancel()
+	p.servingMu.Unlock()
+
 	p.streamWaitGroup.Wait()
 	// The management API shuts itself down on the cancellation above; waiting
 	// for it here is what makes its port free again before this returns.

@@ -26,7 +26,11 @@ const (
 // ServeConn serves a connection. We do not check IP blocklist and concurrency
 // limit here.
 func (p *Proxy) ServeConn(conn essentials.Conn) {
-	p.streamWaitGroup.Add(1)
+	if !p.enterServing() {
+		conn.Close() //nolint: errcheck
+
+		return
+	}
 	defer p.streamWaitGroup.Done()
 
 	// The listener's policy travels on the conn: MultiListener fans several
@@ -135,12 +139,21 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
 		return
 	}
 
+	// A stream revoked while it dialled -- a reload, a kick, the proxy stopping
+	// -- has had its upstream closed by setTelegram rather than kept. There is
+	// nothing to relay to, and a relay handed no upstream would panic.
+	telegram := ctx.telegram()
+	if telegram == nil {
+		ctx.logger.Info("stream was closed while dialling telegram")
+		return
+	}
+
 	tracker := newIdleTracker(p.idleTimeout)
 
 	relay.Relay(
 		ctx,
 		ctx.logger.Named("relay"),
-		connIdleTimeout{Conn: ctx.telegram(), tracker: tracker},
+		connIdleTimeout{Conn: telegram, tracker: tracker},
 		newCountingConn(ctx.ctx, ctx.Close, connIdleTimeout{Conn: ctx.client(), tracker: tracker}, p.stats, ctx.secretName).
 			withActivity(&ctx.lastActiveUnix),
 	)
@@ -278,6 +291,26 @@ func isTransientAcceptError(err error) bool {
 	return errors.As(err, &transient) && transient.Temporary()
 }
 
+// enterServing counts an accept loop or a stream into the wait Shutdown makes,
+// or reports false once Shutdown has begun. Both used to call Add from their
+// own goroutine, which may run while Shutdown is already in Wait: a
+// WaitGroup's Add from zero concurrent with Wait is a misuse the race detector
+// reports, and an Add just after Wait returned is a loop or a stream nobody
+// waits for. The check and the Add sit under the lock Shutdown cancels under,
+// so every Add happens before that Wait, or not at all.
+func (p *Proxy) enterServing() bool {
+	p.servingMu.Lock()
+	defer p.servingMu.Unlock()
+
+	if p.ctx.Err() != nil {
+		return false
+	}
+
+	p.streamWaitGroup.Add(1)
+
+	return true
+}
+
 // Serve starts a proxy on a given listener with the default (FakeTLS-only)
 // policy.
 func (p *Proxy) Serve(listener net.Listener) error {
@@ -288,7 +321,9 @@ func (p *Proxy) Serve(listener net.Listener) error {
 // than FakeTLS. It is Serve's body with one line changed: the accepted conn is
 // stamped with policy before it goes into the worker pool.
 func (p *Proxy) ServeWithPolicy(listener net.Listener, policy ListenerPolicy) error {
-	p.streamWaitGroup.Add(1)
+	if !p.enterServing() {
+		return nil
+	}
 	defer p.streamWaitGroup.Done()
 
 	var retryIn time.Duration

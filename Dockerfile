@@ -10,7 +10,7 @@
 # This is the manifest *index* digest, not a per-architecture manifest: the
 # image is built for linux/amd64 and linux/arm64 and a single-arch digest would
 # break one of them. Dependabot keeps it fresh (.github/dependabot.yml).
-FROM golang:1.26.8-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
+FROM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS build
 
 ENV CGO_ENABLED=0
 
