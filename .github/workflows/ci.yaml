@@ -86,9 +86,49 @@ jobs:
 
       # Only the headless shell: the harness never needs a headed browser, and
       # the full download is several times the size for nothing.
+      #
+      # And no --with-deps. Playwright's dependency install always adds its
+      # "tools" group, xvfb and its font packages, on top of the browser's own
+      # libraries, and on the ubuntu-24.04 image every one of those libraries
+      # is already installed. So what --with-deps did here was apt-get about
+      # 26 MB, mostly fonts, from the Azure Ubuntu mirror. On 2026-10-23 that
+      # mirror served them at 40 KB/s, and the job hit its timeout three times
+      # in an hour. The harness forbids fonts in its own policy (font-src
+      # 'none') and takes no screenshots, so the fonts were never part of what
+      # it tests.
       - name: Install Chromium
         working-directory: test/webbridge
-        run: npx playwright install --with-deps chromium-headless-shell
+        run: npx playwright install chromium-headless-shell
+
+      # Find out whether this runner can run that browser by running it,
+      # without assuming an image. The launch fails if the binary cannot load
+      # a library it links against, and opening a page starts a renderer, so
+      # a library missing at that point shows too. Playwright's own
+      # host-dependency check is no help here: in 1.62.1 it looks in
+      # chrome-linux/, and the x64 headless shell unpacks to
+      # chrome-headless-shell-linux64/, so it finds nothing to check.
+      #
+      # If the probe passes, nothing is installed. If it fails, for example
+      # on an image that lacks a library as ubuntu-latest moves to a new
+      # release, fall back to Playwright's own dependency install. That
+      # brings the fonts back and with them the slow-mirror exposure, so it
+      # is a warning, not a quiet new normal.
+      - name: Check the browser's system libraries
+        working-directory: test/webbridge
+        run: |
+          if node --input-type=module <<'EOF'
+          import { chromium } from 'playwright';
+          const browser = await chromium.launch({ timeout: 60_000 });
+          const page = await browser.newPage();
+          await page.setContent('<!doctype html><title>probe</title>');
+          await browser.close();
+          EOF
+          then
+            echo "The headless shell starts and renders a page on this runner as it is."
+          else
+            echo "::warning::The runner image lacks a library the headless shell needs. Installing Playwright's full dependency set, fonts included, which is the slow-mirror path this job normally avoids."
+            npx playwright install-deps chromium-headless-shell
+          fi
 
       # This variable, and not CI, is what turns the test's skips into
       # failures. Every job in a run has CI set, including the one that tests
