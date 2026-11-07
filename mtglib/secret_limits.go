@@ -82,6 +82,50 @@ type SecretLimits struct {
 	// address counts as its /64. Refusal happens at admission, after the
 	// secret matched, so only a holder of the valid secret can observe it.
 	IPLimit int
+
+	// ClientConns is how many live connections one address may hold to this
+	// secret at once, client-conns: the per-address connection cap. 0 means
+	// unlimited.
+	//
+	// It is counted from the address ledger -- the same unit and the same live
+	// count IPLimit reads, so a v4-mapped address is its IPv4 address and an
+	// IPv6 address is its /64 -- and not from the per-address table, so it
+	// holds when the table is full and counts the connections that were open
+	// before it was set. A connection from an address already holding that
+	// many is refused after the handshake, as an IPLimit refusal is. An
+	// address that does not stand for one place (loopback, private and the
+	// like: behind a carrier that forwards no client address, every client) is
+	// never capped. Distinct from IPLimit, which counts places: a Telegram
+	// client opens several connections, so this is set to a few times that.
+	ClientConns int
+
+	// ClientSpeedBytesPerSecond is how fast one address may move bytes on this
+	// secret, upload and download combined across all of its connections,
+	// client-speed: the per-address ceiling. 0 means unlimited.
+	//
+	// It is the address's own bucket, beside the user's SpeedBytesPerSecond,
+	// which still holds the secret as a whole: an address is held to whichever
+	// is reached first, and two addresses are each held to it, not to it
+	// between them. An address is the unit IPLimit counts (an IPv4 address, an
+	// IPv6 /64). Every peer that does not stand for one place, and every
+	// address the per-address table has no room for, shares the secret's one
+	// rest entry, which has no ceiling: it stands for many clients at once, and
+	// one address's ceiling would hold all of them together.
+	ClientSpeedBytesPerSecond int64
+
+	// ClientFair, client-fair, divides the secret's own speed limits among the
+	// addresses using it: a work-conserving share, worked out again every
+	// second, in which an address that wants less than an even split keeps
+	// what it wants and the others share the rest equally, however many
+	// connections each holds. Each of SpeedBytesPerSecond,
+	// SpeedUpBytesPerSecond and SpeedDownBytesPerSecond that is set is divided
+	// on its own, so it needs at least one of them. Without one of speed /
+	// speed-up / speed-down the engine treats it as off -- nothing is divided,
+	// though as a per-address control it still keeps the secret's addresses'
+	// entries; only the config and the HTTP API refuse it. The rest entry --
+	// every address that does not stand for one place -- holds one share
+	// between them.
+	ClientFair bool
 }
 
 // IsZero reports whether the limits impose no restriction at all, i.e. the
@@ -91,7 +135,34 @@ func (l SecretLimits) IsZero() bool {
 	return l.QuotaBytes == 0 && l.QuotaReset == QuotaResetNone &&
 		l.ExpiresAt.IsZero() && !l.Disabled && l.SpeedBytesPerSecond == 0 &&
 		l.SpeedUpBytesPerSecond == 0 && l.SpeedDownBytesPerSecond == 0 &&
-		l.IPLimit == 0
+		l.IPLimit == 0 && l.ClientConns == 0 && l.ClientSpeedBytesPerSecond == 0 &&
+		!l.ClientFair
+}
+
+// hasClientControl reports whether the limits carry a per-address control --
+// client-conns, client-speed or client-fair -- which needs the per-address
+// table to hold an entry for every address of the secret even when the proxy
+// does not track client addresses. It is the one place that says which limits
+// are per-address: admission, a reload's backfill and the secret set's own
+// summary all ask it. Each control adds itself here as it lands.
+func (l SecretLimits) hasClientControl() bool {
+	return l.ClientConns > 0 || l.ClientSpeedBytesPerSecond > 0 || l.ClientFair
+}
+
+// fairTotals is what client-fair divides among the secret's addresses: each of
+// its speed limits that is set, on its own, or nothing when fair share is off.
+// The per-address ceiling is not among them: it holds one address, and fair
+// share divides what the secret as a whole may move.
+func (l SecretLimits) fairTotals() fairTotals {
+	if !l.ClientFair {
+		return fairTotals{}
+	}
+
+	return fairTotals{
+		Speed: l.SpeedBytesPerSecond,
+		Up:    l.SpeedUpBytesPerSecond,
+		Down:  l.SpeedDownBytesPerSecond,
+	}
 }
 
 // DenyReason explains why a connection was refused by the per-user limits.
@@ -113,6 +184,14 @@ const (
 	// DenyIPLimit means the connection came from an address the user is not
 	// already counted at, while they are at their address limit.
 	DenyIPLimit
+
+	// DenyClientConns means the connection came from an address that already
+	// holds the per-address connection cap of live connections to this secret.
+	DenyClientConns
+
+	// DenyBanned means the connection came from an address an operator banned
+	// from this secret.
+	DenyBanned
 )
 
 // String returns a short machine-friendly reason label for logs.
@@ -126,6 +205,10 @@ func (d DenyReason) String() string {
 		return "quota_exceeded"
 	case DenyIPLimit:
 		return "ip_limit"
+	case DenyClientConns:
+		return "client_conns"
+	case DenyBanned:
+		return "banned"
 	default:
 		return "allowed"
 	}

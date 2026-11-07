@@ -57,12 +57,29 @@ type streamContext struct {
 	// matched, read from the same snapshot as the rest of the attribution.
 	ipLimit int
 
+	// clientConns is the user's per-address connection cap as it stood when
+	// the secret matched, read with ipLimit; zero is no cap.
+	clientConns int
+
 	// addrKey is the address this stream was counted under in its user's
 	// ledger, and addrCounted says whether it was counted at all -- so the
 	// release on the way out undoes exactly what admission did, whichever
 	// snapshot of the limit it happened under.
 	addrKey     addressKey
 	addrCounted bool
+
+	// addrKeyed says whether the address stands for one place (clientKeyed):
+	// a keyed stream gets an entry of its own in the per-address table, any
+	// other joins its secret's rest entry. Set at admission with the two
+	// fields above, under liveMu, so a reload's backfill can read it there
+	// without resolving the address again.
+	addrKeyed bool
+
+	// addrEntry is the per-address table entry this stream is governed by, or
+	// nil when its secret needs none. Stored once admission has passed every
+	// step, or by a reload's backfill, both under liveMu, and given back by
+	// unregisterConn. Atomic because the data path reads it without a lock.
+	addrEntry atomic.Pointer[clientEntry]
 
 	// scanRes is what the FakeTLS door's scan was charged to the handshake
 	// budget, or nil when nothing was (a hinted match, the budget off, another

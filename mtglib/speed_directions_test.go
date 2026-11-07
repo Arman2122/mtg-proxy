@@ -14,14 +14,14 @@ import (
 
 // readTimed drains n bytes through the throttled reader the way the relay
 // reads a client, fed by a writer that is never the bottleneck, and returns
-// how long it took.
-func readTimed(t *testing.T, stats *ProxyStats, user string, n int) time.Duration {
+// how long it took. The reader is governed as gc has it.
+func readTimed(t *testing.T, stats *ProxyStats, user string, n int, gc governedCase) time.Duration {
 	t.Helper()
 
 	client, proxySide := net.Pipe()
 	t.Cleanup(func() { client.Close(); proxySide.Close() }) //nolint: errcheck
 
-	reader := newCountingConn(t.Context(), nil, essentials.WrapNetConn(proxySide), stats, user)
+	reader := gc.govern(t, newCountingConn(t.Context(), nil, essentials.WrapNetConn(proxySide), stats, user))
 
 	go func() {
 		piece := make([]byte, 32<<10)
@@ -48,53 +48,62 @@ func readTimed(t *testing.T, stats *ProxyStats, user string, n int) time.Duratio
 // A cap on one direction paces that direction alone: the download cap holds
 // what the proxy writes to the client and leaves what it reads at wire speed,
 // and the upload cap the other way round. Each is its own bucket, and the
-// combined cap still applies on top of both.
+// combined cap still applies on top of both. All of it on every path a stream
+// takes to the user's buckets (governedCases).
 func TestSpeedLimitPerDirection(t *testing.T) {
 	t.Parallel()
 
 	const rateBytes = 1 << 20
 
-	t.Run("download cap paces writes and not reads", func(t *testing.T) {
-		t.Parallel()
+	for _, gc := range governedCases() {
+		t.Run(gc.name, func(t *testing.T) {
+			t.Parallel()
 
-		stats := NewProxyStats()
-		stats.SetDirectionalSpeedLimits("alice", 0, rateBytes)
+			t.Run("download cap paces writes and not reads", func(t *testing.T) {
+				t.Parallel()
 
-		capped, _ := throttledPair(t, t.Context(), stats, "alice")
-		elapsed := writeTimed(t, capped, 2*rateBytes)
-		assert.GreaterOrEqual(t, elapsed, 800*time.Millisecond, "2x the download rate must take about a second")
-		assert.Less(t, elapsed, 3*time.Second)
+				stats := NewProxyStats()
+				stats.SetDirectionalSpeedLimits("alice", 0, rateBytes)
 
-		assert.Less(t, readTimed(t, stats, "alice", 2*rateBytes), 300*time.Millisecond, "the upload direction is uncapped")
-		assert.Positive(t, stats.getOrCreate("alice").speedDown.throttledNanos.Load())
-		assert.Zero(t, stats.getOrCreate("alice").speedUp.throttledNanos.Load())
-	})
+				capped, _ := throttledPair(t, t.Context(), stats, "alice")
+				elapsed := writeTimed(t, gc.govern(t, capped), 2*rateBytes)
+				assert.GreaterOrEqual(t, elapsed, 800*time.Millisecond, "2x the download rate must take about a second")
+				assert.Less(t, elapsed, 3*time.Second)
 
-	t.Run("upload cap paces reads and not writes", func(t *testing.T) {
-		t.Parallel()
+				assert.Less(t, readTimed(t, stats, "alice", 2*rateBytes, gc), 300*time.Millisecond,
+					"the upload direction is uncapped")
+				assert.Positive(t, stats.getOrCreate("alice").speedDown.throttledNanos.Load())
+				assert.Zero(t, stats.getOrCreate("alice").speedUp.throttledNanos.Load())
+			})
 
-		stats := NewProxyStats()
-		stats.SetDirectionalSpeedLimits("alice", rateBytes, 0)
+			t.Run("upload cap paces reads and not writes", func(t *testing.T) {
+				t.Parallel()
 
-		elapsed := readTimed(t, stats, "alice", 2*rateBytes)
-		assert.GreaterOrEqual(t, elapsed, 800*time.Millisecond, "2x the upload rate must take about a second")
-		assert.Less(t, elapsed, 3*time.Second)
+				stats := NewProxyStats()
+				stats.SetDirectionalSpeedLimits("alice", rateBytes, 0)
 
-		free, _ := throttledPair(t, t.Context(), stats, "alice")
-		assert.Less(t, writeTimed(t, free, 2*rateBytes), 300*time.Millisecond, "the download direction is uncapped")
-	})
+				elapsed := readTimed(t, stats, "alice", 2*rateBytes, gc)
+				assert.GreaterOrEqual(t, elapsed, 800*time.Millisecond, "2x the upload rate must take about a second")
+				assert.Less(t, elapsed, 3*time.Second)
 
-	t.Run("the combined cap still applies on top", func(t *testing.T) {
-		t.Parallel()
+				free, _ := throttledPair(t, t.Context(), stats, "alice")
+				assert.Less(t, writeTimed(t, gc.govern(t, free), 2*rateBytes), 300*time.Millisecond,
+					"the download direction is uncapped")
+			})
 
-		stats := NewProxyStats()
-		stats.SetSpeedLimit("alice", rateBytes)
-		stats.SetDirectionalSpeedLimits("alice", 0, 8*rateBytes)
+			t.Run("the combined cap still applies on top", func(t *testing.T) {
+				t.Parallel()
 
-		capped, _ := throttledPair(t, t.Context(), stats, "alice")
-		assert.GreaterOrEqual(t, writeTimed(t, capped, 2*rateBytes), 800*time.Millisecond,
-			"the tighter of the two caps is the one that holds")
-	})
+				stats := NewProxyStats()
+				stats.SetSpeedLimit("alice", rateBytes)
+				stats.SetDirectionalSpeedLimits("alice", 0, 8*rateBytes)
+
+				capped, _ := throttledPair(t, t.Context(), stats, "alice")
+				assert.GreaterOrEqual(t, writeTimed(t, gc.govern(t, capped), 2*rateBytes), 800*time.Millisecond,
+					"the tighter of the two caps is the one that holds")
+			})
+		})
+	}
 }
 
 // The two caps travel the API under their own names and read back under their

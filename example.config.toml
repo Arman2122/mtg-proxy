@@ -36,11 +36,16 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 #   GET    /secrets/{name}   one entry of that list, by name
 #   POST   /secrets          add/update one secret: {"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?}
 #   PUT    /secrets          replace the whole set: {"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?,ip_limit?}},"ad_tag"?}
+#                            (both also take speed_up, speed_down, client_conns, client_speed and client_fair)
 #   DELETE /secrets/{name}   remove one secret
 #   POST   /secrets/{name}/reset-quota   zero the secret's used-bytes counter
 #   GET    /secrets/{name}/external-ips  the user's address view: ip_limit, active_ips (+ addresses with track-client-ips)
 #   PUT    /secrets/{name}/external-ips  {"ips":[...],"ttl":"90s"}: addresses the user holds on other systems, counted here until ttl
 #   DELETE /secrets/{name}/external-ips  clear that report
+#   GET    /secrets/{name}/clients?limit=N  per-address usage, most bytes first (addresses only with track-client-ips)
+#   POST   /secrets/{name}/bans  {"ips":[...],"ttl":"1h","force":false}: refuse those addresses this secret, in memory, until ttl
+#   GET    /secrets/{name}/bans  the secret's bans (addresses only with track-client-ips)
+#   DELETE /secrets/{name}/bans/{address}  lift one ban; an IPv6 ban may be named by its /64
 #   GET    /adtag            read the global ad-tag: {"ad_tag": "<hex>"|null}
 #   PUT    /adtag            set the global ad-tag: {"ad_tag":"<32 hex chars>"}
 #   DELETE /adtag            clear the global ad-tag
@@ -323,6 +328,11 @@ allow-fallback-on-unknown-dc = false
 # -- but "last_ip" outlives the connection it came from, so a deployment that
 # never asks for either never accumulates one.
 #
+# With it on, every secret's addresses are also kept in memory, with what each
+# moved, until ten minutes after its last connection, and listed by
+# GET /secrets/{name}/clients for up to about eleven minutes (see the per-address
+# controls under [secret-limits] below).
+#
 # Nothing here is written to disk in any form: usage-state-file below persists
 # quota counters only, so no address survives a restart.
 #
@@ -389,6 +399,9 @@ allow-fallback-on-unknown-dc = false
 #                user is at the limit; lowering it never drops open connections.
 #                A panel may report the user's addresses on other systems via
 #                PUT /secrets/{name}/external-ips so one limit spans them all.
+#   client-conns, client-speed, client-fair
+#                per-address controls inside one secret; see the last example
+#                block below.
 #
 # Set usage-state-file above so quota usage survives restarts. Limits set via
 # the management API are in-memory only and are overridden by the next reload.
@@ -404,6 +417,25 @@ allow-fallback-on-unknown-dc = false
 # disabled = false
 # [secret-limits.bob]
 # quota = "500MB"
+#
+# Per-address controls, for a secret many people share. All optional, all off
+# by default. An address is an IPv4 address or an IPv6 /64. Loopback and private
+# addresses do not stand for one place: they, and any address the per-address
+# table has no room for, share one "rest" entry per secret, which is never
+# capped and has no ceiling. One address may be many people behind a carrier's
+# NAT. Behind a PROXY-protocol listener the address is whatever the header says,
+# and anyone who can reach that listener can forge it; the proxy warns about
+# that at start. The table name must be a secret in [secrets]. See the
+# Configuration and Security pages of the wiki.
+# [secret-limits.shared]
+# speed = "50mbit"
+# ip-limit = 30
+# # Live connections one address may hold to this secret; omit or 0 for no cap.
+# client-conns = 16
+# # A ceiling on one address, both directions together; spelled like speed.
+# client-speed = "10mbit"
+# # Divide this secret's speed among its addresses; needs speed, speed-up or speed-down.
+# client-fair = true
 
 # This section is relevant to communication with fronting domain. Usually
 # you do not need to setup anything here but there are plenty of cases, especially

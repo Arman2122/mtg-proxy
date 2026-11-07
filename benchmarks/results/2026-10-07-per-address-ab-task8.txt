@@ -1,0 +1,200 @@
+# Per-address governance, Task 8: the counting conn's per-address step. Same-session A/B, 2026-10-07
+#
+# old = commit 4024026 production (before any per-address code on the data path) with the NEW
+#       mtglib/door_bench_test.go copied in (the file compiles against both trees); its own
+#       counting_conn_bench_test.go (noentry rows only).
+# new = commit b3c5a38 (feat/client-governance; the later commit aced5dc touches only the idle sweep).
+# Both: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c, run on 5.75.199.10 (2 vCPU Skylake, no SHA-NI),
+#       from /root/mtg-bench, load 0.1 at the start (3 other tenants logged in).
+# Protocol: 10 iterations, old and new ALTERNATED inside one session with the order swapped every
+#       iteration (old,new / new,old / ...), `-test.cpu 2 -test.benchtime 1s`, TIME_WAIT < 200 between runs:
+#         wrapper rows  -test.bench '^BenchmarkCountingConn(Parallel)?$/^(read|write)$/^noentry$'
+#         door rows     -test.bench '^BenchmarkDoorBulk$'   (9 rows without and 9 with `/tracked`, i.e. track-client-ips ON,
+#                                                             the panel's configuration; in the old binary that means "tracking, no entry")
+#       then, new binary only and informational, the wrapper rows WITH an entry and no limiter (the panel's case at wrapper level),
+#       -test.count 3 (benchstat cannot give an interval from 3 samples).
+# Tool: benchstat (golang.org/x/perf), default settings, alpha 0.05.
+#
+# READ THIS BEFORE THE NUMBERS
+#  * No row is slower in the new binary. 17 of 18 door rows and 4 of 4 wrapper rows show no difference (p > 0.05);
+#    the one row below p = 0.05 (plain/conns=16/addr=shared/tracked, p = 0.035) is FASTER in the new binary (-3.3%),
+#    which with 18 rows compared is what chance alone produces about once.
+#  * The door rows are noisy (+-3% to +-24% per row on the shared box), so this A/B cannot by itself certify "no more than 2%";
+#    what bounds the cost is the wrapper measurement: with an entry present and no limiter a call costs about
+#    +14 ns (serial: 106 -> 120 ns) and about +75 ns when both cores hammer ONE shared entry (parallel: ~104 -> ~178 ns). A 1 MiB door
+#    chunk through the 16 KiB relay buffer is 64 calls, so even the shared-entry worst case is ~1,000 calls x 75 ns = ~77 us per
+#    ~21 ms door iteration, about 0.4%; the door rows are consistent with that (shared/tracked: ee +0.3%, dd -0.7%, plain -3.3%, all within noise).
+#  * noentry (a stream with no entry: tracking off and no per-address control) is the old code plus one atomic load: 105.3 ns vs 106.2 ns
+#    geomean (+0.9%, no row below p = 0.05; the closest, parallel/write, p = 0.052 at +3.7% with +-6-7% noise).
+#
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+                                     │ old.wrap.raw │            new.wrap.raw             │
+                                     │    sec/op    │    sec/op     vs base               │
+CountingConn/read/noentry-2             105.4n ± 3%    106.7n ± 3%       ~ (p=0.383 n=10)
+CountingConn/write/noentry-2            113.0n ± 3%    111.2n ± 5%       ~ (p=1.000 n=10)
+CountingConnParallel/read/noentry-2     105.9n ± 4%    106.4n ± 6%       ~ (p=0.971 n=10)
+CountingConnParallel/write/noentry-2    97.39n ± 7%   100.95n ± 6%       ~ (p=0.052 n=10)
+geomean                                 105.3n         106.2n       +0.89%
+
+                                     │ old.wrap.raw │            new.wrap.raw             │
+                                     │     B/s      │     B/s       vs base               │
+CountingConn/read/noentry-2            144.7Gi ± 3%   143.0Gi ± 3%       ~ (p=0.353 n=10)
+CountingConn/write/noentry-2           135.0Gi ± 3%   137.3Gi ± 5%       ~ (p=1.000 n=10)
+CountingConnParallel/read/noentry-2    144.1Gi ± 4%   143.4Gi ± 6%       ~ (p=0.971 n=10)
+CountingConnParallel/write/noentry-2   156.6Gi ± 8%   151.1Gi ± 5%       ~ (p=0.052 n=10)
+geomean                                144.9Gi        143.6Gi       -0.88%
+
+                                     │ old.wrap.raw │            new.wrap.raw             │
+                                     │     B/op     │    B/op     vs base                 │
+CountingConn/read/noentry-2            0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+CountingConn/write/noentry-2           0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+CountingConnParallel/read/noentry-2    0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+CountingConnParallel/write/noentry-2   0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+geomean                                           ²               +0.00%                ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+
+                                     │ old.wrap.raw │            new.wrap.raw             │
+                                     │  allocs/op   │ allocs/op   vs base                 │
+CountingConn/read/noentry-2            0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+CountingConn/write/noentry-2           0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+CountingConnParallel/read/noentry-2    0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+CountingConnParallel/write/noentry-2   0.000 ± 0%     0.000 ± 0%       ~ (p=1.000 n=10) ¹
+geomean                                           ²               +0.00%                ²
+¹ all samples are equal
+² summaries must be >0 to compute geomean
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+                                                    │ old.door.raw │            new.door.raw             │
+                                                    │    sec/op    │    sec/op     vs base               │
+DoorBulk/ee-unpaced/conns=1/addr=stamped-2            1.887m ± 12%   1.942m ±  9%       ~ (p=0.739 n=10)
+DoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2    1.995m ±  7%   1.938m ± 13%       ~ (p=0.912 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=stamped-2           23.45m ±  4%   23.53m ±  8%       ~ (p=0.436 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2   23.65m ± 10%   23.48m ±  3%       ~ (p=0.481 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=shared-2            24.02m ± 10%   23.93m ±  8%       ~ (p=1.000 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2    23.15m ±  8%   23.23m ±  4%       ~ (p=0.739 n=10)
+DoorBulk/dd/conns=1/addr=stamped-2                    2.569m ± 14%   2.598m ±  7%       ~ (p=0.912 n=10)
+DoorBulk/dd/conns=1/addr=stamped/tracked-2            2.711m ±  4%   2.704m ±  6%       ~ (p=0.579 n=10)
+DoorBulk/dd/conns=16/addr=stamped-2                   21.16m ± 10%   21.50m ±  8%       ~ (p=0.684 n=10)
+DoorBulk/dd/conns=16/addr=stamped/tracked-2           20.91m ± 16%   21.41m ± 11%       ~ (p=0.631 n=10)
+DoorBulk/dd/conns=16/addr=shared-2                    21.65m ±  5%   21.44m ±  4%       ~ (p=0.481 n=10)
+DoorBulk/dd/conns=16/addr=shared/tracked-2            21.51m ± 24%   21.35m ±  3%       ~ (p=1.000 n=10)
+DoorBulk/plain/conns=1/addr=stamped-2                 2.648m ±  9%   2.662m ± 12%       ~ (p=1.000 n=10)
+DoorBulk/plain/conns=1/addr=stamped/tracked-2         2.635m ±  7%   2.645m ±  7%       ~ (p=0.853 n=10)
+DoorBulk/plain/conns=16/addr=stamped-2                21.16m ±  7%   21.23m ±  4%       ~ (p=0.796 n=10)
+DoorBulk/plain/conns=16/addr=stamped/tracked-2        21.33m ±  4%   21.87m ±  6%       ~ (p=0.393 n=10)
+DoorBulk/plain/conns=16/addr=shared-2                 21.75m ± 15%   21.34m ±  3%       ~ (p=0.218 n=10)
+DoorBulk/plain/conns=16/addr=shared/tracked-2         21.39m ±  5%   20.68m ±  5%  -3.30% (p=0.035 n=10)
+geomean                                               10.51m         10.51m        +0.06%
+
+                                                    │ old.door.raw  │             new.door.raw             │
+                                                    │      B/s      │      B/s       vs base               │
+DoorBulk/ee-unpaced/conns=1/addr=stamped-2            530.0Mi ± 10%   515.8Mi ±  8%       ~ (p=0.739 n=10)
+DoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2    501.3Mi ±  7%   516.1Mi ± 12%       ~ (p=0.912 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=stamped-2           682.2Mi ±  4%   679.9Mi ±  8%       ~ (p=0.436 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2   676.7Mi ±  9%   681.7Mi ±  3%       ~ (p=0.481 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=shared-2            666.0Mi ±  9%   668.5Mi ±  7%       ~ (p=1.000 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2    691.0Mi ±  8%   688.9Mi ±  4%       ~ (p=0.739 n=10)
+DoorBulk/dd/conns=1/addr=stamped-2                    389.2Mi ± 12%   384.9Mi ±  6%       ~ (p=0.912 n=10)
+DoorBulk/dd/conns=1/addr=stamped/tracked-2            368.8Mi ±  5%   370.1Mi ±  6%       ~ (p=0.579 n=10)
+DoorBulk/dd/conns=16/addr=stamped-2                   756.1Mi ±  9%   745.0Mi ±  8%       ~ (p=0.684 n=10)
+DoorBulk/dd/conns=16/addr=stamped/tracked-2           765.3Mi ± 14%   747.3Mi ± 10%       ~ (p=0.631 n=10)
+DoorBulk/dd/conns=16/addr=shared-2                    739.1Mi ±  5%   746.4Mi ±  4%       ~ (p=0.481 n=10)
+DoorBulk/dd/conns=16/addr=shared/tracked-2            743.9Mi ± 19%   749.3Mi ±  3%       ~ (p=1.000 n=10)
+DoorBulk/plain/conns=1/addr=stamped-2                 377.7Mi ±  8%   375.8Mi ± 11%       ~ (p=1.000 n=10)
+DoorBulk/plain/conns=1/addr=stamped/tracked-2         379.5Mi ±  7%   378.0Mi ±  8%       ~ (p=0.853 n=10)
+DoorBulk/plain/conns=16/addr=stamped-2                756.2Mi ±  6%   753.7Mi ±  4%       ~ (p=0.796 n=10)
+DoorBulk/plain/conns=16/addr=stamped/tracked-2        750.1Mi ±  4%   731.7Mi ±  6%       ~ (p=0.393 n=10)
+DoorBulk/plain/conns=16/addr=shared-2                 735.6Mi ± 13%   749.9Mi ±  3%       ~ (p=0.218 n=10)
+DoorBulk/plain/conns=16/addr=shared/tracked-2         748.2Mi ±  5%   773.7Mi ±  5%  +3.41% (p=0.035 n=10)
+geomean                                               604.3Mi         604.0Mi        -0.04%
+
+                                                    │ old.door.raw  │             new.door.raw             │
+                                                    │     B/op      │     B/op       vs base               │
+DoorBulk/ee-unpaced/conns=1/addr=stamped-2            5.439Ki ± 27%   5.316Ki ± 34%       ~ (p=0.739 n=10)
+DoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2    5.734Ki ± 34%   5.582Ki ± 43%       ~ (p=0.912 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=stamped-2           670.3Ki ±  7%   716.6Ki ± 12%       ~ (p=0.075 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2   691.1Ki ± 17%   665.5Ki ± 18%       ~ (p=0.971 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=shared-2            685.3Ki ±  6%   680.5Ki ± 11%       ~ (p=0.912 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2    639.0Ki ± 11%   696.2Ki ±  7%       ~ (p=0.063 n=10)
+DoorBulk/dd/conns=1/addr=stamped-2                    1.307Ki ±  3%   1.309Ki ±  1%       ~ (p=0.752 n=10)
+DoorBulk/dd/conns=1/addr=stamped/tracked-2            1.305Ki ±  2%   1.305Ki ±  3%       ~ (p=0.755 n=10)
+DoorBulk/dd/conns=16/addr=stamped-2                   22.06Ki ±  2%   22.16Ki ±  1%       ~ (p=0.796 n=10)
+DoorBulk/dd/conns=16/addr=stamped/tracked-2           21.96Ki ±  3%   22.02Ki ±  1%       ~ (p=0.971 n=10)
+DoorBulk/dd/conns=16/addr=shared-2                    22.18Ki ±  2%   21.98Ki ±  1%       ~ (p=0.247 n=10)
+DoorBulk/dd/conns=16/addr=shared/tracked-2            22.01Ki ±  1%   22.07Ki ±  1%       ~ (p=0.481 n=10)
+DoorBulk/plain/conns=1/addr=stamped-2                 1.274Ki ±  2%   1.290Ki ±  1%       ~ (p=0.592 n=10)
+DoorBulk/plain/conns=1/addr=stamped/tracked-2         1.299Ki ±  2%   1.298Ki ±  2%       ~ (p=0.927 n=10)
+DoorBulk/plain/conns=16/addr=stamped-2                21.99Ki ±  1%   22.12Ki ±  1%       ~ (p=0.481 n=10)
+DoorBulk/plain/conns=16/addr=stamped/tracked-2        21.91Ki ±  1%   21.99Ki ±  1%       ~ (p=0.324 n=10)
+DoorBulk/plain/conns=16/addr=shared-2                 22.03Ki ±  2%   22.11Ki ±  2%       ~ (p=0.739 n=10)
+DoorBulk/plain/conns=16/addr=shared/tracked-2         21.87Ki ±  2%   21.98Ki ±  2%       ~ (p=0.631 n=10)
+geomean                                               21.52Ki         21.63Ki        +0.49%
+
+                                                    │ old.door.raw │            new.door.raw            │
+                                                    │  allocs/op   │  allocs/op   vs base               │
+DoorBulk/ee-unpaced/conns=1/addr=stamped-2              74.00 ± 0%    74.00 ± 0%       ~ (p=1.000 n=10)
+DoorBulk/ee-unpaced/conns=1/addr=stamped/tracked-2      74.50 ± 2%    74.00 ± 3%       ~ (p=0.564 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=stamped-2            1.134k ± 0%   1.137k ± 0%  +0.22% (p=0.041 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=stamped/tracked-2    1.132k ± 0%   1.133k ± 0%       ~ (p=0.989 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=shared-2             1.133k ± 0%   1.133k ± 0%       ~ (p=0.783 n=10)
+DoorBulk/ee-unpaced/conns=16/addr=shared/tracked-2     1.133k ± 0%   1.134k ± 0%       ~ (p=0.484 n=10)
+DoorBulk/dd/conns=1/addr=stamped-2                      74.00 ± 3%    74.00 ± 3%       ~ (p=1.000 n=10)
+DoorBulk/dd/conns=1/addr=stamped/tracked-2              76.00 ± 3%    76.00 ± 3%       ~ (p=1.000 n=10)
+DoorBulk/dd/conns=16/addr=stamped-2                    1.129k ± 0%   1.130k ± 0%       ~ (p=0.319 n=10)
+DoorBulk/dd/conns=16/addr=stamped/tracked-2            1.130k ± 0%   1.129k ± 0%       ~ (p=0.287 n=10)
+DoorBulk/dd/conns=16/addr=shared-2                     1.129k ± 0%   1.128k ± 0%       ~ (p=0.646 n=10)
+DoorBulk/dd/conns=16/addr=shared/tracked-2             1.128k ± 0%   1.129k ± 0%       ~ (p=0.198 n=10)
+DoorBulk/plain/conns=1/addr=stamped-2                   74.00 ± 3%    74.50 ± 2%       ~ (p=0.825 n=10)
+DoorBulk/plain/conns=1/addr=stamped/tracked-2           74.50 ± 2%    74.00 ± 3%       ~ (p=0.650 n=10)
+DoorBulk/plain/conns=16/addr=stamped-2                 1.129k ± 0%   1.129k ± 0%       ~ (p=0.408 n=10)
+DoorBulk/plain/conns=16/addr=stamped/tracked-2         1.128k ± 0%   1.128k ± 0%       ~ (p=0.599 n=10)
+DoorBulk/plain/conns=16/addr=shared-2                  1.131k ± 0%   1.128k ± 0%  -0.27% (p=0.037 n=10)
+DoorBulk/plain/conns=16/addr=shared/tracked-2          1.129k ± 0%   1.129k ± 0%       ~ (p=0.956 n=10)
+geomean                                                 456.6         456.5       -0.02%
+goos: linux
+goarch: amd64
+pkg: github.com/Arman2122/mtg-proxy/mtglib
+cpu: Intel Xeon Processor (Skylake, IBRS, no TSX)
+                                   │ new.entry.raw │
+                                   │    sec/op     │
+CountingConn/read/entry-2             119.8n ± ∞ ¹
+CountingConn/write/entry-2            119.8n ± ∞ ¹
+CountingConnParallel/read/entry-2     175.5n ± ∞ ¹
+CountingConnParallel/write/entry-2    181.2n ± ∞ ¹
+geomean                               146.2n
+¹ need >= 6 samples for confidence interval at level 0.95
+
+                                   │ new.entry.raw │
+                                   │      B/s      │
+CountingConn/read/entry-2            127.3Gi ± ∞ ¹
+CountingConn/write/entry-2           127.3Gi ± ∞ ¹
+CountingConnParallel/read/entry-2    86.94Gi ± ∞ ¹
+CountingConnParallel/write/entry-2   84.19Gi ± ∞ ¹
+geomean                              104.4Gi
+¹ need >= 6 samples for confidence interval at level 0.95
+
+                                   │ new.entry.raw │
+                                   │     B/op      │
+CountingConn/read/entry-2              0.000 ± ∞ ¹
+CountingConn/write/entry-2             0.000 ± ∞ ¹
+CountingConnParallel/read/entry-2      0.000 ± ∞ ¹
+CountingConnParallel/write/entry-2     0.000 ± ∞ ¹
+geomean                                          ²
+¹ need >= 6 samples for confidence interval at level 0.95
+² summaries must be >0 to compute geomean
+
+                                   │ new.entry.raw │
+                                   │   allocs/op   │
+CountingConn/read/entry-2              0.000 ± ∞ ¹
+CountingConn/write/entry-2             0.000 ± ∞ ¹
+CountingConnParallel/read/entry-2      0.000 ± ∞ ¹
+CountingConnParallel/write/entry-2     0.000 ± ∞ ¹
+geomean                                          ²
+¹ need >= 6 samples for confidence interval at level 0.95
+² summaries must be >0 to compute geomean

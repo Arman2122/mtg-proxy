@@ -107,26 +107,34 @@ func TestParseSpeed(t *testing.T) {
 }
 
 // The cap holds. Twice the rate takes about a second; unlimited takes nothing
-// measurable. Remove the wait from countingConn.Write and this fails.
+// measurable. Remove the wait from countingConn.Write and this fails -- on
+// every path a stream takes to the user's bucket (governedCases).
 func TestSpeedLimitHoldsSustainedThroughput(t *testing.T) {
 	t.Parallel()
 
 	const rateBytes = 1 << 20
 
-	stats := NewProxyStats()
-	stats.SetSpeedLimit("alice", rateBytes)
+	for _, gc := range governedCases() {
+		t.Run(gc.name, func(t *testing.T) {
+			t.Parallel()
 
-	capped, _ := throttledPair(t, t.Context(), stats, "alice")
-	elapsed := writeTimed(t, capped, 2*rateBytes)
+			stats := NewProxyStats()
+			stats.SetSpeedLimit("alice", rateBytes)
 
-	assert.GreaterOrEqual(t, elapsed, 800*time.Millisecond, "2x the rate must take about a second at the cap")
-	assert.Less(t, elapsed, 3*time.Second, "the cap paced far below the rate")
+			capped, _ := throttledPair(t, t.Context(), stats, "alice")
+			elapsed := writeTimed(t, gc.govern(t, capped), 2*rateBytes)
 
-	free, _ := throttledPair(t, t.Context(), stats, "bob")
-	assert.Less(t, writeTimed(t, free, 2*rateBytes), 300*time.Millisecond, "an unlimited user must not be paced at all")
+			assert.GreaterOrEqual(t, elapsed, 800*time.Millisecond, "2x the rate must take about a second at the cap")
+			assert.Less(t, elapsed, 3*time.Second, "the cap paced far below the rate")
 
-	assert.Positive(t, stats.getOrCreate("alice").speed.throttledNanos.Load(), "time held to the cap must be counted")
-	assert.Zero(t, stats.getOrCreate("bob").speed.throttledNanos.Load())
+			free, _ := throttledPair(t, t.Context(), stats, "bob")
+			assert.Less(t, writeTimed(t, gc.govern(t, free), 2*rateBytes), 300*time.Millisecond,
+				"an unlimited user must not be paced at all")
+
+			assert.Positive(t, stats.getOrCreate("alice").speed.throttledNanos.Load(), "time held to the cap must be counted")
+			assert.Zero(t, stats.getOrCreate("bob").speed.throttledNanos.Load())
+		})
+	}
 }
 
 // One user, two connections, one allowance: together they cannot exceed the
@@ -309,6 +317,11 @@ func TestSpeedLimitThroughAReload(t *testing.T) {
 // ServeConn, and Telegram pushing bytes down it. The capped user receives them
 // at the cap; the uncapped one does not wait. This is the test that fails if
 // the wrapper is wired anywhere but on the client side of every stream.
+//
+// The tracked runs are the same on a proxy that keeps client addresses, as a
+// panel always runs it, with clients at documentation addresses: each stream
+// has a per-address entry of its own, so the relay's wrapper takes its entry
+// path, and the user's cap must hold there just the same.
 func TestSpeedLimitAppliesThroughTheProxy(t *testing.T) {
 	t.Parallel()
 
@@ -322,63 +335,106 @@ func TestSpeedLimitAppliesThroughTheProxy(t *testing.T) {
 	// the cover host in SNI and is admitted only under it; the obfuscated2 door
 	// takes a hostless dd key.
 	for _, entry := range govEntryCases()[:2] {
-		t.Run(entry.name, func(t *testing.T) {
-			t.Parallel()
-
-			alice := entry.secret(t)
-			bob := entry.secret(t)
-
-			// The case's own harness: it runs the doppelganger, which the FakeTLS door
-			// cannot get past without, and pins the idle and handshake timeouts and
-			// the doppelganger's own wait between records, so nothing but the cap
-			// can pace these streams.
-			h := entry.harness(t,
-				map[string]Secret{"alice": alice, "bob": bob},
-				map[string]SecretLimits{"alice": {SpeedBytesPerSecond: rateBytes}})
-
-			timeDownload := func(name string, key [SecretKeyLength]byte) time.Duration {
-				client, done := h.dialProxy(t, entry.policy)
-				upstream := connectThrough(t, entry, h, client, name, key)
-
-				defer endStream(client, upstream, done)
-
-				go func() { upstream.Write(make([]byte, 2*rateBytes)) }() //nolint: errcheck
-
-				// The client sees the bytes wrapped in TLS records, which are only
-				// larger, so counting raw bytes up to the payload size is enough.
-				require.NoError(t, client.SetReadDeadline(time.Now().Add(15*time.Second)))
-
-				started := time.Now()
-				buf := make([]byte, 64<<10)
-
-				for received := 0; received < 2*rateBytes; {
-					n, err := client.Read(buf)
-					require.NoError(t, err)
-
-					received += n
-				}
-
-				return time.Since(started)
+		for _, tracked := range []bool{false, true} {
+			name := entry.name
+			if tracked {
+				name += "/tracked"
 			}
 
-			capped := timeDownload("alice", alice.Key)
-			assert.GreaterOrEqual(t, capped, 800*time.Millisecond,
-				"alice is capped and must receive twice her rate in about a second")
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 
-			free := timeDownload("bob", bob.Key)
-			assert.Less(t, free, 500*time.Millisecond, "bob is unlimited and must not be paced")
-			assert.Less(t, free, capped/2, "the same transfer must be far faster without the cap than with it")
-
-			var throttled int64
-
-			require.Eventually(t, func() bool {
-				throttled = h.proxy.stats.getOrCreate("alice").speed.throttledNanos.Load()
-
-				return throttled > 0
-			}, time.Second, 10*time.Millisecond, "time held to the cap must be counted for the capped user")
-			assert.Zero(t, h.proxy.stats.getOrCreate("bob").speed.throttledNanos.Load())
-		})
+				speedLimitThroughTheProxy(t, entry, tracked, rateBytes)
+			})
+		}
 	}
+}
+
+// speedLimitThroughTheProxy is one door's run of
+// TestSpeedLimitAppliesThroughTheProxy, on a proxy that keeps client addresses
+// or one that does not.
+func speedLimitThroughTheProxy(t *testing.T, entry govEntryCase, tracked bool, rateBytes int) {
+	t.Helper()
+
+	alice := entry.secret(t)
+	bob := entry.secret(t)
+
+	// The case's own harness: it runs the doppelganger, which the FakeTLS door
+	// cannot get past without, and pins the idle and handshake timeouts and
+	// the doppelganger's own wait between records, so nothing but the cap
+	// can pace these streams.
+	h := entry.harness(t,
+		map[string]Secret{"alice": alice, "bob": bob},
+		map[string]SecretLimits{"alice": {SpeedBytesPerSecond: int64(rateBytes)}})
+	h.proxy.trackClientIPs = tracked
+
+	// Where each user's client is, when the proxy keeps addresses.
+	from := map[string]net.Addr{"alice": tcpFrom("203.0.113.41", 50001), "bob": tcpFrom("203.0.113.42", 50002)}
+
+	timeDownload := func(name string, key [SecretKeyLength]byte) time.Duration {
+		var (
+			client net.Conn
+			done   <-chan struct{}
+		)
+
+		if tracked {
+			client, done = dialProxyFrom(t, h, entry.policy, from[name])
+		} else {
+			client, done = h.dialProxy(t, entry.policy)
+		}
+
+		upstream := connectThrough(t, entry, h, client, name, key)
+
+		defer endStream(client, upstream, done)
+
+		if tracked {
+			addrEntry := h.liveStream(t, name).addrEntry.Load()
+			require.NotNil(t, addrEntry, "a keyed stream on a tracking proxy has an entry")
+			require.False(t, addrEntry.rest, "of its own")
+
+			// The wrapper counts a write after the socket write returns. Checked
+			// before the stream ends, which runs after this.
+			defer func() {
+				assert.Eventually(t, func() bool { return addrEntry.bytesOut.Load() == int64(2*rateBytes) },
+					5*time.Second, time.Millisecond, "the download went through the stream's entry")
+			}()
+		}
+
+		go func() { upstream.Write(make([]byte, 2*rateBytes)) }() //nolint: errcheck
+
+		// The client sees the bytes wrapped in TLS records, which are only
+		// larger, so counting raw bytes up to the payload size is enough.
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(15*time.Second)))
+
+		started := time.Now()
+		buf := make([]byte, 64<<10)
+
+		for received := 0; received < 2*rateBytes; {
+			n, err := client.Read(buf)
+			require.NoError(t, err)
+
+			received += n
+		}
+
+		return time.Since(started)
+	}
+
+	capped := timeDownload("alice", alice.Key)
+	assert.GreaterOrEqual(t, capped, 800*time.Millisecond,
+		"alice is capped and must receive twice her rate in about a second")
+
+	free := timeDownload("bob", bob.Key)
+	assert.Less(t, free, 500*time.Millisecond, "bob is unlimited and must not be paced")
+	assert.Less(t, free, capped/2, "the same transfer must be far faster without the cap than with it")
+
+	var throttled int64
+
+	require.Eventually(t, func() bool {
+		throttled = h.proxy.stats.getOrCreate("alice").speed.throttledNanos.Load()
+
+		return throttled > 0
+	}, time.Second, 10*time.Millisecond, "time held to the cap must be counted for the capped user")
+	assert.Zero(t, h.proxy.stats.getOrCreate("bob").speed.throttledNanos.Load())
 }
 
 // An unlimited user pays nothing: the wrapper is the same single read and
@@ -415,42 +471,49 @@ func (w *writeCounter) Write(p []byte) (int, error) {
 // The upload direction is paced too. Everything above times writes, which is
 // the download direction at the client side; this times reads, which is
 // upload: a client pushing twice the rate into the proxy is held to it just
-// the same. Remove the wait from countingConn.Read and this fails.
+// the same. Remove the wait from countingConn.Read and this fails, on every
+// path a stream takes to the user's bucket (governedCases).
 func TestSpeedLimitHoldsUploadToo(t *testing.T) {
 	t.Parallel()
 
 	const rateBytes = 1 << 20
 
-	stats := NewProxyStats()
-	stats.SetSpeedLimit("alice", rateBytes)
+	for _, gc := range governedCases() {
+		t.Run(gc.name, func(t *testing.T) {
+			t.Parallel()
 
-	client, proxySide := net.Pipe()
-	t.Cleanup(func() { client.Close(); proxySide.Close() }) //nolint: errcheck
+			stats := NewProxyStats()
+			stats.SetSpeedLimit("alice", rateBytes)
 
-	reader := newCountingConn(t.Context(), nil, essentials.WrapNetConn(proxySide), stats, "alice")
+			client, proxySide := net.Pipe()
+			t.Cleanup(func() { client.Close(); proxySide.Close() }) //nolint: errcheck
 
-	// The client writes as fast as the pipe takes it; the proxy side reads
-	// through the throttled wrapper, the way the relay reads a client.
-	go func() {
-		piece := make([]byte, 32<<10)
-		for written := 0; written < 2*rateBytes; written += len(piece) {
-			if _, err := client.Write(piece); err != nil {
-				return
+			reader := gc.govern(t, newCountingConn(t.Context(), nil, essentials.WrapNetConn(proxySide), stats, "alice"))
+
+			// The client writes as fast as the pipe takes it; the proxy side reads
+			// through the throttled wrapper, the way the relay reads a client.
+			go func() {
+				piece := make([]byte, 32<<10)
+				for written := 0; written < 2*rateBytes; written += len(piece) {
+					if _, err := client.Write(piece); err != nil {
+						return
+					}
+				}
+			}()
+
+			started := time.Now()
+			buf := make([]byte, 64<<10)
+
+			for received := 0; received < 2*rateBytes; {
+				n, err := reader.Read(buf)
+				require.NoError(t, err)
+
+				received += n
 			}
-		}
-	}()
 
-	started := time.Now()
-	buf := make([]byte, 64<<10)
-
-	for received := 0; received < 2*rateBytes; {
-		n, err := reader.Read(buf)
-		require.NoError(t, err)
-
-		received += n
+			elapsed := time.Since(started)
+			assert.GreaterOrEqual(t, elapsed, 800*time.Millisecond, "uploading 2x the rate must take about a second at the cap")
+			assert.Less(t, elapsed, 3*time.Second)
+		})
 	}
-
-	elapsed := time.Since(started)
-	assert.GreaterOrEqual(t, elapsed, 800*time.Millisecond, "uploading 2x the rate must take about a second at the cap")
-	assert.Less(t, elapsed, 3*time.Second)
 }

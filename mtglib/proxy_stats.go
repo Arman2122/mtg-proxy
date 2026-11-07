@@ -57,6 +57,12 @@ type secretStats struct {
 	// it constantly is either sharing a secret or roaming between networks.
 	ipLimitRefused atomic.Int64
 
+	// clientConnsRefused counts connections turned away for arriving from an
+	// address already at the per-address connection cap. Kept apart from
+	// ipLimitRefused: that one says how many places a user is at, this one how
+	// many sockets one place opens, and the two are tuned differently.
+	clientConnsRefused atomic.Int64
+
 	// lastIP is the client address of the most recently admitted connection,
 	// stored as a string. It is written only when the proxy is configured to
 	// track addresses, so a deployment that does not ask for them never holds
@@ -74,6 +80,14 @@ type secretStats struct {
 	// on top of the combined one. Unlimited when the user has no such cap.
 	speedUp   speedLimiter
 	speedDown speedLimiter
+
+	// clientThrottledNanos is the time this user's connections have spent
+	// waiting at the per-address limiters of the addresses they came from, the
+	// ceilings' included; throttled_ms reports it with the user's own buckets'.
+	// A counter of the user's own, added to at every wait, rather than a sum
+	// over the per-address table: the table forgets an address ten minutes
+	// after its last stream, and the figure must never go back.
+	clientThrottledNanos atomic.Int64
 }
 
 // rolloverIfNeeded zeroes quotaUsed when the monthly quota period has elapsed.
@@ -196,6 +210,12 @@ func (s *ProxyStats) SetDirectionalSpeedLimits(name string, upBytesPerSecond, do
 // OnIPLimitRefused counts one connection refused by the user's address limit.
 func (s *ProxyStats) OnIPLimitRefused(name string) {
 	s.getOrCreate(name).ipLimitRefused.Add(1)
+}
+
+// OnClientConnsRefused counts one connection refused by the per-address
+// connection cap.
+func (s *ProxyStats) OnClientConnsRefused(name string) {
+	s.getOrCreate(name).clientConnsRefused.Add(1)
 }
 
 // SetQuotaCeiling installs the quota the data path holds a user to, or
@@ -479,12 +499,40 @@ func computeFairCaps(userConns map[string]int64, limit int64) map[string]int64 {
 // the capability actually exists in the binary — advertising an absent one
 // defeats the point of the array.
 const (
+	// FeatureClientBans means POST and GET /secrets/{name}/bans and DELETE
+	// /secrets/{name}/bans/{address...} are served: an operator refuses a
+	// secret to an address -- an IPv4 address or an IPv6 /64 -- for a ttl, in
+	// memory only, ending its live streams; the place is turned away at every
+	// door as a wrong secret is; and GET /secrets/{name}/clients rows carry
+	// banned_until. Addresses are listed and echoed only with track-client-ips.
+	// The API is strict, so a client must see this before it calls the routes.
+	FeatureClientBans = "client-bans"
+
 	// FeatureClientIPs means the binary understands the track-client-ips
 	// option, so a panel may offer the switch and may expect connected_ips and
 	// last_ip on GET /stats when it is on. It says nothing about whether the
 	// running deployment has actually enabled it -- the fields' presence says
 	// that, and their absence is indistinguishable from an idle secret.
 	FeatureClientIPs = "client-ips"
+
+	// FeatureClientLimits means the per-address controls inside one secret are
+	// honoured: [secret-limits.<name>] and the secrets API accept client-conns
+	// (client_conns on the API), a cap on the live connections one address may
+	// hold to the secret; client-speed (client_speed), a ceiling on how fast
+	// one address may move bytes; and client-fair (client_fair), which divides
+	// the secret's speed, speed-up and speed-down among its addresses and is
+	// refused without one of them. /stats reads them back as client_conns,
+	// client_speed_limit and client_fair and counts the cap's refusals in
+	// client_conns_refused. The API is strict, so a client must see this before
+	// it sends any of these fields.
+	FeatureClientLimits = "client-limits"
+
+	// FeatureClientStats means GET /secrets/{name}/clients is served: each
+	// source address of a secret, with the bytes it moved, its live
+	// connections and the per-address rates in force, most bytes first --
+	// listed only with track-client-ips, the counts answered either way -- and
+	// that /stats carries clients and clients_overflow inside the user object.
+	FeatureClientStats = "client-stats"
 
 	// FeatureFakeTLS means the proxy speaks the FakeTLS (obfuscated) handshake.
 	FeatureFakeTLS = "faketls"
@@ -565,8 +613,11 @@ const (
 // supportedFeatures is the sorted capability list this build advertises. Keep it
 // sorted so the response is byte-stable across restarts.
 var supportedFeatures = []string{
+	FeatureClientBans,
 	FeatureClientIPActivity,
 	FeatureClientIPs,
+	FeatureClientLimits,
+	FeatureClientStats,
 	FeatureFakeTLS,
 	FeatureHandshakeBudget,
 	FeatureIPLimits,
@@ -721,7 +772,8 @@ type UserStatsJSON struct {
 
 	// SpeedLimitUp and SpeedLimitDown are the per-direction caps in bytes per
 	// second, from the client's side, or absent for unlimited. ThrottledMillis
-	// above counts the time held to any of the three buckets.
+	// above counts the time held to any of the three buckets, and to the
+	// per-address limiters of the addresses the user connects from.
 	SpeedLimitUp   int64 `json:"speed_limit_up,omitempty"`
 	SpeedLimitDown int64 `json:"speed_limit_down,omitempty"`
 
@@ -735,6 +787,33 @@ type UserStatsJSON struct {
 	IPLimit        int   `json:"ip_limit,omitempty"`
 	ActiveIPs      int   `json:"active_ips,omitempty"`
 	IPLimitRefused int64 `json:"ip_limit_refused,omitempty"`
+
+	// ClientConns is the per-address connection cap, read back, and
+	// ClientConnsRefused is how many connections were turned away for arriving
+	// from an address that already held that many. Scalars inside the user
+	// object, never a key under users and never an address: both are absent
+	// when zero, and neither is gated.
+	ClientConns        int   `json:"client_conns,omitempty"`
+	ClientConnsRefused int64 `json:"client_conns_refused,omitempty"`
+
+	// ClientSpeedLimit is the per-address ceiling in bytes per second, read
+	// back as SpeedLimit is, and absent for unlimited. Time an address spent
+	// held to it is in ThrottledMillis.
+	ClientSpeedLimit int64 `json:"client_speed_limit,omitempty"`
+
+	// ClientFair is whether the user's speed limits are divided among the
+	// addresses they connect from, read back, and absent when they are not.
+	// Time an address spent held to its share is in ThrottledMillis.
+	ClientFair bool `json:"client_fair,omitempty"`
+
+	// Clients is how many source addresses the per-address table holds an
+	// entry for, the shared rest entry not counted, and ClientsOverflow how
+	// many connections were sent to the rest entry because the table had no
+	// room for their address, since the secret was added. Counts, never
+	// addresses: both are absent when zero and neither is gated. The addresses
+	// themselves are on GET /secrets/{name}/clients, never here.
+	Clients         int   `json:"clients,omitempty"`
+	ClientsOverflow int64 `json:"clients_overflow,omitempty"`
 
 	// ConnectedIPs lists the distinct client addresses holding a live
 	// connection right now, sorted. LastIP is the address of the most recent
@@ -789,9 +868,10 @@ func (s *ProxyStats) buildResponse() StatsResponse {
 			AdTagSkipped: st.adTagSkipped.Load(),
 			AdTagFailed:  st.adTagFailed.Load(),
 			ThrottledMillis: (st.speed.throttledNanos.Load() + st.speedUp.throttledNanos.Load() +
-				st.speedDown.throttledNanos.Load()) / int64(time.Millisecond),
-			IPLimitRefused: st.ipLimitRefused.Load(),
-			LastIP:         lastIP,
+				st.speedDown.throttledNanos.Load() + st.clientThrottledNanos.Load()) / int64(time.Millisecond),
+			IPLimitRefused:     st.ipLimitRefused.Load(),
+			ClientConnsRefused: st.clientConnsRefused.Load(),
+			LastIP:             lastIP,
 		}
 	}
 	s.mu.RUnlock()

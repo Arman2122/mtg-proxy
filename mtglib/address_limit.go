@@ -89,6 +89,20 @@ func keyOfAddr(addr netip.Addr) addressKey {
 	return addressKey(prefix.String())
 }
 
+// unitBase is the first address of the unit keyOfAddr counts addr in: the
+// address itself for IPv4, a v4-mapped one unmapped, and the first address of
+// its /64 for IPv6.
+func unitBase(addr netip.Addr) netip.Addr {
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return addr
+	}
+
+	prefix, _ := addr.Prefix(ipv6AddressPrefixBits)
+
+	return prefix.Addr()
+}
+
 // externalEntry is one reported address: when it stops counting, and the
 // spelling it was reported with, so a report reads back as it was written.
 type externalEntry struct {
@@ -158,6 +172,17 @@ func (l *addressLedger) admit(key addressKey, limit int, now time.Time) bool {
 	l.local[key]++
 
 	return true
+}
+
+// live is how many connections from key the ledger counts here, reported
+// addresses not included: the count the per-address connection cap reads.
+// Zero on a nil ledger, which is a user with nothing counted.
+func (l *addressLedger) live(key addressKey) int {
+	if l == nil {
+		return 0
+	}
+
+	return l.local[key]
 }
 
 // release undoes one admit.
@@ -236,6 +261,17 @@ func (p *Proxy) ledgerLocked(name string) *addressLedger {
 func (p *Proxy) dropLedgerIfIdleLocked(name string, now time.Time) {
 	if ledger := p.addresses[name]; ledger != nil && ledger.idle(now) {
 		delete(p.addresses, name)
+	}
+}
+
+// releaseAddressLocked gives back one connection the ledger counted for key and
+// forgets the ledger if that leaves it counting nothing. It is what undoes an
+// admit, whether the stream later ended or a step after the admit refused it.
+// Caller holds liveMu.
+func (p *Proxy) releaseAddressLocked(name string, key addressKey, now time.Time) {
+	if ledger := p.addresses[name]; ledger != nil {
+		ledger.release(key)
+		p.dropLedgerIfIdleLocked(name, now)
 	}
 }
 

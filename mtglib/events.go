@@ -103,7 +103,8 @@ type EventThrottled struct {
 
 // EventIPLimited is emitted when a connection is refused because the user is
 // at their address limit and it came from an address they are not counted
-// at. It carries the user and not the address, like the refusal's log line.
+// at. It carries the user and not the address. The refusal's log line is not
+// the same: it is written on the stream logger, whose client-ip comes with it.
 type EventIPLimited struct {
 	eventBase
 

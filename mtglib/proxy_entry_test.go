@@ -225,6 +225,10 @@ func newEntryHarness(t testing.TB, secrets map[string]Secret, limits map[string]
 		// channel round-trip with that run loop. With no scout URLs the raid it
 		// starts is a no-op.
 		doppelGanger: doppel.NewGanger(ctx, network, testLogger(), time.Hour, 1, nil, false, doppel.ShapingRecord, false),
+		// Built as NewProxy builds it. It holds nothing until a test turns on
+		// what needs an entry (track-client-ips, or a per-address control), so
+		// every other harness test runs exactly as it did without one.
+		clients: newClientTable(addrClock{}),
 	}
 
 	set := buildSecretSet(secrets, nil, nil, limits)

@@ -5,6 +5,7 @@ might expect:
 
 - **The proxy's GET /stats** — live per-user counters as JSON, on the management API.
 - **Per-user client addresses** — off by default, and usually should stay off.
+- **Per-address usage** — what each address of one secret moved, on its own endpoint.
 - **The WEB relay stats server** — new in v1.3.0, a loopback-only socket on the relay process.
 - **Prometheus** and **statsd** — aggregate metrics from the event stream, with no per-user dimension.
 - **Logs** — zerolog JSON on stdout.
@@ -231,12 +232,18 @@ shape it always had:
 | `expires_at` | The user has an `expires` deadline. |
 | `disabled` | The user is disabled. Omitted, not `false`, when enabled. |
 | `speed_limit` | The user has a speed limit; this is it, in bytes per second. |
-| `throttled_ms` | It is non-zero: milliseconds this user's connections have spent held to their speed limit, all connections summed. A user with a limit and no `throttled_ms` is not reaching it; one whose `throttled_ms` grows a second every second is living at it. That is the honest measure of a cap — one nobody ever waits for is doing nothing. |
+| `throttled_ms` | It is non-zero: milliseconds this user's connections have spent held to their speed limits, all connections summed, including the time held to the per-address limits (`client-speed`, `client-fair`) of the addresses they came from. A user with a limit and no `throttled_ms` is not reaching it; one whose `throttled_ms` grows a second every second is living at it. That is the honest measure of a cap — one nobody ever waits for is doing nothing. It never goes back, even when the per-address table forgets an address. |
 | `ad_tag_skipped` | It is non-zero: an ad-tagged stream of this user's took the direct path because its transport has no middle-proxy reframer, losing its sponsored channel. A silent skip is a revenue bug nobody can diagnose, so it is reported. |
 | `ad_tag_failed` | It is non-zero: an ad-tagged stream on a transport the middle proxy *does* handle took the direct path anyway, because the middle proxy could not be reached or refused it. Unlike a skip this is not by design — a server that cannot reach `core.telegram.org`, or a revoked tag, shows up here and nowhere else. A few right after a restart are normal: clients reconnecting in the first couple of seconds, before the middle-proxy config has loaded, go direct rather than wait. |
 | `ip_limit` | The user has a `[secret-limits.<name>] ip-limit`: how many places they may be at once. |
 | `active_ips` | It is non-zero: how many places the user counts as being in right now — the addresses of their live connections here plus any a panel reported from elsewhere. A count, so it is never gated. Above `ip_limit` means the limit was lowered under open connections, which are never dropped for it. |
 | `ip_limit_refused` | It is non-zero: connections turned away for arriving from one place too many. A limit nobody ever hits is doing nothing; a user hitting it constantly is sharing a secret or roaming between networks, and `active_ips` tells the two apart. |
+| `client_conns` | The secret has `client-conns`: how many live connections one address may hold to it. |
+| `client_conns_refused` | It is non-zero: connections turned away for arriving from an address that already held `client_conns` of them. There is no event and no Prometheus or statsd counter for it; this is the only place it shows. |
+| `client_speed_limit` | The secret has `client-speed`: the per-address ceiling, in bytes per second. |
+| `client_fair` | The secret has `client-fair = true`: its speed limits are divided among its addresses. |
+| `clients` | It is non-zero: how many addresses the per-address table holds an entry for on this secret, live and idle (an entry is kept ten minutes after the address's last connection), the shared rest entry not counted. A count, never gated. |
+| `clients_overflow` | It is non-zero: connections sent to the rest entry because the table had no room for their address, since the process started; a secret removed and added again starts from zero. Peers that do not stand for one place, which share the rest entry anyway, are not counted here. |
 | `connected_ips` / `last_ip` | `track-client-ips` is on. See below. |
 | `external_ips` / `external_expires_at` | `track-client-ips` is on and a panel has reported the user's addresses elsewhere through `PUT /secrets/{name}/external-ips`. See [[Multi-User-and-API]]. |
 
@@ -284,6 +291,11 @@ for either never accumulates one. (That is about these two fields. The ee
 handshake budget keeps a separate anonymous per-address bucket in memory whatever
 `track-client-ips` says; see *Client addresses* in [[Security]].)
 
+With tracking on, the per-address table also keeps every address a secret is
+used from, with what it moved, until ten minutes after its last connection, and
+[`GET /secrets/{name}/clients`](#per-address-usage) lists it for up to about
+eleven minutes: further back than `connected_ips`.
+
 Neither field is written to disk in any form. `usage-state-file` persists quota
 counters alone, so no address survives a restart.
 
@@ -291,6 +303,69 @@ Behind a front proxy, both report what the PROXY header carried — the client's
 real address rather than the loopback peer. That is what makes them usable at
 all in a WEB deployment, and it is also why the address you would be storing is
 a real one. See [[Security]].
+
+## Per-address usage
+
+`GET /secrets/{name}/clients` (feature `client-stats`) is one secret's usage per
+source address. The route and every field are on [[Multi-User-and-API]]; this
+section is how to read it.
+
+```bash
+curl -s -H "Authorization: Bearer a-long-random-string" "http://127.0.0.1:9090/secrets/alice/clients?limit=20"
+```
+
+**Which addresses are there.** The per-address table holds an entry per address
+for every secret when `track-client-ips` is on, and for a secret with a
+per-address control (`client-conns`, `client-speed`, `client-fair`) whatever
+tracking says. The addresses are listed only with tracking on. Without it the
+answer is three things, `total`, `overflow` and `"tracking": false`, with no
+`rest` and no rows, even when the table holds entries.
+
+Then:
+
+- **A row is not a live connection.** An entry is kept ten minutes after the
+  address's last connection closes, and the sweep runs once a minute, so an
+  address that left shows `"connections": 0` for up to about eleven minutes.
+  `connected_ips` on `/stats` is live connections only.
+- **IPv6 rows are /64s.** A row spells an IPv6 place as its /64
+  (`2001:db8:1:2::/64`), the unit `ip-limit`, `client-conns`, kick and bans
+  count, while `connected_ips` shows full addresses (`2001:db8:1:2::5`). Two
+  devices in one /64 are one row. To kick a row, send its prefix address without
+  the `/64`; ban and unban take either form.
+- **`rest` is one row for many clients.** It stands for every peer that does not
+  stand for one place — loopback, private, link-local, unspecified, multicast, or
+  no address at all — and every address the table had no room for. Behind a
+  carrier that forwards no client address, that is every client. It holds one
+  fair share and has no ceiling. It is absent when the secret has no rest entry.
+- **Connections come from the address ledger**, the live count `ip-limit`
+  reads, while `rest.connections` counts the streams the rest entry governs. An
+  address that overflowed into the rest entry and later got an entry of its own
+  can be counted in both.
+- **An absent rate means none.** `speed_limit` is the tighter of the address's
+  `client-speed` and its fair share of `speed`; `speed_limit_up` and
+  `speed_limit_down` are its fair shares of `speed-up` and `speed-down`.
+- **A row's `throttled_ms`** is the time its streams waited at its own
+  per-address limits. The user's `throttled_ms` on `/stats` includes it, plus the
+  time held at the secret's own buckets.
+- **Counters start again from zero** when an entry is dropped and made again: an
+  address that comes back after more than ten minutes, and every address after a
+  restart.
+- **Times are UTC**, in whole seconds. `/stats` times are in the server's zone.
+- **Order.** Rows are sorted by `bytes_in` plus `bytes_out`, most first, ties by
+  address, and then cut to `limit` (100 by default, at most 1,000). `total`
+  counts every entry, not the page.
+
+**Watching fair share work.** With `client-fair` on, every row with a live
+connection shows the same fair rate, the level of the last tick, whether the
+address is busy or quiet: in `speed_limit` for a `speed` total (or the row's
+own ceiling there, when that is lower), and in `speed_limit_up` or
+`speed_limit_down` for a `speed-up` or `speed-down` total, with no ceiling
+folded in. A row with `"connections": 0` keeps the rate it left at until it
+comes back. A quiet address moves less than the level and keeps what it asks
+for; the busy ones share the rest. If two busy addresses move very different
+amounts for long, read *Fair share: what to expect* on [[Configuration]]: with
+thousands of addresses the share can take about a minute to settle, and a
+client that waits less than a quarter of the time is not corrected at all.
 
 ## The WEB relay stats server 🌐
 
@@ -579,6 +654,19 @@ Lines worth knowing, all at warn level unless noted:
   and `client-ip` like every stream line (the `Stream has been started` line
   already logs the address of every connection at that level). The per-address
   bucket is never logged; the stream logger is separate from it.
+- `per-address controls are in use and this listener expects PROXY headers: ...`
+  — warn, once per such listener at start, with fields `listener` and `keys`.
+  Some secret has `client-conns`, `client-speed` or `client-fair`, and the
+  address those act on is whatever the PROXY header claims. See *Per-address
+  controls* on [[Configuration]]. A reload that adds the keys later does not log
+  it.
+- `connection denied by per-user limit` with `deny_reason` `client_conns` or
+  `banned` — info, so debug only, like the other reasons. It carries the stream's
+  `client-ip` like every stream line. `client_conns_refused` on `/stats` is the
+  way to watch the first at the default level; a ban refusal has no counter.
+- `addresses banned through the API` and `ban lifted through the API` — info,
+  with the secret's name and, for a ban, how many places were banned and how many
+  streams closed. No address.
 - `web relay reload: ...` — one line per refused reload, each saying which
   profiles were kept, with `trigger=file` or `trigger=signal` for where it came
   from.
@@ -616,6 +704,21 @@ On the proxy, from `GET /stats`:
 - Per user, `quota_remaining` approaching zero or `expires_at` approaching. Both
   are silent when they land: the user is routed to the fronting domain and sees
   what a wrong secret sees.
+- Per user, `client_conns_refused` climbing. Some address is holding
+  `client_conns` connections and asking for more. One heavy device is the case the
+  cap is for; a carrier's NAT with many people behind one address, or a front
+  that sends no PROXY header, looks the same, so check `/clients` before you
+  lower anything.
+- Per user, `clients_overflow` above zero. The per-address table had no room —
+  4,096 entries for the secret, counting the ones idle for up to ten minutes, or
+  32,768 in all — and new addresses are sharing the rest entry, which has no
+  ceiling. `clients` near 4,096 on a secret with a modest `ip-limit` points at
+  many addresses passing through, such as one IPv6 holder rotating /64s.
+- Per user, `throttled_ms` growing about a second a second on a secret with
+  `client-speed` or `client-fair`. Someone is living at a per-address limit;
+  `/clients` says which address, by its own `throttled_ms`.
+- At start, the `per-address controls are in use and this listener expects
+  PROXY headers` warning on a listener that anyone but your own front can reach.
 
 On the WEB relay, from its own `/stats`:
 

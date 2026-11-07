@@ -530,6 +530,79 @@ func listenerReport(conf *config.Config) []mtglib.ListenerJSON {
 	return report
 }
 
+// perAddressControlsIn names the per-address keys of [secret-limits.<name>] that
+// are in force in conf: client-conns, client-speed and client-fair, each once,
+// sorted, and only when a secret really uses it (a zero, an empty speed or
+// client-fair = false is the key written and off). ip-limit is not among them:
+// it is the older control and this warning does not cover it. Operator bans are
+// not either, they arrive through the API and cannot be known at start.
+func perAddressControlsIn(conf *config.Config) []string {
+	var conns, speed, fair bool
+
+	for _, limit := range conf.GetSecretLimits() {
+		conns = conns || limit.ClientConns > 0
+		speed = speed || limit.ClientSpeedBytesPerSecond > 0
+		fair = fair || limit.ClientFair
+	}
+
+	var keys []string
+
+	// Alphabetical, so the line reads the same whatever order the file lists
+	// its tables in.
+	if conns {
+		keys = append(keys, "client-conns")
+	}
+
+	if fair {
+		keys = append(keys, "client-fair")
+	}
+
+	if speed {
+		keys = append(keys, "client-speed")
+	}
+
+	return keys
+}
+
+// proxyProtocolListeners names, by the address every other log line calls them,
+// the served sockets that expect a PROXY header. It reads what was built and
+// not what was asked for: the global flag reaches bind-to only, an extra
+// listener carries its own key, and one that failed to bind is not in served
+// and so is not named.
+func proxyProtocolListeners(served []servedListener) []string {
+	var addrs []string
+
+	for _, sl := range served {
+		if _, ok := sl.serve.(*proxyprotocol.ListenerAdapter); ok {
+			addrs = append(addrs, sl.raw.Addr().String())
+		}
+	}
+
+	return addrs
+}
+
+// warnPerAddressControls says, once per listener, that per-address controls are
+// in use behind a PROXY header. Those controls act on the address the proxy
+// sees, and on such a listener that is whatever the header claims. There is no
+// trusted-sender list, so anyone who can reach the listener can write another
+// member's address into it. The line names the keys and the listener, never a
+// secret or a value; it changes nothing about how connections are handled.
+func warnPerAddressControls(log mtglib.Logger, conf *config.Config, served []servedListener) {
+	keys := perAddressControlsIn(conf)
+	if len(keys) == 0 {
+		return
+	}
+
+	for _, addr := range proxyProtocolListeners(served) {
+		log.BindStr("listener", addr).
+			BindStr("keys", strings.Join(keys, ", ")).
+			Warning("per-address controls are in use and this listener expects PROXY headers: " +
+				"the address they see is the one the PROXY header claims, " +
+				"and anyone who can reach this listener can forge it; " +
+				"use them only behind a front proxy you control")
+	}
+}
+
 func runProxy(conf *config.Config, version, configPath string) error {
 	return runProxyWith(utils.RootContext().Done(), conf, version, configPath, func(addr string) (net.Listener, error) {
 		return utils.NewListener(addr, 0)
@@ -665,6 +738,8 @@ func runProxyWith( //nolint: funlen, cyclop
 	if err != nil {
 		return err
 	}
+
+	warnPerAddressControls(logger, conf, served)
 
 	return serveUntilDone(stop, proxy, served, logger)
 }

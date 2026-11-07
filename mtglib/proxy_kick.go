@@ -59,20 +59,8 @@ func (p *Proxy) Kick(name string, addrs []netip.Addr) (int, error) {
 		keys[keyOfAddr(addr)] = struct{}{}
 	}
 
-	var kicked []*streamContext
-
 	p.liveMu.Lock()
-
-	for sc := range p.liveConns[name] {
-		if !sc.addrCounted {
-			continue
-		}
-
-		if _, hit := keys[sc.addrKey]; hit {
-			kicked = append(kicked, sc)
-		}
-	}
-
+	kicked := p.streamsAtLocked(name, keys)
 	p.liveMu.Unlock()
 
 	for _, sc := range kicked {
@@ -84,6 +72,25 @@ func (p *Proxy) Kick(name string, addrs []netip.Addr) (int, error) {
 	}
 
 	return len(kicked), nil
+}
+
+// streamsAtLocked lists the named secret's live streams counted at one of keys:
+// the streams a kick or a ban of those places ends. Caller holds liveMu, and
+// closes them after letting go of it.
+func (p *Proxy) streamsAtLocked(name string, keys map[addressKey]struct{}) []*streamContext {
+	var found []*streamContext
+
+	for sc := range p.liveConns[name] {
+		if !sc.addrCounted {
+			continue
+		}
+
+		if _, hit := keys[sc.addrKey]; hit {
+			found = append(found, sc)
+		}
+	}
+
+	return found
 }
 
 // kickRequest is the POST /secrets/{name}/kick body: the places to end the

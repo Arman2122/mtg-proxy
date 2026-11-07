@@ -41,6 +41,15 @@ type Proxy struct {
 	// waits for so the socket is released by the time it returns.
 	apiWaitGroup sync.WaitGroup
 
+	// fairWaitGroup is fair share's ticker (startFairShare), which Shutdown
+	// waits for so that no tick runs once it has returned.
+	fairWaitGroup sync.WaitGroup
+
+	// afterFairPass, when set, runs after each pass of fair share's ticker.
+	// Only tests set it, and it is read without a lock: a test sets it before
+	// the ticker starts.
+	afterFairPass func()
+
 	allowFallbackOnUnknownDC    bool
 	trackClientIPs              bool
 	tolerateTimeSkewness        time.Duration
@@ -91,7 +100,21 @@ type Proxy struct {
 	// that the address-limit check and the registration of a stream are one
 	// critical section. Created on first use and dropped when it counts
 	// nothing, so an idle user costs no memory here.
-	addresses       map[string]*addressLedger
+	addresses map[string]*addressLedger
+
+	// clients is the per-address table: what each source address of a secret
+	// has moved and is allowed, kept past its connections (client_table.go).
+	// It has a lock of its own, taken after liveMu. nil is "off": NewProxy
+	// always builds one, and a Proxy{} literal in a test has none. An empty
+	// table costs nothing; a stream takes an entry only when its secret needs
+	// one (clientEntriesWanted).
+	clients *clientTable
+
+	// bans are the places an operator has refused a secret to, until each
+	// lapses (proxy_bans.go). Memory only. Its lock is inner to liveMu. The zero
+	// value is an empty list, so a Proxy{} literal in a test bans nobody.
+	bans banList
+
 	network         Network
 	antiReplayCache AntiReplayCache
 	blocklist       IPBlocklist
@@ -136,6 +159,8 @@ func (p *Proxy) Shutdown() {
 	// The management API shuts itself down on the cancellation above; waiting
 	// for it here is what makes its port free again before this returns.
 	p.apiWaitGroup.Wait()
+	// So does fair share's ticker, and no tick runs once this has returned.
+	p.fairWaitGroup.Wait()
 	p.workerPool.Release()
 	p.configUpdater.Wait()
 	p.doppelGanger.Shutdown()
@@ -244,6 +269,11 @@ func NewProxy(opts ProxyOpts) (*Proxy, error) {
 	if opts.handshakeHints() {
 		proxy.hints = newMatchHints(ctx)
 	}
+
+	// The per-address table is always built: it is empty until a secret needs
+	// per-address entries, and applyLimits below must find it for a secret
+	// that already does. Its sweep runs from the maintenance loop.
+	proxy.clients = newClientTable(addrClock{})
 
 	// The scan budget is in real CPU, so it needs what a SHA-256 block costs
 	// here: measured once per process, by whichever proxy is built first, and
