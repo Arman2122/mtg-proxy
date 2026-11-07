@@ -251,6 +251,15 @@ What each check actually does:
   honoured**, as fallbacks behind their replacements in `[domain-fronting]` and
   `[network] dns`. They work today and will be removed in a later release.
 
+**Retiring secrets.** Only when the file has something to say about rotation: a
+`[[retiring-secret]]` entry the proxy would ignore or warn about (each line names the
+entry by position and name, never by key), or a `[secrets]` user named
+`retiring-secret`, which is never served. Those lines fail the verdict, as an unknown key
+does. Blocks past their `until` are only counted, with the way to remove them
+(`mtg-proxy rotate-secret --prune`), and do not fail it. A config without the table, the
+panel's included, prints no such section. See [[Configuration]] for the lines and what each
+means.
+
 **Time skewness.** Queries `0.pool.ntp.org` and compares the offset against your
 `tolerate-time-skewness`. Under 30% of the tolerance passes, under 70% warns, above that
 fails. If the NTP query itself cannot be made, the check fails — outbound UDP 123 has to

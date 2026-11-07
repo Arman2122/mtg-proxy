@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -37,6 +38,25 @@ type ConfigSecretLimit struct {
 	ClientConns TypeClientConns `json:"clientConns,omitzero"`
 	ClientSpeed TypeClientSpeed `json:"clientSpeed,omitzero"`
 	ClientFair  TypeBool        `json:"clientFair,omitzero"`
+}
+
+// ConfigRetiringSecret is one [[retiring-secret]] block, its three fields as
+// the file spelled them: Name, Secret (the old value, hex or base64url, any
+// mode) and Until (an RFC 3339 instant; a TOML offset date-time arrives here
+// in RFC 3339 with nanoseconds). None is parsed while decoding, so a bad value
+// never fails the file and no decoder error, which carries no entry index and
+// might echo the value, is ever raised; GetRetiringSecrets parses and judges
+// them. Secret is a credential: Config.String() redacts it.
+type ConfigRetiringSecret struct {
+	Name   string `json:"name"`
+	Secret string `json:"secret"`
+	Until  string `json:"until"`
+
+	// wrongType marks, one bit per field, the fields whose TOML value had the
+	// wrong type: their text above is fmt.Sprint of that value. Parse sets it
+	// after the JSON step, which an unexported field does not cross, and for
+	// the same reason Config.String() never shows it.
+	wrongType uint8
 }
 
 // ConfigListener is one [[listener]] block: an extra socket serving the
@@ -108,6 +128,13 @@ type Config struct {
 	AdTag                    TypeAdTag                    `json:"adTag"`
 	SecretAdTags             map[string]TypeAdTag         `json:"secretAdTags"`
 	SecretLimits             map[string]ConfigSecretLimit `json:"secretLimits"`
+
+	// RetiringSecrets are the [[retiring-secret]] blocks, raw: a secret's
+	// previous key and when it stops being accepted. GetRetiringSecrets judges
+	// them; Validate never does, because a problem in one drops that entry and
+	// never refuses the file. omitempty keeps Config.String() byte-identical
+	// for every file without the table, the panel's included.
+	RetiringSecrets []ConfigRetiringSecret `json:"retiringSecrets,omitempty"`
 
 	// UnknownKeys are the dotted paths of every key the file carried that this
 	// binary does not know, sorted. The parser is deliberately lenient -- a
@@ -254,12 +281,19 @@ func (c *Config) GetDomainFrontingProxyProtocol(defaultValue bool) bool {
 }
 
 func (c *Config) Validate() error {
-	if len(c.Secrets) == 0 {
+	// The secrets GetSecrets serves: [secrets] when it has any key, the
+	// top-level secret only when it has none. A [secrets] user named
+	// retiring-secret is never served, so a [secrets] holding only that user
+	// serves nothing, and is refused before anything formats a value.
+	switch served := c.servedSecrets(); {
+	case len(c.Secrets) == 0:
 		if !c.Secret.Valid() {
 			return fmt.Errorf("invalid secret %s", c.Secret.String())
 		}
-	} else {
-		for name, s := range c.Secrets {
+	case len(served) == 0:
+		return ErrOnlyMisplacedRetiringUser
+	default:
+		for name, s := range served {
 			if !s.Valid() {
 				return fmt.Errorf("invalid secret %q: %s", name, s.String())
 			}
@@ -362,9 +396,11 @@ func (c *Config) validateAdTags() error {
 		known["default"] = struct{}{}
 	}
 
+	// The name is the file's text, and could be a value pasted where a name
+	// goes: shownName hides that, and shows any other name as before.
 	for name := range c.SecretAdTags {
 		if _, ok := known[name]; !ok {
-			return fmt.Errorf("secret-ad-tags refers to unknown secret %q", name)
+			return fmt.Errorf("secret-ad-tags refers to unknown secret %s", shownName(name))
 		}
 	}
 
@@ -403,9 +439,10 @@ func (c *Config) validateSecretLimits() error {
 		known["default"] = struct{}{}
 	}
 
+	// A name is shown as validateAdTags shows it: never a value pasted there.
 	for name, l := range c.SecretLimits {
 		if _, ok := known[name]; !ok {
-			return fmt.Errorf("secret-limits refers to unknown secret %q", name)
+			return fmt.Errorf("secret-limits refers to unknown secret %s", shownName(name))
 		}
 
 		// client-speed is not a speed fair share divides: it holds one
@@ -413,7 +450,7 @@ func (c *Config) validateSecretLimits() error {
 		if l.ClientFair.Get(false) && l.Speed.Get(0) == 0 && l.SpeedUp.Get(0) == 0 && l.SpeedDown.Get(0) == 0 {
 			return fmt.Errorf(
 				"secret-limits.%s: client-fair divides the secret's speed among its addresses "+
-					"and needs speed, speed-up or speed-down beside it", name)
+					"and needs speed, speed-up or speed-down beside it", valueFreeName(name))
 		}
 	}
 
@@ -422,12 +459,58 @@ func (c *Config) validateSecretLimits() error {
 
 // GetSecrets returns all secrets as a map. If the new [secrets] section is used,
 // returns that map. Otherwise, wraps the single Secret as {"default": Secret}.
+//
+// A [secrets] user named retiring-secret is never in it (misplacedRetiringUser):
+// every reader that serves or prints secrets -- run and its reloader, access,
+// doctor, the WEB relay -- reads this map, so none of them serves that user.
+// Whether [secrets] is used is decided by the table as written, that user
+// included: a [secrets] holding nothing else serves nothing, and never the
+// top-level secret, which the file left off when it took up [secrets] (final
+// review B, I-1: lost state kills a key, never revives one). Validate refuses
+// such a file.
 func (c *Config) GetSecrets() map[string]mtglib.Secret {
 	if len(c.Secrets) > 0 {
-		return c.Secrets
+		return c.servedSecrets()
 	}
 
 	return map[string]mtglib.Secret{"default": c.Secret}
+}
+
+// misplacedRetiringUser is the one [secrets] name never served. Written below
+// the first table header, the hand edit meant to retire a leaked link,
+// retiring-secret = "<old value>", is no parse error: it is a [secrets] user of
+// that name whose primary key is the leaked one, accepted for ever. So the user
+// is dropped -- the kill direction R0 asks for -- and GetRetiringSecrets reports
+// it as a problem: run warns, run --check and doctor refuse. The load is not
+// refused for it while [secrets] has another user to serve; a [secrets] holding
+// it alone serves nothing and is refused (ErrOnlyMisplacedRetiringUser).
+const misplacedRetiringUser = "retiring-secret"
+
+// ErrOnlyMisplacedRetiringUser is Validate's refusal of a [secrets] whose only
+// user is misplacedRetiringUser. It says why nothing is served and how the file
+// is written, and names no value. It is exported so that the reloader can add
+// what a refusal keeps in force (errors.Is sees through the wrapping).
+var ErrOnlyMisplacedRetiringUser = errors.New(`[secrets] holds only the reserved name "retiring-secret", ` +
+	"which is never served, and the top-level secret is not served while [secrets] is present, " +
+	"so the file serves no secret: name the users to serve in [secrets], " +
+	"and write an old key as a [[retiring-secret]] block above [secrets]")
+
+// servedSecrets is [secrets] without a user named misplacedRetiringUser: the
+// table itself when it has none, so a file without one reads as before.
+func (c *Config) servedSecrets() map[string]mtglib.Secret {
+	if _, misplaced := c.Secrets[misplacedRetiringUser]; !misplaced {
+		return c.Secrets
+	}
+
+	served := make(map[string]mtglib.Secret, len(c.Secrets)-1)
+
+	for name, secret := range c.Secrets {
+		if name != misplacedRetiringUser {
+			served[name] = secret
+		}
+	}
+
+	return served
 }
 
 // GetAdTag returns the global advertising tag, or nil when none is configured.
@@ -615,6 +698,7 @@ func (c *Config) String() string {
 	}
 
 	redactConfigCredentials(fields)
+	redactSuspectRetiringFields(fields, c.RetiringSecrets)
 
 	buf := &bytes.Buffer{}
 	encoder := json.NewEncoder(buf)
@@ -656,7 +740,59 @@ func redactConfigCredentials(fields map[string]any) {
 		}
 	}
 
+	// A retiring entry keeps its name and until -- which rotations are
+	// configured, and until when, is the point of the line -- and loses its
+	// value, the old link's credential (D21).
+	for _, entry := range retiringEntryFields(fields) {
+		if _, found := entry["secret"]; found {
+			entry["secret"] = redactedValue
+		}
+	}
+
 	redactProxyPasswords(fields)
+}
+
+// redactSuspectRetiringFields blanks a retiring entry's name or until when it
+// may hold a value pasted in the wrong place: its TOML value had the wrong
+// type (the field holds fmt.Sprint of an array or an inline table), or its
+// text reads as a value (readsAsAValue). Any other name or until is shown as
+// written.
+func redactSuspectRetiringFields(fields map[string]any, entries []ConfigRetiringSecret) {
+	for i, entry := range retiringEntryFields(fields) {
+		if i >= len(entries) {
+			return
+		}
+
+		if entries[i].wrongType&retiringNameWrongType != 0 || readsAsAValue(entries[i].Name) {
+			entry["name"] = redactedValue
+		}
+
+		if entries[i].wrongType&retiringUntilWrongType != 0 || readsAsAValue(entries[i].Until) {
+			entry["until"] = redactedValue
+		}
+	}
+}
+
+// retiringEntryFields is the rendering's retiringSecrets list, one map per
+// entry, in file order; nil when the table is absent.
+func retiringEntryFields(fields map[string]any) []map[string]any {
+	list, ok := fields["retiringSecrets"].([]any)
+	if !ok {
+		return nil
+	}
+
+	out := make([]map[string]any, 0, len(list))
+
+	for _, item := range list {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			entry = map[string]any{}
+		}
+
+		out = append(out, entry)
+	}
+
+	return out
 }
 
 // redactProxyPasswords takes the password out of every upstream proxy URL

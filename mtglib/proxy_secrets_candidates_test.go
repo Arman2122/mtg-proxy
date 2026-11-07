@@ -74,7 +74,7 @@ func scanFor(t testing.TB, p *Proxy, set *secretSet, key [SecretKeyLength]byte) 
 
 	wire := fakeTLSClientHello(t, key, candidatesCover, bytes.Repeat([]byte{0x33}, 32))
 
-	return p.scanCandidates(parsedHello(t, wire, candidatesCover), set, nil)
+	return p.scanCandidates(parsedHello(t, wire, candidatesCover), set, nil, nil)
 }
 
 func TestCandidatesAreTheHostedSecretsInNameOrder(t *testing.T) {
@@ -339,12 +339,12 @@ func TestNoHostedSecretsMeansNoCandidatesAndFronting(t *testing.T) {
 	p := &Proxy{tolerateTimeSkewness: time.Hour}
 	parsed := parsedHello(t, fakeTLSClientHello(t, dd, candidatesCover, bytes.Repeat([]byte{0x33}, 32)), candidatesCover)
 
-	pos, tried := p.scanCandidates(parsed, set, forbidden)
+	pos, tried := p.scanCandidates(parsed, set, forbidden, nil)
 	assert.Equal(t, -1, pos)
 	assert.Zero(t, tried)
 
 	// The set a test builds by hand has none of the three fields set at all.
-	pos, tried = p.scanCandidates(parsed, &secretSet{}, forbidden)
+	pos, tried = p.scanCandidates(parsed, &secretSet{}, forbidden, nil)
 	assert.Equal(t, -1, pos)
 	assert.Zero(t, tried)
 
@@ -538,12 +538,12 @@ func TestScanCandidatesSkipsAndCounts(t *testing.T) {
 			asked = append(asked, at)
 
 			return skipAt(at)
-		})
+		}, nil)
 
 		return pos, tried, asked
 	}
 
-	pos, tried := p.scanCandidates(parsed, set, nil)
+	pos, tried := p.scanCandidates(parsed, set, nil, nil)
 	assert.Equal(t, 2, pos, "no skip: c is the third")
 	assert.Equal(t, 3, tried)
 
@@ -569,7 +569,7 @@ func TestScanCandidatesSkipsAndCounts(t *testing.T) {
 	// A hello no candidate matches is verified against all of them.
 	stranger := parsedHello(t, fakeTLSClientHello(t, keyFilledFrom(200), candidatesCover, bytes.Repeat([]byte{0x34}, 32)), candidatesCover)
 
-	pos, tried = p.scanCandidates(stranger, set, nil)
+	pos, tried = p.scanCandidates(stranger, set, nil, nil)
 	assert.Equal(t, -1, pos)
 	assert.Equal(t, 4, tried)
 }
@@ -588,11 +588,11 @@ func TestScanCandidatesUsesTheProxysSkew(t *testing.T) {
 
 	parsed := parsedHello(t, wire, candidatesCover)
 
-	pos, tried := (&Proxy{tolerateTimeSkewness: 3 * time.Second}).scanCandidates(parsed, set, nil)
+	pos, tried := (&Proxy{tolerateTimeSkewness: 3 * time.Second}).scanCandidates(parsed, set, nil, nil)
 	assert.Equal(t, -1, pos, "ten seconds late under a 3 s tolerance")
 	assert.Equal(t, 1, tried)
 
-	pos, tried = (&Proxy{tolerateTimeSkewness: time.Hour}).scanCandidates(parsed, set, nil)
+	pos, tried = (&Proxy{tolerateTimeSkewness: time.Hour}).scanCandidates(parsed, set, nil, nil)
 	assert.Equal(t, 0, pos, "the same hello under an hour")
 	assert.Equal(t, 1, tried)
 }

@@ -79,7 +79,7 @@ func runInBackground(
 ) <-chan error {
 	done := make(chan error, 1)
 
-	go func() { done <- runProxyWith(stop, conf, "test", path, listen) }()
+	go func() { done <- runProxyWith(stop, conf, "test", path, listen, time.Now) }()
 
 	return done
 }

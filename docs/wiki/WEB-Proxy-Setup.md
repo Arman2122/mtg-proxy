@@ -312,6 +312,20 @@ What a reload does and does not do:
 
 Windows builds have no SIGHUP. The watcher is the only trigger there, and it is enough.
 
+## Rotating a secret: no overlap on WEB
+
+`mtg-proxy rotate-secret` (feature `secret-rotation`, see [[Multi-User-and-API]]) keeps a rotated secret's old key working on the proxy's doors until an `until` you choose. **The relay does not**: it serves current keys only. Once it reads the rotated file — by its watcher, within a few seconds of the write, or at once on SIGHUP — the secret's WEB link is the new one, and the old WEB link stops working. `rotate-secret` says so when `[web] enabled = true`: `WEB links of "alice" change now; the WEB transport has no overlap (see WEB-Proxy-Setup)`. Hand WEB users the new link from `mtg-proxy access` straight away.
+
+The old WEB link is still **recognised**. Its holder gets the relay's local uncacheable 404, counted in `refused.not_found` — never the bridge, and never the cover site — so a capability that was once valid does not land in a `cover-upstream`'s access log. Recognition follows the `[[retiring-secret]]` blocks in the file, not their time: the relay has no expiry clock, so an expired block is recognised all the same, until it is removed. Three consequences:
+
+- **Pruning ends recognition.** Once `rotate-secret --prune` (or `--end-overlap`) removes a block, its old WEB link is just another unknown value and goes to the cover site — with `cover-upstream`, a third party. Prune when you are content for that to happen.
+- **Only a well-formed block is recognised.** A block with a field missing or malformed, or an all-zero key, is not; nor is a `[secrets]` user named `retiring-secret`, nor a key that was re-keyed with no block at all. Their WEB holders reach the cover site, as before rotation existed.
+- **At most 4,096 retired links are recognised.** Past that, the ones with the latest `until` are kept and the ones that expired first fall to the cover site. Expired blocks left in the file are what fill it — the same trade as pruning.
+
+The list never stops the relay: duplicates, a value equal to a current key (the current one serves), and values past the cap are left out in silence, and the relay never refuses to start or reload over it. A change to the blocks alone, found by the file watcher, is not a reload — `reloads` does not move (a SIGHUP counts as one) — and is logged at debug level as `web relay: the retired capabilities changed, the profiles did not`, with `retired-values`, the number of values in the file. With `SECRET` set in the environment the file's blocks do not apply, and nothing is recognised.
+
+**The cost.** Recognition is one constant-time scan over every current and every retired capability, whichever matches: up to 4,096 + 4,096 = 8,192 compares of 32 bytes for one credential-shaped value. The relay scans at most 64 such values in one request, so a request costs at most 64 × 8,192 = 524,288 compares, about twice what it cost before retired links existed. How long the scan takes does not say which list a value is in.
+
 ## Verifying it 🔍
 
 The relay places every request into exactly one of three tiers, and the tier is a security property rather than a routing convenience:
@@ -319,7 +333,7 @@ The relay places every request into exactly one of three tiers, and the tier is 
 | tier | what it is | answer |
 |---|---|---|
 | Exact | `GET /` with one canonical `bridge` parameter that resolves to a configured profile | the bridge page |
-| Authentic but unusable | a real capability or a token this relay minted, but wrong path, wrong method, padded spelling, duplicated field, expired | a **local** uncacheable 404 |
+| Authentic but unusable | a real capability or a token this relay minted, but wrong path, wrong method, padded spelling, duplicated field, expired; or the capability of a key a rotation retired | a **local** uncacheable 404 |
 | Unauthentic | everything else | the cover site, unaltered |
 
 The middle tier exists to stop one specific leak. If a request carrying an operator's real capability were forwarded to a `cover-upstream`, that credential would land in a third party's access log. So the relay scans every query value, every header value and the path for anything it could have minted, and answers locally the moment it finds one — never proxying it onward.

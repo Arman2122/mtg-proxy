@@ -1,0 +1,11 @@
+bind-to = "0.0.0.0:3128"
+
+[retiring-secret]
+# bob's previous key, retired by hand with one pair of brackets.
+name = "bob"
+secret = "ee1111111111111111aaaaaaaaaaaaaaaa73746f726167652e676f6f676c65617069732e636f6d"
+until = "2026-10-05T00:00:00Z"
+
+[secrets]
+alice = "eea1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d473746f726167652e676f6f676c65617069732e636f6d"
+bob = "eeb5b5b5b5c6c6c6c6d7d7d7d7e8e8e8e873746f726167652e676f6f676c65617069732e636f6d"

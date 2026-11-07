@@ -1,6 +1,7 @@
 package mtglib
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"slices"
@@ -45,12 +46,17 @@ type secretSet struct {
 	// with the set: one Candidate per hosted secret, in name order, minus any
 	// whose key an earlier hosted secret already has (the earlier one wins a
 	// match, as it always did, so a repeat could never be the first to match).
+	// After every primary candidate, from primaryEnd() on, come the kept ee
+	// retiring keys, in retiring's order.
 	// candIdx[i] is the index into secrets, names, limits and adTags of the secret
-	// cands[i] stands for -- the match position is NOT an index into secrets.
-	// candByName maps names[candIdx[i]] to i; a name that is not a candidate (a
-	// hostless secret, a dropped repeat) is absent, so look it up with the
-	// two-value form: a missing name reads as 0, which is a position. All three
-	// are nil on a set that was not built by buildSecretSet, which has no
+	// cands[i] stands for -- the match position is NOT an index into secrets. For
+	// a retiring position it is the index of the entry's name: the name is what
+	// the match bills. matchAt turns a position into what was matched.
+	// candByName maps names[candIdx[i]] to i for the PRIMARY candidates only; a
+	// name that is not a candidate (a hostless secret, a dropped repeat) is
+	// absent, so look it up with the two-value form: a missing name reads as 0,
+	// which is a position. A name's retiring positions are in retiringCands. All
+	// three are nil on a set that was not built by buildSecretSet, which has no
 	// candidates.
 	cands      []*fake.Candidate
 	candIdx    []int
@@ -59,7 +65,9 @@ type secretSet struct {
 	// frontHost is the domain-fronting fallback: the first non-empty Host in
 	// name order, or "" when no ee secret is configured. It replaces
 	// secrets[0].Host, which under a management panel was whichever client name
-	// sorted first -- operator-uncontrolled, and now possibly hostless.
+	// sorted first -- operator-uncontrolled, and now possibly hostless. It is
+	// the primaries' alone: a retiring key's host never fronts, so a set whose
+	// only ee key is retiring has none, as SecretsCanFront says.
 	frontHost string
 
 	// clientControl says whether any secret in the set has a per-address
@@ -68,6 +76,30 @@ type secretSet struct {
 	// in the per-address table, and admission knows that without looking the
 	// secret up.
 	clientControl bool
+
+	// The retiring keys the set keeps: old keys of a name, still accepted
+	// until their own until after the name was given a new primary key
+	// (RetiringSecret). EVERY ONE of these fields is nil or zero when the set
+	// keeps no retiring entry, and the set is then field for field the set
+	// buildSecretSet made before rotation existed.
+	//
+	// retiring is sorted by (nameIdx, until descending, key bytes); every
+	// value in it is Valid(), no two entries share a key, and none has a
+	// primary's key. retiringOf maps a
+	// name's index to its entries' indices in retiring, in that order.
+	// primaryCands is how many of cands are primaries when there are retiring
+	// entries, and 0 otherwise -- so it is never a bound on its own:
+	// primaryEnd() is the boundary. candRetiring[pos-primaryEnd()] is the
+	// index into retiring of the retiring candidate at pos, and
+	// retiringCands[name] the name's retiring candidate positions, in
+	// retiring's order, whether or not its primary is a candidate.
+	// retiringNext is the earliest until in retiring.
+	retiring      []retiringEntry  // {nameIdx int; secret Secret; until time.Time}, sorted by (nameIdx, until desc, key bytes)
+	retiringOf    map[int][]int    // nameIdx -> indices into retiring
+	primaryCands  int              // how many of cands are primaries when there are retiring entries, else 0: never a bound, use primaryEnd()
+	candRetiring  []int            // candRetiring[pos-primaryEnd()] = index into retiring
+	retiringCands map[string][]int // name -> its retiring candidate positions, same order
+	retiringNext  time.Time        // earliest until in retiring; zero when none
 }
 
 // anyClientControl reports whether any secret in the set has a per-address
@@ -107,9 +139,43 @@ func (s *secretSet) limitsOf(name string) (SecretLimits, bool) {
 	return SecretLimits{}, true
 }
 
+// accepts says whether the set lets a stream of the named secret go on with
+// key, the key the stream matched: true when key is the name's key in this set,
+// or the key of one of the name's retiring entries while now is before its
+// until. False on a nil set, which holds nothing, for a name the set does not
+// hold, and for any other key, a nil or partial one included. now is when the
+// question is asked; a name's own key is accepted at any time, and a retiring
+// key is refused from its until on. Registration asks it of the set in force
+// (tryRegisterConn), so a stream that matched a key a swap has since taken
+// away is refused rather than registered. names is sorted, so this is a binary
+// search and not a walk of every secret.
+func (s *secretSet) accepts(name string, key []byte, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+
+	i, found := slices.BinarySearch(s.names, name)
+	if !found || i >= len(s.secrets) {
+		return false
+	}
+
+	if bytes.Equal(s.secrets[i].Key[:], key) {
+		return true
+	}
+
+	for _, r := range s.retiringOf[i] {
+		if entry := &s.retiring[r]; now.Before(entry.until) && bytes.Equal(entry.secret.Key[:], key) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // toConfig reconstructs a mutable SecretConfig from the immutable snapshot. It
 // is the copy-on-write starting point for the management-API mutators, which
-// apply a delta and swap the result back in.
+// apply a delta and swap the result back in. Retiring is every entry the set
+// keeps, in its order, and nil when it keeps none.
 func (s *secretSet) toConfig() SecretConfig {
 	secrets := make(map[string]Secret, len(s.names))
 
@@ -137,7 +203,23 @@ func (s *secretSet) toConfig() SecretConfig {
 		}
 	}
 
-	return SecretConfig{Secrets: secrets, SecretAdTags: perSecret, GlobalAdTag: s.globalAdTag, Limits: limits}
+	var retiring []RetiringSecret
+
+	if len(s.retiring) > 0 {
+		retiring = make([]RetiringSecret, 0, len(s.retiring))
+
+		for _, entry := range s.retiring {
+			retiring = append(retiring, RetiringSecret{Name: s.names[entry.nameIdx], Secret: entry.secret, Until: entry.until})
+		}
+	}
+
+	return SecretConfig{
+		Secrets:      secrets,
+		SecretAdTags: perSecret,
+		GlobalAdTag:  s.globalAdTag,
+		Limits:       limits,
+		Retiring:     retiring,
+	}
 }
 
 // buildSecretSet turns a name->secret map into an immutable, name-sorted
@@ -145,8 +227,28 @@ func (s *secretSet) toConfig() SecretConfig {
 // matched index stable across processes for a given secret map. perSecret
 // carries optional per-name advertising tags and global is the fallback tag;
 // both may be nil. limitsMap carries optional per-name governance limits and
-// may be nil.
+// may be nil. It is buildSecretSetAt with no retiring entry, so the set it
+// makes holds none.
 func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLength]byte, global *[AdTagLength]byte, limitsMap map[string]SecretLimits) *secretSet {
+	set, _ := buildSecretSetAt(secretsMap, perSecret, global, limitsMap, nil, time.Time{})
+
+	return set
+}
+
+// buildSecretSetAt is buildSecretSet with retiring keys: the primaries are
+// built exactly as buildSecretSet always built them, and then retiring, the
+// complete list of entries the set is to hold (nil is none), is classified at
+// now: an invalid value (Secret.Valid()) first, then the §1.3 rules 2, 3, 5,
+// 6, 7 and 8 (buildRetiring). The caller's slice is only read. The kept entries
+// come after every primary: their hosts join hostnames (the SNI gate) when
+// they are ee, their ee keys are candidates after every primary candidate, and
+// nothing else a primary decides -- hosted, frontHost, candByName -- changes.
+// The entries it does not keep are returned, in input order, for the log;
+// none is an error. A set that keeps no entry has every retiring field nil or
+// zero.
+func buildSecretSetAt(secretsMap map[string]Secret, perSecret map[string][AdTagLength]byte, global *[AdTagLength]byte,
+	limitsMap map[string]SecretLimits, retiring []RetiringSecret, now time.Time,
+) (*secretSet, []retiringDrop) {
 	names := make([]string, 0, len(secretsMap))
 	for name := range secretsMap {
 		names = append(names, name)
@@ -197,6 +299,17 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 		}
 	}
 
+	kept, drops := buildRetiring(names, secretsList, retiring, now)
+
+	// A kept ee entry's host passes the SNI gate until the entry leaves the
+	// set: a rotation that also moves the fronting domain must not cut the old
+	// link's clients at the gate. It never becomes frontHost.
+	for r := range kept {
+		if entry := &kept[r]; entry.secret.Hosted() && entry.secret.Host != "" {
+			hostnameSet[entry.secret.Host] = struct{}{}
+		}
+	}
+
 	hostnames := make([]string, 0, len(hostnameSet))
 	for h := range hostnameSet {
 		hostnames = append(hostnames, h)
@@ -206,7 +319,7 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 
 	cands, candIdx, candByName := buildCandidates(secretsList, names, hosted)
 
-	return &secretSet{
+	set := &secretSet{
 		secrets:       secretsList,
 		names:         names,
 		hostnames:     hostnames,
@@ -220,6 +333,10 @@ func buildSecretSet(secretsMap map[string]Secret, perSecret map[string][AdTagLen
 		frontHost:     frontHost,
 		clientControl: clientControl,
 	}
+
+	set.addRetiring(kept)
+
+	return set, drops
 }
 
 // buildCandidates makes the FakeTLS candidates for the hosted secrets (indices
@@ -276,10 +393,11 @@ func (p *Proxy) ReloadSecrets() error {
 	return p.swapSecretConfigLocked(cfg)
 }
 
-// swapSecretConfigLocked validates cfg, builds a fresh immutable snapshot,
-// swaps it in atomically, pre-registers stats for every name, and closes stale
-// connections. It is the single mutation point shared by ReloadSecrets and the
-// management-API mutators; the caller MUST hold reloadMu.
+// swapSecretConfigLocked validates cfg, then applies it
+// (applySecretConfigLocked). It is the single mutation point shared by
+// ReloadSecrets and the management-API mutators, every one of which brings a
+// configuration in; the caller MUST hold reloadMu, taken before liveMu (and
+// liveMu before the table's lock), never under it.
 func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 	if len(cfg.Secrets) == 0 {
 		return ErrSecretInvalid
@@ -300,9 +418,38 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 		return ErrSecretInvalid
 	}
 
-	newSet := buildSecretSet(cfg.Secrets, cfg.SecretAdTags, cfg.GlobalAdTag, cfg.Limits)
+	p.applySecretConfigLocked(cfg)
+
+	return nil
+}
+
+// applySecretConfigLocked is the swap itself, with none of
+// swapSecretConfigLocked's input checks: it builds a fresh immutable snapshot
+// from cfg, swaps it in atomically, pre-registers stats for every name, and
+// closes stale connections. It cannot fail. Only two callers reach it: the
+// checked swap, and the expiry sweep, whose cfg is the set in force rebuilt --
+// it brings in nothing the checks exist to stop, and it must end an overlap
+// whatever they would say of a set NewProxy never checked. The caller MUST hold
+// reloadMu, as for swapSecretConfigLocked.
+func (p *Proxy) applySecretConfigLocked(cfg SecretConfig) {
+	// The one read of the clock for the whole swap: the build judges every
+	// retiring entry by it, and whatever else the swap judges against the clock
+	// must take this same instant rather than read its own.
+	now := p.rotation.Now()
+
+	newSet, drops := buildSecretSetAt(cfg.Secrets, cfg.SecretAdTags, cfg.GlobalAdTag, cfg.Limits, cfg.Retiring, now)
+
+	// BEFORE the Swap, not after it: once the new set is stored a stream on a new
+	// old link can register and stamp retiring_last_seen, and a reset that ran
+	// then would wipe it. reloadMu is held, so the set in force is the one being
+	// replaced.
+	p.resetRetiringSeen(p.secrets.Load(), newSet, now)
+
 	oldSet := p.secrets.Swap(newSet)
 
+	afterSecretStoreHook(newSet)
+
+	p.logRetiringDrops(drops)
 	p.doppelGanger.SetCoverHosts(p.coverHosts(newSet))
 
 	for _, name := range newSet.names {
@@ -311,10 +458,196 @@ func (p *Proxy) swapSecretConfigLocked(cfg SecretConfig) error {
 
 	p.applyLimits(newSet)
 	p.dropRemovedSecrets(oldSet, newSet)
-	p.closeStaleConns(oldSet, newSet)
-	p.closeDeniedConns()
 
-	return nil
+	closed := p.closeStaleConns(oldSet, newSet, now)
+	p.logRetiringChanges(oldSet, newSet, now, closed)
+
+	p.closeDeniedConns()
+}
+
+// afterSecretStoreHook runs in applySecretConfigLocked right after the new set
+// is stored and before anything in the swap takes liveMu: the window in which
+// a registration already reads the new set and the swap's walk has not run. A
+// no-op in production. A test uses it to register a stream in that window
+// (beforeRegisterLockHook cannot place one there: it runs a whole swap before
+// the stream locks). A variable so it can be replaced; a test that does must
+// restore it and must not run in parallel.
+var afterSecretStoreHook = func(*secretSet) {}
+
+// expireRetiring is the maintenance sweep's end of an overlap (spec §4.2):
+// once the clock reaches the earliest until the set in force holds, it swaps
+// in that same set rebuilt at the clock's instant. The build drops every entry
+// that has expired by then, the keys it held leave the set, and closeStaleConns
+// closes their streams by the held-key judgment it gives every swap. It closes
+// nothing itself. A set with no retiring entry costs one load and one compare.
+//
+// It takes reloadMu with TryLock, never Lock. A reload or an API mutation holds
+// that lock across a file read or a request, and waiting behind one would hold
+// up the rest of the maintenance tick -- closeDeniedConns, the quota rollover,
+// the usage flush -- on the same goroutine. A tick that loses the lock retries
+// on the next: a holder that swaps rebuilds at its own instant and does this
+// sweep's work, and one that fails leaves it to the next tick. Admission stays
+// exact meanwhile, because the doors and registration judge until themselves.
+//
+// The swap rebuilds from the set in force as it is once the lock is held -- not
+// the set loaded to decide, which a mutation may have replaced since -- so the
+// API's mutations survive it and nothing they removed comes back. It applies
+// the rebuild without a swap's input checks (applySecretConfigLocked), so it
+// cannot be refused: its primaries are those the set already holds, it brings
+// nothing in, and a set the checks would refuse -- a library caller's initial
+// set that cannot front, which NewProxy does not check -- still has its
+// overlaps ended and their streams closed.
+func (p *Proxy) expireRetiring() {
+	set := p.secrets.Load()
+	if set.retiringNext.IsZero() {
+		return
+	}
+
+	now := p.rotation.Now()
+	if now.Before(set.retiringNext) {
+		return
+	}
+
+	if !p.reloadMu.TryLock() {
+		return
+	}
+	defer p.reloadMu.Unlock()
+
+	set = p.secrets.Load()
+	if set.retiringNext.IsZero() || now.Before(set.retiringNext) {
+		return
+	}
+
+	p.applySecretConfigLocked(set.toConfig())
+}
+
+// logRetiringDrops writes one line for each retiring entry a build did not keep:
+// the secret's name and the reason, and nothing else. A retiring key is a
+// credential, and the line is written from a retiringDrop, which holds none.
+// Three reasons are routine and logged at Info -- the entry repeats a key the
+// name already accepts (same_as_primary, duplicate), or its overlap ended
+// between the reader and the build (expired). The rest say the entries handed in
+// are not what their author meant, and are Warnings: invalid, dangling,
+// key_of_other_secret and over_cap.
+//
+// It touches the logger only when there is a line to write: a Proxy{} literal
+// in a test has none.
+func (p *Proxy) logRetiringDrops(drops []retiringDrop) {
+	for _, drop := range drops {
+		line := p.logger.BindStr("secret_name", drop.name).BindStr("reason", drop.reason)
+
+		switch drop.reason {
+		case retiringSameAsPrimary, retiringDuplicate, retiringExpired:
+			line.Info("a retiring key was ignored")
+		default:
+			line.Warning("a retiring key was ignored")
+		}
+	}
+}
+
+// The rotation change log's lines (spec §6.2) and the one reason a removal
+// gives.
+const (
+	retiringAddedLine     = "secret accepts a previous key until its overlap ends"
+	retiringEndedLine     = "previous key of the secret is no longer accepted: overlap ended"
+	retiringRemovedLine   = "previous key of the secret is no longer accepted"
+	retiringReturnedLine  = "previous key of the secret is the primary again"
+	retiringRemovedReason = "removed"
+)
+
+// retiringID is a retiring entry as the change log matches it across two sets:
+// its name and its key. It is a map key and nothing else; it is never written
+// anywhere.
+type retiringID struct {
+	name string
+	key  [SecretKeyLength]byte
+}
+
+// retiringIDs is every entry set keeps, by name and key, and nil for a set
+// that keeps none, a nil set included.
+func retiringIDs(set *secretSet) map[retiringID]struct{} {
+	if set == nil || len(set.retiring) == 0 {
+		return nil
+	}
+
+	ids := make(map[retiringID]struct{}, len(set.retiring))
+
+	for r := range set.retiring {
+		entry := &set.retiring[r]
+		ids[retiringID{name: set.names[entry.nameIdx], key: entry.secret.Key}] = struct{}{}
+	}
+
+	return ids
+}
+
+// logUntil is how a change line writes an until: UTC, to the second, as
+// rotate-secret writes it into the file.
+func logUntil(until time.Time) string {
+	return until.UTC().Format(time.RFC3339)
+}
+
+// logRetiringChanges is the rotation change log of one swap (spec §6.3): it
+// diffs oldSet's retiring entries with newSet's, matching them by name and key,
+// and writes a line for each difference, naming the secret and never the key.
+//   - An entry of oldSet that newSet lacks left. When its key is the name's
+//     primary in newSet it was reverted -- made the primary again, through
+//     POST /secrets for one -- and the line is "the primary again", at
+//     Warning, whatever its until: the key is still accepted, so neither
+//     other line is true of it. Otherwise the line is "overlap ended", with
+//     its until, when its until is not after now -- the swap's own instant,
+//     the one its build and closeStaleConns judged by -- and "no longer
+//     accepted" with reason=removed when it is. All three carry closed, the
+//     streams of the name the swap closed (closeStaleConns' count). The
+//     engine's own expired drop plays no part: on a reload after until the
+//     config layer has already left the entry out, and only this diff sees
+//     it go.
+//   - An entry of newSet that oldSet lacks is new: "accepts a previous key",
+//     with its until.
+//
+// Departures come first, each list in its set's order. A swap that changes
+// nothing about rotation writes nothing; nor does one whose only change is an
+// entry's until. NewProxy calls it with a nil oldSet once the proxy exists, so
+// the start writes a line for each entry the first set keeps. Like
+// logRetiringDrops it touches the logger only when it has a line to write: a
+// Proxy{} literal in a test has none.
+func (p *Proxy) logRetiringChanges(oldSet, newSet *secretSet, now time.Time, closed map[string]int) {
+	before, after := retiringIDs(oldSet), retiringIDs(newSet)
+	if before == nil && after == nil {
+		return
+	}
+
+	if before != nil {
+		for r := range oldSet.retiring {
+			entry := &oldSet.retiring[r]
+			name := oldSet.names[entry.nameIdx]
+
+			if _, kept := after[retiringID{name: name, key: entry.secret.Key}]; kept {
+				continue
+			}
+
+			line := p.logger.BindStr("secret_name", name)
+
+			switch i, held := newSet.indexOf(name); {
+			case held && newSet.secrets[i].Key == entry.secret.Key:
+				line.BindInt("closed", closed[name]).Warning(retiringReturnedLine)
+			case now.Before(entry.until):
+				line.BindStr("reason", retiringRemovedReason).BindInt("closed", closed[name]).Info(retiringRemovedLine)
+			default:
+				line.BindStr("until", logUntil(entry.until)).BindInt("closed", closed[name]).Info(retiringEndedLine)
+			}
+		}
+	}
+
+	for r := range newSet.retiring {
+		entry := &newSet.retiring[r]
+		name := newSet.names[entry.nameIdx]
+
+		if _, held := before[retiringID{name: name, key: entry.secret.Key}]; held {
+			continue
+		}
+
+		p.logger.BindStr("secret_name", name).BindStr("until", logUntil(entry.until)).Info(retiringAddedLine)
+	}
 }
 
 // dropRemovedSecrets forgets what the proxy holds per address for every secret
@@ -357,22 +690,34 @@ func (p *Proxy) dropRemovedSecrets(oldSet, newSet *secretSet) {
 
 // coverHosts lists the cover sites the set's ee secrets name, each once, in
 // name order, with the address domain fronting would dial for it -- where the
-// doppelganger measures it. A host with no fronting address is left out.
+// doppelganger measures it. A host with no fronting address is left out. The
+// hosts of the set's kept ee retiring keys follow every primary's, in the
+// set's order, so a client of an old link gets the server flight sizing it got
+// before its secret was rotated.
 func (p *Proxy) coverHosts(set *secretSet) []doppel.CoverHost {
 	seen := make(map[string]bool)
 
 	var hosts []doppel.CoverHost
 
-	for _, idx := range set.hosted {
-		host := set.secrets[idx].Host
+	add := func(host string) {
 		if host == "" || seen[host] {
-			continue
+			return
 		}
 
 		seen[host] = true
 
 		if addr := p.domainFrontingAddressForHost(host); addr != "" {
 			hosts = append(hosts, doppel.CoverHost{Host: host, Addr: addr})
+		}
+	}
+
+	for _, idx := range set.hosted {
+		add(set.secrets[idx].Host)
+	}
+
+	for r := range set.retiring {
+		if entry := &set.retiring[r]; entry.secret.Hosted() {
+			add(entry.secret.Host)
 		}
 	}
 
@@ -478,47 +823,76 @@ func (p *Proxy) backfillClientsLocked(set *secretSet) {
 	}
 }
 
-// closeStaleConns closes every live stream whose secret was dropped from the
-// new set or whose key changed since the old set (a re-key), and leaves the
-// rest connected. It compares the KEY ALONE, deliberately: a Host change
-// touches nothing on a live stream (the FakeTLS handshake is long finished and
-// the fronting host is read only on the failure path of a NEW connection) and a
-// Mode change touches nothing at all (the three modes share the key and derive
-// identical ciphers), so widening the comparison would kill every live stream
-// of every client on a hostname edit for no correctness gain. Streams are snapshotted under the lock and closed outside it,
-// so each stream's own unregister (which also takes the lock) cannot deadlock.
-func (p *Proxy) closeStaleConns(oldSet, newSet *secretSet) {
-	newKeys := make(map[string][SecretKeyLength]byte, len(newSet.names))
-	for i, name := range newSet.names {
-		newKeys[name] = newSet.secrets[i].Key
-	}
-
-	oldKeys := make(map[string][SecretKeyLength]byte)
-	if oldSet != nil {
-		for i, name := range oldSet.names {
-			oldKeys[name] = oldSet.secrets[i].Key
-		}
-	}
-
-	var stale []*streamContext
+// closeStaleConns closes every live stream whose key newSet no longer accepts
+// at now, the swap's own instant, leaves the rest connected, and returns how
+// many it closed per name (nil when it closed none). It decides stream by
+// stream (D15), for each name in the registry:
+//   - a name newSet does not have accepts no key: every stream of it is closed;
+//   - a name whose keys the two sets HOLD alike (sameHeldKeys) is skipped
+//     whole, the fast path, and staleSkipHook hears of it;
+//   - otherwise each stream is closed unless newSet accepts the key it matched
+//     (matchedSecretKey) at now.
+//
+// The fast path compares what the sets hold -- the primary and every retiring
+// key, expired or not -- and never what they accept at now. Judged at now,
+// the expiry swap's two sets accept the same keys once an overlap has ended,
+// the name would be skipped, and the old key's streams would stay open for
+// good: no later swap looks at a name whose set holds no retiring key (B1). A
+// name the old set lacks holds nothing there, so it never takes the fast path.
+// The judgment against newSet at now is belt and braces: a set this swap built
+// at now holds no key that has expired by it.
+//
+// It compares KEYS ALONE, deliberately: a Host change touches nothing on a live
+// stream (the FakeTLS handshake is long finished and the fronting host is read
+// only on the failure path of a NEW connection) and a Mode change touches
+// nothing at all (the three modes share the key and derive identical ciphers),
+// so widening the comparison would kill every live stream of every client on a
+// hostname edit for no correctness gain.
+//
+// Streams are snapshotted under liveMu and closed outside it, so each stream's
+// own unregister (which also takes the lock) cannot deadlock. staleSkipHook
+// runs under liveMu and must not take it.
+func (p *Proxy) closeStaleConns(oldSet, newSet *secretSet, now time.Time) map[string]int {
+	var (
+		stale  []*streamContext
+		closed map[string]int
+	)
 
 	p.liveMu.Lock()
+
 	for name, conns := range p.liveConns {
-		if newKey, kept := newKeys[name]; kept {
-			if oldKey, had := oldKeys[name]; had && oldKey == newKey {
-				continue
+		_, kept := newSet.indexOf(name)
+
+		if kept && sameHeldKeys(oldSet, newSet, name) {
+			if p.staleSkipHook != nil {
+				p.staleSkipHook(name)
 			}
+
+			continue
 		}
 
 		for sc := range conns {
+			if kept && newSet.accepts(name, sc.matchedSecretKey, now) {
+				continue
+			}
+
+			if closed == nil {
+				closed = make(map[string]int)
+			}
+
+			closed[name]++
+
 			stale = append(stale, sc)
 		}
 	}
+
 	p.liveMu.Unlock()
 
 	for _, sc := range stale {
 		sc.Close()
 	}
+
+	return closed
 }
 
 // checkLimits reports whether a new connection for the named secret is allowed
@@ -599,13 +973,16 @@ func (p *Proxy) rolloverAllQuotas() {
 
 // denySweepInterval is how often live streams are checked against the limits
 // the clock alone can cross: an expiry that passes, a quota period that rolls
-// over. It bounds how long a user outlives their deadline, and it is short
-// because the sweep is a walk of the live registry and nothing more.
+// over, a retiring key's until. It bounds how long a user, or an old key,
+// outlives their deadline, and it is short because the sweep is a walk of the
+// live registry and nothing more -- unless an overlap has ended, which costs
+// one swap.
 const denySweepInterval = 5 * time.Second
 
 // startMaintenance runs, until ctx is cancelled, the work that has to happen
 // on the clock rather than on an event: every sweepEvery, monthly quota
-// periods roll over and streams of users who are now denied are closed;
+// periods roll over, overlaps the clock has ended are ended (expireRetiring)
+// and streams of users who are now denied are closed;
 // every flushEvery, the usage counters are written to usageStateFile if one
 // is configured; every clientSweepInterval, the per-address table forgets the
 // addresses that have been gone long enough; and every fairTickInterval, fair
@@ -644,6 +1021,7 @@ func (p *Proxy) startMaintenanceEvery(ctx context.Context, sweepEvery, flushEver
 				return
 			case <-sweep.C:
 				p.rolloverAllQuotas()
+				p.expireRetiring()
 				p.closeDeniedConns()
 			case <-clients.C:
 				p.sweepClients()

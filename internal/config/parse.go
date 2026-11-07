@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -33,6 +33,18 @@ type tomlConfig struct {
 		ClientSpeed string `toml:"client-speed" json:"clientSpeed,omitempty"`
 		ClientFair  bool   `toml:"client-fair" json:"clientFair,omitempty"`
 	} `toml:"secret-limits" json:"secretLimits,omitempty"`
+	// The fields are any so that a wrong TOML type is a problem of that one
+	// entry, never a failure to parse the file; Parse turns each into a string
+	// before the JSON step (normaliseRetiringSecrets). The table itself keeps a
+	// typed shape, so go-toml still names a misspelt field inside a block as
+	// an unknown key, and a scalar where the table belongs
+	// (retiring-secret = "x") is the one hand edit of this table that refuses
+	// the file.
+	RetiringSecrets []struct {
+		Name   any `toml:"name"   json:"name"`
+		Secret any `toml:"secret" json:"secret"`
+		Until  any `toml:"until"  json:"until"`
+	} `toml:"retiring-secret" json:"retiringSecrets,omitempty"`
 	UsageStateFile string `toml:"usage-state-file" json:"usageStateFile,omitempty"`
 	APIToken       string `toml:"api-token" json:"apiToken,omitempty"`
 	BindTo         any    `toml:"bind-to" json:"bindTo"`
@@ -171,8 +183,9 @@ func Parse(rawData []byte) (*Config, error) {
 	jsonEncoder.SetEscapeHTML(false)
 	jsonEncoder.SetIndent("", "")
 
+	// Neither error below may carry a value of the file (parse_error.go).
 	if err := toml.Unmarshal(rawData, tomlConf); err != nil {
-		return nil, fmt.Errorf("cannot parse toml config: %w", err)
+		return nil, fmt.Errorf("cannot parse toml config: %w", parseError(rawData, err))
 	}
 
 	switch v := tomlConf.BindTo.(type) {
@@ -195,6 +208,8 @@ func Parse(rawData []byte) (*Config, error) {
 		tomlConf.BindTo = strs
 	}
 
+	retiringMarks := normaliseRetiringSecrets(tomlConf)
+
 	// G117: the buffer is decoded back into conf three lines down and never
 	// leaves this function. This is the TOML-to-struct pipeline, not output.
 	//nolint:gosec // an in-memory round trip
@@ -203,7 +218,15 @@ func Parse(rawData []byte) (*Config, error) {
 	}
 
 	if err := json.NewDecoder(jsonBuf).Decode(conf); err != nil {
-		return nil, fmt.Errorf("cannot parse a config: %w", err)
+		return nil, fmt.Errorf("cannot parse a config: %w", valueFreeError(rawData, err))
+	}
+
+	// The wrong-type marks are unexported, so they cannot cross the JSON step:
+	// they are set here, from the record the normalisation kept.
+	for i, mark := range retiringMarks {
+		if i < len(conf.RetiringSecrets) {
+			conf.RetiringSecrets[i].wrongType = mark
+		}
 	}
 
 	if len(conf.BindTo) == 0 {
@@ -215,10 +238,78 @@ func Parse(rawData []byte) (*Config, error) {
 	return conf, nil
 }
 
+// normaliseRetiringSecrets turns every field of every [[retiring-secret]]
+// block into a string, in place, and returns which fields of each entry had
+// the wrong TOML type, as wrong-type marks:
+//   - a string is kept;
+//   - an offset date-time (a time.Time) in until becomes RFC 3339 with
+//     nanoseconds; in name or secret it is a wrong type (§1.1 allows one for
+//     until only);
+//   - an absent field becomes "", which rule 1 reports as missing, not as a
+//     wrong type;
+//   - anything else -- a number, a boolean, an array, an inline table, a
+//     local date-time, date or time -- becomes fmt.Sprint of it, marked.
+func normaliseRetiringSecrets(conf *tomlConfig) []uint8 {
+	if len(conf.RetiringSecrets) == 0 {
+		return nil
+	}
+
+	marks := make([]uint8, len(conf.RetiringSecrets))
+
+	for i := range conf.RetiringSecrets {
+		entry := &conf.RetiringSecrets[i]
+
+		for _, field := range []struct {
+			value    *any
+			mark     uint8
+			dateTime bool // an offset date-time is this field's type
+		}{
+			{&entry.Name, retiringNameWrongType, false},
+			{&entry.Secret, retiringSecretWrongType, false},
+			{&entry.Until, retiringUntilWrongType, true},
+		} {
+			text, wrongType := normaliseRetiringField(*field.value, field.dateTime)
+			*field.value = text
+
+			if wrongType {
+				marks[i] |= field.mark
+			}
+		}
+	}
+
+	return marks
+}
+
+// normaliseRetiringField is one field of normaliseRetiringSecrets: its text,
+// and whether its TOML type was wrong. dateTime says whether an offset
+// date-time is a right type for the field.
+func normaliseRetiringField(value any, dateTime bool) (string, bool) {
+	switch v := value.(type) {
+	case nil:
+		return "", false
+	case string:
+		return v, false
+	case time.Time:
+		if dateTime {
+			return v.Format(time.RFC3339Nano), false
+		}
+
+		return fmt.Sprint(v), true
+	default:
+		return fmt.Sprint(v), true
+	}
+}
+
 // unknownKeys is the list of keys a strict decode of the same document would
 // have refused. The lenient decode above is the one that counts; this second
 // pass exists only to name what it dropped. Any failure of this pass other
 // than unknown keys is ignored, because the document already parsed.
+//
+// A part of a key that could spell a secret value -- a value written where a
+// key goes -- is not shown (valueFreeKey); the rest of its path is, and the
+// line the key is on, so that the operator can find it (UnknownKeyPath takes
+// that off again). Keys are listed once each by their path as written, so two
+// such keys are two entries.
 func unknownKeys(rawData []byte) []string {
 	decoder := toml.NewDecoder(bytes.NewReader(rawData))
 	decoder.DisallowUnknownFields()
@@ -233,12 +324,28 @@ func unknownKeys(rawData []byte) []string {
 	}
 
 	keys := make([]string, 0, len(strict.Errors))
+	seen := make(map[string]bool, len(strict.Errors))
 
-	for _, decodeErr := range strict.Errors {
-		keys = append(keys, strings.Join(decodeErr.Key(), "."))
+	for i := range strict.Errors {
+		decodeErr := &strict.Errors[i]
+
+		written := strings.Join(decodeErr.Key(), ".")
+		if seen[written] {
+			continue
+		}
+
+		seen[written] = true
+
+		key := strings.Join(valueFreeKey(decodeErr.Key()), ".")
+		if key != written {
+			line, _ := decodeErr.Position()
+			key += fmt.Sprintf("%s%d)", unknownKeyLine, line)
+		}
+
+		keys = append(keys, key)
 	}
 
 	sort.Strings(keys)
 
-	return slices.Compact(keys)
+	return keys
 }

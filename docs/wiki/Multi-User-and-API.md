@@ -19,6 +19,7 @@ change.
   - [Per-address usage](#per-address-usage-get-secretsnameclients)
   - [Bans](#bans-secretsnamebans)
   - [Kick, ban or re-key](#kick-ban-or-re-key)
+- [Rotating a secret with an overlap](#rotating-a-secret-with-an-overlap)
 - [The ad-tag routes](#the-ad-tag-routes)
 - [Errors and status codes](#errors-and-status-codes)
 - [Hot reload](#hot-reload)
@@ -202,6 +203,10 @@ Per user:
 | `ad_tag_failed` | when non-zero | Ad-tagged streams that took the direct path because the middle proxy could not be reached or refused them. Not by design: this is the sponsored channel going missing — except for a few right after a restart, while the middle-proxy config loads. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` | See below. |
 | `external_ips`, `external_expires_at` | only with `track-client-ips` | The addresses a panel reported the user present at elsewhere, and when that report lapses. See [external addresses](#external-addresses-secretsnameexternal-ips). |
+| `retiring_keys` | while the user has an unexpired previous key (`secret-rotation`) | How many previous keys of the secret are still accepted. See [Rotating a secret with an overlap](#rotating-a-secret-with-an-overlap). |
+| `retiring_until` | with `retiring_keys` | The latest `until` among them, in UTC: when the last old link stops working. |
+| `retiring_connections` | with `retiring_keys`, when non-zero | Live connections of the user on a key that is not its current one. |
+| `retiring_last_seen` | with `retiring_keys`, once a connection came in on a previous key | When the last one did, in UTC. Cleared when a secret that had no unexpired previous key gets one. |
 
 The per-address fields are scalars inside the user object. Nothing per-address
 is ever a key under `users`, which a panel bills as one client per key; the
@@ -225,7 +230,7 @@ Cross-reference: [[Limits-and-Quotas]] for what the quota fields mean,
 `features` is a sorted list of capability names the **binary** supports:
 
 ```text
-client-bans  client-ip-activity  client-ips  client-limits  client-stats  faketls  handshake-budget  ip-limits  kick  listeners  quota-ceiling  quota-reset  secret-modes  secret-read  secrets-api  speed-directions  speed-limits  web-relay  web-relay-watch
+client-bans  client-ip-activity  client-ips  client-limits  client-stats  faketls  handshake-budget  ip-limits  kick  listeners  quota-ceiling  quota-reset  secret-modes  secret-read  secret-rotation  secrets-api  speed-directions  speed-limits  web-relay  web-relay-watch
 ```
 
 | Name | Means |
@@ -244,6 +249,7 @@ client-bans  client-ip-activity  client-ips  client-limits  client-stats  faketl
 | `quota-reset` | `POST /secrets/{name}/reset-quota` is served. |
 | `secret-modes` | The `dd` and plain secret forms parse and serve. |
 | `secret-read` | `GET /secrets/{name}` is served. |
+| `secret-rotation` | `[[retiring-secret]]` is honoured, the binary has `mtg-proxy rotate-secret`, and `/stats` and `GET /secrets` may carry `retiring_keys`, `retiring_until`, `retiring_connections` and `retiring_last_seen` inside a user's own object. `rotate-secret --reload` asks for it before it writes anything. |
 | `secrets-api` | The `GET`/`PUT`/`POST`/`DELETE` `/secrets` routes are served. |
 | `speed-directions` | `speed-up` and `speed-down` (`speed_up`/`speed_down` on the API) cap each direction on its own bucket, read back as `speed_limit_up`/`speed_limit_down`. |
 | `speed-limits` | `speed` is accepted on `[secret-limits.<name>]` and the secrets API, and `/stats` reports `speed_limit` and `throttled_ms`. |
@@ -414,6 +420,7 @@ The list is sorted by name.
 | `last_seen` | always (v1.3.0) | `null` when never connected. |
 | `connected_ips`, `last_ip` | only with `track-client-ips` (v1.3.0) | Same gate as `/stats`. |
 | `external_ips`, `external_expires_at` | only with `track-client-ips` (v1.7.0) | Same gate. The user's reported addresses elsewhere and when the report lapses. |
+| `retiring_keys`, `retiring_until`, `retiring_connections`, `retiring_last_seen` | while the secret has an unexpired previous key (`secret-rotation`) | The same four fields as on `/stats`, from the same set and counters. Never a key. See [Rotating a secret with an overlap](#rotating-a-secret-with-an-overlap). |
 
 `connections` and `last_seen` were added so a caller rendering one user does not
 have to fetch and filter the whole of `/stats`. They are the same counters
@@ -767,13 +774,14 @@ an unknown secret; a well-formed one for an unknown secret is `404`.
 |---|---|---|---|
 | `kick` | Closes the streams one place holds on one secret. The device reconnects at once. | A moment | A device that is one too many, when `ip-limit` should decide whether it comes back |
 | ban | Closes them and refuses the place that secret until the ban lapses | Up to `720h`, in memory; lost on restart | Short-term abuse from one place |
-| re-key | Gives the secret a new key (`POST /secrets` with a new `secret`, or the file and a reload). Every live connection of the secret closes and every holder needs a new link | Permanent | A leaked link |
+| re-key | Gives the secret a new key (`POST /secrets` with a new `secret`, or the file and a reload). Every live connection of the secret closes and every holder needs a new link | Permanent | A leaked link that must stop now |
+| rotate | Gives the secret a new key and keeps the old one accepted until a time you choose (`mtg-proxy rotate-secret`, then a reload). Nothing closes at the rotation; at `until` the old key is refused and its live connections close | Permanent; the old key for the overlap only | A leaked link whose rightful holders need time to move |
 
 A ban is a refusal, not concealment. Someone who holds the secret and connects
 from a banned place can tell from the timing that the key matched, and can come
-back from another place. For a leaked link, re-key the secret. Rotation with an
-overlap period, which would let holders move to a new key without a gap, is not
-part of this release. See [[Security]] for what a ban does and does not hide.
+back from another place. For a leaked link, re-key the secret, or rotate it with
+an overlap so that its holders can move to the new link without a gap (below).
+See [[Security]] for what a ban does and does not hide.
 
 ### What a mutation does to live connections
 
@@ -782,6 +790,11 @@ part of this release. See [[Security]] for what a ban does and does not hide.
 - a **new** secret starts working immediately;
 - a **re-keyed or removed** secret has its live connections closed, because the
   key they were admitted with no longer exists;
+- more exactly, each live connection is judged by the key it came in on (feature
+  `secret-rotation`): it is closed when the new set no longer accepts that key
+  for its secret, and left alone when the set still does, as the primary or as
+  an unexpired previous key. So a rotation closes nothing, and the end of its
+  overlap closes the old key's connections and only those;
 - an **ad-tag-only** change leaves connections running — the tag affects the
   routing of new connections only;
 - **disabling** a secret, or giving it an expiry already in the past, closes its
@@ -816,9 +829,329 @@ exception: the file has no place for them, so a reload leaves them alone. They
 end when they lapse, when they are lifted, when their secret is removed, or when
 the process restarts.
 
+Overlaps are the other way round: the file is their only source. No route can
+write a previous key. A route that rotated a key in memory would be undone by
+the next reload or restart, which reads the file and makes the leaked key the
+primary again while the new link handed out dies; the proxy never writes its
+config file, and in a panel deployment the panel owns it. So an overlap is
+written to the file by `rotate-secret` and read by a reload, and the routes
+only keep what the file granted — see
+[what the API does to an overlap](#what-the-api-does-to-an-overlap).
+
 One practical consequence: `mtg-proxy access` reads the config file, not the
 API. A user added only through `POST /secrets` gets no link from `access` until
 they are also in the file.
+
+## Rotating a secret with an overlap
+
+New with the `secret-rotation` feature. A re-key cuts every holder of a link at
+once. A rotation gives the secret a new key and keeps the old one accepted until
+an instant you choose, so the people who rightfully hold the link can move to
+the new one without a gap; then the old key is refused, and its live
+connections are closed.
+
+**An overlap is a grant.** Until `until`, whoever holds the old link — the
+person it leaked to included — uses the secret exactly as its rightful holders
+do: the same quota, speed, address limit and connection caps. A link posted in
+public can crowd them out of `ip-limit` and `client-conns` for as long as the
+overlap lasts. Choose a short one, or `--overlap 0` with bans of the abusive
+places, for a hostile leak (with the WEB relay, the old WEB link then goes to
+the cover site at once; see [[WEB-Proxy-Setup]]); see *Rotating a leaked link*
+on [[Security]].
+
+### The command
+
+The overlap lives in the config file, as a `[[retiring-secret]]` block (see
+[[Configuration]]), and `mtg-proxy rotate-secret` writes it. It makes no
+network access unless you give `--reload`.
+
+```bash
+mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --overlap 24h
+```
+
+On stderr, for people:
+
+```text
+rotated "alice" in /etc/mtg-proxy/config.toml
+the previous key is accepted until 2026-10-13T09:30:00Z (24h0m0s from now)
+the running proxy does not know yet: POST /reload on its management API, or restart it
+links: mtg-proxy access /etc/mtg-proxy/config.toml
+```
+
+On stdout, exactly one line: the new value, spelled as the old one was (hex if
+the file had hex, base64url otherwise). It is printed once, right after the
+file is replaced, before the lines above (the report of the rotation) and before
+any reload, so
+redirect it if a script needs it.
+With `[web] enabled = true` stderr also says `WEB links of "alice" change now;
+the WEB transport has no overlap (see WEB-Proxy-Setup)`.
+
+What the edit does to the file:
+
+- **The new key** goes into alice's line in `[secrets]` (or the top-level
+  `secret` for `default`), in the same form (`ee`, `dd` or plain) and, for `ee`,
+  with the same fronting host unless `--host` names another. A mode change is a
+  hand edit; [[Configuration]] shows one.
+- **The old value** goes into a new block just above the `[secrets]` header,
+  with `until` in UTC to the second and a `# added by mtg-proxy rotate-secret at
+  <time>` comment inside it. A file with no `[secrets]` header gets it at the
+  end.
+- **Nothing else changes.** The file is edited as text, spliced, never
+  rewritten from scratch: comments, order, quoting and line endings stay. The
+  result is parsed again and must differ from the original in exactly the
+  intended places, or nothing is written. Removing a block (`--end-overlap`,
+  `--prune`) removes its lines from the header to the next table, comments
+  inside it included; a comment above its header, or heading the next table,
+  stays.
+- **It never writes a block the proxy would drop**, or one that would make a
+  dead key usable again, and it never writes an overlap over 720h.
+
+Then reload the proxy (or pass `--reload`), and hand every rightful holder the
+new link, from `mtg-proxy access`, before `until`. Their clients keep working on
+the old link until then; after it, only the new link works. The reload is
+`POST /reload` or a restart: `run` has no `SIGHUP` handler, and a `SIGHUP` ends
+it, as it always has.
+
+| form | does |
+|---|---|
+| `rotate-secret <config> <name> --overlap <d>` | Rotates `<name>`. `<d>` is a Go duration from `0` to `720h` and has no default: a security action states its grant. `0` writes no block and is an immediate re-key: the old key dies at the reload. Below `1s` (other than `0`) is refused. `--host` gives an `ee` secret a new fronting host. |
+| `rotate-secret <config> <name> --end-overlap` | Removes every block of `<name>`, expired or not: its old keys stop at the reload. |
+| `rotate-secret <config> --prune` | Removes every block whose `until` has passed, of any name. It also combines with either form above. |
+| `--dry-run` | Says on stderr what the run would do, and writes nothing. No key is generated, and no diff is printed: it would show the old value. |
+| `--reload` | Reloads the running proxy through its management API and reads the rotation back (below). |
+| `--force` | Goes past the two refusals that are guesses: the panel file name, and a running proxy without `secret-rotation`. Never past a validation failure. |
+
+`default` names the single top-level `secret`, and only while the file has no
+`[secrets]`. A secret holds at most 4 unexpired previous keys: a fifth rotation
+is refused until one expires, or `--end-overlap` ends them.
+
+### What happens over time
+
+| moment | the new key | the old key |
+|---|---|---|
+| the file is written | not served yet: the running proxy has its old set | as before |
+| the reload (or a restart) | the primary, at once | accepted until `until`; no live connection is closed |
+| during the overlap | works | works, as the same user |
+| `until` | works | refused at the door, as a wrong key is; its live connections close at the next five-second sweep, or at any reload or API change before it |
+| a restart during the overlap | the file's | accepted until `until`: the file still says so |
+| `--end-overlap` and a reload | works | refused, and its connections closed, at that reload |
+| a binary without `secret-rotation` reads the file | the file's | refused: an older binary ignores the table as an unknown key (one recent enough to name unknown keys logs it), and an older `run --check` refuses the file |
+
+Expiry is exact for new connections; only the live ones wait for the sweep. A
+connection that matched a key in the moment before a reload or the expiry took
+that key away, and registers after it, is refused there and logged as
+`connection denied by per-user limit` with `deny_reason` `key_revoked`.
+
+To cut the old link **now** rather than at `until`: `rotate-secret <config>
+<name> --end-overlap` and a reload, which ends every old key of that name. A
+kick of the abusive places closes their streams on both keys, and a ban refuses
+them on both, because a ban is held per secret and place, not per key — but a
+ban lives in memory only and goes with a restart.
+
+The proxy's log says what each swap did, by name and never by key: see *Logs*
+on [[Monitoring]].
+
+### `--reload` and the read-back
+
+`--reload` reads `api-bind-to` and `api-token` from the same file; a wildcard
+bind (`0.0.0.0`, `::`) is reached on the loopback of its family. Without
+`api-bind-to` it is refused before anything is written. In order:
+
+1. **Before writing:** `GET /stats`. An API that does not answer is a refusal.
+   So is a proxy whose `features` lack `secret-rotation`: an older binary
+   ignores the block, and its reload would end the overlap at once. `--force`
+   goes past that one with a warning.
+2. **The write.**
+3. **`POST /reload`**, which must answer `200`.
+4. **The read-back.** For the name, `GET /secrets/{name}`, compared with what
+   the written file says the proxy must serve: the same primary (key, form and
+   host), `retiring_keys` equal to the name's usable blocks, and, after a
+   rotation, `retiring_until` no earlier than the new block's `until`. A name
+   whose expired blocks `--prune` removed gets the count check.
+
+When it all holds the run says `reloaded the proxy through its management API at
+127.0.0.1:9090; it serves the file as written`. A check that fails is a line of
+its own, with its likely causes:
+
+```text
+the file is rotated but the proxy does not serve it: retiring_keys of "alice" differs (1 vs 0); likely: the proxy's clock is ahead of this machine's (its latest time judged an entry expired), or the proxy logged a problem with a [[retiring-secret]] block
+```
+
+- **A different primary** points at a `SECRET` environment variable overriding
+  `[secrets]`, a single-file bind mount that still shows the old file, or
+  another process that rewrote the file.
+- **More previous keys than the file says** point at a proxy reading another
+  file, or this machine's clock being ahead of the proxy's.
+- **After `--force` past an older binary**, a shortfall names first
+  `the running proxy is an older binary (--force), which ignores [[retiring-secret]]`,
+  and a proxy that does not serve `GET /secrets/{name}` is named as such. Expect
+  a non-zero exit there after a rotation with an overlap: the older binary holds
+  no previous key.
+- **A refused reload** prints its status line only, never the body, which is the
+  proxy's own error text: the proxy's log says why.
+
+The file is **never rolled back**. It is the truth, and a rollback would make
+the leaked key the primary again at the next restart. `--reload` reaches one
+proxy: reload every other process that reads the file yourself (the WEB relay
+follows the file by itself). `--dry-run --reload` asks the pre-check and writes
+nothing.
+
+### Exit status and refusals
+
+`0` is success, a run with nothing to do included (`nothing to do: … nothing was
+written`). Anything else exits non-zero, and every message says whether the
+file was written: a refusal, and any failure before the file is replaced, ends
+in `nothing was written`; a failure after it — the reload, the read-back — says
+the file is rotated (or written) and what did not happen. Refusals worth
+knowing:
+
+- `say how long the previous key stays accepted: --overlap 24h, or --overlap 0
+  to retire it at once`;
+- `"default" is not served while [secrets] is present; rotate a name from
+  [secrets]`;
+- `<name> already has 4 unexpired previous keys, the most one secret can have:
+  end them with --end-overlap, or wait for one to expire, and retry`;
+- the current key still held by another block until a later time, which names
+  that block and how to end it; another name's block, or another name's
+  primary, already holding the key being retired; a removal that would make a
+  dead key usable again. Each names the block, never a key;
+- `the edit would add a problem the file does not have: …`, with the line
+  `run` would log;
+- a config that does not load, with the parser's error (the shapes on
+  [[Configuration]] that refuse the whole file, a byte-order mark);
+- `the file's retiring-secret entries are not all [[retiring-secret]] blocks (an inline array of tables, or a retiring-secret key?); rotate-secret edits only blocks: rewrite them as blocks and retry`:
+  the file holds `retiring-secret = [{ … }]`, which `run` honours but this
+  command does not edit;
+- `the file has a [retiring-secret] table with one pair of brackets, and a [[retiring-secret]] block cannot be added beside it: write its header as [[retiring-secret]] and retry`;
+- `the file changed while rotating; nothing was written`: another writer (an
+  editor, the panel) changed the file between the read and the replace;
+- `this looks like a config the Penhoon panel generates (…/mtproto/mtg-N.toml);
+  the panel rewrites it from its own records and would make the old key the
+  primary again; re-key the client in the panel instead`.
+
+**Not for a panel-managed file.** The panel rewrites its config from its own
+records and would make the old key the primary again. The refusal above is a
+guess from the path (`…/mtproto/mtg-<digits>.toml`), so `--force` passes it,
+and a panel that keeps its files elsewhere is not recognised at all: rotation is
+unsupported on any file a panel writes. Re-key the client in the panel.
+
+### How the file is written, and what can be left behind
+
+The only write is atomic: a temporary file `<config>.rotate-<8 random hex>.tmp`
+beside the config, given the config's permissions before anything is written
+into it, then written, synced and renamed over it. No copy of the old file is
+ever made — it would be a second file holding every secret with the leaked key
+as the primary. A symlinked config has its target replaced; the link stays.
+
+- **The lock.** `<config>.rotate.lock`, holding the pid and the start time,
+  keeps two runs apart, a dry run included. A lock that exists is refused with
+  its age: `another rotate-secret holds <lock> (started <age> ago); if none is
+  running, remove it and retry`. The tool never breaks a lock itself. It is
+  created exclusively, which is reliable on local file systems only: **a config
+  on NFS is not protected against two concurrent runs.**
+- **After a crash** — the process killed, the machine down — the lock can stay,
+  and before the rename the temporary file can too. The temporary file holds
+  every secret of the config: delete it. The lock refusal names any such file
+  it finds beside the config.
+- **Interrupts.** The first Ctrl-C, `SIGTERM` or `SIGHUP` does not kill the
+  run: before the rename it stops cleanly there, and removes the temporary file
+  and the lock (`interrupted; nothing was written`); after the rename the
+  rotation is complete, so the run exits `0` with `warning: interrupted after
+  the file was written; the rotation is complete`, and with `--reload` it says
+  the reload was not finished or not read back. A **second** interrupt kills
+  the process as usual and leaves the lock behind (and, before the rename, the
+  temporary file). A signal ignored at the start (`nohup`) stays ignored.
+- **Another writer.** The file is read again just before the rename, and a
+  change since the run read it aborts it. A short window between that read and
+  the rename remains.
+
+On Unix the temporary file is created `0600`, then given the config's owner,
+group and permission bits exactly, whatever the umask; a run that cannot set
+the owner is refused (`run as the file's owner, in the file's group, or as
+root`). Nothing else is copied: set-id and sticky bits, the file's own ACL
+entries (`setfacl`), extended attributes and a non-default security label
+(SELinux, AppArmor) are not kept, so a config whose access rests on them needs
+them set again before the reload. (That list is from reading the code; it has
+not been run on Unix.) The directory is synced after the rename. A config with
+other hard links is warned about, here and on Windows: `the config has N names
+(hard links); the others keep the previous file: replace them by hand` — those
+names still hold the old key as the primary. A read-only mount is refused with
+`(a read-only mount? run rotate-secret on the host, and mount the config's
+directory into the container)`; a single-file bind mount, with `cannot replace
+<config>: it is a mount point (a single-file bind mount?); run rotate-secret on
+the host, and mount the config's directory into the container`. See
+[[Installation]] for Docker.
+
+On Windows the new file is created readable by the runner alone and shared with
+no one until the config's security is copied onto it:
+
+- **Kept:** the access control list exactly as it was — its entries, the
+  inherited ones as they were, protected or not, and a NULL list (open to
+  everyone) — and the mandatory integrity label, or its absence. A legacy
+  unprotected list (without the auto-inherited flag) comes back marked
+  protected, with the same entries.
+- **Not kept:** the owner (the new file's owner is the runner; for an elevated
+  runner, Administrators), alternate data streams, audit entries, and the
+  hidden and system attributes. A read-only config is refused like any config
+  the runner cannot open for writing.
+- **EFS.** A config encrypted with EFS is refused: `rotate-secret cannot keep a
+  file encrypted with EFS; decrypt it with cipher /d "<config>", rotate, and
+  encrypt it again with cipher /e "<config>"`. A plain config in a directory
+  that encrypts new files comes back encrypted under the runner's key.
+- **A rotated config always carries a label part**, `S:NO_ACCESS_CONTROL` when
+  it had no label: the same access and the same `icacls` output, but a tool
+  that compares raw SDDL sees a difference.
+- **When the copy comes out different**, the run refuses with nothing written:
+  `the new file would not get the access control list of <config>: the copy
+  differs from the original; give the file a list of its own with icacls
+  "<config>" /inheritance:d, and retry`. For a label, the remedy never suggests
+  a tool that would weaken it.
+- **Not tried** on SMB shares, ReFS or FAT. A volume with no security (FAT) has
+  nothing to copy; one that rejects the descriptor or the label makes the run
+  refuse, with nothing written.
+
+### What the API does to an overlap
+
+The routes cannot create or extend an overlap: the bodies have no field for
+it. They keep what the file granted, a removal takes a secret's previous keys
+with it, and the next `POST /reload` or restart returns to the file.
+
+| call | the secret's previous keys afterwards |
+|---|---|
+| `POST /reload` | exactly the file's usable blocks |
+| `PUT /secrets` | the current ones of every name the body keeps, whatever else the body changes; a name the body drops loses them. A panel's re-key stays immediate: the old primary never becomes a previous key |
+| `POST /secrets` | the name's are kept; the old primary never becomes one |
+| `DELETE /secrets/{name}` | the name's go with it |
+| `PUT`/`DELETE /adtag` | kept |
+
+**Reverting puts the leaked key back on purpose.** A `POST` or `PUT /secrets`
+that makes a secret's previous key its primary again — the key you just retired
+— does exactly that: the block's key is now the primary, the new key's
+connections close, and the proxy logs `previous key of the secret is the primary
+again` at warning level, with `secret_name` and `closed` (after `a retiring key
+was ignored` with `reason` `same_as_primary`, at info). A `POST` or `PUT` that
+gives the previous key to **another** secret makes it that secret's primary: the
+first secret stops accepting it and its connections on it close, logged as `a
+retiring key was ignored` with `reason` `key_of_other_secret` at warning level,
+then `previous key of the secret is no longer accepted` with `reason` `removed`
+and `closed`. Either lasts until the next reload, which returns to the file.
+
+### The four fields
+
+On `GET /stats`, inside the user's own object, and on `GET /secrets` and
+`GET /secrets/{name}`; never a key under `users`, never a key's value, and
+absent for a secret with no unexpired previous key:
+
+| field | means |
+|---|---|
+| `retiring_keys` | How many previous keys the secret still accepts. |
+| `retiring_until` | The latest `until` among them, in UTC: when the last old link stops. |
+| `retiring_connections` | Live connections of the secret on a key that is not its current primary: the old-link users still connected. Counted when you ask, from each connection's own key, so right after a rotation it shows every old-link connection, and it falls as they move. Absent at `0`. |
+| `retiring_last_seen` | When a connection last came in on a previous key, in UTC. Cleared when a secret that had no unexpired previous key gets one; a second rotation inside a running overlap keeps it, so it can show traffic on the first old link. |
+
+`retiring_connections` at zero and an old `retiring_last_seen` say the old link
+is no longer used; `--end-overlap` ends it early. A user on the old link is
+counted in the user's other fields as any connection is.
 
 ## The ad-tag routes
 
@@ -902,12 +1235,13 @@ secret set in atomically, with exactly the connection semantics listed above.
 - `ad-tag`
 - `[secret-ad-tags]`
 - `[secret-limits]`
+- `[[retiring-secret]]` (feature `secret-rotation`)
 
 **Not hot-applied.** Everything else needs a restart: `bind-to`, `api-bind-to`,
 `api-token`, `[[listener]]` blocks, `[domain-fronting]`, `[network]`,
 `[throttle]`, `track-client-ips`, `usage-state-file` and the whole `[web]`
 table. A reload does not report these as unchanged or refused — it reads the
-whole file, validates it, and applies only the four items above. If you edited
+whole file, validates it, and applies only the items above. If you edited
 `bind-to` and called `/reload`, the call succeeds and the port does not move.
 
 The reload path runs the same parse, environment overlay and validation as
@@ -917,6 +1251,13 @@ broken file is far worse than a stale one. And environment overrides are
 re-applied on every read, so a `SECRET` or `TAG` pinned in the environment
 survives a reload rather than being replaced by whatever the file says. See
 [[Configuration]].
+
+A mistake inside a `[[retiring-secret]]` block is not an invalid file: the
+block is dropped with a warning and everything else is applied, the new primary
+included, so the worst it does is end that old link early. Only an edit of the
+table that does not parse refuses the reload, and then the set in force is kept
+(the `500` says so when the parser stopped at the table). See
+`[[retiring-secret]]` on [[Configuration]].
 
 `POST /reload` returns `503` when the proxy was started with `simple-run`, which
 takes flags instead of a file: there is no source to re-read.

@@ -13,7 +13,9 @@
 //   - Authentic but unusable. [Registry.IsAuthentic] says the value is a
 //     spelling of a configured capability, but something else disqualifies it:
 //     a padded or standard-alphabet spelling, a set unused trailing bit, the
-//     wrong path, the wrong method, a duplicated query field. Answer LOCALLY
+//     wrong path, the wrong method, a duplicated query field -- or the
+//     capability belongs to a key a rotation retired, which is recognised so
+//     its holder is told no here and nothing is forwarded. Answer LOCALLY
 //     with an uncacheable 404. Never proxy such a request to the public site --
 //     that would write an operator's real capability into a third party's
 //     access log, which is the leak this tier exists to prevent.
@@ -45,6 +47,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Arman2122/mtg-proxy/internal/config"
 	"github.com/Arman2122/mtg-proxy/mtglib"
 	"golang.org/x/net/idna"
 )
@@ -123,7 +126,27 @@ func (c Capability) String() string {
 // guaranteed to round-trip identically on every client. A hand-typed Unicode
 // host can be mapped differently by different client toolkit versions and then
 // derive a capability this server never computes.
+//
+// A refusal quotes the host, and the IDNA library's own error can too. The host
+// is [web] host from the config file, where a secret value may have been
+// pasted, so the refusal is passed through config.ValueFreeText: any text that
+// could spell a value is replaced (Task 10's second review, N-A), and an
+// ordinary host reads as before. It still wraps ErrInvalidHost.
 func CanonicalHost(host string) (string, error) {
+	canonical, err := canonicalHost(host)
+	if err == nil {
+		return canonical, nil
+	}
+
+	if text := config.ValueFreeText(err.Error()); text != err.Error() {
+		return "", fmt.Errorf("%w%s", ErrInvalidHost, strings.TrimPrefix(text, ErrInvalidHost.Error()))
+	}
+
+	return "", err
+}
+
+// canonicalHost is CanonicalHost before its refusal is cleaned.
+func canonicalHost(host string) (string, error) {
 	if host == "" {
 		return "", fmt.Errorf("%w: empty", ErrInvalidHost)
 	}
@@ -309,8 +332,15 @@ func decodeAnyBase64(param string) (Capability, bool) {
 
 // Registry resolves a presented bridge parameter to one of the profiles the
 // operator configured, without revealing through timing which of them matched.
+//
+// It also holds the capabilities of keys that were retired in a rotation. They
+// are recognised -- the holder of an old link gets the same local 404 as any
+// authentic-but-unusable request, instead of reaching the cover site with a
+// capability that was once valid -- and never resolved: [Registry.Lookup] and
+// [Registry.Len] see the profiles alone.
 type Registry struct {
 	capabilities []Capability
+	retired      []Capability
 }
 
 // WebSecret re-expresses a secret's key in the one form a WEB client can hold.
@@ -333,6 +363,30 @@ func WebSecret(secret mtglib.Secret) mtglib.Secret {
 // Pass secrets through [WebSecret] first unless they are already dd or plain:
 // Derive refuses an ee secret, because the client refuses one too.
 func NewRegistry(host string, secrets []mtglib.Secret) (*Registry, error) {
+	return NewRegistryWithRetired(host, secrets, nil)
+}
+
+// NewRegistryWithRetired is [NewRegistry] with the keys a rotation retired. Each
+// retired value's capability, derived from [WebSecret] of it, joins the
+// recognition scan of [Registry.IsAuthentic] and nothing else: a retired
+// capability is never a profile, so it never serves the bridge.
+//
+// Only the live list keeps NewRegistry's errors. The retired list is read from
+// a file that can hold duplicates, more than MaxProfiles values, a value equal
+// to a live one and a value that cannot be derived, and none of that makes the
+// relay unusable, so a relay must not refuse to start, or to reload, over it.
+// It is trimmed in silence instead, in the list's order:
+//   - a value that cannot be derived is skipped (an all-zero key, or a host the
+//     live list would already have refused);
+//   - a capability already in the list is dropped, so the list holds each once;
+//   - a capability equal to a live one is dropped, and the live one serves;
+//   - past MaxProfiles capabilities held, the rest are left out. The cap counts
+//     what is held, so duplicates and skipped values never use it up.
+//
+// retired is passed as the config gives it, not through [WebSecret] first: the
+// ee-to-dd re-spelling is done here, so a value in any of the three forms is
+// recognised as the WEB link its holder has.
+func NewRegistryWithRetired(host string, secrets, retired []mtglib.Secret) (*Registry, error) {
 	switch {
 	case len(secrets) == 0:
 		return nil, ErrNoProfiles
@@ -357,7 +411,47 @@ func NewRegistry(host string, secrets []mtglib.Secret) (*Registry, error) {
 		registry.capabilities = append(registry.capabilities, capability)
 	}
 
+	registry.retired = deriveRetired(host, retired, registry.capabilities)
+
 	return registry, nil
+}
+
+// deriveRetired is the retired list of a registry whose live capabilities are
+// live, trimmed as [NewRegistryWithRetired] says. It never fails. It builds a
+// set rather than comparing pairwise: the list comes from a file and is not
+// bounded by anything but its size, and building it is not on a request's path,
+// so only its cost, not its timing, matters.
+func deriveRetired(host string, retired []mtglib.Secret, live []Capability) []Capability {
+	if len(retired) == 0 {
+		return nil
+	}
+
+	seen := make(map[Capability]struct{}, len(live)+min(len(retired), MaxProfiles))
+	for _, capability := range live {
+		seen[capability] = struct{}{}
+	}
+
+	kept := make([]Capability, 0, min(len(retired), MaxProfiles))
+
+	for _, secret := range retired {
+		if len(kept) == MaxProfiles {
+			break
+		}
+
+		capability, err := Derive(WebSecret(secret), host)
+		if err != nil {
+			continue
+		}
+
+		if _, duplicate := seen[capability]; duplicate {
+			continue
+		}
+
+		seen[capability] = struct{}{}
+		kept = append(kept, capability)
+	}
+
+	return kept
 }
 
 // Len is the number of configured profiles.
@@ -400,18 +494,53 @@ func (r *Registry) Lookup(param string) (int, bool) {
 // bridge on a lenient match, which is exactly the tier boundary this method
 // exists to draw. Only [Registry.Lookup] may select a profile.
 //
-// The scan is the same non-breaking constant-time one Lookup uses.
+// The scan is the same non-breaking constant-time one Lookup uses, over the
+// live capabilities and then the retired ones: a retired capability is
+// recognised, so its holder gets the local 404 and the cover site never sees
+// it. Every capability of both lists is compared whichever one matches, or
+// none, so how long the scan takes does not say which list a value is in.
+//
+// The bound is per value: at most MaxProfiles of each list, so
+// 2 * MaxProfiles = 8,192 compares of 32 bytes for ONE credential-shaped value.
+// A request is scanned once per such value it carries (the origin stops at
+// maxCredentialAtoms = 64 of them), so at the worst a single request costs
+// 64 * 8,192 = 524,288 compares, about twice what it cost before retired
+// capabilities existed.
 func (r *Registry) IsAuthentic(param string) bool {
+	found, _ := r.authentic(param)
+
+	return found
+}
+
+// authentic is IsAuthentic that also reports how many compares the scan made.
+// The count is taken inside ctEqual, the one function that makes a compare, so
+// a scan that skips a compare skips its count: that is what lets a test assert
+// the 8,192 bound without trusting a second statement to keep step with the
+// first. A value that does not parse is refused before the scan with a count of
+// zero: that depends only on the prober's own input.
+func (r *Registry) authentic(param string) (bool, int) {
 	presented, ok := ParseCapabilityLenient(param)
 	if !ok {
-		return false
+		return false, 0
 	}
 
-	found := 0
+	found, compares := 0, 0
 
-	for _, capability := range r.capabilities {
-		found |= subtle.ConstantTimeCompare(capability[:], presented[:])
+	for i := range r.capabilities {
+		found |= ctEqual(&r.capabilities[i], &presented, &compares)
 	}
 
-	return found == 1
+	for i := range r.retired {
+		found |= ctEqual(&r.retired[i], &presented, &compares)
+	}
+
+	return found == 1, compares
+}
+
+// ctEqual is one constant-time compare of two capabilities, 1 when they are
+// equal, and it counts itself in *compares.
+func ctEqual(a, b *Capability, compares *int) int {
+	*compares++
+
+	return subtle.ConstantTimeCompare(a[:], b[:])
 }

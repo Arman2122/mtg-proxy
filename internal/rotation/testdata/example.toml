@@ -1,0 +1,843 @@
+# This is an example of the configuration file for mtg. You actually can
+# run mtg with it. It starts a proxy on all interfaces with a secret
+# ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d
+#
+# It has all possible options with default values. So, a real world
+# configuration file should contain only those options you are going to
+# use. You do not need to enumerate all of them. In other words, each
+# option here has a default value. If you comment a key-value pair, it
+# should not make any effect.
+#
+# stats is the only exception.
+#
+# A few environment variables are overlaid on top of this file (environment
+# wins), mirroring the official telegrammessenger/proxy Docker image:
+# SECRET (full ee-secret, or a bare 16-byte hex key + SECRET_HOST), TAG
+# (same as ad-tag below) and MTG_BIND_TO (comma-separated host:port list,
+# same as bind-to below). MTG_-prefixed variants take precedence. See README.
+
+# Debug starts application in debug mode. It starts to be quite verbose
+# in output. Actually, the idea is that you run it in debug mode only if
+# you have any issue.
+debug = true
+
+# A secret (required). Please remember that mtg supports only FakeTLS
+# mode, legacy simple and secured mode are prohibited. For you it means
+# that secret should either be base64-encoded or starts with ee.
+secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+
+# Host:port pair to bind the built-in management HTTP API server.
+# If not set, the API server is not started. Bind it to a loopback address
+# (127.0.0.1) unless you set api-token below, since the API can mutate secrets.
+# Endpoints:
+#   GET    /stats            per-user connection counts, traffic and quota usage
+#   POST   /reload           re-read [secrets], ad-tag, [secret-ad-tags] and [secret-limits] from this file
+#   GET    /secrets          list secrets (name, secret, host, ad_tag, effective_ad_tag, quota/expiry/disabled/speed_limit/ip_limit)
+#   GET    /secrets/{name}   one entry of that list, by name
+#   POST   /secrets          add/update one secret: {"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?}
+#   PUT    /secrets          replace the whole set: {"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?,ip_limit?}},"ad_tag"?}
+#                            (both also take speed_up, speed_down, client_conns, client_speed and client_fair)
+#   DELETE /secrets/{name}   remove one secret
+#   POST   /secrets/{name}/reset-quota   zero the secret's used-bytes counter
+#   GET    /secrets/{name}/external-ips  the user's address view: ip_limit, active_ips (+ addresses with track-client-ips)
+#   PUT    /secrets/{name}/external-ips  {"ips":[...],"ttl":"90s"}: addresses the user holds on other systems, counted here until ttl
+#   DELETE /secrets/{name}/external-ips  clear that report
+#   GET    /secrets/{name}/clients?limit=N  per-address usage, most bytes first (addresses only with track-client-ips)
+#   POST   /secrets/{name}/bans  {"ips":[...],"ttl":"1h","force":false}: refuse those addresses this secret, in memory, until ttl
+#   GET    /secrets/{name}/bans  the secret's bans (addresses only with track-client-ips)
+#   DELETE /secrets/{name}/bans/{address}  lift one ban; an IPv6 ban may be named by its /64
+#   GET    /adtag            read the global ad-tag: {"ad_tag": "<hex>"|null}
+#   PUT    /adtag            set the global ad-tag: {"ad_tag":"<32 hex chars>"}
+#   DELETE /adtag            clear the global ad-tag
+# Note: direct API mutations are in-memory only; a later POST /reload (or a
+# restart) re-reads this file and overrides them.
+# api-bind-to = "127.0.0.1:9090"
+
+# Optional bearer token guarding EVERY API endpoint above. When set, requests
+# must carry "Authorization: Bearer <token>". When unset (default), the API is
+# unauthenticated and relies on the loopback bind above.
+# api-token = "change-me"
+
+# Telegram advertising tag (ad_tag / proxy tag). When set, matching clients are
+# routed through Telegram middle proxies so a sponsored channel appears at the
+# top of their chat list. Register your proxy with @MTProxybot to obtain a tag;
+# it is a 32-character hex string (16 bytes). Requires public-ipv4/public-ipv6
+# (below) to be reachable. Applies to every secret unless overridden in
+# [secret-ad-tags]. Leave unset to connect directly to the DCs (no advertising).
+# ad-tag = "0123456789abcdef0123456789abcdef"
+
+# Host:port pair(s) to run proxy on (required).
+# The host part must be a literal IP address; hostnames and "*" are rejected.
+#   - IPv4 only:
+#     "0.0.0.0:3128"
+#   - dual-stack (IPv4 + IPv6) on Linux, macOS, FreeBSD, Windows:
+#     "[::]:3128"
+# A single address (string) for backwards compatibility:
+bind-to = "0.0.0.0:3128"
+# Or an array to listen on multiple addresses at once:
+# bind-to = ["127.0.0.1:443", "[::1]:443"]
+
+# Additional listeners for the pre-FakeTLS secret forms. This section is purely
+# additive: bind-to above is never replaced and always serves FakeTLS only, so a
+# config written for this feature still runs on an older mtg-proxy (which ignores
+# unknown TOML keys) -- it just loses the extra listener.
+#
+# The intended consumer is Telegram's own WEB proxy front-end
+# (github.com/telegramdesktop/tproxy-server), whose backend address is restricted
+# to loopback. It speaks plain TCP obfuscated2 to its backend and accepts only
+# 16-byte and 17-byte-0xdd secrets, so this is what makes mtg-proxy a drop-in
+# replacement for stock MTProxy behind it.
+#
+# There is deliberately no way to accept dd or plain on the bind-to port: a
+# listener that answers obfuscated2 is fingerprintable as an MTProto proxy, and
+# that has to be an explicit stanza, not a one-token edit.
+#
+# [[listener]] is an array of TABLES: every top-level key that follows it belongs
+# to the listener, not to the global scope. Uncommenting the block where it
+# stands would silently swallow proxy-protocol-listener, concurrency and
+# everything else below. Move it down to just above [secrets] instead.
+#
+# [[listener]]
+# # Required. Host must be a literal IP.
+# bind-to = "127.0.0.1:2398"
+#
+# # Required. Non-empty subset of ["dd", "plain"]. "ee" is not accepted here.
+# #   dd    - honours 0xdddddddd (padded-intermediate) only.
+# #   plain - honours 0xdddddddd, 0xeeeeeeee and 0xefefefef. A bare 16-byte
+# #           secret places no constraint on the client's transport: tdlib sends
+# #           intermediate, Telegram Desktop and iOS send abridged, and any of
+# #           them may pick padded-intermediate.
+# accept = ["dd", "plain"]
+#
+# # Required when bind-to above is not a loopback address. It is your
+# # acknowledgement that this port answers obfuscated2 in the clear.
+# # public = false
+#
+# # Expect a PROXY protocol header on THIS listener. Independent of the
+# # top-level proxy-protocol-listener, which applies to bind-to only.
+# #
+# # For a [web] backend this is the setting that decides whether the browser's
+# # real address reaches the proxy: mtg-proxy's own relay reads this stanza and
+# # sends a header only when it says true. Leave it false and every WEB user is
+# # 127.0.0.1 here -- the blocklist stops matching and the per-IP limits stop
+# # counting, with nothing in a log to say so. Telegram's own tproxy-server
+# # sends no header at all, so leave it false if that is your relay.
+# # proxy-protocol = false
+#
+# # What to do with a connection no secret matches (also: unhonoured transport,
+# # rate-limited peer, replayed frame, disabled/expired/over-quota user -- all
+# # take the same exit, so none is distinguishable from the others).
+# #   close - close immediately. The default, and the right answer on loopback.
+# #   drain - read and discard, bounded to 8 KiB / 20 seconds, then close. For a
+# #           public listener, where a socket that neither answers nor hangs up
+# #           is less distinctive than a prompt reset.
+# # This listener never domain-fronts: it does not speak TLS, so relaying a probe
+# # to an HTTPS cover site would pipe a TLS alert back out of a plaintext port.
+# # on-unknown-secret = "close"
+#
+# # Failed-handshake budget per client IP, per second (burst 2x), minimum 1.
+# # Armed only when public = true: behind a loopback carrier every connection
+# # presents 127.0.0.1, so a per-IP bucket there is one shared bucket an attacker
+# # empties for every legitimate user -- a self-DoS, not a defence. That is also
+# # how you turn it off: leave public unset.
+# # handshakes-per-ip = 30
+
+# The WEB proxy relay: the transport Telegram Desktop 7.1 added, where the
+# client loads a page from your hostname inside its own WebView and carries
+# MTProto over a WebSocket from there.
+#
+# It is served by a SEPARATE PROCESS of this binary, reading this same file:
+#
+#     mtg-proxy web-relay /etc/mtg-proxy/config.toml
+#
+# The proxy ignores this table entirely, so an unusable [web] block cannot stop
+# the MTProto port. Check it on its own with `web-relay --check`.
+#
+# Requires a real hostname with a browser-trusted certificate on 443 and a
+# client on Telegram Desktop 7.1.2 or later. There is no FakeTLS here: a WEB
+# client refuses an ee secret before it opens a socket, so `mtg-proxy access`
+# prints the dd spelling of the same key for these links.
+#
+# [web] is a TABLE, so like [[listener]] every top-level key after it belongs to
+# it. Put it just above [secrets], with the listener it names.
+#
+# [web]
+# # Off unless this is true. The relay refuses to start without it.
+# enabled = true
+#
+# # Required. The hostname a client types, and the name its capability is
+# # derived over -- changing it invalidates every WEB link ever issued, exactly
+# # like changing an ee secret's fronting domain. Must be a bare name with a
+# # public certificate: no scheme, no port, no IP literal, no localhost.
+# host = "web.example.com"
+#
+# # Required. Where the relay listens for the front proxy. Loopback on a host
+# # install; inside a container it must be reachable from the front proxy, so
+# # 0.0.0.0 with the port unpublished.
+# bind-to = "127.0.0.1:8099"
+#
+# # Required. Must name a [[listener]] above that accepts "dd". That stanza also
+# # decides whether the relay sends a PROXY header, so the two processes cannot
+# # disagree about what the socket between them speaks.
+# backend = "127.0.0.1:2398"
+#
+# # Required. 32 bytes, mode 0600, from `mtg-proxy generate-web-key <path>`.
+# # Never generated at startup: a key invented on a missing file works until the
+# # first restart and then hands this relay's own live tokens to the cover site.
+# token-key = "/etc/mtg-proxy/web.key"
+#
+# # Required: exactly one. The hostname must serve a plausible website to
+# # everyone who is not a Telegram client, and no default ships -- a starter
+# # page many operators installed would be a better signature than anything the
+# # protocol leaks. cover-dir serves a directory; cover-upstream reverse-proxies
+# # an application. Listings are always off.
+# cover-dir = "/srv/site"
+# # cover-upstream = "http://127.0.0.1:8080"
+
+# The relay's own counters, on a socket of their own: sessions, streams, bytes,
+# and why requests were refused. Empty (the default) means no stats server.
+#
+# MUST be a loopback address, and the relay refuses to start otherwise. This
+# endpoint answers, with no credential at all, how many sessions are live and
+# how many bytes have moved -- exactly the traffic analysis this transport
+# exists to deny -- so publishing it would undo the point of running it.
+#
+# Deliberately NOT a path on bind-to above: that socket is published to the
+# internet by the front proxy, and everything on it without a credential the
+# relay minted is answered by the cover site. A real endpoint there would be a
+# fingerprint no matter how it was gated.
+#
+#   curl http://127.0.0.1:8100/stats
+#
+# stats-bind-to = "127.0.0.1:8100"
+#
+# # How the relay learns the browser's address. There is no fallback to the
+# # socket: behind a front proxy that is loopback for every user alive.
+# #   proxy-protocol  - a PROXY header from the front proxy. The default, and
+# #                     REQUIRED once chosen: a connection without one is
+# #                     refused rather than silently attributed to the loopback.
+# #   x-forwarded-for - the right-most entry, and only from a loopback peer.
+# # client-ip = "proxy-protocol"
+#
+# # Ceilings. Both may only be LOWERED: the client has these compiled in and
+# # learns nothing from the handshake, so a larger value breaks interop with no
+# # error anywhere. The published reason to lower the first is a deployment
+# # still serving Linux Desktop builds from before the 2 MiB message cap.
+# # max-frame-payload = "512kib"
+# # carrier-batch-bytes = "2mib"
+#
+# # Ceilings on concurrency. Defaults shown.
+# # max-sessions = 1024
+# # max-streams = 512
+
+# This defines what types of traffic mtg listens to. If you are not sure,
+# then definitely keep it disable. Enable it only and only if incoming traffic
+# is coming from some sort of load-balancer like HAProxy or ELB.
+# https://www.haproxy.org/download/2.3/doc/proxy-protocol.txt
+#
+# mtg uses a library that supports v1 and v2 versions of ProxyProtocol.
+# default value is false.
+# proxy-protocol-listener = false
+
+# Defines how many concurrent connections are allowed to this proxy.
+# All other incoming connections are going to be dropped.
+concurrency = 8192
+
+# Sometimes you want to enforce mtg to use some types of
+# IP connectivity to Telegram. We have 4 modes:
+#   - prefer-ipv6:
+#     We can use both ipv4 and ipv6 but ipv6 has a preference (default)
+#   - prefer-ipv4:
+#     We can use both ipv4 and ipv6 but ipv4 has a preference
+#   - only-ipv6:
+#     Only ipv6 connectivity is used
+#   - only-ipv4:
+#     Only ipv4 connectivity is used
+prefer-ip = "prefer-ipv6"
+
+# Public IP addresses of this server. Used by 'mtg access' to generate
+# proxy links, by 'mtg doctor' to validate SNI-DNS match, and — when ad-tag is
+# set — as this proxy's own address in the middle-proxy RPC handshake and
+# RPC_PROXY_REQ. Set them if the server sits behind NAT/is multi-homed or if
+# ifconfig.co is unreachable from your server.
+# public-ipv4 = "1.2.3.4"
+# public-ipv6 = "2001:db8::1"
+
+# If this setting is set, then mtg will try to get proxy updates from Telegram
+# Usually this is completely fine to have it disabled, because mtg has a list
+# of some core proxies hardcoded.
+auto-update = false
+
+# FakeTLS uses domain fronting protection. So it needs to know a port to
+# access.
+#
+# Deprecated: use [domain-fronting] configuration block. If relevant option
+# is defined there, this one would be ignored.
+# domain-fronting-port = 443
+
+# By default, mtg resolves the fronting hostname (from the secret) via DNS
+# to establish a TCP connection. If DNS resolution of that hostname is blocked,
+# you can specify an IP address to connect to directly. The hostname is still
+# used for SNI in the TLS handshake.
+#
+# default value is not set (DNS resolution is used).
+#
+# Deprecated: use [domain-fronting] configuration block. If relevant option
+# is defined there, this one would be ignored.
+# domain-fronting-ip = "10.0.0.10"
+
+# This makes a communication between both fronting website and mtg to use
+# proxy protocol.
+#
+# Deprecated: use [domain-fronting] configuration block. If relevant option
+# is defined there, this one would be ignored.
+# domain-fronting-proxy-protocol = false
+
+# FakeTLS can compare timestamps to prevent probes. Each message has
+# encrypted timestamp. So, mtg can compare this timestamp and decide if
+# we need to proceed with connection or not.
+#
+# Sometimes time can be skewed so we accept all messages within a
+# time range of this parameter.
+#
+# Default value is 3s
+tolerate-time-skewness = "5s"
+
+# Telegram has a concept of DC. You can think about DC as a number of a cluster
+# with a certain purpose. Some clusters serve media, some - messages, some rule
+# channels and so on. But sometimes unknown DC number is requested by client.
+# It could be a bug or some global reconfiguration of the Telegram.
+#
+# By default, proxy rejects such requests. But it is also possible to fallback
+# this request to any DC. Telegram works in a way that any DC is able to serve
+# any request but sacrificing a latency.
+#
+# If this setting is disabled (default), mtg will reject a connection.
+# Otherwise, chose a new DC.
+allow-fallback-on-unknown-dc = false
+
+# Report per-user client addresses on GET /stats: "connected_ips", the distinct
+# addresses holding a live connection right now, and "last_ip", the address of
+# the most recent admitted connection.
+#
+# Off by default, and that default is deliberate rather than cautious. This is a
+# circumvention proxy: the people using it are often the reason it exists, and
+# an operator's answer to "who connected from where" is also the answer to
+# whoever takes the server. "connected_ips" costs no new retention -- those
+# addresses are already held for the life of the connection and vanish with it
+# -- but "last_ip" outlives the connection it came from, so a deployment that
+# never asks for either never accumulates one.
+#
+# With it on, every secret's addresses are also kept in memory, with what each
+# moved, until ten minutes after its last connection, and listed by
+# GET /secrets/{name}/clients for up to about eleven minutes (see the per-address
+# controls under [secret-limits] below).
+#
+# Nothing here is written to disk in any form: usage-state-file below persists
+# quota counters only, so no address survives a restart.
+#
+# Behind a front proxy this reports what the PROXY header said, which is the
+# client's real address -- see proxy-protocol-listener and the per-listener
+# proxy-protocol option.
+# track-client-ips = false
+
+# Path of a JSON file where per-secret data-quota usage is persisted so it
+# survives restarts (see [secret-limits] below). When unset (default), quota
+# accounting is in-memory only and resets when the process restarts. The file is
+# rewritten atomically every ~30s and on shutdown.
+# usage-state-file = "/var/lib/mtg/usage.json"
+
+# For multi-user support, use the [secrets] section instead of "secret".
+# Each key is a user name, used for per-user stats tracking.
+# Secrets may use different hostnames for per-user domain fronting.
+#
+# IMPORTANT: [secrets] must appear after all global keys (like bind-to,
+# api-bind-to) — in TOML, keys after a [section] belong to that table.
+[secrets]
+alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+bob = "ee0123456789abcdef0123456789abcd9573746f726167652e676f6f676c65617069732e636f6d"
+
+# Optional per-secret advertising tag overrides. Each key is a secret name from
+# [secrets] and each value is a 32-character hex (16-byte) ad_tag. A secret
+# listed here uses its own tag instead of the global ad-tag; a secret not listed
+# falls back to the global ad-tag (if any). Register each host:port + secret in
+# @MTProxybot separately to get a distinct tag.
+# [secret-ad-tags]
+# bob = "fedcba9876543210fedcba9876543210"
+
+# Optional per-secret governance limits: a data quota, a speed limit, an expiry
+# deadline and a disabled switch. Each [secret-limits.<name>] names a secret
+# from [secrets]. A secret without an entry is unlimited in both senses, never
+# expires and is enabled.
+#
+# When a user is over quota, past its expiry, or disabled, new connections are
+# transparently routed to the fronting domain (exactly like a wrong secret), so
+# the outcome is indistinguishable to a prober. A quota is a ceiling: the stream
+# that reaches it ends at that byte and the user's next connection is refused.
+# Disabling or expiring a secret closes its live connections, at once on reload
+# or through the API and within five seconds when the clock passes the expiry.
+# Every key in this file that the binary does not know is logged as a warning
+# at startup and on reload, and listed by `mtg-proxy doctor`.
+#
+# Fields (all optional):
+#   quota        max relayed bytes; human sizes ("10GB", "500MiB") or a bare
+#                integer byte count; omit for unlimited
+#   quota-reset  "none" (default, lifetime cap) or "monthly" (reset each month)
+#   expires      RFC3339 ("2026-12-31T00:00:00Z") or date ("2026-12-31"); omit
+#                for never
+#   disabled     true to reject the secret without removing it (default false)
+#   speed        sustained throughput cap, upload and download combined, shared
+#                by every connection and every door of this user: "5mbit",
+#                "500kbit", "1MB/s" (bits are decimal, bytes are base 2, "/s"
+#                is optional). Minimum 64kbit. Omit for unlimited. Enforced by
+#                the proxy, which is the only hop that knows which user a byte
+#                belongs to; live connections follow a change on reload.
+#   ip-limit     how many places this user may be at once: an integer, omit or
+#                0 for unlimited. A place is an IPv4 address or an IPv6 /64, and
+#                counts once however many connections it holds. A connection
+#                from a new place is refused (closed, not fronted) while the
+#                user is at the limit; lowering it never drops open connections.
+#                A panel may report the user's addresses on other systems via
+#                PUT /secrets/{name}/external-ips so one limit spans them all.
+#   client-conns, client-speed, client-fair
+#                per-address controls inside one secret; see the last example
+#                block below.
+#
+# Set usage-state-file above so quota usage survives restarts. Limits set via
+# the management API are in-memory only and are overridden by the next reload.
+#
+# IMPORTANT: like [secrets] and [secret-ad-tags], [secret-limits] must appear
+# after all global keys — in TOML, keys after a [section] belong to that table.
+# [secret-limits.alice]
+# quota = "10GB"
+# speed = "5mbit"
+# ip-limit = 2
+# quota-reset = "monthly"
+# expires = "2026-12-31"
+# disabled = false
+# [secret-limits.bob]
+# quota = "500MB"
+#
+# Per-address controls, for a secret many people share. All optional, all off
+# by default. An address is an IPv4 address or an IPv6 /64. Loopback and private
+# addresses do not stand for one place: they, and any address the per-address
+# table has no room for, share one "rest" entry per secret, which is never
+# capped and has no ceiling. One address may be many people behind a carrier's
+# NAT. Behind a PROXY-protocol listener the address is whatever the header says,
+# and anyone who can reach that listener can forge it; the proxy warns about
+# that at start. The table name must be a secret in [secrets]. See the
+# Configuration and Security pages of the wiki.
+# [secret-limits.shared]
+# speed = "50mbit"
+# ip-limit = 30
+# # Live connections one address may hold to this secret; omit or 0 for no cap.
+# client-conns = 16
+# # A ceiling on one address, both directions together; spelled like speed.
+# client-speed = "10mbit"
+# # Divide this secret's speed among its addresses; needs speed, speed-up or speed-down.
+# client-fair = true
+
+# This section is relevant to communication with fronting domain. Usually
+# you do not need to setup anything here but there are plenty of cases, especially
+# if you put mtg behind load balancer, when some specific configuration is
+# required.
+[domain-fronting]
+# By default, mtg resolves the fronting hostname (from the secret) via DNS
+# to establish a TCP connection. If that resolution is blocked, or loops
+# back to this server (e.g. mtg sits behind an SNI router whose DNS points
+# at itself), override the destination here.
+#
+# Use `host` — accepts a hostname or a literal IP. Hostnames are resolved
+# at dial time, so a dual-stack DNS record can reach the right backend
+# address family for IPv4 or IPv6 clients.
+#
+# The hostname from the secret is still used for SNI in the TLS handshake.
+#
+# default value is not set (the secret's hostname is used).
+# host = "fronting-backend"
+
+# Deprecated: use `host`. If `ip` is set, mtg logs a warning at startup
+# and ignores the value (domain-fronting falls back to the secret's
+# hostname unless `host` is also set).
+# ip = "10.10.10.11"
+
+# FakeTLS uses domain fronting protection. So it needs to know a port to
+# access. Default value is 443
+# port = 443
+
+# This makes a communication between both fronting website and mtg to use
+# proxy protocol.
+# proxy-protocol = false
+
+# network defines different network-related settings
+[network]
+# please be aware that mtg needs to do some external requests. For
+# example, if you do not pass public ips, it will request your public ip
+# address from some external service.
+#
+# As for 2.0, if you set a public-ip on your own, mtg won't issue any
+# network requests except of those required for Telegram.
+#
+# so, in order of doing them, it needs to do DNS lookup. mtg ignores DNS
+# resolver of the operating system and uses DOH instead. This is a host
+# it has to access.
+#
+# By default we use Cloudflare.
+#
+# DEPRECATED option:
+#  If dns option is specified, it will be used instead. No default is defined
+#  anymore. But if you set this option, this is literally the same providing
+#  https:// URL to `dns`.
+#
+#  In other words:
+#
+#    doh-ip = "1.1.1.1"
+#
+# is literally the same as
+#
+#    dns = "https://1.1.1.1"
+# doh-ip = "1.1.1.1"
+
+# Starting from mtg v2.1.12 we have changed a configuration for DNS. Now it
+# supports DNS-over-HTTPS, DNS-over-TLS, custom UDP resolver and system
+# resolver.
+#
+# Here is how to define DNS-over-HTTPS:
+#  - https://1.1.1.1
+#  - https://1.1.1.1/dns-query
+#  - https://cloudflare-dns.com/dns-query
+#  - https://cloudflare-dns.com
+#
+# Here is how to define DNS-over-TLS:
+#  - tls://1.1.1.1
+#  - tls://cloudflare-dns.com
+#
+# Here is how to define a custom UDP resolver (we support only IPs here)
+#  - 1.1.1.1
+#  - udp://1.1.1.1
+#
+# If you set it to empty string, default resolver will be used.
+# But please comment out doh-ip
+dns = "https://1.1.1.1"
+
+# mtg can work via proxies (for now, we support only socks5). Proxy
+# configuration is done via list. So, you can specify many proxies
+# there.
+#
+# Actually, if you supply an empty list, then no proxies are going to be
+# used. If you supply a single proxy, then mtg will use it exclusively.
+# If you supply >= 2, then mtg will load balance between them.
+#
+# If you add an empty string here, this is an equivalent of 'plain network',
+# with no proxy usage.
+#
+# Proxy configuration is done via ordinary URI schema:
+#
+#     socks5://user:password@host:port
+#
+# Only socks5 proxy is used. user/password is optional. As you can
+# see, you can specify some parameters in GET query. These parameters
+# configure circuit breaker.
+proxies = [
+    # "socks5://user:password@host:port"
+]
+
+# network timeouts define different settings for timeouts. tcp timeout
+# define a global timeout on establishing of network connections. idle
+# means a timeout on pumping data between sockset when nothing is
+# happening.
+[network.timeout]
+tcp = "5s"
+http = "10s"
+idle = "5m"
+handshake = "10s"
+
+# TCP_NOTSENT_LOWAT (bytes) caps the amount of *unsent* data that the
+# kernel buffers per outbound socket. When the not-yet-sent backlog drops
+# below this threshold the socket becomes writable again, which applies
+# back-pressure to mtg's relay loop instead of letting kernel buffers
+# bloat. This reduces per-connection memory and bufferbloat, but on
+# high-BDP links (fast pipe × high RTT) it can cap single-flow upload
+# throughput at roughly value / RTT.
+#
+# Default is 128kib (good for interactive latency). If uploads through
+# the proxy feel slow on a fast link, raise this to 1mib–4mib. Suffixes
+# follow the same scheme as anti-replay max-size (kib, mib, gib).
+# Only applies to Linux and Darwin; ignored on other platforms.
+# tcp-not-sent-lowat = "128kib"
+
+# this defines a configuration for TCP keep alives. Default values are taken
+# from Golang default behavior.
+[network.keep-alive]
+disabled = false
+# idle means a time period after which we start sending TCP Keep Alive probes
+idle = "15s"
+# interval is a period between 2 consecutive probes
+interval = "15s"
+# if we miss that many probes, a connection will be considered as a dead one.
+count = 9
+
+# mtg has to mimic real websites. It does not mean domain fronting, it also
+# means that traffic characteristics should be similar to real world traffic.
+# websites and applications behave differently, their traffic patterns are also
+# different. Applications do bursts of RPC-style messages (or JSON communication,
+# does not really matter), while websites pump heavy content in HTTP2 streams
+#
+# It means that statistically there is a different between traffic shape:
+# delays between packets are also different.
+# In order to avoid censorship detection based on these patterns, there is a
+# mtg subsystem called "Doppelganger" that aims to mimic website statistics
+# as close as it could.
+#
+# Delays between TLS packets are not constant. There are many factors
+# that come in play. Application should generate some response, it could
+# send some headers first and stream content with chunked encoding. So
+# some first packets could come as soon as possible, with some delays
+# after first ones. Such phenomenon is described by different statistic
+# distribution. There are 2 distribution that describe it: lognormal
+# distribution and Weibul distribution. Lognormal is all about steady streams
+# of heavy content like a video. Weibul is great about short bursts like
+# user who requested a static page an a couple of images.
+[defense.doppelganger]
+# This is a list of URLs that would be crawled by mtg to approximate delay
+# statistics. They MUST be HTTPS urls.
+#
+# You can come to the website and collect different URLs, with light and
+# heavy content. We recommend to search for CDNs.
+urls = [
+    # "https://st-ok.cdn-vk.ru/res/react/vendor/clsx-2.1.1-amd.js"
+]
+# With no urls, the cover sites your ee secrets name are fetched instead
+# (https://<host>/, through the address domain fronting would dial), to size
+# the fake handshake's certificate record like the real site's. Only that size
+# is taken: record timing keeps the built-in model. "false" makes no such
+# requests, and handshakes use a generic size.
+# scout-covers = true
+# A collection is done in raids. Each raid makes this number of requests to
+# each URL in this list, or to each cover site. Do not use a huge number, 10
+# is probably ok.
+repeats-per-raid = 10
+# This is a duration between each raid. It makes no sense to have a small number
+# here as you would start to make a noticeable activity. Usually traffic patterns
+# do not change a lot, so do not expect different results if you request
+# each 10 minutes.
+raid-each = "6h"
+# This enables dynamic tls record sizing.
+#
+# Some modern stacks and platforms start to use the technique that is called
+# DRS. They start with small TLS packets and ramp up eventually. First packets
+# are usually about MTU size, after that we get 4k and eventually max size.
+# This is done with a good intention: to minimize a time to the first byte,
+# so application could start doing something with the data right after first
+# RTT.
+#
+# Apparently, about 90% of application do not employ this technique, they use
+# max size always: nginx, apache, java stuff. But Golang tools, angie and
+# some specific patches activate this technique.
+#
+# In order to mimic a real website we need to know something about software
+# it uses. Usually nobody cares: openssl does 16384, Python does it, nginx
+# does it. So this setting is disabled by default.
+#
+#      https://blog.cloudflare.com/optimizing-tls-over-tcp-to-reduce-latency/
+#      https://aws.github.io/s2n-tls/usage-guide/ch08-record-sizes.html
+#      https://github.com/cloudflare/sslconfig/blob/master/patches/nginx__dynamic_tls_records.patch
+drs = false
+# How the doppelganger spaces the TLS records it writes to ee clients.
+#
+# "record" (the default) waits a delay drawn from the statistics above before
+# EVERY record. Those statistics describe a web page's records, so a bulk
+# download -- a video, a large file -- is paced like a page too: about 20 Mbit/s
+# per connection with the built-in statistics.
+#
+# "burst" waits one such delay when a connection wakes from idle (nothing sent
+# for a second) and then sends records back to back, the way a server streams
+# a response, leaving the pace to TCP. Downloads run at the speed of the link.
+# Each record's size is drawn the same way in both -- 16 KiB, or the drs ramp
+# -- and both send a shorter record when less is waiting than was drawn. With
+# no wait before each record less has piled up, so "burst" sends more of
+# those short records.
+#
+# "burst" is being canaried: it changes timing a censor can observe, so it
+# becomes the default only after it has run on real networks without
+# connections being blocked.
+# shaping = "record"
+
+# The ee handshake budget. A client proves it holds a secret with one HMAC, and
+# the proxy does not know which secret that is, so it tries the hosted ee
+# secrets in turn: a hello that matches nothing costs one HMAC per hosted
+# secret, and a hello can be made up to 64 KiB long. This table bounds that work
+# in real CPU, so that thousands of secrets are not a cheap way to burn a core.
+#
+# It is ON by default, with the values below: a config without this table gets
+# them, so uncomment it only to change something. It is read once at start. A
+# POST /reload re-reads the secrets, not this table.
+#
+# A scan the budget can pay for within 150 ms waits for it and runs; one it
+# cannot pay for is fronted at once to the cover site, with the same bytes a
+# wrong secret gets -- never closed. A hello larger than 128 SHA-256 blocks
+# (about 8 KiB; a real client sends 0.5 to 2 KiB) is, in "enforce" mode, never
+# scanned at all and is fronted the same way. When hints are on (see hints
+# below: they follow track-client-ips), a client whose address matched a secret
+# recently is tried against that secret first and skips the scan. A legitimate
+# client with no such hint can therefore be fronted while a flood keeps the
+# budget spent; it retries.
+#
+# The budget bounds the proxy's CPU; it does not make an attack expensive. To
+# keep the process-wide bucket empty an attacker needs about
+# (cpu-percent/100 x GOMAXPROCS x 1e9 / ns_per_block) / (candidates x 12)
+# unmatched 517-byte hellos a second (candidates: the hosted ee secrets, less
+# duplicate keys and any already tried as hints): about 60 a second on 2 cores
+# at 340 ns a block with 2,000 secrets, where saturating the CPU used to take
+# about 240. That is the figure for 517-byte hellos, not the minimum: a hello
+# under 12 blocks is charged as 517 bytes, so about 60 a second of roughly 100
+# bytes do the same, and one near the 128-block cap (about 8 KiB) costs about
+# ten times as much, so about 6 a second do. So "enforce" deliberately makes
+# locking out clients WITHOUT a hint cheaper to cause than CPU exhaustion was,
+# and in exchange keeps the relays, the data path and every hinted client up
+# while an attack lasts. Hints follow track-client-ips (or set hints below);
+# behind a loopback or private carrier that sends no PROXY header there are no
+# hints at all. "observe" below is how to see whether any of this touches your
+# users before you enforce. See the Security and Configuration pages of the
+# wiki.
+#
+# [defense.handshake-budget]
+# # "enforce" (the default) acts on the budget as described above.
+# # "observe" keeps the same accounting but never waits and never refuses: it
+# # counts what "enforce" would have refused, and how many of those hellos then
+# # matched a real secret (over_budget_matched on GET /stats). Run it first, and
+# # switch to "enforce" once that number stays near zero.
+# # "off" has no budget and no scan cap.
+# mode = "enforce"
+#
+# # Scan CPU one client address (an IPv4 address, or an IPv6 /64) may spend per
+# # second, in milliseconds; 0 to 1000. Burst: four seconds' worth. 0 turns the
+# # per-address bucket off and leaves only the process-wide one below. Loopback
+# # and private addresses have no bucket of their own either way, so behind a
+# # front proxy that connects from one of those without sending a PROXY header,
+# # every client shares the process-wide bucket. Behind one on a PUBLIC address
+# # without PROXY protocol, every client lands in that one address's bucket:
+# # set 0 there.
+# #
+# # The per-address bucket holds an address (IPv4, or IPv6 /64) as the key to a
+# # token count and the time it was last charged -- no secret name. An address
+# # gets a bucket on its first granted scan, and it is held in process memory for
+# # 30 to 60 minutes after the last hello from it that reached the budget (a
+# # refused hello only refreshes a bucket it already has); the bucket is never
+# # logged, exported or written to disk, and per-ip-ms = 0 or mode = "off" keeps
+# # none. It is not governed by track-client-ips or hints.
+# per-ip-ms = 50
+#
+# # The share of the cores (GOMAXPROCS, read at start) the whole process may
+# # spend scanning; 1 to 100. Burst: one second's worth. This is the bound that
+# # holds against many addresses and against forged ones.
+# cpu-percent = 25
+#
+# # Remember which secrets a client address matched, and try them first. The
+# # cache holds address -> secret name in memory for 30 to 60 minutes after the
+# # last successful handshake; it is never logged, exported or written to disk.
+# # Left out, this follows track-client-ips: on exactly when you have already
+# # chosen to keep client addresses beyond their connection. true or false
+# # overrides that either way.
+# # hints = true
+
+# Some countries do active probing on Telegram connections. This technique
+# allows to protect from such effort.
+#
+# mtg has a cache of some connection fingerprints. Actually, first bytes
+# of each connection. So, it stores them in some in-memory LRU+TTL cache.
+# You can configure this cache here.
+[defense.anti-replay]
+# On by default: a config without this table still refuses replays. Only
+# "enabled = false" turns it off. It costs about max-size of memory, and at
+# error-rate 0.001 about one genuine connection attempt in a thousand is
+# taken for a replay and sent to the cover site; the client retries.
+enabled = true
+# max size of such a cache. Please be aware that this number is
+# approximate we try hard to store data quite dense but it is possible
+# that we can go over this limit for 10-20% under some conditions and
+# architectures.
+max-size = "1mib"
+# we use stable bloom filters for anti-replay cache. This helps
+# to maintain a desired error ratio.
+error-rate = 0.001
+
+# You can protect proxies by using different blocklists. If client has
+# ip from the given range, we do not try to do a proper handshake. We
+# actually route it to fronting domain. So, this client will never ever
+# have a chance to use mtg to access Telegram.
+#
+# Please remember that blocklists are initialized in async way. So,
+# when you start a proxy, blocklists are empty, they are populated and
+# processed in backgrounds. An error in any URL is ignored.
+[defense.blocklist]
+# You can enable/disable this feature.
+enabled = true
+# This is a limiter for concurrency. In order to protect website
+# from overloading, we download files in this number of threads.
+download-concurrency = 2
+# A list of URLs in FireHOL format (https://iplists.firehol.org/)
+# You can provider links here (starts with https:// or http://) or
+# path to a local file, but in this case it should be absolute.
+#
+# NOTE: the default list below (firehol_level1.netset) includes bogon
+# networks, and therefore RFC1918 ranges as well (10.0.0.0/8,
+# 172.16.0.0/12, 192.168.0.0/16). If you run mtg on a home/LAN network
+# and connect from a client on the same LAN, that client will be
+# rejected with "ip was blacklisted" and the connection dropped (TCP
+# close, no response). If you see this, you can either disable this section
+# (enabled = false), replace firehol_level1 with a narrower list that
+# does not include bogons (e.g. firehol_abusers_1d), or connect via
+# a public IP/domain with hairpin NAT on your router. See README for
+# details.
+urls = [
+    "https://iplists.firehol.org/files/firehol_level1.netset",
+    # "/local.file"
+]
+# How often do we need to update a blocklist set.
+update-each = "24h"
+
+# Allowlist is an opposite to a blocklist. Only those IPs that are coming from
+# subnets defined in these lists are allowed. All others will be rejected.
+#
+# If this feature is disabled, then there won't be any check performed by this
+# validator. It is possible to combine both blocklist and whitelist.
+[defense.allowlist]
+# You can enable/disable this feature.
+enabled = false
+# This is a limiter for concurrency. In order to protect website
+# from overloading, we download files in this number of threads.
+download-concurrency = 2
+# A list of URLs in FireHOL format (https://iplists.firehol.org/)
+# You can provider links here (starts with https:// or http://) or
+# path to a local file, but in this case it should be absolute.
+urls = [
+    # "https://iplists.firehol.org/files/firehol_level1.netset",
+    # "/local.file"
+
+]
+update-each = "24h"
+
+# statsd statistics integration.
+[stats.statsd]
+# enabled/disabled
+enabled = false
+# host:port for UDP endpoint of statsd
+address = "127.0.0.1:8888"
+# prefix of metric for statsd
+metric-prefix = "mtg"
+# tag format to use
+# supported values are 'datadog', 'influxdb' and 'graphite'
+# default format is graphite.
+tag-format = "datadog"
+
+# prometheus metrics integration.
+[stats.prometheus]
+# enabled/disabled
+enabled = true
+# host:port where to start http server for endpoint
+bind-to = "127.0.0.1:3129"
+# prefix of http path
+http-path = "/"
+# prefix for metrics for prometheus
+metric-prefix = "mtg"

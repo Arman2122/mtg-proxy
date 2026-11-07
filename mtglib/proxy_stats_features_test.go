@@ -47,8 +47,8 @@ func TestStatsFeatures(t *testing.T) {
 			[]string{
 				FeatureClientBans, FeatureClientIPActivity, FeatureClientIPs, FeatureClientLimits, FeatureClientStats,
 				FeatureFakeTLS, FeatureHandshakeBudget, FeatureIPLimits, FeatureKick, FeatureListeners,
-				FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretsAPI,
-				FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
+				FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretRotation,
+				FeatureSecretsAPI, FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
 	})
@@ -75,6 +75,7 @@ func TestStatsFeatures(t *testing.T) {
 		assert.Equal(t, "client-ip-activity", FeatureClientIPActivity)
 		assert.Equal(t, "quota-ceiling", FeatureQuotaCeiling)
 		assert.Equal(t, "secret-read", FeatureSecretRead)
+		assert.Equal(t, "secret-rotation", FeatureSecretRotation)
 	})
 
 	t.Run("every advertised route actually exists", func(t *testing.T) {
@@ -115,7 +116,8 @@ func TestStatsFeatures(t *testing.T) {
 			[]any{
 				"client-bans", "client-ip-activity", "client-ips", "client-limits", "client-stats", "faketls",
 				"handshake-budget", "ip-limits", "kick", "listeners", "quota-ceiling", "quota-reset", "secret-modes",
-				"secret-read", "secrets-api", "speed-directions", "speed-limits", "web-relay", "web-relay-watch",
+				"secret-read", "secret-rotation", "secrets-api", "speed-directions", "speed-limits", "web-relay",
+				"web-relay-watch",
 			},
 			features)
 		// Asserted independently of the literal above, so appending a capability
@@ -136,8 +138,8 @@ func TestStatsFeatures(t *testing.T) {
 			[]string{
 				FeatureClientBans, FeatureClientIPActivity, FeatureClientIPs, FeatureClientLimits, FeatureClientStats,
 				FeatureFakeTLS, FeatureHandshakeBudget, FeatureIPLimits, FeatureKick, FeatureListeners,
-				FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretsAPI,
-				FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
+				FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretRotation,
+				FeatureSecretsAPI, FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			stats.buildResponse().Features)
 	})
@@ -155,8 +157,8 @@ func TestStatsFeatures(t *testing.T) {
 			[]string{
 				FeatureClientBans, FeatureClientIPActivity, FeatureClientIPs, FeatureClientLimits, FeatureClientStats,
 				FeatureFakeTLS, FeatureHandshakeBudget, FeatureIPLimits, FeatureKick, FeatureListeners,
-				FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretsAPI,
-				FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
+				FeatureQuotaCeiling, FeatureQuotaReset, FeatureSecretModes, FeatureSecretRead, FeatureSecretRotation,
+				FeatureSecretsAPI, FeatureSpeedDirections, FeatureSpeedLimits, FeatureWebRelay, FeatureWebRelayWatch,
 			},
 			resp.Features)
 	})

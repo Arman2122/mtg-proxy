@@ -18,11 +18,21 @@ const (
 	maxScanBlocks = 128
 
 	// maxHintNames is how many secret names one address keeps, most recent
-	// first, since a carrier NAT puts many users behind one address. It bounds
-	// what hints can cost before the scan: at most 16 verifications of a hello
-	// of at most maxScanBlocks, so 16 x 128 blocks in the worst case (192 for
-	// a real client's 517-byte hello).
+	// first, since a carrier NAT puts many users behind one address. With no
+	// retiring keys it bounds what hints can cost before the scan: at most 16
+	// verifications of a hello of at most maxScanBlocks, so 16 x 128 blocks in
+	// the worst case (192 for a real client's 517-byte hello).
 	maxHintNames = 16
+
+	// maxHintPositions is how many candidates the hinted names resolve to at
+	// most, which bounds what hints can cost before the scan: a name in the
+	// middle of a rotation is its primary and up to MaxRetiringPerSecret
+	// retiring keys, all tried before the scan. 32 x 128 blocks in the worst
+	// case, twice the bound without retiring keys, and reachable only from an
+	// address that holds earned hints for many names, each mid-rotation. Without
+	// retiring keys the names resolve to at most 16 positions, and the cap never
+	// bites. Positions past it are left to the budgeted scan.
+	maxHintPositions = 32
 
 	// maxHintAddresses bounds the addresses held across BOTH generations.
 	maxHintAddresses = 32768

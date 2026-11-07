@@ -40,8 +40,8 @@ func TestExpiryEndsALiveSessionOnTheClock(t *testing.T) {
 	p := newLimitTestProxy(secrets, limits)
 	p.logger = testLogger()
 
-	soon := registerFakeStream(p, "soon")
-	later := registerFakeStream(p, "later")
+	soon := registerFakeStream(t, p, "soon")
+	later := registerFakeStream(t, p, "later")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -67,7 +67,7 @@ func TestMaintenanceRunsWithoutAUsageFile(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(proxy.Shutdown)
 
-	stream := registerFakeStream(proxy, "alice")
+	stream := registerFakeStream(t, proxy, "alice")
 
 	require.True(t, awaitClosed(stream, 3*denySweepInterval),
 		"a proxy with no usage file must still sweep expired users off on the clock")

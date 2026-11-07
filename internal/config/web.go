@@ -251,6 +251,13 @@ func webStatsBind(addr string) error {
 	return nil
 }
 
+// WebHost is [web] host as ValidateWeb accepts it, lowercased, or the error it
+// refuses it with, which never shows a secret value pasted there. access
+// prints no WEB link for a host it refuses (Task 10's second review, N-A).
+func (c *Config) WebHost() (string, error) {
+	return webCanonicalHost(c.Web.Host.Get(""))
+}
+
 // webCanonicalHost is a small local check so config does not import webrelay,
 // which would be a cycle in waiting: the relay reads config. The authoritative
 // canonicalisation lives with the capability derivation, and this only catches
@@ -260,16 +267,18 @@ func webCanonicalHost(host string) (string, error) {
 		return "", fmt.Errorf("[web] host is required: it is the name a client derives its capability over")
 	}
 
+	// The host is quoted by shownName: a secret value pasted into it is not
+	// shown, and any other host is, as before.
 	if strings.ContainsAny(host, ":/?#@ ") {
-		return "", fmt.Errorf("[web] host %q must be a bare hostname, not a URL", host)
+		return "", fmt.Errorf("[web] host %s must be a bare hostname, not a URL", shownName(host))
 	}
 
 	if !strings.Contains(host, ".") {
-		return "", fmt.Errorf("[web] host %q must be a fully qualified name with a public certificate", host)
+		return "", fmt.Errorf("[web] host %s must be a fully qualified name with a public certificate", shownName(host))
 	}
 
 	if net.ParseIP(host) != nil {
-		return "", fmt.Errorf("[web] host %q is an IP address; a WEB client refuses one", host)
+		return "", fmt.Errorf("[web] host %s is an IP address; a WEB client refuses one", shownName(host))
 	}
 
 	return strings.ToLower(host), nil

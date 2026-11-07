@@ -70,7 +70,7 @@ func TestAPISecretLimits(t *testing.T) {
 		t.Parallel()
 
 		p := newAPITestProxy(map[string]Secret{"alice": alice})
-		stream := registerFakeStream(p, "alice")
+		stream := registerFakeStream(t, p, "alice")
 
 		body := `{"name":"alice","secret":"` + alice.Hex() + `","disabled":true}`
 		require.Equal(t, http.StatusOK, doAPI(t, p, "", http.MethodPost, "/secrets", body).Code)

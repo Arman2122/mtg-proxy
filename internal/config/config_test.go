@@ -3,9 +3,12 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Arman2122/mtg-proxy/internal/config"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -225,6 +228,10 @@ func TestConfigStringRedactsEveryCredential(t *testing.T) {
 		// one can present another proxy's traffic as theirs.
 		globalAdTag = "0123456789abcdef0123456789abcdef"
 		bobAdTag    = "fedcba9876543210fedcba9876543210"
+		// bob's previous key, still accepted until its overlap ends: a value
+		// like any other (D21).
+		bobRetiringSecret = "ee0f1e2d3c4b5a69788796a5b4c3d2e1f0676f6f676c652e636f6d"
+		bobRetiringUntil  = "2026-10-09T09:30:00Z"
 	)
 
 	conf, err := config.Parse([]byte(`
@@ -239,6 +246,11 @@ bob = "` + bobSecret + `"
 
 [secret-ad-tags]
 bob = "` + bobAdTag + `"
+
+[[retiring-secret]]
+name = "bob"
+secret = "` + bobRetiringSecret + `"
+until = ` + bobRetiringUntil + `
 `))
 	require.NoError(t, err)
 
@@ -258,7 +270,50 @@ bob = "` + bobAdTag + `"
 		require.NotContains(t, rendered, credential, "a credential reached the log rendering")
 	}
 
+	// The retiring value in each spelling of the value and of its key, named
+	// by label on a failure and never printed.
+	require.Empty(t, rotLeaks(rendered, bobRetiringSecret), "a retiring value reached the log rendering")
+
 	require.Contains(t, rendered, "alice", "the secret names must survive redaction")
 	require.Contains(t, rendered, "bob")
 	require.Contains(t, rendered, "0.0.0.0:3128", "ordinary settings must survive redaction")
+	require.Contains(t, rendered, bobRetiringUntil, "which rotations are configured, and until when, survives")
+}
+
+// C7: a file without [[retiring-secret]] renders exactly as it did before the
+// table existed. The panel's own file is the one that matters (p-ui reads this
+// binary's output as a sidecar), so testdata/panel-rendered.toml is a byte copy
+// of TestPanelEmittedConfigIsAccepted's rendered text, and the golden was
+// rendered from it by the code before this table was added, once, and is never
+// regenerated.
+func TestConfigStringIsUnchangedWithoutTheTable(t *testing.T) {
+	t.Parallel()
+
+	panel, err := os.ReadFile(filepath.Join("testdata", "panel-rendered.toml"))
+	require.NoError(t, err)
+
+	golden, err := os.ReadFile(filepath.Join("testdata", "panel-config-string.golden"))
+	require.NoError(t, err)
+
+	// The copy is still a copy: panel_contract_test.go is never edited, so
+	// this test reads its text where it stands.
+	source, err := os.ReadFile("panel_contract_test.go")
+	require.NoError(t, err)
+
+	const opening = "const rendered = `"
+
+	start := strings.Index(string(source), opening)
+	require.Positive(t, start, "the panel test's rendered text")
+
+	rest := string(source)[start+len(opening):]
+	end := strings.Index(rest, "`")
+	require.Positive(t, end)
+	require.Equal(t, rest[:end], string(panel), "testdata/panel-rendered.toml is the panel test's text, byte for byte")
+
+	conf, err := config.Parse(panel)
+	require.NoError(t, err)
+
+	assert.Equal(t, string(golden), conf.String(), "Config.String() of the panel's file changed")
+	assert.Equal(t, 0, len(conf.RetiringSecrets))
+	rotEmptyReport(t, conf.GetRetiringSecrets(time.Now()), "the panel's file")
 }

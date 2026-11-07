@@ -69,17 +69,6 @@ func newReloadTestProxy(secrets map[string]Secret) *Proxy {
 	return p
 }
 
-func registerFakeStream(p *Proxy, secretName string) *streamContext {
-	ctx, cancel := context.WithCancel(context.Background())
-	sc := &streamContext{ctx: ctx, ctxCancel: cancel, secretName: secretName}
-
-	// A fake stream has no client socket, so it registers uncounted: the
-	// address ledger is exercised by the entry tests, not by these.
-	p.tryRegisterConn(sc)
-
-	return sc
-}
-
 func TestProxyReloadSecrets(t *testing.T) {
 	t.Parallel()
 
@@ -94,8 +83,8 @@ func TestProxyReloadSecrets(t *testing.T) {
 			return SecretConfig{Secrets: map[string]Secret{"alice": alice}}, nil
 		}
 
-		aliceStream := registerFakeStream(p, "alice")
-		bobStream := registerFakeStream(p, "bob")
+		aliceStream := registerFakeStream(t, p, "alice")
+		bobStream := registerFakeStream(t, p, "bob")
 
 		require.NoError(t, p.ReloadSecrets())
 
@@ -113,7 +102,7 @@ func TestProxyReloadSecrets(t *testing.T) {
 			return SecretConfig{Secrets: map[string]Secret{"alice": rekeyed}}, nil
 		}
 
-		stream := registerFakeStream(p, "alice")
+		stream := registerFakeStream(t, p, "alice")
 
 		require.NoError(t, p.ReloadSecrets())
 
@@ -129,7 +118,7 @@ func TestProxyReloadSecrets(t *testing.T) {
 			return SecretConfig{Secrets: map[string]Secret{"alice": alice, "bob": bob}}, nil
 		}
 
-		stream := registerFakeStream(p, "alice")
+		stream := registerFakeStream(t, p, "alice")
 
 		require.NoError(t, p.ReloadSecrets())
 

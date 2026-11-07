@@ -996,9 +996,10 @@ func TestABannedHelloReachesTheCoverSiteAsAWrongSecretDoes(t *testing.T) {
 
 // The re-check: a stream attributed before the ban was recorded -- it passed
 // the ban check at attribution -- is refused when it comes to register, under
-// liveMu, as step one, and leaves the ledger, the registry and the counters as
-// they were. The refusal is logged as a ban and counted nowhere. A stream
-// attributed after the ban is refused at attribution, and says why.
+// liveMu, before the cap and the limit, and leaves the ledger, the registry and
+// the counters as they were. The refusal is logged as a ban and counted
+// nowhere. A stream attributed after the ban is refused at attribution, and
+// says why.
 func TestTheReCheckRefusesAStreamThatPassedAttribution(t *testing.T) {
 	t.Parallel()
 
@@ -1031,11 +1032,13 @@ func TestTheReCheckRefusesAStreamThatPassedAttribution(t *testing.T) {
 	assert.Equal(t, []string{"banned", "banned"}, probe.log.denyReasons())
 }
 
-// The re-check is the first step of registration (spec §2): a banned place is
-// refused as banned, whatever the steps after it would have said -- the
-// connection cap with the place at its cap, the address limit with the user at
-// hers -- and a forced ban of an unkeyed address holds there too.
-func TestTheReCheckIsTheFirstStep(t *testing.T) {
+// The ban re-check precedes the limits of registration (spec §2): a banned
+// place is refused as banned, whatever the steps after it would have said --
+// the connection cap with the place at its cap, the address limit with the user
+// at hers -- and a forced ban of an unkeyed address holds there too. Only the
+// key re-check comes before it: see
+// TestARevokedKeyFromABannedPlaceIsRefusedAsKeyRevoked.
+func TestTheBanReCheckPrecedesTheLimits(t *testing.T) {
 	t.Parallel()
 
 	probe, _ := banProbe(t, false)

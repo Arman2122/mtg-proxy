@@ -1,0 +1,31 @@
+bind-to = "0.0.0.0:3128"
+concurrency = 64
+
+[[retiring-secret]]
+# added by mtg-proxy rotate-secret at 2026-10-01T09:30:00Z
+name   = "alice"
+secret = "ee1111111111111111aaaaaaaaaaaaaaaa73746f726167652e676f6f676c65617069732e636f6d"
+until  = "2026-10-02T09:30:00Z"
+
+[[retiring-secret]]
+# added by mtg-proxy rotate-secret at 2026-10-07T21:30:00Z
+name   = "alice"
+secret = "ee2222222222222222bbbbbbbbbbbbbbbb73746f726167652e676f6f676c65617069732e636f6d"
+until  = "2026-10-08T21:30:00Z"
+
+# bob's previous link, kept for his phone until the weekend.
+[[retiring-secret]]
+name   = "bob"
+secret = "ee3333333333333333cccccccccccccccc73746f726167652e676f6f676c65617069732e636f6d"
+until  = "2026-10-10T18:00:00+03:30"
+
+# The users.
+[secrets]
+alice = "eea1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d473746f726167652e676f6f676c65617069732e636f6d"
+bob = "eeb5b5b5b5c6c6c6c6d7d7d7d7e8e8e8e873746f726167652e676f6f676c65617069732e636f6d"
+
+[[retiring-secret]]
+# appended by hand, after the users
+name = "bob"
+secret = "dd4444444444444444dddddddddddddddd"
+until = 2026-10-09T12:00:00Z

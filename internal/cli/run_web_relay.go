@@ -344,8 +344,12 @@ func buildOrigin(
 	counters.SetProfiles(names)
 
 	origin, err := webrelay.NewOrigin(webrelay.OriginOptions{
-		Host:        conf.Web.Host.Get(""),
-		Secrets:     secrets,
+		Host:    conf.Web.Host.Get(""),
+		Secrets: secrets,
+		// The relay serves primaries only (orderedSecrets). The keys a rotation
+		// retired are only recognised, so their holders get the local 404
+		// instead of the cover site (Task 11); the registry trims the list.
+		Retired:     conf.RetiringValues(),
 		Counters:    counters,
 		Signer:      signer,
 		Cover:       cover,

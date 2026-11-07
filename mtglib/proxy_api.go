@@ -100,6 +100,16 @@ type SecretInfo struct {
 	// exactly as ConnectedIPs is.
 	ExternalIPs       []string   `json:"external_ips,omitempty"`
 	ExternalExpiresAt *time.Time `json:"external_expires_at,omitempty"`
+
+	// RetiringKeys, RetiringUntil, RetiringConnections and RetiringLastSeen mirror
+	// the same four fields on GET /stats, read from the same set and the same
+	// counters, and absent for a secret with no unexpired previous key. A count,
+	// two times and a count: none is an address, so none is gated, and none is
+	// ever a key.
+	RetiringKeys        int        `json:"retiring_keys,omitempty"`
+	RetiringUntil       *time.Time `json:"retiring_until,omitempty"`
+	RetiringConnections int        `json:"retiring_connections,omitempty"`
+	RetiringLastSeen    *time.Time `json:"retiring_last_seen,omitempty"`
 }
 
 // SnapshotSecrets returns the active secret set as a name-sorted list, exposing
@@ -122,6 +132,15 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 	// counts are not, and a lookup of a user with no ledger is the zero
 	// report, so nothing below needs a second branch.
 	addresses := p.addressReports()
+
+	// The overlap of every name that still accepts a previous key, read once for
+	// the whole list and only when the set holds a retiring entry: the registry
+	// is walked under liveMu, as for the addresses above, and the rotation
+	// clock's high-water mark is not moved by a read that has nothing to judge.
+	var overlaps map[string]retiringView
+	if len(set.retiring) > 0 {
+		overlaps = p.retiringViews(set, p.rotation.Now())
+	}
 
 	for i, name := range set.names {
 		secret := set.secrets[i]
@@ -150,6 +169,11 @@ func (p *Proxy) SnapshotSecrets() []SecretInfo {
 		info.ConnectedIPsLastSeen = report.ConnectedIPsLastSeen
 		info.ExternalIPs = report.ExternalIPs
 		info.ExternalExpiresAt = report.ExternalExpiresAt
+
+		if view, ok := overlaps[name]; ok {
+			info.RetiringKeys, info.RetiringConnections = view.keys, view.connections
+			info.RetiringUntil, info.RetiringLastSeen = view.times()
+		}
 
 		out[i] = info
 	}
@@ -194,6 +218,14 @@ func fillLimitInfo(info *SecretInfo, lim SecretLimits, used int64) {
 // ReplaceSecrets swaps the entire secret configuration (secrets + advertising
 // tags) for cfg, going through the same validation, atomic swap and stale
 // connection close as a file reload.
+//
+// cfg.Retiring is the COMPLETE list of retiring keys the new set holds, and nil
+// is none, as for a reload: a ReplaceSecrets that leaves it nil ends every
+// overlap in force, and closes the streams on the keys that were retiring. A
+// config file that still grants an overlap grants it again at the next reload,
+// until the entry's own until. The management API's PUT /secrets is the one
+// caller that keeps the overlaps of the names it keeps, through its own step
+// (replaceSecretsKeepingRetiring), not through this method.
 func (p *Proxy) ReplaceSecrets(cfg SecretConfig) error {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
@@ -201,12 +233,72 @@ func (p *Proxy) ReplaceSecrets(cfg SecretConfig) error {
 	return p.swapSecretConfigLocked(cfg)
 }
 
+// replaceSecretsKeepingRetiring is the PUT /secrets handler's replacement of the
+// whole set: ReplaceSecrets, except that the retiring entries of every name cfg
+// keeps stay, and those of every name it removes go with it. It is the handler's
+// alone and not a second meaning of a nil cfg.Retiring, which is none wherever a
+// SecretConfig is consumed.
+//
+// The API cannot express an overlap (there is no write field, D18), so a PUT
+// built from a request body can only be silent about one. Reading that as "none"
+// would make a rotation-unaware client -- the panel, today -- end every overlap
+// the config file granted as a side effect, and the next restart would grant it
+// again: a kill and then a revival nobody asked for. Reading it as "keep" is
+// right, and the keeping is done here, under reloadMu, against the set as it is
+// then: a reload or an API call that ran after the body was read has changed the
+// entries, and a copy taken earlier would put back an entry that one of them had
+// removed, with its until still ahead. cfg.Retiring is overwritten, not added to.
+//
+// An entry whose until has passed is kept like any other and then dropped by the
+// build, which judges it by the rotation clock (rule 2), so the merge reads no
+// clock of its own. A name whose primary the PUT changes keeps its entries all
+// the same, and its old primary does not become one: the re-key is immediate. An
+// entry that repeats a key the PUT now makes a primary is dropped by the build
+// (rules 5 and 6), as in any swap.
+func (p *Proxy) replaceSecretsKeepingRetiring(cfg SecretConfig) error {
+	beforeKeepMergeLockHook()
+
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
+	// The set's own entries, read in place and in its order: toConfig would
+	// build every name's maps, under the lock, for this one list (final review
+	// A, n1).
+	set := p.secrets.Load()
+
+	var kept []RetiringSecret
+
+	for _, entry := range set.retiring {
+		name := set.names[entry.nameIdx]
+		if _, ok := cfg.Secrets[name]; ok {
+			kept = append(kept, RetiringSecret{Name: name, Secret: entry.secret, Until: entry.until})
+		}
+	}
+
+	cfg.Retiring = kept
+
+	return p.swapSecretConfigLocked(cfg)
+}
+
+// beforeKeepMergeLockHook runs in replaceSecretsKeepingRetiring before it takes
+// reloadMu: the window in which a reload or another API call can change the
+// entries the merge is about to read. A no-op in production. A test uses it to
+// run a reload that removes an entry whose until is still ahead; an expiry sweep
+// there would prove nothing, because the build drops an expired entry whatever
+// the merge handed it. A variable so it can be replaced; a test that does must
+// restore it and must not run in parallel.
+var beforeKeepMergeLockHook = func() {}
+
 // PutSecret adds or updates a single secret, optionally setting its per-secret
 // advertising tag (nil clears the override) and governance limits (nil or a
 // zero value clears them). Only a key change closes that secret's live
 // connections; an adtag-only change leaves them running because closeStaleConns
 // keys on the secret key, not the tag. A disable/expiry set here takes effect
 // immediately because swapSecretConfigLocked also closes newly-denied streams.
+// The name's retiring entries are kept, and the old primary never becomes one.
+// The primary wins: a key that repeats one of the name's own entries makes that
+// entry go (rule 6), and a key that is another name's retiring key makes that
+// other name's entry go (rule 5), the key being this name's primary.
 func (p *Proxy) PutSecret(name string, s Secret, adTag *[AdTagLength]byte, limits *SecretLimits) error {
 	if name == "" {
 		return fmt.Errorf("%w: empty name", ErrSecretInvalid)
@@ -248,7 +340,7 @@ func (p *Proxy) PutSecret(name string, s Secret, adTag *[AdTagLength]byte, limit
 // DeleteSecret removes a single secret, its advertising override and its
 // limits. It returns ErrSecretNotFound for an unknown name and ErrLastSecret if
 // the removal would empty the set. The removed secret's live connections are
-// closed.
+// closed, and its retiring entries go with it (forget), whatever their until.
 func (p *Proxy) DeleteSecret(name string) error {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
@@ -269,15 +361,28 @@ func (p *Proxy) DeleteSecret(name string) error {
 }
 
 // forget removes everything cfg files under name: the secret, its advertising
-// override and its limits. A set is built from the names in Secrets alone, so
-// an override or limits left behind would never be read; they go all the same,
-// so that the config handed to the swap says what the set will hold. Deleting
-// from a nil map does nothing, so a config with no overrides or no limits needs
-// no check.
+// override, its limits and its retiring entries. A set is built from the names
+// in Secrets alone, so an override or limits left behind would never be read,
+// and a retiring entry left behind would be dropped as dangling; they go all
+// the same, so that the config handed to the swap says what the set will hold.
+// Deleting from a nil map does nothing, so a config with no overrides or no
+// limits needs no check. Retiring is rebuilt rather than filtered in place, so
+// a slice the caller handed in is never rewritten under it, and it is nil when
+// no entry is left, which is what none means.
 func (c *SecretConfig) forget(name string) {
 	delete(c.Secrets, name)
 	delete(c.SecretAdTags, name)
 	delete(c.Limits, name)
+
+	var retiring []RetiringSecret
+
+	for _, entry := range c.Retiring {
+		if entry.Name != name {
+			retiring = append(retiring, entry)
+		}
+	}
+
+	c.Retiring = retiring
 }
 
 // GlobalAdTag returns the currently active global advertising tag, or nil when
@@ -531,6 +636,18 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	set := p.secrets.Load()
+
+	// The overlap of every name that still accepts a previous key: four scalars
+	// inside a user object that is already there, for the same reason as the
+	// counts above -- every key under Users is billed as a client, and a name is
+	// not one for having an overlap. The clock is read only when the set holds a
+	// retiring entry, and once for the whole response; a set that holds none costs
+	// this length check.
+	var overlaps map[string]retiringView
+	if len(set.retiring) > 0 {
+		overlaps = p.retiringViews(set, p.rotation.Now())
+	}
+
 	for i, name := range set.names {
 		user, ok := resp.Users[name]
 		if !ok {
@@ -538,6 +655,11 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		}
 
 		lim := set.limits[i]
+
+		if view, ok := overlaps[name]; ok {
+			user.RetiringKeys, user.RetiringConnections = view.keys, view.connections
+			user.RetiringUntil, user.RetiringLastSeen = view.times()
+		}
 
 		if lim.QuotaBytes > 0 {
 			user.Quota = lim.QuotaBytes
@@ -872,7 +994,9 @@ func (p *Proxy) handlePutSecrets(w http.ResponseWriter, r *http.Request) {
 
 	cfg.GlobalAdTag = global
 
-	if err := p.ReplaceSecrets(cfg); err != nil {
+	// The body cannot say a retiring key, so it cannot end one: the entries of
+	// the names it keeps stay.
+	if err := p.replaceSecretsKeepingRetiring(cfg); err != nil {
 		httpError(w, secretMutationStatus(err), err)
 
 		return
