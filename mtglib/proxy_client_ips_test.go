@@ -35,7 +35,7 @@ func (c remoteAddrConn) RemoteAddr() net.Addr { return c.addr }
 // dialProxyFrom is dialProxy with the client address the proxy will see stamped
 // on the accepted end.
 func dialProxyFrom(
-	t *testing.T, h *entryHarness, policy *ListenerPolicy, addr net.Addr,
+	t testing.TB, h *entryHarness, policy *ListenerPolicy, addr net.Addr,
 ) (net.Conn, <-chan struct{}) {
 	t.Helper()
 

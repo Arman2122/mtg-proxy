@@ -1,9 +1,12 @@
 package mtglib
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"time"
 
 	"github.com/Arman2122/mtg-proxy/essentials"
 	"github.com/Arman2122/mtg-proxy/mtglib/internal/relay"
@@ -20,62 +23,205 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	rewind := newConnRewind(ctx.client())
 
 	// Read the active secret snapshot once so a concurrent ReloadSecrets swap
-	// cannot desync the key list, hostnames and matched index mid-handshake.
+	// cannot desync the candidates, hostnames and the index a match maps back to
+	// mid-handshake.
 	set := p.secrets.Load()
 
-	// Only HOSTED secrets are HMAC candidates. ReadClientHelloMulti matches SNI
-	// against the global hostname list and then HMACs against every key it is
-	// given, so leaving a hostless key in this list would let a client borrow
-	// another secret's hostname to authenticate with it.
-	secretKeys := make([][]byte, 0, len(set.hosted))
-	for _, i := range set.hosted {
-		secretKeys = append(secretKeys, set.secrets[i].Key[:])
-	}
-
-	result, err := fake.ReadClientHelloMulti(
-		rewind,
-		secretKeys,
-		set.hostnames,
-		p.tolerateTimeSkewness,
-	)
+	// The hello is read and put through the SNI gate once; what is tried against
+	// it is set.cands, which are the HOSTED secrets only. The gate matches SNI
+	// against the global hostname list, so a hostless key among the candidates
+	// would let a client borrow another secret's hostname to authenticate with it.
+	parsed, err := fake.ParseClientHelloFor(rewind, set.hostnames)
 	if err != nil {
 		p.logger.InfoError("cannot read client hello", err)
+		p.doDomainFrontingForHost(ctx, rewind, set.frontHost)
 
-		frontHost := set.frontHost
-		if result != nil && result.MatchedHost != "" {
-			frontHost = result.MatchedHost
+		return false
+	}
+
+	// The scan cap, past the SNI gate and before anything is verified: a hello
+	// above it is never hinted and never scanned. Observe mode counts it and
+	// goes on.
+	overBudget := p.scanBudget.oversized(parsed.Blocks())
+	if overBudget {
+		p.fakeStats.OnOversized()
+
+		if p.scanBudget.enforced() {
+			p.refuseOverBudget(ctx, rewind, parsed, "oversized")
+
+			return false
+		}
+	}
+
+	// First the secrets this client's address completed a handshake with
+	// before, if any: a returning client is found here in one verification.
+	// Hinted verification is outside the budget; it is bounded by the cap.
+	hinted := p.hintedPositions(ctx, parsed, set)
+
+	pos, tried := p.verifyHinted(parsed, set, hinted)
+	if pos >= 0 {
+		p.fakeStats.addVerifications(tried)
+		p.fakeStats.OnHinted()
+
+		return p.completeFakeTLS(ctx, rewind, set, parsed, set.candIdx[pos])
+	}
+
+	// Then the scan, over every candidate the hints did not already try, which
+	// the budget has to pay for first.
+	res, overBudget, ok := p.reserveScan(ctx, rewind, parsed, len(set.cands)-tried, overBudget)
+	if !ok {
+		p.fakeStats.addVerifications(tried)
+
+		return false
+	}
+
+	pos, scanned := p.scanCandidates(parsed, set, skipPositions(hinted))
+	p.fakeStats.addVerifications(tried + scanned)
+
+	if pos < 0 {
+		// The charge is kept: a hello that matched nothing is what the budget
+		// is for.
+		p.fakeStats.OnUnmatched()
+		p.logger.InfoError("cannot read client hello", fake.ErrBadDigest)
+		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
+
+		return false
+	}
+
+	p.fakeStats.OnScanned()
+
+	if overBudget {
+		p.fakeStats.OnOverBudgetMatched()
+	}
+
+	// Refunded only once the whole handshake has succeeded, which is decided
+	// after this returns: ServeConn settles it once admit has. Every exit
+	// before that -- a replay, a denied user, a refused admission -- keeps it.
+	ctx.scanRes = res
+
+	// pos is a position in set.cands; map it back into the full secret list
+	// before anything reads names, limits or ad tags by it.
+	return p.completeFakeTLS(ctx, rewind, set, parsed, set.candIdx[pos])
+}
+
+// reserveScan has the budget pay for scanning remaining candidates, and waits
+// until it has. It returns the reservation to settle once the handshake is
+// decided (nil when nothing was charged), whether the scan is over budget --
+// which only observe mode goes on with -- and false when the hello has been
+// disposed of and must not be scanned: fronted because enforce refused it, or
+// abandoned because the stream ended during the wait.
+//
+// overBudget comes in true for an oversized hello in observe mode, which has
+// been counted already and is not charged: enforce would have refused it
+// without charging, and observe keeps enforce's accounting.
+func (p *Proxy) reserveScan(
+	ctx *streamContext, rewind *connRewind, parsed *fake.Parsed, remaining int, overBudget bool,
+) (*scanReservation, bool, bool) {
+	if overBudget || remaining <= 0 {
+		return nil, overBudget, true
+	}
+
+	res, wait, verdict := p.scanBudget.reserve(ctx.ClientIP(), parsed.Blocks(), remaining)
+
+	var reason string
+
+	switch verdict {
+	case budgetGranted:
+	case budgetDeniedIP:
+		p.fakeStats.OnDeniedIP()
+
+		reason = "denied_ip"
+	case budgetDeniedGlobal:
+		p.fakeStats.OnDeniedGlobal()
+
+		reason = "denied_global"
+	case budgetOversized:
+		// Unreachable today: the cap is applied, and the hello counted as
+		// oversized, before the hints, and a budget that is off grants before it
+		// looks at the size. It counts nothing here on purpose: were it ever
+		// reachable, the hello would already have been counted, and a second
+		// count would break the one-counter-per-hello rule. It only names the
+		// reason, so the switch says what every verdict means.
+		reason = "oversized"
+	}
+
+	if reason != "" {
+		if p.scanBudget.enforced() {
+			p.refuseOverBudget(ctx, rewind, parsed, reason)
+
+			return nil, true, false
 		}
 
-		p.doDomainFrontingForHost(ctx, rewind, frontHost)
-
-		return false
+		return nil, true, true
 	}
 
-	if p.antiReplayCache.SeenBefore(result.Hello.SessionID) {
+	if wait > 0 && !waitForBudget(ctx, wait) {
+		// The stream ended while it waited -- the proxy is shutting down --
+		// so nothing was scanned and nobody is left to front.
+		res.settle(true)
+
+		return nil, false, false
+	}
+
+	return res, false, true
+}
+
+// refuseOverBudget fronts a hello the budget refused, through the same call a
+// hello that matched nothing takes: the cover site gets the same bytes. What
+// differs is the time to the first fronted byte -- a no-match is fronted after
+// its scan, a refusal at once (a scan that is granted may wait, but then it
+// runs and is not refused) -- the same kind of difference hello size and the
+// SNI gate already made.
+func (p *Proxy) refuseOverBudget(ctx *streamContext, rewind *connRewind, parsed *fake.Parsed, reason string) {
+	ctx.logger.BindStr("reason", reason).Info("ee hello refused by the scan budget")
+	p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
+}
+
+// waitForBudget waits d, or until ctx is done; it reports whether the wait ran
+// its course.
+func waitForBudget(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// completeFakeTLS is what follows a hello that matched one secret, idx being its
+// index into set.secrets: the replay check, the per-user limits, and the
+// server's flight.
+func (p *Proxy) completeFakeTLS(
+	ctx *streamContext,
+	rewind *connRewind,
+	set *secretSet,
+	parsed *fake.Parsed,
+	idx int,
+) bool {
+	if p.antiReplayCache.SeenBefore(parsed.Hello.SessionID) {
 		p.logger.Warning("replay attack has been detected!")
 		p.eventStream.Send(p.ctx, NewEventReplayAttack(ctx.streamID))
-		p.doDomainFrontingForHost(ctx, rewind, result.MatchedHost)
+		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
 
 		return false
 	}
-
-	// MatchedIndex indexes the hosted candidate list; map it back into the full
-	// secret list before anything reads names, limits or ad tags by it.
-	idx := set.hosted[result.MatchedIndex]
 
 	// Enforce per-user governance limits before we speak TLS back. A denied
 	// user (disabled, expired, or over quota) is routed to the cover site just
 	// like a wrong secret, so the outcome is indistinguishable to a prober.
 	if !p.attribute(ctx, set, idx) {
-		p.doDomainFrontingForHost(ctx, rewind, result.MatchedHost)
+		p.doDomainFrontingForHost(ctx, rewind, parsed.MatchedHost)
 
 		return false
 	}
 
-	gangerNoise := p.doppelGanger.NoiseParamsFor(result.MatchedHost)
+	gangerNoise := p.doppelGanger.NoiseParamsFor(parsed.MatchedHost)
 	noiseParams := fake.NoiseParams{Mean: gangerNoise.Mean, Jitter: gangerNoise.Jitter}
 
-	if err := fake.SendServerHello(ctx.client(), set.secrets[idx].Key[:], result.Hello, noiseParams); err != nil {
+	if err := fake.SendServerHello(ctx.client(), set.secrets[idx].Key[:], parsed.Hello, noiseParams); err != nil {
 		p.logger.InfoError("cannot send welcome packet", err)
 		return false
 	}
@@ -83,6 +229,82 @@ func (p *Proxy) doFakeTLSHandshake(ctx *streamContext) bool {
 	ctx.setClient(tls.New(ctx.client(), true, false))
 
 	return true
+}
+
+// scanCandidates verifies parsed against set.cands in order and returns the
+// position of the first that matches, or -1; tried is how many it verified.
+// Positions skip reports true for are passed over, unverified and uncounted;
+// nil skips none. A set with no candidates is scanned for nothing: -1, 0.
+func (p *Proxy) scanCandidates(parsed *fake.Parsed, set *secretSet, skip func(pos int) bool) (pos, tried int) {
+	for at, cand := range set.cands {
+		if skip != nil && skip(at) {
+			continue
+		}
+
+		tried++
+
+		if parsed.Verify(cand, p.tolerateTimeSkewness) {
+			return at, tried
+		}
+	}
+
+	return -1, tried
+}
+
+// hintedPositions resolves the names this client's address completed a
+// handshake with before into positions in set.cands, in the order to try them.
+// It is nil when hints do not apply: the cache is off, the address is unkeyed or
+// has none, or the hello is above maxScanBlocks.
+//
+// A hint is a name, and only the snapshot this hello met says where that name
+// is, so a reload between the write and now cannot misdirect it: a name the set
+// no longer holds as a candidate is skipped, a re-keyed name is tried under its
+// new key, and a re-sorted name is found where it is now.
+func (p *Proxy) hintedPositions(ctx *streamContext, parsed *fake.Parsed, set *secretSet) []int {
+	if p.hints == nil || parsed.Blocks() > maxScanBlocks {
+		return nil
+	}
+
+	names := p.hints.recall(ctx.ClientIP())
+	if len(names) == 0 {
+		return nil
+	}
+
+	positions := make([]int, 0, len(names))
+
+	for _, name := range names {
+		if pos, ok := set.candByName[name]; ok && !slices.Contains(positions, pos) {
+			positions = append(positions, pos)
+		}
+	}
+
+	return positions
+}
+
+// verifyHinted verifies parsed against the candidates at positions, in order,
+// and returns the first that matches, or -1; tried is how many it verified.
+func (p *Proxy) verifyHinted(parsed *fake.Parsed, set *secretSet, positions []int) (pos, tried int) {
+	for _, at := range positions {
+		tried++
+
+		if parsed.Verify(set.cands[at], p.tolerateTimeSkewness) {
+			return at, tried
+		}
+	}
+
+	return -1, tried
+}
+
+// skipPositions is the scanCandidates skip that passes over positions already
+// verified, or nil when there are none.
+func skipPositions(positions []int) func(pos int) bool {
+	if len(positions) == 0 {
+		return nil
+	}
+
+	return func(pos int) bool {
+		return slices.Contains(positions, pos)
+	}
 }
 
 // obfuscatedDrainBytes bounds the drain disposal by volume; the handshake

@@ -452,6 +452,15 @@ func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 		resp.Obfuscated = obfuscatedJSONOf(&p.obfsStats)
 	}
 
+	// The FakeTLS door's counters are a top-level object of their own, never
+	// something under Users: nothing about the door is a client, and the panel
+	// bills every key under Users as one. Omitted until the door has counted
+	// something, which is what keeps a proxy nobody has connected to reporting
+	// the response it always did.
+	if fake := fakeTLSJSONOf(&p.fakeStats, p.scanBudget); fake.counted() {
+		resp.FakeTLSHandshake = fake
+	}
+
 	// Keyed on resp.Users rather than on the secret snapshot, deliberately: a
 	// secret removed through DELETE /secrets keeps its counter bucket (nothing
 	// ever deletes one), so it is still reported, and its connections are still

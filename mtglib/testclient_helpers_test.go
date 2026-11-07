@@ -23,6 +23,17 @@ func fakeTLSClientHello(t testing.TB, key [SecretKeyLength]byte, sni string, ses
 	return hello
 }
 
+// fakeTLSClientHelloPadded is fakeTLSClientHello for a hello whose whole record
+// is exactly size bytes, which is what a real client's 517 looks like.
+func fakeTLSClientHelloPadded(t testing.TB, key [SecretKeyLength]byte, sni string, sessionID []byte, size int) []byte {
+	t.Helper()
+
+	hello, err := testclient.ClientHelloPadded(key, sni, sessionID, size)
+	require.NoError(t, err)
+
+	return hello
+}
+
 func obfuscatedFrame(t testing.TB, key [SecretKeyLength]byte, tag obfuscation.ConnectionTag, dcID int) []byte {
 	t.Helper()
 

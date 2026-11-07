@@ -222,6 +222,12 @@ type govEntryCase struct {
 	// speak TLS, so relaying to an HTTPS cover site would pipe a TLS alert out
 	// of a plaintext port, and it closes instead.
 	frontingsOnEntryDeny int
+
+	// helloSize, when non-zero, makes the ee entry flight a ClientHello whose
+	// whole record is exactly that many bytes (a real client's is 517); zero is
+	// the short forged hello every governance test sends. Only the handshake
+	// benchmarks set it, through withHelloSize.
+	helloSize int
 }
 
 func govEntryCases() []govEntryCase {
@@ -326,13 +332,62 @@ func (ec govEntryCase) openEntry(t testing.TB, client net.Conn, key [SecretKeyLe
 		_, err := rand.Read(sessionID)
 		require.NoError(t, err)
 
-		flight = fakeTLSClientHello(t, key, govCoverHost, sessionID)
+		flight = ec.clientHello(t, key, sessionID)
 	} else {
 		flight = obfuscatedFrame(t, key, obfuscation.TagPaddedIntermediate, 2)
 	}
 
 	_, err := client.Write(flight)
 	require.NoError(t, err)
+}
+
+// withHelloSize is this case with an ee entry flight of exactly size bytes; see
+// helloSize. The other doors ignore it.
+func (ec govEntryCase) withHelloSize(size int) govEntryCase {
+	ec.helloSize = size
+
+	return ec
+}
+
+// clientHello is the ee entry flight for one connection: the short forged hello
+// unless the case asks for a size.
+func (ec govEntryCase) clientHello(t testing.TB, key [SecretKeyLength]byte, sessionID []byte) []byte {
+	t.Helper()
+
+	if ec.helloSize > 0 {
+		return fakeTLSClientHelloPadded(t, key, govCoverHost, sessionID, ec.helloSize)
+	}
+
+	return fakeTLSClientHello(t, key, govCoverHost, sessionID)
+}
+
+// The handshake benchmarks claim their ee rows send a hello of a stated size and
+// every other row sends the short one. That is a claim about bytes on the wire,
+// so it is counted at the door: the proxy has read the hello plus the one
+// obfuscated-frame record the client sends after the server flight, and nothing
+// else.
+func TestHelloSizeIsWhatTheEntryReads(t *testing.T) {
+	t.Parallel()
+
+	for name, size := range map[string]int{"the short hello": 0, "a real client's 517": 517} {
+		ec := govEntryCases()[0].withHelloSize(size)
+		secret := ec.secret(t)
+		h := ec.harness(t, map[string]Secret{"alice": secret}, nil)
+
+		client, done := h.dialProxy(t, ec.policy)
+		upstream := connectThrough(t, ec, h, client, "alice", secret.Key)
+
+		wantHello := size
+		if size == 0 {
+			wantHello = len(fakeTLSClientHello(t, secret.Key, govCoverHost, make([]byte, 32)))
+		}
+
+		frame := tlsApplicationRecord(obfuscatedFrame(t, secret.Key, obfuscation.TagPaddedIntermediate, 2))
+
+		assert.EqualValues(t, wantHello+len(frame), h.serverBytesRead.Load(), name)
+
+		endStream(client, upstream, done)
+	}
 }
 
 // framePayload wraps post-handshake client traffic the way this door carries

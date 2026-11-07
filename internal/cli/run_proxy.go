@@ -110,6 +110,18 @@ func scoutCovers(conf *config.Config) bool {
 	return enabled == nil || enabled.Get(false)
 }
 
+// applyHandshakeBudget copies [defense.handshake-budget] into the proxy's
+// options. A key the file does not set stays the zero value, which mtglib reads
+// as its default: enforce, 50 ms per address, 25% of the cores, and a hint cache
+// that follows track-client-ips. An explicit hints = false and per-ip-ms = 0
+// arrive as non-nil pointers, which is how they override those defaults.
+func applyHandshakeBudget(opts *mtglib.ProxyOpts, conf *config.Config) {
+	opts.HandshakeHints = conf.GetHandshakeHints()
+	opts.HandshakeBudgetMode = conf.GetHandshakeBudgetMode()
+	opts.HandshakeBudgetPerIPMillis = conf.GetHandshakeBudgetPerIPMillis()
+	opts.HandshakeBudgetCPUPercent = conf.GetHandshakeBudgetCPUPercent()
+}
+
 func makeAntiReplayCache(conf *config.Config) (mtglib.AntiReplayCache, error) {
 	// On unless the config turns it off. A proxy that answers a replayed
 	// ClientHello within the clock-skew window confirms itself to whoever
@@ -641,6 +653,8 @@ func runProxyWith( //nolint: funlen, cyclop
 		ThrottleMaxConnections: conf.Throttle.MaxConnections.Get(0),
 		ThrottleCheckInterval:  conf.Throttle.CheckInterval.Get(5 * time.Second),
 	}
+
+	applyHandshakeBudget(&opts, conf)
 
 	proxy, err := mtglib.NewProxy(opts)
 	if err != nil {

@@ -489,6 +489,12 @@ const (
 	// FeatureFakeTLS means the proxy speaks the FakeTLS (obfuscated) handshake.
 	FeatureFakeTLS = "faketls"
 
+	// FeatureHandshakeBudget means the FakeTLS door bounds the CPU it spends
+	// scanning hellos no hint matched, [defense.handshake-budget] is honoured,
+	// and /stats reports the door's counters as the top-level faketls_handshake
+	// object once it has counted something.
+	FeatureHandshakeBudget = "handshake-budget"
+
 	// FeatureIPLimits means [secret-limits.<name>] and the secrets API accept
 	// a per-user ip_limit, the proxy refuses a connection from one address
 	// too many, /stats reports ip_limit, active_ips and ip_limit_refused, and
@@ -562,6 +568,7 @@ var supportedFeatures = []string{
 	FeatureClientIPActivity,
 	FeatureClientIPs,
 	FeatureFakeTLS,
+	FeatureHandshakeBudget,
 	FeatureIPLimits,
 	FeatureKick,
 	FeatureListeners,
@@ -590,7 +597,29 @@ type StatsResponse struct {
 	Listeners  []ListenerJSON  `json:"listeners,omitempty"`
 	Obfuscated *ObfuscatedJSON `json:"obfuscated,omitempty"`
 
+	// FakeTLSHandshake is what the FakeTLS door decided about the hellos that
+	// reached its secret scan. It is omitted until the door has counted
+	// something, and it is a top-level object on purpose: nothing about the door
+	// is a user, and the panel bills every key under Users as one.
+	FakeTLSHandshake *FakeTLSJSON `json:"faketls_handshake,omitempty"`
+
 	Users map[string]UserStatsJSON `json:"users"`
+}
+
+// FakeTLSJSON is the FakeTLS door's counter block on GET /stats: one number per
+// way a hello past the SNI gate can end, the flag saying whether the handshake
+// budget acts on a refusal, and what the budget believes a SHA-256 block costs.
+// Every count is a total since the process started.
+type FakeTLSJSON struct {
+	Hinted            int64   `json:"hinted"`
+	Scanned           int64   `json:"scanned"`
+	Unmatched         int64   `json:"unmatched"`
+	DeniedIP          int64   `json:"denied_ip"`
+	DeniedGlobal      int64   `json:"denied_global"`
+	Oversized         int64   `json:"oversized"`
+	OverBudgetMatched int64   `json:"over_budget_matched"`
+	Enforced          bool    `json:"enforced"`
+	NsPerBlock        float64 `json:"ns_per_block"`
 }
 
 // ObfuscatedJSON is the obfuscated2 entry counter block on GET /stats. Draining
@@ -614,6 +643,32 @@ func obfuscatedJSONOf(c *obfuscatedCounters) *ObfuscatedJSON {
 		Draining:    c.draining.Load(),
 		RateLimited: c.rateLimited.Load(),
 	}
+}
+
+// fakeTLSJSONOf snapshots the door's counters and the budget's own view of what
+// a block costs. It takes pointers because fakeTLSCounters holds atomics and must
+// never be copied by value; a nil budget, which is "budget off", is not enforcing
+// and has no block cost to report.
+func fakeTLSJSONOf(c *fakeTLSCounters, b *scanBudget) *FakeTLSJSON {
+	return &FakeTLSJSON{
+		Hinted:            c.hinted.Load(),
+		Scanned:           c.scanned.Load(),
+		Unmatched:         c.unmatched.Load(),
+		DeniedIP:          c.deniedIP.Load(),
+		DeniedGlobal:      c.deniedGlobal.Load(),
+		Oversized:         c.oversized.Load(),
+		OverBudgetMatched: c.overBudgetMatched.Load(),
+		Enforced:          b.enforced(),
+		NsPerBlock:        b.reportedBlockNanos(),
+	}
+}
+
+// counted reports whether the door has counted anything at all. The flag and the
+// block cost are not counts: a door that has been asked nothing has nothing to
+// report, however it is configured.
+func (j *FakeTLSJSON) counted() bool {
+	return j.Hinted != 0 || j.Scanned != 0 || j.Unmatched != 0 || j.DeniedIP != 0 ||
+		j.DeniedGlobal != 0 || j.Oversized != 0 || j.OverBudgetMatched != 0
 }
 
 // ThrottleJSON is the throttle portion of the stats JSON response.
