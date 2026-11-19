@@ -1,0 +1,27 @@
+[package]
+name = "mtg-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+getrandom.workspace = true
+md-5.workspace = true
+mtg-core.workspace = true
+mtg-crypto.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+sha1.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+proptest.workspace = true
+serde.workspace = true
+serde_json.workspace = true

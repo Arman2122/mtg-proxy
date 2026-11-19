@@ -141,7 +141,7 @@ async function waitFor(predicate, what, timeoutMs = 5000) {
 // TelegramWebProxy object, the shimmed-away platform, and a recorder the
 // scenarios read. It runs before the document's own script, which is exactly
 // when the client installs its object.
-function initScript(withHost) {
+function initScript(withHost, hostMode = 'slot') {
   return `(function () {
     window.__violations = [];
     window.addEventListener('securitypolicyviolation', function (e) {
@@ -152,22 +152,47 @@ function initScript(withHost) {
     window.__deliver = null;
 
     if (${withHost ? 'true' : 'false'}) {
-      window.TelegramWebProxy = {
-        postMessage: function (value) {
-          if (value instanceof ArrayBuffer) {
-            window.__sent.push({ kind: 'binary', hex: Array.from(new Uint8Array(value), function (b) {
-              return b.toString(16).padStart(2, '0');
-            }).join('') });
-          } else {
-            window.__sent.push({ kind: 'control', value: value });
+      if (${JSON.stringify(hostMode)} === 'event-target') {
+        var listeners = [];
+        window.TelegramWebProxy = {
+          postMessage: function (value) {
+            if (value instanceof ArrayBuffer) {
+              window.__sent.push({ kind: 'binary', hex: Array.from(new Uint8Array(value), function (b) {
+                return b.toString(16).padStart(2, '0');
+              }).join('') });
+            } else {
+              window.__sent.push({ kind: 'control', value: value });
+            }
+          },
+          addEventListener: function (type, fn) {
+            if (type === 'message' && typeof fn === 'function') {
+              listeners.push(fn);
+            }
           }
-        },
-        onmessage: null
-      };
+        };
 
-      window.__deliver = function (value) {
-        window.TelegramWebProxy.onmessage(value);
-      };
+        window.__deliver = function (value) {
+          var wrapped = { data: value };
+          listeners.forEach(function (fn) { fn(wrapped); });
+        };
+      } else {
+        window.TelegramWebProxy = {
+          postMessage: function (value) {
+            if (value instanceof ArrayBuffer) {
+              window.__sent.push({ kind: 'binary', hex: Array.from(new Uint8Array(value), function (b) {
+                return b.toString(16).padStart(2, '0');
+              }).join('') });
+            } else {
+              window.__sent.push({ kind: 'control', value: value });
+            }
+          },
+          onmessage: null
+        };
+
+        window.__deliver = function (value) {
+          window.TelegramWebProxy.onmessage(value);
+        };
+      }
     }
 
     // The client shims these away. A page that reaches for one must fail here
@@ -184,13 +209,35 @@ function initScript(withHost) {
   })();`;
 }
 
-async function newPage(browser, { withHost = true, injectCSP = true } = {}) {
+async function newPage(
+  browser,
+  {
+    withHost = true,
+    hostMode = 'slot',
+    injectCSP = true,
+    session503Count = 0,
+    holdSession = false,
+  } = {},
+) {
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
   const page = await context.newPage();
 
-  await page.addInitScript(initScript(withHost));
+  const state = {
+    sessionBodies: [],
+    deletes: 0,
+    wsMessages: [],
+    socket: null,
+    wsOpened: 0,
+    pageErrors: [],
+    remaining503: session503Count,
+    releaseSession: null,
+  };
 
-  const state = { sessionBodies: [], deletes: 0, wsMessages: [], socket: null, wsOpened: 0 };
+  page.on('pageerror', (err) => {
+    state.pageErrors.push(err.message || String(err));
+  });
+
+  await page.addInitScript(initScript(withHost, hostMode));
 
   await page.route(`${ORIGIN}/**`, async (route) => {
     const request = route.request();
@@ -215,6 +262,26 @@ async function newPage(browser, { withHost = true, injectCSP = true } = {}) {
 
     if (request.method() === 'POST' && url.pathname === '/api/v1/session') {
       state.sessionBodies.push(hex(new Uint8Array(request.postDataBuffer())));
+
+      if (holdSession) {
+        await new Promise((resolve) => {
+          state.releaseSession = resolve;
+        });
+      }
+
+      if (state.remaining503 > 0) {
+        state.remaining503 -= 1;
+        await route.fulfill({
+          status: 503,
+          headers: {
+            'Retry-After': '1',
+            'Cache-Control': 'no-store',
+          },
+          body: '',
+        });
+
+        return;
+      }
 
       await route.fulfill({
         status: 200,
@@ -515,8 +582,181 @@ scenario('no CSP violations across a full session', async (browser) => {
   const seen = await violations(page);
   check('zero violations', seen.length === 0, JSON.stringify(seen));
 
-  const errors = await page.evaluate('window.__pageErrors || []');
-  check('no page errors', errors.length === 0, JSON.stringify(errors));
+  check('no page errors', state.pageErrors.length === 0, JSON.stringify(state.pageErrors));
+});
+
+// Desktop WebView delivers messages through addEventListener('message', ...)
+// wrapped in an event-like { data } object rather than host.onmessage.
+scenario('Desktop EventTarget boundary with wrapped {data} messages', async (browser) => {
+  const { page, state } = await newPage(browser, { hostMode: 'event-target' });
+  await page.goto(bridgeURL());
+  await waitFor(async () => (await sent(page)).length > 0, 'the init message');
+  await deliver(page, `hex:${hex(HELLO)}`);
+  await waitFor(() => state.wsOpened === 1, 'the websocket');
+
+  const open = frame(0x01, 42);
+  await deliver(page, `hex:${hex(open)}`);
+  const msgs = await waitFor(() => (state.wsMessages.length >= 1 ? state.wsMessages : null), 'OPEN uplink');
+  equal('EventTarget OPEN forwarded', msgs[0], hex(open));
+  check('no page errors', state.pageErrors.length === 0, JSON.stringify(state.pageErrors));
+});
+
+// When the relay is at max-sessions it answers 503 Retry-After: 1 without
+// spending the bootstrap. The bridge must retry byte-identical HELLO and recover.
+scenario('503 capacity response retries byte-identical HELLO and recovers', async (browser) => {
+  const { page, state } = await newPage(browser, { session503Count: 1 });
+  await page.goto(bridgeURL());
+  await waitFor(async () => (await sent(page)).length > 0, 'the init message');
+  await deliver(page, `hex:${hex(HELLO)}`);
+
+  await waitFor(() => state.wsOpened === 1, 'websocket after 503 retry', 8000);
+  equal('two session POSTs sent', state.sessionBodies.length, 2);
+  equal('retry body byte-identical', state.sessionBodies[1], state.sessionBodies[0]);
+  check('no page errors', state.pageErrors.length === 0, JSON.stringify(state.pageErrors));
+});
+
+// Loopback iframe fallback (Desktop/non-injected WebView): parent on
+// http://127.0.0.1:<port> attaches via tproxy-init + MessageChannel, and
+// downlink batches arrive whole (unsplit) on the MessagePort.
+scenario('loopback iframe parent handshake and whole-batch downlink', async (browser) => {
+  const context = await browser.newContext({ ignoreHTTPSErrors: true });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message || String(err)));
+
+  const state = { wsOpened: 0, socket: null };
+  const PARENT_URL = 'http://127.0.0.1:18443/';
+
+  await page.route(`${PARENT_URL}**`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+      body: `<!doctype html><html><body><iframe id="b" src="${ORIGIN}/?bridge=${fixture.capability}"></iframe></body></html>`,
+    });
+  });
+
+  await page.route(`${ORIGIN}/**`, async (route) => {
+    const req = route.request();
+    const url = new URL(req.url());
+    if (req.method() === 'GET' && url.pathname === '/') {
+      // Do NOT inject frame-ancestors-hostile extra CSP; test our shipped CSP!
+      await route.fulfill({ status: 200, headers: { ...fixture.headers }, body: fixture.html });
+      return;
+    }
+    if (req.method() === 'POST' && url.pathname === '/api/v1/session') {
+      await route.fulfill({
+        status: 200,
+        headers: {
+          'X-Session-Token': SESSION_TOKEN,
+          'X-Down-Cursor': '0',
+          'X-Carrier-Mode': 'websocket',
+          'Cache-Control': 'no-store',
+          'Content-Type': 'application/octet-stream',
+        },
+        body: Buffer.from(WELCOME),
+      });
+      return;
+    }
+    await route.fulfill({ status: 204 });
+  });
+
+  await page.routeWebSocket(WS_URL, (ws) => {
+    state.socket = ws;
+    state.wsOpened += 1;
+  });
+
+  await page.goto(PARENT_URL);
+  await page.waitForFunction(() => {
+    const f = document.getElementById('b');
+    return Boolean(f && f.contentWindow);
+  });
+  await page.waitForTimeout(150);
+
+  await page.evaluate((helloHex) => {
+    window.__parentMsgs = [];
+    const mc = new MessageChannel();
+    window.__port = mc.port1;
+    mc.port1.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        window.__parentMsgs.push({
+          kind: 'binary',
+          hex: Array.from(new Uint8Array(ev.data), (b) => b.toString(16).padStart(2, '0')).join(''),
+        });
+      } else {
+        window.__parentMsgs.push({ kind: 'control', value: ev.data });
+      }
+    };
+    const f = document.getElementById('b');
+    f.contentWindow.postMessage({ t: 'tproxy-init', v: 1 }, '*', [mc.port2]);
+
+    const raw = new Uint8Array(helloHex.length / 2);
+    for (let i = 0; i < raw.length; i += 1) {
+      raw[i] = parseInt(helloHex.substr(i * 2, 2), 16);
+    }
+    mc.port1.postMessage(raw.buffer);
+  }, hex(HELLO));
+
+  await waitFor(() => state.wsOpened === 1, 'iframe websocket');
+
+  const f1 = frame(TYPE_DATA, 5, new Uint8Array([10, 20]));
+  const f2 = frame(TYPE_DATA, 6, new Uint8Array([30, 40]));
+  const whole = bytes(f1, f2);
+  state.socket.send(Buffer.from(whole));
+
+  const bins = await waitFor(async () => {
+    const all = await page.evaluate(() => window.__parentMsgs.filter((m) => m.kind === 'binary').map((m) => m.hex));
+    return all.length >= 2 ? all : null;
+  }, 'whole-batch downlink over MessagePort');
+
+  equal('iframe receives WELCOME first', bins[0], hex(WELCOME));
+  equal('iframe receives unsplit whole batch', bins[1], hex(whole));
+  check('no page errors', pageErrors.length === 0, JSON.stringify(pageErrors));
+  await context.close();
+});
+
+// Exceeding the 32 MiB pre-connect uplink queue cap must fail cleanly instead
+// of growing memory without bound.
+scenario('uplink queue cap overflow emits failed then close', async (browser) => {
+  const { page, state } = await newPage(browser, { holdSession: true });
+  await page.goto(bridgeURL());
+  await waitFor(async () => (await sent(page)).length > 0, 'the init message');
+  await deliver(page, `hex:${hex(HELLO)}`);
+  await waitFor(() => state.sessionBodies.length === 1, 'held session POST');
+
+  // Queue 34 x 1 MiB payloads while socket is not yet open (> 32 MiB cap).
+  await page.evaluate(() => {
+    for (let i = 0; i < 34; i += 1) {
+      const buf = new ArrayBuffer(1024 * 1024);
+      window.__deliver(buf);
+    }
+  });
+
+  const values = await waitFor(async () => {
+    const seen = controls(await sent(page));
+    return seen.some((v) => v.t === 'close') ? seen : null;
+  }, 'failed + close on uplink cap');
+
+  const order = values.map((v) => (v.t === 'status' ? `status:${v.state}` : v.t));
+  check('failed precedes close on queue cap', order.indexOf('status:failed') < order.indexOf('close'), JSON.stringify(order));
+  check('no page errors', state.pageErrors.length === 0, JSON.stringify(state.pageErrors));
+  if (state.releaseSession) state.releaseSession();
+});
+
+// Navigating away / closing the WebView fires pagehide, which must release the
+// relay session via DELETE /api/v1/session.
+scenario('pagehide releases the active session via DELETE', async (browser) => {
+  const { page, state } = await newPage(browser);
+  await page.goto(bridgeURL());
+  await waitFor(async () => (await sent(page)).length > 0, 'the init message');
+  await deliver(page, `hex:${hex(HELLO)}`);
+  await waitFor(() => state.wsOpened === 1, 'the websocket');
+
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('pagehide'));
+  });
+  await waitFor(() => state.deletes > 0, 'DELETE on pagehide');
+  equal('session deleted once on pagehide', state.deletes, 1);
+  check('no page errors', state.pageErrors.length === 0, JSON.stringify(state.pageErrors));
 });
 
 // ------------------------------------------------------------------- runner

@@ -1,0 +1,40 @@
+[package]
+name = "mtg-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mtg-core.workspace = true
+mtg-crypto.workspace = true
+mtg-protocol.workspace = true
+mtg-config.workspace = true
+
+arc-swap.workspace = true
+base64.workspace = true
+bytes.workspace = true
+getrandom.workspace = true
+hickory-resolver.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+io-uring.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rustc-hash.workspace = true
+rustls.workspace = true
+slab.workspace = true
+smallvec.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true

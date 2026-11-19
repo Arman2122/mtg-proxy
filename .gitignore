@@ -1,3 +1,10 @@
+/target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+**/*.rs.bk
+*.profraw
+*.profdata
 *.exe
 *.exe~
 *.dll
@@ -10,4 +17,3 @@ coverage.txt
 dist/
 mtg-proxy
 mtg-proxy-*
-/escapecheck

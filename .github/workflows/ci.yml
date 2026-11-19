@@ -1,0 +1,78 @@
+name: CI (Linux Pure Rust)
+
+on:
+  push:
+    branches: [main, feat/rust-rewrite]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: Linux x86_64 — Format, Clippy, Tests, Fuzz & Playwright
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy strict (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run full workspace unit, golden, zero-alloc & integration tests
+        run: cargo test --workspace -- --nocapture
+
+      - name: Verify all 8 fuzz targets compile cleanly
+        run: cargo check --manifest-path fuzz/Cargo.toml
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Playwright Chromium for WEB bridge harness
+        working-directory: test/webbridge
+        run: |
+          npm ci
+          npx playwright install chromium
+
+      - name: Run real Chromium Playwright WEB bridge tests
+        env:
+          MTG_REQUIRE_BROWSER_HARNESS: "1"
+        run: cargo test -p mtg-webrelay bridge_page_headers_and_optional_playwright_harness -- --nocapture
+
+      - name: Build optimized Linux x86_64 release binaries
+        run: cargo build --release --bin mtg-proxy --bin mtg-bench
+
+  arm64-cross-check:
+    name: Linux aarch64 (ARMv8 AES/SHA-2) — Cross-Compile & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 Linux cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64
+
+      - name: Clippy strict (-D warnings) on aarch64-unknown-linux-gnu
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo clippy --workspace --target aarch64-unknown-linux-gnu -- -D warnings

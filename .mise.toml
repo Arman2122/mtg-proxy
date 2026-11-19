@@ -1,128 +1,29 @@
 [tools]
-# Editor and reporting tools: their version does not decide whether the build
-# passes, so they float. govulncheck deliberately floats too -- for a scanner
-# the newest analyzer is the point, and its database is fetched at run time
-# anyway.
-"go:golang.org/x/pkgsite/cmd/pkgsite" = "latest"
-"go:golang.org/x/tools/gopls" = "latest"
-"go:golang.org/x/vuln/cmd/govulncheck" = "latest"
-"go:mvdan.cc/gofumpt" = "latest"
-
-# These two are PINNED because they decide whether the build passes.
-#
-# mise.lock has recorded these same versions since the first commit, but the
-# lockfile is not being honoured on CI: on 2026-09-04 two Dependabot pull
-# requests that touched no Go code failed the Lint job on five gosec findings
-# the locked golangci-lint does not implement, so the runner had resolved
-# `latest` and installed something newer. A gate whose result depends on the
-# day it runs is not a gate, and a version named here is obeyed whether or not
-# the lockfile is.
-#
-# They match mise.lock deliberately, so the two cannot disagree. Upgrading is a
-# deliberate commit: change the version here, run `mise run fmt` and
-# `mise run lint`, and fix whatever the new version finds in that same change.
-#
-# .golangci.yml is part of that pairing: a config key the pinned version does
-# not know fails `golangci-lint config verify`, the first step of the lint task,
-# even when `golangci-lint run` alone reports 0 issues. Check both steps under
-# the pinned version, not only `run`.
-go = "1.26.10"
-golangci-lint = "2.13.2"
-
-[vars]
-fuzzflags = "-fuzztime=120s"
+rust = "stable"
 
 [tasks.build]
-description = "Build binary"
-sources = ["**/*.go", "go.mod", "go.sum"]
-outputs = ["mtg-proxy"]
-run = "go build"
+description = "Build optimized Linux release binary"
+run = "cargo build --release --bin mtg-proxy"
 
-# No `outputs`: this writes the same ./mtg-proxy path as `build` and `static`,
-# so a staleness check would skip it and leave the previous variant in place.
-[tasks."build:prof"]
-description = "Build binary with profiling enabled"
-sources = ["**/*.go", "go.mod", "go.sum"]
-run = "go build -tags prof"
-
-[tasks.update]
-description = "Update dependencies"
-run = [
-    "go get -u",
-    "go mod tidy -go=1.26"
-]
-
-[tasks.lint]
-description = "Run linter"
-# `config verify` first: .golangci.yml is schema-checked, so a typo in a
-# linter name or an exclusion key fails loudly here instead of silently
-# turning a check off. `run` then gates on 0 issues.
-run = [
-    "golangci-lint config verify",
-    "golangci-lint run"
-]
-
-[tasks.vuln]
-description = "Test for vulnerabilities"
-run = "govulncheck ./..."
-
-[tasks.test]
-description = "Run tests"
-run = "go test -v -race ./..."
-
-[tasks.covtest]
-description = "Run tests with code coverage"
-run = "go test -coverprofile=coverage.txt -covermode=atomic -count=2 -race -v ./..."
-
-[tasks.test-all]
-description = "Run all tests"
-depends = [
-    "test",
-    "test:fuzz:*"
-]
-
-[tasks."test:fuzz:client-hello"]
-description = "Run fuzzy test for ClientHello"
-run = "go test -v {{ vars.fuzzflags }} -fuzz=FuzzReadClientHello ./mtglib/internal/tls/fake"
-
-[tasks."test:fuzz:client-handshake"]
-description = "Run fuzzy test for ClientHandshake"
-run = "go test -v {{ vars.fuzzflags }} -fuzz=FuzzClientServerHandshake ./mtglib/obfuscation"
-
-[tasks."test:fuzz:server-handshake-frame"]
-description = "Run fuzzy test for GenerateHandshakeFrame"
-run = "go test -v {{ vars.fuzzflags }} -fuzz=FuzzGenerateHandshakeFrame ./mtglib/obfuscation"
-
-# No `outputs`, for the same reason as build:prof — same path, different flags.
-[tasks.static]
-description = "Build static binary"
-sources = ["**/*.go", "go.mod", "go.sum"]
-run = """
-#!/bin/bash
-
-version="$(git describe --exact-match HEAD 2>/dev/null || git describe --tags --always)"
-go build \
-    -trimpath \
-    -mod=readonly \
-    -ldflags="-extldflags '-static' -s -w -X 'main.version=$version'" \
-    -a \
-    -tags netgo
-"""
-
-[tasks.image]
-description = "Build docker image"
-sources = ["**/*.go", "go.mod", "go.sum", "Dockerfile"]
-run = "docker buildx build --pull -t mtg-proxy ."
-
-[tasks.docs]
-description = "Run doc server"
-run = "pkgsite -http 0.0.0.0:10000"
+[tasks.bench]
+description = "Build release proxy + A/B benchmark harness"
+run = "cargo build --release --bin mtg-proxy --bin mtg-bench"
 
 [tasks.fmt]
-description = "Reformat source code"
-sources = ["**/*.go"]
-# golangci-lint now ENFORCES gofumpt (formatters.gofumpt.extra-rules in
-# .golangci.yml), so formatting is applied with the same binary that gates
-# it. Shelling out to a separately-pinned `gofumpt = latest` risked the two
-# disagreeing, which reads as a lint failure nobody can reproduce locally.
-run = "golangci-lint fmt"
+description = "Format all Rust workspace crates"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Check formatting and strict Clippy (-D warnings)"
+run = [
+    "cargo fmt --all -- --check",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+]
+
+[tasks.test]
+description = "Run full Rust workspace test suite"
+run = "cargo test --workspace"
+
+[tasks.image]
+description = "Build multi-stage Linux container image"
+run = "docker buildx build --pull -t mtg-proxy ."

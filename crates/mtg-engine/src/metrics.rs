@@ -1,0 +1,828 @@
+//! Per-core cache-line-aligned counters, per-secret runtime metrics,
+//! connection-count fair throttle, crash-safe atomic `usage.json` persistence,
+//! Prometheus exposition renderer, and 1-second batched StatsD UDP exporter.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write as _};
+use std::net::{IpAddr, UdpSocket};
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Datelike as _, Utc};
+use mtg_config::StatsdTagFormat;
+use mtg_core::QuotaReset;
+use mtg_governance::{GcraLimiter, secret_burst};
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+/// Cache-line-aligned per-worker hot counters (eliminates false sharing across cores).
+#[repr(align(64))]
+#[derive(Debug, Default)]
+pub struct CoreMetrics {
+    pub accepted_total: AtomicU64,
+    pub active_conns_v4: AtomicI64,
+    pub active_conns_v6: AtomicI64,
+    pub fronted_conns_v4: AtomicI64,
+    pub fronted_conns_v6: AtomicI64,
+    pub fronted_total: AtomicU64,
+    pub fronted_bytes_from_client: AtomicU64,
+    pub fronted_bytes_to_client: AtomicU64,
+    pub replay_attacks: AtomicU64,
+    pub concurrency_limited: AtomicU64,
+    pub throttled_total: AtomicU64,
+    pub ip_limited_total: AtomicU64,
+    pub blocklisted_total: AtomicU64,
+    pub allowlist_rejected_total: AtomicU64,
+}
+
+/// FakeTLS door handshake counters matching `/stats` `faketls_handshake`.
+#[derive(Debug, Default)]
+pub struct FakeTlsCounters {
+    pub hinted: AtomicI64,
+    pub scanned: AtomicI64,
+    pub unmatched: AtomicI64,
+    pub denied_ip: AtomicI64,
+    pub denied_global: AtomicI64,
+    pub oversized: AtomicI64,
+    pub over_budget_matched: AtomicI64,
+}
+
+impl FakeTlsCounters {
+    pub fn any_counted(&self) -> bool {
+        self.hinted.load(Ordering::Relaxed) != 0
+            || self.scanned.load(Ordering::Relaxed) != 0
+            || self.unmatched.load(Ordering::Relaxed) != 0
+            || self.denied_ip.load(Ordering::Relaxed) != 0
+            || self.denied_global.load(Ordering::Relaxed) != 0
+            || self.oversized.load(Ordering::Relaxed) != 0
+            || self.over_budget_matched.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// Obfuscated2 `[[listener]]` counters matching `/stats` `obfuscated`.
+#[derive(Debug, Default)]
+pub struct ObfsCounters {
+    pub trials: AtomicI64,
+    pub misses: AtomicI64,
+    pub denied: AtomicI64,
+    pub draining: AtomicI64,
+    pub rate_limited: AtomicI64,
+}
+
+/// Persistent runtime counters & lock-free GCRA buckets for a single named secret.
+#[derive(Debug)]
+pub struct SecretRuntime {
+    pub connections: AtomicI64,
+    pub bytes_in: AtomicI64,
+    pub bytes_out: AtomicI64,
+    /// Last seen Unix seconds (`0` = never seen).
+    pub last_seen_unix: AtomicI64,
+    /// Quota used in current period (client read + write).
+    pub quota_used: AtomicI64,
+    /// Quota period start in Unix nanoseconds (`0` = not started).
+    pub period_start_ns: AtomicI64,
+    /// Live quota ceiling enforced on data path (`0` = unlimited).
+    pub quota_ceiling: AtomicI64,
+    pub quota_cutoffs: AtomicI64,
+    pub ad_tag_skipped: AtomicI64,
+    pub ad_tag_failed: AtomicI64,
+    pub ip_limit_refused: AtomicI64,
+    pub client_conns_refused: AtomicI64,
+    /// Cumulative wait nanoseconds spent at user's own speed buckets.
+    pub speed_throttled_ns: AtomicU64,
+    /// Cumulative wait nanoseconds spent at per-address limiters (ceiling + fair).
+    pub client_throttled_ns: AtomicU64,
+    /// Last admission Unix nanoseconds under a retiring key (`0` = none).
+    pub retiring_last_seen_ns: AtomicI64,
+    /// Live connections authenticated via a retiring key.
+    pub retiring_connections: AtomicI64,
+
+    /// Most recently admitted client IP string (populated ONLY when `track-client-ips = true`).
+    pub last_ip: RwLock<String>,
+
+    /// Lock-free aggregate speed limiters (`speed`, `speed-up`, `speed-down`).
+    pub speed: GcraLimiter,
+    pub speed_up: GcraLimiter,
+    pub speed_down: GcraLimiter,
+}
+
+impl Default for SecretRuntime {
+    fn default() -> Self {
+        Self {
+            connections: AtomicI64::new(0),
+            bytes_in: AtomicI64::new(0),
+            bytes_out: AtomicI64::new(0),
+            last_seen_unix: AtomicI64::new(0),
+            quota_used: AtomicI64::new(0),
+            period_start_ns: AtomicI64::new(0),
+            quota_ceiling: AtomicI64::new(0),
+            quota_cutoffs: AtomicI64::new(0),
+            ad_tag_skipped: AtomicI64::new(0),
+            ad_tag_failed: AtomicI64::new(0),
+            ip_limit_refused: AtomicI64::new(0),
+            client_conns_refused: AtomicI64::new(0),
+            speed_throttled_ns: AtomicU64::new(0),
+            client_throttled_ns: AtomicU64::new(0),
+            retiring_last_seen_ns: AtomicI64::new(0),
+            retiring_connections: AtomicI64::new(0),
+            last_ip: RwLock::new(String::new()),
+            speed: GcraLimiter::unlimited(),
+            speed_up: GcraLimiter::unlimited(),
+            speed_down: GcraLimiter::unlimited(),
+        }
+    }
+}
+
+impl SecretRuntime {
+    /// Roll over `quota_used` when `reset == Monthly` and the calendar month changed.
+    pub fn rollover_if_needed(&self, reset: QuotaReset, now: DateTime<Utc>) {
+        if reset != QuotaReset::Monthly {
+            return;
+        }
+        let now_ns = now.timestamp_nanos_opt().unwrap_or(0);
+        let start_ns = self.period_start_ns.load(Ordering::Acquire);
+        if start_ns == 0 {
+            let _ = self.period_start_ns.compare_exchange(
+                0,
+                now_ns,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return;
+        }
+        let start_dt = DateTime::from_timestamp_nanos(start_ns);
+        if (now.year() != start_dt.year() || now.month() != start_dt.month())
+            && self
+                .period_start_ns
+                .compare_exchange(start_ns, now_ns, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.quota_used.store(0, Ordering::Release);
+        }
+    }
+
+    pub fn set_speed_limits(&self, combined: i64, up: i64, down: i64) {
+        self.speed.apply(combined, secret_burst(combined));
+        self.speed_up.apply(up, secret_burst(up));
+        self.speed_down.apply(down, secret_burst(down));
+    }
+
+    #[inline]
+    pub fn total_throttled_ms(&self) -> i64 {
+        let ns = self
+            .speed_throttled_ns
+            .load(Ordering::Relaxed)
+            .saturating_add(self.client_throttled_ns.load(Ordering::Relaxed));
+        (ns / 1_000_000) as i64
+    }
+
+    /// Record moved bytes (`is_in = true` client->DC) and check live quota ceiling.
+    /// Returns `true` if quota ceiling has been reached/exceeded.
+    #[inline]
+    pub fn record_traffic(&self, bytes: i64, is_in: bool, now_unix: i64) -> bool {
+        if is_in {
+            self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+        } else {
+            self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+        }
+        self.last_seen_unix.store(now_unix, Ordering::Relaxed);
+        let used = self.quota_used.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let ceil = self.quota_ceiling.load(Ordering::Relaxed);
+        ceil > 0 && used >= ceil
+    }
+}
+
+/// Persisted JSON schema for `usage-state-file` (100% compatible with Go `usageRecord`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub quota_used: i64,
+    pub period_start: i64,
+}
+
+/// Per-Telegram-DC/IP telemetry bucket for Prometheus & StatsD.
+#[derive(Debug, Default)]
+pub struct DcEndpointStats {
+    pub active_conns: AtomicI64,
+    pub bytes_from_client: AtomicU64,
+    pub bytes_to_client: AtomicU64,
+}
+
+/// Global metrics & observability store shared by engine, API, Prometheus, and StatsD.
+#[derive(Debug)]
+pub struct ProxyMetrics {
+    pub started_at: DateTime<Utc>,
+    pub started_instant: Instant,
+    pub cores: Box<[CoreMetrics]>,
+    pub faketls: FakeTlsCounters,
+    pub obfs: ObfsCounters,
+    users: RwLock<FxHashMap<String, Arc<SecretRuntime>>>,
+    dc_endpoints: RwLock<FxHashMap<(IpAddr, i32), Arc<DcEndpointStats>>>,
+    pub blocklist_size: AtomicU64,
+    pub allowlist_size: AtomicU64,
+
+    // Global connection-count fair throttle (`[throttle]`)
+    pub throttle_limit: i64,
+    pub throttle_interval: Duration,
+    pub throttle_active: AtomicBool,
+    throttle_caps: RwLock<BTreeMap<String, i64>>,
+}
+
+impl ProxyMetrics {
+    pub fn new(num_cores: usize, throttle_limit: u32, throttle_interval: Duration) -> Self {
+        let cores = (0..num_cores.max(1))
+            .map(|_| CoreMetrics::default())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            started_at: Utc::now(),
+            started_instant: Instant::now(),
+            cores,
+            faketls: FakeTlsCounters::default(),
+            obfs: ObfsCounters::default(),
+            users: RwLock::new(FxHashMap::default()),
+            dc_endpoints: RwLock::new(FxHashMap::default()),
+            blocklist_size: AtomicU64::new(0),
+            allowlist_size: AtomicU64::new(0),
+            throttle_limit: i64::from(throttle_limit),
+            throttle_interval: if throttle_interval.is_zero() {
+                Duration::from_secs(5)
+            } else {
+                throttle_interval
+            },
+            throttle_active: AtomicBool::new(false),
+            throttle_caps: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    #[inline]
+    pub fn core(&self, worker_id: usize) -> &CoreMetrics {
+        &self.cores[worker_id % self.cores.len()]
+    }
+
+    /// Get or create the persistent [`SecretRuntime`] for `name`.
+    pub fn user(&self, name: &str) -> Arc<SecretRuntime> {
+        if let Some(u) = self.users.read().get(name) {
+            return Arc::clone(u);
+        }
+        let mut w = self.users.write();
+        Arc::clone(w.entry(name.to_owned()).or_default())
+    }
+
+    /// Read an existing [`SecretRuntime`] without creating a bucket as a side effect.
+    pub fn get_user(&self, name: &str) -> Option<Arc<SecretRuntime>> {
+        self.users.read().get(name).cloned()
+    }
+
+    /// Snapshot all user runtime buckets.
+    pub fn all_users(&self) -> Vec<(String, Arc<SecretRuntime>)> {
+        self.users
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect()
+    }
+
+    /// Pre-register secret name so it shows up in `/stats` even with 0 connections.
+    pub fn pre_register(&self, name: &str) {
+        let _ = self.user(name);
+    }
+
+    pub fn dc_endpoint(&self, ip: IpAddr, dc: i32) -> Arc<DcEndpointStats> {
+        if let Some(s) = self.dc_endpoints.read().get(&(ip, dc)) {
+            return Arc::clone(s);
+        }
+        let mut w = self.dc_endpoints.write();
+        Arc::clone(w.entry((ip, dc)).or_default())
+    }
+
+    /// Reset a secret's quota usage to 0 and restart its period from `now`.
+    pub fn reset_quota(&self, name: &str, now: DateTime<Utc>) {
+        let u = self.user(name);
+        u.quota_used.store(0, Ordering::Release);
+        u.period_start_ns
+            .store(now.timestamp_nanos_opt().unwrap_or(0), Ordering::Release);
+    }
+
+    /// Check global connection-count fair throttle (`[throttle]`).
+    pub fn can_connect_throttle(&self, name: &str) -> bool {
+        if self.throttle_limit <= 0 {
+            return true;
+        }
+        let cap = {
+            let caps = self.throttle_caps.read();
+            caps.get(name).copied()
+        };
+        let Some(user_cap) = cap else {
+            return true;
+        };
+        self.user(name).connections.load(Ordering::Relaxed) < user_cap
+    }
+
+    /// Recompute global connection-count fair caps (exact port of Go `computeFairCaps`).
+    pub fn recompute_throttle_caps(&self) {
+        if self.throttle_limit <= 0 {
+            return;
+        }
+        let user_conns: BTreeMap<String, i64> = self
+            .users
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.connections.load(Ordering::Relaxed)))
+            .collect();
+        let caps = compute_fair_caps(&user_conns, self.throttle_limit);
+        let active = !caps.is_empty();
+        *self.throttle_caps.write() = caps;
+        self.throttle_active.store(active, Ordering::Release);
+    }
+
+    pub fn throttle_snapshot(&self) -> Option<(bool, i64, BTreeMap<String, i64>)> {
+        if self.throttle_limit <= 0 {
+            return None;
+        }
+        let active = self.throttle_active.load(Ordering::Acquire);
+        let caps = self.throttle_caps.read().clone();
+        Some((active, self.throttle_limit, caps))
+    }
+
+    /// Total active client connections summed across all worker cores.
+    pub fn total_active_connections(&self) -> i64 {
+        self.cores
+            .iter()
+            .map(|c| {
+                c.active_conns_v4.load(Ordering::Relaxed)
+                    + c.active_conns_v6.load(Ordering::Relaxed)
+            })
+            .sum()
+    }
+
+    /// Restore persisted quota usage from `path` (missing file is `Ok(())`).
+    pub fn load_usage(&self, path: &Path) -> io::Result<()> {
+        let data = match fs::read(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let records: BTreeMap<String, UsageRecord> = serde_json::from_slice(&data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        for (name, rec) in records {
+            let u = self.user(&name);
+            u.quota_used.store(rec.quota_used, Ordering::Release);
+            u.period_start_ns.store(rec.period_start, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Crash-safe atomic `usage.json` flush: unique temp file (`0600`) ->
+    /// `write_all` -> `sync_data` -> atomic `rename` -> parent dir `fsync`!
+    pub fn flush_usage_atomic(&self, path: &Path) -> io::Result<()> {
+        let records: BTreeMap<String, UsageRecord> = self
+            .users
+            .read()
+            .iter()
+            .map(|(name, st)| {
+                (
+                    name.clone(),
+                    UsageRecord {
+                        quota_used: st.quota_used.load(Ordering::Relaxed),
+                        period_start: st.period_start_ns.load(Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect();
+
+        let data = serde_json::to_vec(&records)
+            .map_err(|e| io::Error::other(format!("marshal usage state: {e}")))?;
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("usage.json");
+        let tmp_path = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+
+        let res = (|| -> io::Result<()> {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            f.write_all(&data)?;
+            f.sync_data()?;
+            drop(f);
+
+            fs::rename(&tmp_path, path)?;
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        })();
+
+        if res.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        res
+    }
+
+    /// Render Prometheus OpenMetrics / text exposition with 100% metric name
+    /// and label parity with Go `stats/prometheus.go`.
+    pub fn render_prometheus(&self, prefix: &str) -> String {
+        let p = if prefix.is_empty() { "mtg" } else { prefix };
+        let mut out = String::with_capacity(4096);
+
+        let mut c_v4 = 0i64;
+        let mut c_v6 = 0i64;
+        let mut f_v4 = 0i64;
+        let mut f_v6 = 0i64;
+        let mut f_total = 0u64;
+        let mut f_from = 0u64;
+        let mut f_to = 0u64;
+        let mut replays = 0u64;
+        let mut conc_lim = 0u64;
+        let mut throttled = 0u64;
+        let mut ip_lim = 0u64;
+        let mut blocklisted = 0u64;
+        let mut allow_rej = 0u64;
+
+        for c in &self.cores {
+            c_v4 += c.active_conns_v4.load(Ordering::Relaxed);
+            c_v6 += c.active_conns_v6.load(Ordering::Relaxed);
+            f_v4 += c.fronted_conns_v4.load(Ordering::Relaxed);
+            f_v6 += c.fronted_conns_v6.load(Ordering::Relaxed);
+            f_total += c.fronted_total.load(Ordering::Relaxed);
+            f_from += c.fronted_bytes_from_client.load(Ordering::Relaxed);
+            f_to += c.fronted_bytes_to_client.load(Ordering::Relaxed);
+            replays += c.replay_attacks.load(Ordering::Relaxed);
+            conc_lim += c.concurrency_limited.load(Ordering::Relaxed);
+            throttled += c.throttled_total.load(Ordering::Relaxed);
+            ip_lim += c.ip_limited_total.load(Ordering::Relaxed);
+            blocklisted += c.blocklisted_total.load(Ordering::Relaxed);
+            allow_rej += c.allowlist_rejected_total.load(Ordering::Relaxed);
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_client_connections A number of actively processing client connections."
+        );
+        let _ = writeln!(out, "# TYPE {p}_client_connections gauge");
+        let _ = writeln!(out, "{p}_client_connections{{ip_family=\"ipv4\"}} {c_v4}");
+        let _ = writeln!(out, "{p}_client_connections{{ip_family=\"ipv6\"}} {c_v6}");
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_domain_fronting_connections A number of connections which talk to front domain."
+        );
+        let _ = writeln!(out, "# TYPE {p}_domain_fronting_connections gauge");
+        let _ = writeln!(
+            out,
+            "{p}_domain_fronting_connections{{ip_family=\"ipv4\"}} {f_v4}"
+        );
+        let _ = writeln!(
+            out,
+            "{p}_domain_fronting_connections{{ip_family=\"ipv6\"}} {f_v6}"
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_domain_fronting A number of routings to front domain."
+        );
+        let _ = writeln!(out, "# TYPE {p}_domain_fronting counter");
+        let _ = writeln!(out, "{p}_domain_fronting {f_total}");
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_domain_fronting_traffic Traffic which is generated talking with front domain."
+        );
+        let _ = writeln!(out, "# TYPE {p}_domain_fronting_traffic counter");
+        let _ = writeln!(
+            out,
+            "{p}_domain_fronting_traffic{{direction=\"from_client\"}} {f_from}"
+        );
+        let _ = writeln!(
+            out,
+            "{p}_domain_fronting_traffic{{direction=\"to_client\"}} {f_to}"
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_telegram_connections A number of connections to Telegram servers."
+        );
+        let _ = writeln!(out, "# TYPE {p}_telegram_connections gauge");
+        let dc_snap: Vec<((IpAddr, i32), i64, u64, u64)> = self
+            .dc_endpoints
+            .read()
+            .iter()
+            .map(|(&k, v)| {
+                (
+                    k,
+                    v.active_conns.load(Ordering::Relaxed),
+                    v.bytes_from_client.load(Ordering::Relaxed),
+                    v.bytes_to_client.load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+        for &((ip, dc), conns, _, _) in &dc_snap {
+            let _ = writeln!(
+                out,
+                "{p}_telegram_connections{{dc=\"{dc}\",telegram_ip=\"{ip}\"}} {conns}"
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_telegram_traffic Traffic which is generated talking with Telegram servers."
+        );
+        let _ = writeln!(out, "# TYPE {p}_telegram_traffic counter");
+        for &((ip, dc), _, from_c, to_c) in &dc_snap {
+            let _ = writeln!(
+                out,
+                "{p}_telegram_traffic{{dc=\"{dc}\",direction=\"from_client\",telegram_ip=\"{ip}\"}} {from_c}"
+            );
+            let _ = writeln!(
+                out,
+                "{p}_telegram_traffic{{dc=\"{dc}\",direction=\"to_client\",telegram_ip=\"{ip}\"}} {to_c}"
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_iplist_size A size of the ip list (blocklist or allowlist)"
+        );
+        let _ = writeln!(out, "# TYPE {p}_iplist_size gauge");
+        let _ = writeln!(
+            out,
+            "{p}_iplist_size{{ip_list=\"blocklist\"}} {}",
+            self.blocklist_size.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "{p}_iplist_size{{ip_list=\"allowlist\"}} {}",
+            self.allowlist_size.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_ip_blocklisted A number of rejected sessions due to ip blocklisting."
+        );
+        let _ = writeln!(out, "# TYPE {p}_ip_blocklisted counter");
+        let _ = writeln!(
+            out,
+            "{p}_ip_blocklisted{{ip_list=\"blocklist\"}} {blocklisted}"
+        );
+        let _ = writeln!(
+            out,
+            "{p}_ip_blocklisted{{ip_list=\"allowlist\"}} {allow_rej}"
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_concurrency_limited A number of sessions that were rejected by concurrency limiter."
+        );
+        let _ = writeln!(out, "# TYPE {p}_concurrency_limited counter");
+        let _ = writeln!(out, "{p}_concurrency_limited {conc_lim}");
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_throttled A number of sessions that were refused by the per-user connection throttle."
+        );
+        let _ = writeln!(out, "# TYPE {p}_throttled counter");
+        let _ = writeln!(out, "{p}_throttled {throttled}");
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_ip_limited A number of sessions that were refused by a per-user address limit."
+        );
+        let _ = writeln!(out, "# TYPE {p}_ip_limited counter");
+        let _ = writeln!(out, "{p}_ip_limited {ip_lim}");
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_replay_attacks A number of detected replay attacks."
+        );
+        let _ = writeln!(out, "# TYPE {p}_replay_attacks counter");
+        let _ = writeln!(out, "{p}_replay_attacks {replays}");
+
+        out
+    }
+
+    /// Spawn a 1-second batched StatsD UDP exporter (Datadog / InfluxDB / Graphite tag formats).
+    pub fn spawn_statsd_flusher(
+        self: &Arc<Self>,
+        target_addr: String,
+        prefix: String,
+        tag_format: StatsdTagFormat,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let metrics = Arc::clone(self);
+        tokio::spawn(async move {
+            let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
+                warn!("cannot bind UDP socket for StatsD");
+                return;
+            };
+            if let Err(e) = sock.connect(&target_addr) {
+                warn!(addr = %target_addr, error = %e, "cannot connect StatsD UDP target");
+                return;
+            }
+            let p = if prefix.is_empty() {
+                "mtg.".to_owned()
+            } else if prefix.ends_with('.') {
+                prefix
+            } else {
+                format!("{prefix}.")
+            };
+            let mut pkt = String::with_capacity(1400);
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            return;
+                        }
+                    }
+                }
+                pkt.clear();
+                let mut v4 = 0i64;
+                let mut v6 = 0i64;
+                let mut fv4 = 0i64;
+                let mut fv6 = 0i64;
+                for c in &metrics.cores {
+                    v4 += c.active_conns_v4.load(Ordering::Relaxed);
+                    v6 += c.active_conns_v6.load(Ordering::Relaxed);
+                    fv4 += c.fronted_conns_v4.load(Ordering::Relaxed);
+                    fv6 += c.fronted_conns_v6.load(Ordering::Relaxed);
+                }
+                push_statsd_gauge(
+                    &mut pkt,
+                    &p,
+                    "client_connections",
+                    v4,
+                    &[("ip_family", "ipv4")],
+                    tag_format,
+                );
+                push_statsd_gauge(
+                    &mut pkt,
+                    &p,
+                    "client_connections",
+                    v6,
+                    &[("ip_family", "ipv6")],
+                    tag_format,
+                );
+                push_statsd_gauge(
+                    &mut pkt,
+                    &p,
+                    "domain_fronting_connections",
+                    fv4,
+                    &[("ip_family", "ipv4")],
+                    tag_format,
+                );
+                push_statsd_gauge(
+                    &mut pkt,
+                    &p,
+                    "domain_fronting_connections",
+                    fv6,
+                    &[("ip_family", "ipv6")],
+                    tag_format,
+                );
+                push_statsd_gauge(
+                    &mut pkt,
+                    &p,
+                    "iplist_size",
+                    metrics.blocklist_size.load(Ordering::Relaxed) as i64,
+                    &[("ip_list", "blocklist")],
+                    tag_format,
+                );
+                push_statsd_gauge(
+                    &mut pkt,
+                    &p,
+                    "iplist_size",
+                    metrics.allowlist_size.load(Ordering::Relaxed) as i64,
+                    &[("ip_list", "allowlist")],
+                    tag_format,
+                );
+                let _ = sock.send(pkt.as_bytes());
+            }
+        });
+    }
+}
+
+fn push_statsd_gauge(
+    out: &mut String,
+    prefix: &str,
+    name: &str,
+    val: i64,
+    tags: &[(&str, &str)],
+    fmt: StatsdTagFormat,
+) {
+    match fmt {
+        StatsdTagFormat::Datadog => {
+            let _ = write!(out, "{prefix}{name}:{val}|g");
+            if !tags.is_empty() {
+                out.push_str("|#");
+                for (i, (k, v)) in tags.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    let _ = write!(out, "{k}:{v}");
+                }
+            }
+            out.push('\n');
+        }
+        StatsdTagFormat::Influxdb => {
+            let _ = write!(out, "{prefix}{name}");
+            for (k, v) in tags {
+                let _ = write!(out, ",{k}={v}");
+            }
+            let _ = writeln!(out, ":{val}|g");
+        }
+        StatsdTagFormat::Graphite => {
+            let _ = write!(out, "{prefix}{name}");
+            for (k, v) in tags {
+                let _ = write!(out, ";{k}={v}");
+            }
+            let _ = writeln!(out, ":{val}|g");
+        }
+    }
+}
+
+/// Fair-share connection-count capping matching Go `computeFairCaps`.
+pub fn compute_fair_caps(user_conns: &BTreeMap<String, i64>, limit: i64) -> BTreeMap<String, i64> {
+    let total: i64 = user_conns.values().sum();
+    if total <= limit {
+        return BTreeMap::new();
+    }
+    let mut remaining = user_conns.clone();
+    let mut budget = limit;
+    let mut caps = BTreeMap::new();
+
+    while !remaining.is_empty() {
+        let fair_share = budget / (remaining.len() as i64);
+        let mut removed = Vec::new();
+        for (name, &conns) in &remaining {
+            if conns <= fair_share {
+                budget -= conns;
+                removed.push(name.clone());
+            }
+        }
+        if removed.is_empty() {
+            for name in remaining.keys() {
+                caps.insert(name.clone(), fair_share);
+            }
+            break;
+        }
+        for name in removed {
+            remaining.remove(&name);
+        }
+    }
+    caps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_usage_persistence_roundtrips_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+
+        let m1 = ProxyMetrics::new(2, 0, Duration::from_secs(5));
+        m1.user("alice")
+            .quota_used
+            .store(123_456, Ordering::Relaxed);
+        m1.user("alice")
+            .period_start_ns
+            .store(1_700_000_000_000_000_000, Ordering::Relaxed);
+        m1.flush_usage_atomic(&path).unwrap();
+
+        let m2 = ProxyMetrics::new(2, 0, Duration::from_secs(5));
+        m2.load_usage(&path).unwrap();
+        assert_eq!(m2.user("alice").quota_used.load(Ordering::Relaxed), 123_456);
+        assert_eq!(
+            m2.user("alice").period_start_ns.load(Ordering::Relaxed),
+            1_700_000_000_000_000_000
+        );
+    }
+
+    #[test]
+    fn fair_throttle_caps_match_go_algorithm() {
+        let mut conns = BTreeMap::new();
+        conns.insert("alice".to_owned(), 2);
+        conns.insert("bob".to_owned(), 10);
+        conns.insert("carol".to_owned(), 10);
+        let caps = compute_fair_caps(&conns, 10);
+        // Alice (2 <= 3) keeps her 2; remaining budget 8 split between bob & carol = 4 each!
+        assert!(!caps.contains_key("alice"));
+        assert_eq!(caps.get("bob"), Some(&4));
+        assert_eq!(caps.get("carol"), Some(&4));
+    }
+}
