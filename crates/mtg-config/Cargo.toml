@@ -1,0 +1,27 @@
+[package]
+name = "mtg-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+hex.workspace = true
+idna.workspace = true
+libc.workspace = true
+mtg-core.workspace = true
+mtg-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml_edit.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

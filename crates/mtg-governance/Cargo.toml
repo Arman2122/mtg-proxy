@@ -1,0 +1,26 @@
+[package]
+name = "mtg-governance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mtg-core.workspace = true
+mtg-crypto.workspace = true
+mtg-config.workspace = true
+mtg-net.workspace = true
+
+arc-swap.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zeroize.workspace = true

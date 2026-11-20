@@ -1,0 +1,136 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mtg-core",
+    "crates/mtg-crypto",
+    "crates/mtg-protocol",
+    "crates/mtg-net",
+    "crates/mtg-governance",
+    "crates/mtg-webrelay",
+    "crates/mtg-config",
+    "crates/mtg-api",
+    "crates/mtg-engine",
+    "crates/mtg-cli",
+    "crates/mtg-bench",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+inline_always = "allow"
+doc_markdown = "allow"
+chunks_exact_to_as_chunks = "allow"
+naive_bytecount = "allow"
+assert_is_empty = "allow"
+
+[workspace.dependencies]
+# Internal crates
+mtg-core = { path = "crates/mtg-core" }
+mtg-crypto = { path = "crates/mtg-crypto" }
+mtg-protocol = { path = "crates/mtg-protocol" }
+mtg-net = { path = "crates/mtg-net" }
+mtg-governance = { path = "crates/mtg-governance" }
+mtg-webrelay = { path = "crates/mtg-webrelay" }
+mtg-config = { path = "crates/mtg-config" }
+mtg-api = { path = "crates/mtg-api" }
+mtg-engine = { path = "crates/mtg-engine" }
+
+# Core & serialization
+anyhow = "1"
+bitflags = "2"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+hex = "0.4"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smallvec = { version = "1", features = ["union", "const_generics"] }
+thiserror = "2"
+rustc-hash = "2"
+slab = "0.4"
+
+# Crypto & hygiene
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
+crc32fast = "1"
+getrandom = "0.3"
+hmac = "0.12"
+md-5 = "0.10"
+rand = "0.9"
+rand_chacha = "0.9"
+rand_core = "0.9"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = { version = "1", features = ["derive"] }
+
+# Concurrency & Linux networking
+arc-swap = "1"
+io-uring = "0.7"
+libc = "0.2"
+parking_lot = "0.12"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "signal", "io-util", "macros"] }
+
+# Config & CLI
+clap = { version = "4", features = ["derive", "env"] }
+toml_edit = "0.22"
+
+# HTTP / TLS / DNS / Observability
+axum = "0.8"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client-legacy", "server-auto"] }
+idna = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "0.26"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "tls-ring", "https-ring", "system-config"] }
+
+# Allocator & benchmarking / testing
+tikv-jemallocator = { version = "0.6", features = ["background_threads_runtime_support"] }
+hdrhistogram = "7"
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true

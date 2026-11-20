@@ -1,0 +1,61 @@
+[package]
+name = "mtg-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+libfuzzer-sys = "0.4"
+mtg-config = { path = "../crates/mtg-config" }
+mtg-core = { path = "../crates/mtg-core" }
+mtg-crypto = { path = "../crates/mtg-crypto" }
+mtg-protocol = { path = "../crates/mtg-protocol" }
+mtg-webrelay = { path = "../crates/mtg-webrelay" }
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+[[bin]]
+name = "fuzz_faketls_client_hello"
+path = "fuzz_targets/fuzz_faketls_client_hello.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_obfs2_handshake"
+path = "fuzz_targets/fuzz_obfs2_handshake.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tls_unframer"
+path = "fuzz_targets/fuzz_tls_unframer.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_proxyproto"
+path = "fuzz_targets/fuzz_proxyproto.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_middleproxy_rpc"
+path = "fuzz_targets/fuzz_middleproxy_rpc.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_config_toml_rotation"
+path = "fuzz_targets/fuzz_config_toml_rotation.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ws_frame_parser"
+path = "fuzz_targets/fuzz_ws_frame_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_webrelay_shared_frame"
+path = "fuzz_targets/fuzz_webrelay_shared_frame.rs"
+doc = false

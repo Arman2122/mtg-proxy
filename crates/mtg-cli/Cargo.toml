@@ -1,0 +1,38 @@
+[package]
+name = "mtg-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mtg-proxy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+http-body-util = "0.1"
+hyper = { workspace = true, features = ["http1", "client"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+libc.workspace = true
+mtg-api.workspace = true
+mtg-config.workspace = true
+mtg-core.workspace = true
+mtg-crypto.workspace = true
+mtg-engine.workspace = true
+mtg-net.workspace = true
+mtg-protocol.workspace = true
+mtg-webrelay.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tikv-jemallocator.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2"

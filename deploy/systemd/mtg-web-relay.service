@@ -1,0 +1,37 @@
+[Unit]
+Description=mtg-proxy WEB Proxy v1 Relay (Pure-Rust Linux)
+After=network-online.target mtg-proxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mtg
+Group=mtg
+ExecStart=/usr/local/bin/mtg-proxy web-relay /etc/mtg-proxy/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+
+LimitNOFILE=1048576
+TasksMax=infinity
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/mtg-proxy
+
+[Install]
+WantedBy=multi-user.target

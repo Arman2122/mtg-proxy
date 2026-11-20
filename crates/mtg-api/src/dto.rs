@@ -1,0 +1,596 @@
+//! Exact JSON request & response DTOs matching Go `mtglib` and the Penhoon
+//! panel API contract byte-for-field, including `#[serde(deny_unknown_fields)]`
+//! strict decoding (Go `DisallowUnknownFields()`).
+
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, Utc};
+use mtg_core::{
+    QuotaReset, SecretLimits, parse_expiry, parse_quota_bytes, parse_quota_reset, parse_speed,
+};
+use mtg_engine::ListenerReport;
+use mtg_governance::BanEntryJson;
+use serde::{Deserialize, Serialize};
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+#[inline]
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+#[inline]
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+#[inline]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+#[inline]
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+#[inline]
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// Top-level `GET /stats` JSON response.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatsResponse {
+    pub started_at: DateTime<Utc>,
+    pub uptime_seconds: i64,
+    pub total_connections: i64,
+    pub features: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttle: Option<ThrottleJson>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub listeners: Vec<ListenerReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub obfuscated: Option<ObfuscatedJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub faketls_handshake: Option<FakeTlsJson>,
+    pub users: BTreeMap<String, UserStatsJson>,
+}
+
+/// `throttle` block on `GET /stats`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThrottleJson {
+    pub active: bool,
+    pub limit: i64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub caps: BTreeMap<String, i64>,
+}
+
+/// `obfuscated` block on `GET /stats` (present only when `[[listener]]` is configured).
+#[derive(Debug, Clone, Serialize)]
+pub struct ObfuscatedJson {
+    pub trials: i64,
+    pub misses: i64,
+    pub denied: i64,
+    pub draining: i64,
+    pub rate_limited: i64,
+}
+
+/// `faketls_handshake` block on `GET /stats` (omitted until the door counts something).
+#[derive(Debug, Clone, Serialize)]
+pub struct FakeTlsJson {
+    pub hinted: i64,
+    pub scanned: i64,
+    pub unmatched: i64,
+    pub denied_ip: i64,
+    pub denied_global: i64,
+    pub oversized: i64,
+    pub over_budget_matched: i64,
+    pub enforced: bool,
+    pub ns_per_block: f64,
+}
+
+/// Per-user stats entry under `GET /stats` (`users.<name>`).
+#[derive(Debug, Clone, Serialize)]
+pub struct UserStatsJson {
+    pub connections: i64,
+    pub bytes_in: i64,
+    pub bytes_out: i64,
+    pub last_seen: Option<DateTime<Utc>>,
+
+    pub quota_used: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub quota: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_remaining: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub quota_reset: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub disabled: bool,
+
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub quota_cutoffs: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub ad_tag_skipped: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub ad_tag_failed: i64,
+
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub speed_limit: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub throttled_ms: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub speed_limit_up: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub speed_limit_down: i64,
+
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub ip_limit: u32,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub active_ips: usize,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub ip_limit_refused: i64,
+
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub client_conns: u32,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub client_conns_refused: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub client_speed_limit: i64,
+    #[serde(skip_serializing_if = "is_false")]
+    pub client_fair: bool,
+
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub clients: usize,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub clients_overflow: u64,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connected_ips: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub last_ip: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub external_ips: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub connected_ips_last_seen: BTreeMap<String, DateTime<Utc>>,
+
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub retiring_keys: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retiring_until: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub retiring_connections: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retiring_last_seen: Option<DateTime<Utc>>,
+}
+
+/// One secret object returned by `GET /secrets` and `GET /secrets/{name}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SecretInfoJson {
+    pub name: String,
+    pub secret: String,
+    pub host: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ad_tag: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub effective_ad_tag: String,
+
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub quota: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub quota_used: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_remaining: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub quota_reset: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub disabled: bool,
+
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub speed_limit: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub speed_limit_up: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub speed_limit_down: i64,
+
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub ip_limit: u32,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub active_ips: usize,
+
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub client_conns: u32,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub client_speed_limit: i64,
+    #[serde(skip_serializing_if = "is_false")]
+    pub client_fair: bool,
+
+    pub mode: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub unserved: bool,
+
+    pub connections: i64,
+    pub last_seen: Option<DateTime<Utc>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connected_ips: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub last_ip: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub connected_ips_last_seen: BTreeMap<String, DateTime<Utc>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub external_ips: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_expires_at: Option<DateTime<Utc>>,
+
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub retiring_keys: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retiring_until: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub retiring_connections: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retiring_last_seen: Option<DateTime<Utc>>,
+}
+
+/// `GET /secrets` envelope.
+#[derive(Debug, Clone, Serialize)]
+pub struct SecretsListResponse {
+    pub secrets: Vec<SecretInfoJson>,
+}
+
+/// `GET /secrets/{name}/external-ips` and `PUT /secrets/{name}/external-ips` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct AddressReportJson {
+    pub name: String,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub ip_limit: u32,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub active_ips: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connected_ips: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub external_ips: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub connected_ips_last_seen: BTreeMap<String, DateTime<Utc>>,
+}
+
+/// Per-address usage block on `GET /secrets/{name}/clients`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientUsageJson {
+    pub connections: u32,
+    pub bytes_in: i64,
+    pub bytes_out: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub throttled_ms: i64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub speed_limit: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub speed_limit_up: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub speed_limit_down: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub banned_until: Option<DateTime<Utc>>,
+}
+
+/// One row of `GET /secrets/{name}/clients`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientRowJson {
+    pub address: String,
+    #[serde(flatten)]
+    pub usage: ClientUsageJson,
+}
+
+/// `GET /secrets/{name}/clients` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientsReportJson {
+    pub total: usize,
+    pub overflow: u64,
+    pub tracking: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rest: Option<ClientUsageJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clients: Option<Vec<ClientRowJson>>,
+}
+
+/// `POST /secrets/{name}/kick` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct KickResultJson {
+    pub closed: usize,
+}
+
+/// `POST /secrets/{name}/bans` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct BanResultJson {
+    pub banned: usize,
+    pub closed: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+}
+
+/// `GET /secrets/{name}/bans` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct BansReportJson {
+    pub total: usize,
+    pub tracking: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bans: Option<Vec<BanEntryJson>>,
+}
+
+/// `DELETE /secrets/{name}/bans/{*address}` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnbanResultJson {
+    pub removed: u8,
+}
+
+/// `GET /adtag` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdTagResponse {
+    pub ad_tag: Option<String>,
+}
+
+/// Standard `{"status":"ok"}` response.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct StatusOk {
+    pub status: &'static str,
+}
+
+pub const STATUS_OK: StatusOk = StatusOk { status: "ok" };
+
+/// Standard `{"error":"..."}` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorBody {
+    pub error: String,
+}
+
+// ============================================================================
+// Strict Request Payloads (`#[serde(deny_unknown_fields)]`)
+// ============================================================================
+
+/// Shared per-secret limit fields in `PUT /secrets` and `POST /secrets`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitFieldsReq {
+    #[serde(default)]
+    pub quota: String,
+    #[serde(default)]
+    pub quota_reset: String,
+    #[serde(default)]
+    pub expires: String,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub speed: String,
+    #[serde(default)]
+    pub speed_up: String,
+    #[serde(default)]
+    pub speed_down: String,
+    #[serde(default)]
+    pub ip_limit: i64,
+    #[serde(default)]
+    pub client_conns: i64,
+    #[serde(default)]
+    pub client_speed: String,
+    #[serde(default)]
+    pub client_fair: bool,
+}
+
+impl LimitFieldsReq {
+    pub fn parse_limits(&self) -> Result<SecretLimits, String> {
+        if self.ip_limit < 0 || self.ip_limit > i64::from(u32::MAX) {
+            return Err(format!("ip_limit must not be negative ({})", self.ip_limit));
+        }
+        if self.client_conns < 0 || self.client_conns > i64::from(u32::MAX) {
+            return Err(format!(
+                "client_conns must not be negative ({})",
+                self.client_conns
+            ));
+        }
+        let quota_bytes = parse_quota_bytes(&self.quota).map_err(|e| e.to_string())?;
+        let quota_reset = parse_quota_reset(&self.quota_reset).map_err(|e| e.to_string())?;
+        let expires_at = parse_expiry(&self.expires).map_err(|e| e.to_string())?;
+        let speed = parse_speed(&self.speed).map_err(|e| e.to_string())?;
+        let speed_up = parse_speed(&self.speed_up).map_err(|e| format!("speed_up: {e}"))?;
+        let speed_down = parse_speed(&self.speed_down).map_err(|e| format!("speed_down: {e}"))?;
+        let client_speed =
+            parse_speed(&self.client_speed).map_err(|e| format!("client_speed: {e}"))?;
+
+        let lim = SecretLimits {
+            quota_bytes,
+            quota_reset,
+            expires_at,
+            disabled: self.disabled,
+            speed_bytes_per_second: speed,
+            speed_up_bytes_per_second: speed_up,
+            speed_down_bytes_per_second: speed_down,
+            ip_limit: self.ip_limit as u32,
+            client_conns: self.client_conns as u32,
+            client_speed_bytes_per_second: client_speed,
+            client_fair: self.client_fair,
+        };
+
+        if lim.client_fair && !lim.fair_totals().is_active() {
+            return Err(
+                "client_fair divides the secret's speed and needs speed, speed_up or speed_down"
+                    .to_owned(),
+            );
+        }
+
+        Ok(lim)
+    }
+}
+
+/// Entry inside `PUT /secrets` (`secrets.<name>`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretEntryReq {
+    #[serde(default)]
+    pub secret: String,
+    #[serde(default)]
+    pub ad_tag: String,
+    #[serde(default)]
+    pub quota: String,
+    #[serde(default)]
+    pub quota_reset: String,
+    #[serde(default)]
+    pub expires: String,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub speed: String,
+    #[serde(default)]
+    pub speed_up: String,
+    #[serde(default)]
+    pub speed_down: String,
+    #[serde(default)]
+    pub ip_limit: i64,
+    #[serde(default)]
+    pub client_conns: i64,
+    #[serde(default)]
+    pub client_speed: String,
+    #[serde(default)]
+    pub client_fair: bool,
+}
+
+impl SecretEntryReq {
+    pub fn parse_limits(&self) -> Result<SecretLimits, String> {
+        LimitFieldsReq {
+            quota: self.quota.clone(),
+            quota_reset: self.quota_reset.clone(),
+            expires: self.expires.clone(),
+            disabled: self.disabled,
+            speed: self.speed.clone(),
+            speed_up: self.speed_up.clone(),
+            speed_down: self.speed_down.clone(),
+            ip_limit: self.ip_limit,
+            client_conns: self.client_conns,
+            client_speed: self.client_speed.clone(),
+            client_fair: self.client_fair,
+        }
+        .parse_limits()
+    }
+}
+
+/// `PUT /secrets` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutSecretsReq {
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretEntryReq>,
+    #[serde(default)]
+    pub ad_tag: String,
+}
+
+/// `POST /secrets` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostSecretReq {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub secret: String,
+    #[serde(default)]
+    pub ad_tag: String,
+    #[serde(default)]
+    pub quota: String,
+    #[serde(default)]
+    pub quota_reset: String,
+    #[serde(default)]
+    pub expires: String,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub speed: String,
+    #[serde(default)]
+    pub speed_up: String,
+    #[serde(default)]
+    pub speed_down: String,
+    #[serde(default)]
+    pub ip_limit: i64,
+    #[serde(default)]
+    pub client_conns: i64,
+    #[serde(default)]
+    pub client_speed: String,
+    #[serde(default)]
+    pub client_fair: bool,
+}
+
+impl PostSecretReq {
+    pub fn parse_limits(&self) -> Result<SecretLimits, String> {
+        LimitFieldsReq {
+            quota: self.quota.clone(),
+            quota_reset: self.quota_reset.clone(),
+            expires: self.expires.clone(),
+            disabled: self.disabled,
+            speed: self.speed.clone(),
+            speed_up: self.speed_up.clone(),
+            speed_down: self.speed_down.clone(),
+            ip_limit: self.ip_limit,
+            client_conns: self.client_conns,
+            client_speed: self.client_speed.clone(),
+            client_fair: self.client_fair,
+        }
+        .parse_limits()
+    }
+}
+
+/// `POST /secrets/{name}/kick` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KickReq {
+    #[serde(default)]
+    pub ips: Vec<String>,
+}
+
+/// `POST /secrets/{name}/bans` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BanReq {
+    #[serde(default)]
+    pub ips: Vec<String>,
+    #[serde(default)]
+    pub ttl: String,
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `PUT /secrets/{name}/external-ips` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIpsReq {
+    #[serde(default)]
+    pub ips: Vec<String>,
+    #[serde(default)]
+    pub ttl: String,
+}
+
+/// `PUT /adtag` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutAdTagReq {
+    #[serde(default)]
+    pub ad_tag: String,
+}
+
+/// Format quota reset string (`""` when `QuotaReset::None`, `"monthly"` when `Monthly`).
+#[inline]
+pub fn quota_reset_str(r: QuotaReset) -> String {
+    match r {
+        QuotaReset::None => String::new(),
+        QuotaReset::Monthly => r.as_str().to_owned(),
+    }
+}

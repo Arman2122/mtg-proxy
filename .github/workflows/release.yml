@@ -1,0 +1,148 @@
+name: Release (Linux Pure Rust)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Gate — Format, Clippy & Workspace Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy strict (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run full workspace test suite
+        run: cargo test --workspace
+
+  build:
+    name: Build ${{ matrix.asset_arch }}
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset_arch: linux-amd64
+            target: x86_64-unknown-linux-gnu
+            cross_cc: ""
+          - asset_arch: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            cross_cc: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install cross-compilation toolchain (arm64)
+        if: matrix.cross_cc != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build optimized Linux release binary
+        env:
+          MTG_BUILD_VERSION: ${{ github.ref_name }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cross_cc }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_cc }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin mtg-proxy
+
+      - name: Package release archive
+        env:
+          TAG: ${{ github.ref_name }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          PKG="mtg-proxy-${VERSION}-${ASSET_ARCH}"
+          mkdir -p "dist/${PKG}/deploy"
+          cp "target/${TARGET}/release/mtg-proxy" "dist/${PKG}/mtg-proxy"
+          chmod 0755 "dist/${PKG}/mtg-proxy"
+          cp LICENSE README.md CHANGELOG.md example.config.toml "dist/${PKG}/"
+          cp -r deploy/systemd deploy/sysctl.d "dist/${PKG}/deploy/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          rm -rf "dist/${PKG}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.asset_arch }}
+          path: dist/*.tar.gz
+
+  publish:
+    name: Checksums, SBOM, Attestation & GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SPDX 2.3 SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: Cargo.lock
+          format: spdx-json
+          output-file: dist/sbom.spdx.json
+          upload-artifact: false
+
+      - name: Finalize SBOM & SHA-256 checksums
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          mv dist/sbom.spdx.json "dist/mtg-proxy-${VERSION}-sbom.spdx.json"
+          (cd dist && sha256sum mtg-proxy-*.tar.gz mtg-proxy-*-sbom.spdx.json > "mtg-proxy-${VERSION}-checksums.txt")
+          ls -lh dist/
+
+      - name: Attest build provenance (Sigstore / in-toto)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/mtg-proxy-*.tar.gz
+            dist/mtg-proxy-*-sbom.spdx.json
+            dist/mtg-proxy-*-checksums.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" dist/* \
+            --title "mtg-proxy ${TAG}" \
+            --generate-notes

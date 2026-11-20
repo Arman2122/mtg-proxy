@@ -1,85 +1,34 @@
-###############################################################################
-# BUILD STAGE
+# Multi-stage pure-Rust Linux container build for mtg-proxy (linux/amd64 & linux/arm64)
+FROM rust:1-slim-bookworm AS builder
 
-# Pinned to the exact Go release named in go.mod, by multi-arch index digest.
-# Two reasons, both about the binary people actually run:
-#   - the tag `1.26-alpine` floats to a newer patch release than the tagged
-#     release binaries are built with, so the image and the tarball silently
-#     stop being the same program;
-#   - a tag is mutable, a digest is not.
-# This is the manifest *index* digest, not a per-architecture manifest: the
-# image is built for linux/amd64 and linux/arm64 and a single-arch digest would
-# break one of them. Dependabot keeps it fresh (.github/dependabot.yml).
-FROM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS build
+ARG VERSION=""
+ENV MTG_BUILD_VERSION=${VERSION}
 
-ENV CGO_ENABLED=0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates pkg-config make gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# this is done for backward compatibility: before that we mounted a config
-# into /config.toml. Some application allow mounting directories only,
-# so it makes problems. So, instead we are going to do 2 steps:
-#  1. Create /config/config.toml as a symlink to /config.toml
-#  2. Force /mtg to use /config/config.toml
-#
-# it helps in both ways: users with directories could use /config directory
-# and overlap a symlink by their bind mount. Old users could continue using
-# /config.toml as a real config.
-RUN set -x \
-  && mkdir -p /config \
-  && ln -sv /config.toml /config/config.toml
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY tests ./tests
+COPY example.config.toml ./
 
-# ca-certificates for the bundle copied into the final image, git for the
-# version string below. Nothing else: bash was installed and never used.
-RUN --mount=type=cache,target=/var/cache/apk \
-    set -x \
-    && apk --update add \
-      ca-certificates \
-      git
+RUN cargo build --release --locked --bin mtg-proxy \
+    && mkdir -p /rootfs/config /rootfs/usr/local/bin \
+    && cp target/release/mtg-proxy /rootfs/usr/local/bin/mtg-proxy \
+    && ln -s /usr/local/bin/mtg-proxy /rootfs/mtg \
+    && cp example.config.toml /rootfs/config.toml \
+    && ln -s /config.toml /rootfs/config/config.toml
 
-COPY go.mod go.sum /app/
-WORKDIR /app
+# Distroless glibc runtime (~20 MiB total image, includes CA certs & libgcc_s)
+FROM gcr.io/distroless/cc-debian12
 
-RUN go mod download
+COPY --from=builder /rootfs/ /
 
-COPY . /app
-
-# The flags are deliberately identical to the ones .github/workflows/go.yml
-# uses for the linux release binaries, so that this image ships the same
-# program the tarballs do. What was dropped and why:
-#   -a                      forced a rebuild of every dependency, costing
-#                           minutes and changing nothing.
-#   -tags netgo             CGO_ENABLED=0 already selects the pure Go resolver.
-#   -extldflags '-static'   there is no external linker to pass it to.
-# The `v` is stripped from the tag so the version string matches the release
-# build, which embeds the tag without it.
-RUN set -x \
-  && version="$(git describe --exact-match HEAD 2>/dev/null || git describe --tags --always 2>/dev/null || echo dev)" \
-  && version="${version#v}" \
-  && go build \
-      -o mtg \
-      -trimpath \
-      -mod=readonly \
-      -ldflags="-s -w -X 'main.version=$version'"
-
-
-###############################################################################
-# PACKAGE STAGE
-
-FROM scratch
-
-# The bundled /config/config.toml is a working default; for a config-file-free
-# setup (official telegrammessenger/proxy style) override it with environment
-# variables: SECRET (full ee-secret, or a bare 16-byte hex key + SECRET_HOST),
-# TAG (ad-tag from @MTProxybot) and MTG_BIND_TO (e.g. 0.0.0.0:443). See README.
-#
-# This runs as root. Recommended hardening is `docker run --user 65534:65534`;
-# it is not baked in because it would break, on the next `docker pull`, every
-# operator who bind-mounts a root-owned 0600 config or who runs on a runtime
-# that does not set net.ipv4.ip_unprivileged_port_start=0. See the README's
-# "Running with Docker" section.
-ENTRYPOINT ["/mtg"]
+# Bundled /config/config.toml works out of the box with env-var overrides:
+#   docker run -d -p 443:443 -e SECRET=... -e SECRET_HOST=... ghcr.io/arman2122/mtg-proxy
+# For hardened non-root execution, pass: --user 65534:65534
+EXPOSE 443/tcp
+ENTRYPOINT ["/usr/local/bin/mtg-proxy"]
 CMD ["run", "/config/config.toml"]
-
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build /app/mtg /mtg
-COPY --from=build /app/example.config.toml /config.toml
-COPY --from=build /config /config
