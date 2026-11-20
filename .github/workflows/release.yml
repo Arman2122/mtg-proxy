@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -105,6 +107,8 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -137,12 +141,54 @@ jobs:
             dist/mtg-proxy-*-sbom.spdx.json
             dist/mtg-proxy-*-checksums.txt
 
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          python3 - "$VERSION" <<'PY' > dist/RELEASE_NOTES.md
+          import sys
+          ver = sys.argv[1]
+          prefix = f"## [{ver}]"
+          lines = open("CHANGELOG.md", encoding="utf-8").read().splitlines()
+          out, found = [], False
+          for line in lines:
+              if not found:
+                  if line.startswith(prefix):
+                      found = True
+                  continue
+              if line.startswith("## ["):
+                  break
+              out.append(line)
+          while out and out[0].strip() in ("", "---"):
+              out.pop(0)
+          while out and out[-1].strip() in ("", "---"):
+              out.pop()
+          if out:
+              print("\n".join(out))
+          PY
+          if [ -s dist/RELEASE_NOTES.md ]; then
+            PREV_TAG="$(git tag --sort=-version:refname | grep -Fxv "$TAG" | head -n 1 || true)"
+            if [ -n "$PREV_TAG" ]; then
+              printf '\n---\n\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+                "${GITHUB_REPOSITORY}" "$PREV_TAG" "$TAG" >> dist/RELEASE_NOTES.md
+            fi
+          fi
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release create "${TAG}" dist/* \
-            --title "mtg-proxy ${TAG}" \
-            --generate-notes
+          ASSETS=(dist/mtg-proxy-*.tar.gz dist/mtg-proxy-*-sbom.spdx.json dist/mtg-proxy-*-checksums.txt)
+          if [ -s dist/RELEASE_NOTES.md ]; then
+            gh release create "${TAG}" "${ASSETS[@]}" \
+              --title "mtg-proxy ${TAG}" \
+              --notes-file dist/RELEASE_NOTES.md
+          else
+            gh release create "${TAG}" "${ASSETS[@]}" \
+              --title "mtg-proxy ${TAG}" \
+              --generate-notes
+          fi
