@@ -1,8 +1,6 @@
 # Contributing
 
-Pull requests are welcome. So are bug reports, questions, and "I tried to set this
-up and got stuck at step four" — the last one is genuinely useful, because it is
-the only way documentation gets tested.
+Pull requests are welcome. So are bug reports, benchmarks on new Linux kernels/architectures, questions, and "I tried to set this up and got stuck at step four" — the last one is genuinely useful, because it is the only way documentation gets tested.
 
 ## Where things go
 
@@ -16,117 +14,87 @@ the only way documentation gets tested.
 
 ## Getting set up
 
-You need Go (the version in [go.mod](go.mod)). Everything else is optional.
+`mtg-proxy` v2.0+ is a pure-Rust Linux workspace (`edition = "2024"`, Rust 1.89+ stable). You need a Linux host (or WSL2 on Windows) with `rustup` and a C toolchain (`gcc`, `make`, `pkg-config` for `tikv-jemalloc-sys` and `ring`).
 
 ```bash
 git clone https://github.com/Arman2122/mtg-proxy.git
+cd mtg-proxy
+cargo build --release --bin mtg-proxy
 ```
 
-```bash
-cd mtg-proxy && go build
-```
-
-If you use [mise](https://mise.jdx.dev/), it pins the whole toolchain — including the
-exact linter version CI uses, which matters more than it sounds:
-
-```bash
-mise install && mise run build
-```
+If you use [mise](https://mise.jdx.dev/), `mise install && mise run build` sets up the toolchain and builds the optimized binary.
 
 ## Running the checks
 
-Run what CI runs, not something close to it:
+Run what [CI](.github/workflows/ci.yml) runs before opening a PR:
 
 ```bash
-go test ./... -race -count=2
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
+
+To cross-check ARM64 (`aarch64` ARMv8 AES/SHA-2 intrinsics) from an `x86_64` host:
 
 ```bash
-mise run lint
+rustup target add aarch64-unknown-linux-gnu
+cargo clippy -p mtg-core -p mtg-crypto -p mtg-protocol -p mtg-config \
+    --target aarch64-unknown-linux-gnu -- -D warnings
 ```
 
-Two things that have actually bitten this project:
-
-- **`-count=2` is not decoration.** CI runs every test twice in one process. A
-  concurrency test that passes on the first iteration and fails on the second is a
-  real failure, and running `-count=1` locally will not show it to you.
-- **The linter version matters.** A local golangci-lint that is older than the pinned
-  one will happily report zero issues while CI is red. `mise install` gets you the
-  right one; otherwise check [.mise.toml](.mise.toml) and match it.
-
-### The browser harness
-
-The WEB proxy's bridge page has a test that runs it in a real browser. It is the only
-test that can catch the class of bug where the page is correct by every static reading
-and still does nothing inside a client's WebView.
-
-It needs a one-time setup:
+To run the interleaved Linux benchmark harness against another binary:
 
 ```bash
-cd test/webbridge && npm ci && npx playwright install chromium-headless-shell
+cargo build --release --bin mtg-proxy --bin mtg-bench
+./target/release/mtg-bench ab \
+    --bin-a /path/to/baseline-mtg-proxy \
+    --bin-b ./target/release/mtg-proxy \
+    --rounds 3
 ```
 
-Then:
+### The WEB bridge browser harness
+
+The WEB proxy's bridge page has an end-to-end test that runs inside real Chromium via Playwright. It catches browser/WebView/CSP regressions that static unit tests cannot see.
+
+One-time setup:
 
 ```bash
-go test ./internal/webrelay/page/ -run TestBridgeInABrowser -v
+cd test/webbridge && npm ci && npx playwright install chromium
 ```
 
-Without that setup it skips locally, and **fails** in CI. That asymmetry is deliberate:
-for two releases nothing installed a browser, the test skipped silently on every run,
-and the defect it exists to catch shipped twice.
-
-To get CI's behaviour on your own machine — a skip counted as a failure — set the
-variable CI sets:
+Run with strict failure on missing browser (the exact CI gate):
 
 ```bash
-MTG_REQUIRE_BROWSER_HARNESS=1 go test ./internal/webrelay/page/
+MTG_REQUIRE_BROWSER_HARNESS=1 cargo test -p mtg-webrelay \
+    bridge_page_headers_and_optional_playwright_harness -- --nocapture
 ```
 
-That is worth doing before a release when CI is unavailable, because a silent skip is
-indistinguishable from a pass in exactly the situation where nothing else is checking.
+## Engineering standards
 
-## What makes a change easy to accept
+- **Keep idle connection memory tiny:** `mtg-engine::tests::steady_state_connection_future_size_guard` enforces hard upper bounds on `DirectRelay` (`<= 1,536 B`), `DirectRelay::run()` (`<= 256 B`), and `handle_faketls_connection` / `handle_obfs2_connection` (`<= 1,920 B`). Box cold or short-lived async phases (`handshake`, `fronting`, `pacing`, `MiddleProxy`) so they never bloat long-lived idle Tokio tasks.
+- **Zero heap allocations on hot crypto paths:** `crates/mtg-crypto/tests/zero_alloc.rs` guards `parse_client_hello_incremental`, `scan_candidates_at`, `build_server_hello`, `match_handshake`, and `FusedCtrPair::apply_fused_in_place`.
+- **Every `unsafe` block must carry a `// SAFETY:` justification** and compile cleanly with `unsafe_op_in_unsafe_fn = "warn"` and `-D warnings` on both `x86_64` and `aarch64`.
+- **Preserve additive contracts:** Release asset names, TOML keys, Management API JSON schemas, and wire formats are external contracts panels and clients depend on. Add rather than rename.
+- **Secrets never reach logs:** Always redact credentials via `Config::redacted_json()` and custom `fmt::Debug` implementations (`Secret`, `Aes256EncKey`, `ProxyEndpoint`).
+- **Wire constants come from specs and golden vectors:** Pin test vectors in `tests/golden/` rather than self-generated expectations.
 
-**A test that fails without your change.** This is the single most useful thing in a
-pull request. If you fixed a bug, the ideal is a test you can watch go red when you
-revert the fix — say so in the PR, it is worth more than any description.
+## Workspace layout
 
-**Additive changes.** This proxy runs as a sidecar under other software. Release asset
-names, config keys and the management API are contracts someone else's deploy depends
-on. Adding a key is easy; renaming one breaks people silently.
-
-**Comments that say why, not what.** The code in this repository explains its reasoning,
-especially where the reasoning is not obvious — why a check runs *after* attribution,
-why a socket is loopback, why a default is off. Match that. A comment restating the line
-below it is noise; a comment explaining why the line is not the obvious one is the most
-valuable thing in the file.
-
-**Prose in commit messages.** Explain what was wrong and what changed, in sentences.
-[The log](https://github.com/Arman2122/mtg-proxy/commits/main) is the house style.
-
-## Things worth knowing before you start
-
-**A config key lives in two structs.** `internal/config/parse.go` holds the TOML-facing
-mirror, `internal/config/config.go` the public one, and they are joined by nothing but a
-matching `json:` tag. Get the tag wrong and the value parses, gets dropped, and the option
-reads as its zero value forever with no error anywhere. Add a round-trip test.
-
-**A new `[web]` field must declare itself.** Decide whether changing it is a live reload
-or needs a restart, then add it to `webStructure` in `internal/cli/run_web_relay.go`. A
-reflection test fails until you do — deliberately, so nothing can become silently
-reloadable by being forgotten.
-
-**Wire constants come from the specification, not from this codebase.** If you add one,
-copy the value *and* a test vector out of the document, and say in the test where they
-came from. A pinned vector generated by the code it is testing proves only that the code
-agrees with itself — which is exactly how a mistyped RFC 6455 GUID passed three test
-layers and shipped.
-
-**Secrets never reach a log.** `Config.String()` redacts; anything new that renders
-configuration must go through it.
+| Crate | Responsibility |
+|---|---|
+| `crates/mtg-core` | Secrets, `IpUnit`, limits, monotonic `RotationClock` |
+| `crates/mtg-crypto` | Hardware VAES/AES-NI/ARMv8-AES fused-CTR, 4-way SHA-NI / 8-way AVX2 / ARMv8-SHA2 FakeTLS, Obfuscated2, AES-CBC |
+| `crates/mtg-protocol` | TLS record unframer, PROXY protocol v1/v2, MiddleProxy RPC, Doppelganger MLE/DRS, Telegram DC `req_pq_multi` probe |
+| `crates/mtg-net` | Linux sockopts & listener inheritance, cgroup CPU affinity, `epoll`/`io_uring` drivers, `splice(2)`, DNS/DoH/DoT, Happy Eyeballs DC router, proxy pool, MiddleProxy multiplexer |
+| `crates/mtg-governance` | Sharded `AddressRegistry`, `ClientTable`, lock-free GCRA + fair-share water-level pacing, bans, anti-replay, `MatchHints`, `ScanBudget`, FireHOL IP filters |
+| `crates/mtg-webrelay` | Telegram Desktop 7.1+ WEB proxy origin, strict RFC 6455 WebSocket, shared binary framing, bridge HTML/CSP nonce, 2s live config watcher |
+| `crates/mtg-config` | Strict TOML parser, env overlays, secret redaction, lossless `toml_edit` rotation |
+| `crates/mtg-engine` | Pinned thread-per-core workers, boxed handshake doors, single-poll `DirectRelay`, `splice(2)` fronting, live Doppelganger cover scouting, metrics |
+| `crates/mtg-api` | 19-route Penhoon Management HTTP API, constant-time Bearer auth, Prometheus & StatsD exporters |
+| `crates/mtg-cli` | `mtg-proxy` binary (all 9 subcommands, `tikv-jemallocator`, `SIGHUP` reload, `doctor`) |
+| `crates/mtg-bench` | Interleaved Linux A/B benchmark & wire-interop harness |
+| `fuzz/` | 8 `libFuzzer` harnesses for hostile network/config inputs |
 
 ## Licence
 
-By contributing you agree your work is licensed under the [MIT licence](LICENSE), the
-same as the rest of the project.
+By contributing you agree your work is licensed under the [MIT licence](LICENSE), the same as the rest of the project.

@@ -1,241 +1,187 @@
+<div align="center">
+
 # mtg-proxy
 
-[![CI](https://github.com/Arman2122/mtg-proxy/actions/workflows/ci.yml/badge.svg?branch=feat/rust-rewrite)](https://github.com/Arman2122/mtg-proxy/actions/workflows/ci.yml)
+**Ultra-high-performance, pure-Rust, Linux-native Telegram MTProto Proxy**
+
+[![CI](https://github.com/Arman2122/mtg-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Arman2122/mtg-proxy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Arman2122/mtg-proxy?sort=semver)](https://github.com/Arman2122/mtg-proxy/releases/latest)
-[![Rust](https://img.shields.io/badge/rust-1.89%2B%20(Linux%20x86__64%20%26%20aarch64)-orange)](Cargo.toml)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B%20%7C%20Linux%20x86__64%20%26%20aarch64-orange)](Cargo.toml)
+[![Docker](https://img.shields.io/badge/ghcr.io-linux%2Famd64%20%7C%20linux%2Farm64-2496ED?logo=docker&logoColor=white)](https://github.com/Arman2122/mtg-proxy/pkgs/container/mtg-proxy)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-An ultra-high-performance, pure-Rust, Linux-native, censorship-resistant
-[Telegram MTProto proxy](https://core.telegram.org/mtproto) engineered to serve
-thousands of users and 100k+ concurrent connections from a single 9.5 MiB binary.
+*One `9.6 MiB` binary. Multi-tenant governance. Hardware VAES / SHA-NI / ARMv8 crypto. `10+ GiB/s` throughput. `4.58 KiB/conn` marginal RAM.*
 
-Most MTProto proxies serve one secret. mtg-proxy gives every user their own named
-secret, their own fronting host, their own traffic counters and their own limits,
-and lets you change all of that on a running proxy without dropping a single
-connection. That is what makes it usable as the engine behind a panel, and it is
-equally happy running on its own from a TOML file.
+</div>
 
-It originated as a fork of [9seconds/mtg](https://github.com/9seconds/mtg), now
-completely re-engineered from the ground up in pure Rust (v2.0) for Linux
-bare-metal servers, VMs, and containers (`x86_64` and `aarch64`), maintaining
-100% drop-in parity for TOML configs, the Penhoon Management HTTP API, FakeTLS,
-obfuscated2, MiddleProxy ad-tags, and the WEB proxy transport. See [Credits](#credits).
+---
 
-## Pure-Rust 2.0 Linux Architecture & Benchmarks
+`mtg-proxy` is a censorship-resistant [Telegram MTProto proxy](https://core.telegram.org/mtproto) engineered to serve thousands of users and 100k+ concurrent connections from a single Linux process.
 
-| Subsystem | Engineering Design |
-|---|---|
-| **Thread-per-Core Data Plane** | CPU-pinned worker threads respecting Linux `sched_getaffinity(0)` (cgroup / Docker / K8s cpusets), per-core `SO_REUSEPORT` listeners, zero-syscall child socket inheritance (`TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_USER_TIMEOUT`, `TCP_NOTSENT_LOWAT`, `TCP_FASTOPEN`, best-effort `BBR`). |
-| **Single-Poll Full-Duplex Relay** | Owns `(client, dc)` directly (no `into_split()` `Arc`s), 1 amortized idle timer, L1-hot thread-local 64 KiB scratch (`0 B` idle I/O buffers), 4-record stack-stamped `writev(2)` FakeTLS framing, and a regression-guarded `1,776 B` live task frame. |
-| **Multi-Arch Hardware Crypto** | Single-pass in-place fused double-CTR (`x86_64` VAES+AVX2 & AES-NI; `aarch64` ARMv8 AES) and multi-secret FakeTLS verification (`x86_64` 4-way interleaved SHA-NI & 8-way AVX2; `aarch64` ARMv8 SHA-256). |
-| **Zero-Copy Domain Fronting** | Kernel-to-kernel Linux `splice(2)` pipe relay with verbatim ClientHello replay and automatic userspace fallback under restricted sandboxes. |
-| **Memory & Lock Hygiene** | `tikv-jemallocator` (`percpu_arena:percpu`, 1s dirty/muzzy decay, background purge), 32-byte `CancelToken`, cache-line-aligned per-worker admission gate & live-connection shards, per-secret sharded address ledgers, and vDSO coarse clocks. |
+Unlike single-secret proxies, `mtg-proxy` gives every user their own named secret, fronting hostname, traffic counters, quota/speed/address governance, and live rotation — all mutable at runtime via a REST Management API or `SIGHUP` without dropping existing connections.
 
-Interleaved Linux A/B benchmarks (`mtg-bench ab`) comparing the legacy Go 1.x binary against Rust 2.0 on identical workloads:
+**Version 2.0** is a complete ground-up rewrite in pure Rust targeting Linux (`x86_64` and `aarch64`) on bare metal, VMs, and containers, maintaining **100% drop-in compatibility** with `v1.x` TOML configs, Penhoon panel APIs, FakeTLS (`ee`), obfuscated2 (`dd`/`plain`), MiddleProxy (`ad-tag`), and the Telegram Desktop 7.1+ WEB proxy transport.
 
-| Workload | Legacy Go (15 MiB) | **Rust 2.0 (9.5 MiB)** | Improvement |
-|---|---:|---:|---:|
-| **5,000 Idle FakeTLS Connections (Total RSS)** | 307.6 MiB | **39.8 MiB** | **7.7× less RAM** |
-| **Marginal RAM per Live FakeTLS Conn (2k → 5k)** | 60.1 KiB/conn | **4.58 KiB/conn** | **13.1× less marginal RAM** |
-| **32-Stream Raw `dd` Throughput** | 4.92–5.67 GiB/s | **10.80–12.34 GiB/s** | **2.0–2.2× faster** |
-| **32-Stream Raw `dd` CPU / Tail (`p99.9`)** | 1.01 CPU-s/GB / 39.7 ms | **0.50–0.54 CPU-s/GB / 1.31–1.58 ms** | **1.9× less CPU, up to 30× tighter p99.9** |
-| **32-Stream FakeTLS `ee` Throughput** | 0.08–0.09 GiB/s | **9.68–10.70 GiB/s** (`16 sys/MB`) | **~115× faster** |
-| **5,000-Secret FakeTLS Scan (1-core microbench)** | ~6.5 ms | **357.8 µs** (4-way SHA-NI) | **~18× faster** |
-| **5,000-Secret Live Handshake Flood (`p50`)** | 3.9–6.0 ms (`3.9k–5.5k hs/s`) | **1.24–1.51 ms** (up to **9.7k hs/s**) | **3–4× lower median latency** |
+---
 
-## What it adds
+## Table of Contents
 
-- **Multiple secrets** — one named secret per user, each with its own fronting host.
-- **Per-user stats** — a JSON endpoint with live connection and byte counters.
-- **Management API** — add, remove, and re-key secrets and the ad-tag at runtime.
-- **Hot reload** — swap the secret set from the config file without dropping users.
-- **Sponsored channel (ad-tag)** — the promoted-channel feature, back again.
-- **Connection throttling** — automatic fair-share per-user connection caps.
-- **Per-user quotas, speed, addresses, expiry & disable** — data caps (with
-  optional monthly reset), a speed limit, a limit on how many places a user may
-  be at once, a validity deadline, and an on/off switch, persisted across restarts.
-- **Per-address controls inside a shared secret** — a connection cap and a speed
-  ceiling per source address, a fair share of the secret's speed, per-address
-  usage on its own endpoint, and temporary bans.
-- **Secret rotation with an overlap** — give a leaked link's secret a new key
-  and keep the old one working until a time you choose, so its holders can
-  move without a gap.
-- **WEB proxy transport** — the connection type Telegram Desktop 7.1
-  added: a page on your hostname carries MTProto over a WebSocket, so a
-  network in between sees a browser visiting a website.
-- **Public IP override** and **Docker-style environment variables**.
-
-Everything underneath — FakeTLS, domain fronting, the doppelganger traffic mimic,
-SOCKS5 proxy chaining, IP blocklists and allowlists, Prometheus and statsd metrics
-— is upstream's and behaves as upstream documents it.
-
-## How a client reaches it
-
-Three entry paths, all sharing one set of users. A secret is sixteen key bytes;
-the prefix only tells the *client* which door to knock on, so the same person
-keeps one name, one quota bucket and one set of counters whichever they use.
-
-| | door | secret form | what a network in between sees |
-|---|---|---|---|
-| **FakeTLS** | `bind-to`, normally `:443` | `ee…` | a real-looking TLS handshake to your fronting domain |
-| **obfuscated2** | a `[[listener]]` | `dd…` or bare hex | a nondescript TCP stream, fingerprintable as an MTProto proxy — keep it on loopback |
-| **WEB** | your own hostname over HTTPS | `dd…` | a browser loading a page and opening a WebSocket, over genuine TLS |
-
-FakeTLS is the default and every client speaks it. WEB needs Telegram Desktop
-7.1.2 or later, a hostname you control and a real certificate, and it is the only
-one whose TLS is not an imitation. See
-[WEB proxy transport](#web-proxy-transport).
-
-**[Documentation](https://github.com/Arman2122/mtg-proxy/wiki)** — installation,
-configuration reference, the WEB transport, monitoring, security and
-troubleshooting. **[Discussions](https://github.com/Arman2122/mtg-proxy/discussions)**
-for questions. **[Contributing](CONTRIBUTING.md)** if you want to send a change.
-
-## Table of contents
-
-- [How a client reaches it](#how-a-client-reaches-it)
-- [Quick start](#quick-start)
-- [Verifying a download](#verifying-a-download)
+- [Architecture & Performance Benchmarks](#architecture--performance-benchmarks)
+- [How Clients Reach It](#how-clients-reach-it)
+- [Quick Start](#quick-start)
+- [Verifying Releases](#verifying-releases)
 - [Running with Docker](#running-with-docker)
-  - [Running the container as a non-root user](#running-the-container-as-a-non-root-user)
+- [Production Linux Tuning (`systemd` & `sysctl`)](#production-linux-tuning-systemd--sysctl)
 - [Features](#features)
-  - [Multiple secrets](#multiple-secrets)
-  - [Per-user stats API](#per-user-stats-api)
-  - [Hot secret reload](#hot-secret-reload)
-  - [Secrets & ad-tag management API](#secrets--ad-tag-management-api)
-  - [API authentication](#api-authentication)
-  - [Sponsored channel (ad-tag)](#sponsored-channel-ad-tag)
-  - [Connection throttling](#connection-throttling)
-  - [Per-user quotas, expiry & disable](#per-user-quotas-expiry--disable)
-  - [Per-address controls](#per-address-controls)
-  - [Secret rotation](#secret-rotation)
-  - [WEB proxy transport](#web-proxy-transport)
-  - [Public IP override](#public-ip-override)
-  - [Environment variables](#environment-variables)
-- [Command reference](#command-reference)
-- [Configuration](#configuration)
-  - [Extra listeners (`[[listener]]`)](#extra-listeners-listener)
-- [Credits](#credits)
+  - [Multiple Secrets & Hot Reload](#multiple-secrets--hot-reload)
+  - [Management HTTP API & Stats](#management-http-api--stats)
+  - [Per-User Quotas, Speed, IP Limits, Expiry & Disable](#per-user-quotas-speed-ip-limits-expiry--disable)
+  - [Per-Address Controls, Fair-Share & Bans](#per-address-controls-fair-share--bans)
+  - [Secret Rotation with Overlap](#secret-rotation-with-overlap)
+  - [Sponsored Channel (`ad-tag`)](#sponsored-channel-ad-tag)
+  - [Connection Throttling](#connection-throttling)
+  - [Extra Listeners (`[[listener]]`)](#extra-listeners-listener)
+  - [WEB Proxy Transport (`web-relay`)](#web-proxy-transport-web-relay)
+  - [Doppelganger Cover Scouting & Traffic Mimicry](#doppelganger-cover-scouting--traffic-mimicry)
+  - [Public IP Override & Environment Variables](#public-ip-override--environment-variables)
+- [CLI Command Reference](#cli-command-reference)
+- [Upgrading from v1.x (Go) to v2.0 (Rust)](#upgrading-from-v1x-go-to-v20-rust)
+- [Workspace Architecture](#workspace-architecture)
+- [Documentation, Security & Contributing](#documentation-security--contributing)
+- [Credits & License](#credits--license)
 
-## Quick start
+---
 
-Download a Linux binary from [Releases](https://github.com/Arman2122/mtg-proxy/releases)
-— or build from source on Linux (`x86_64` or `aarch64`, requires Rust 1.89+):
+## Architecture & Performance Benchmarks
 
-```console
+### Key Systems Engineering
+
+| Layer | Pure-Rust v2.0 Implementation |
+|---|---|
+| **Thread-per-Core Runtime** | Pinned single-threaded `LocalSet` workers respecting Linux `sched_getaffinity(0)` (Docker/Kubernetes/systemd `AllowedCPUs=` cpusets) with independent per-core `SO_REUSEPORT` listen queues. |
+| **Zero-Syscall Socket Inheritance** | Tunes `TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_KEEP*`, `TCP_USER_TIMEOUT`, `TCP_NOTSENT_LOWAT`, `TCP_FASTOPEN`, and best-effort `TCP_CONGESTION=bbr` once on each listener before `listen(2)` — **0 `setsockopt` syscalls per accepted connection**. |
+| **Single-Poll Full-Duplex `DirectRelay`** | Owns `(client, dc)` directly (no `into_split()` `Arc`s), shares 1 amortized idle timer, uses L1-hot 64 KiB thread-local scratch (`0 B` idle I/O buffers), batches up to 4 × 16 KiB FakeTLS records per `writev(2)`, and locks live task frame size to **`1,776 B`** via CI unit-test guard. |
+| **Multi-Arch Hardware Crypto** | Single-pass in-place fused double-CTR (`x86_64` **VAES+AVX2** 8-block, **AES-NI** 4-block; `aarch64` **ARMv8 AES** 4-block) + multi-secret FakeTLS HMAC-SHA256 (**4-way interleaved SHA-NI**, **8-way AVX2**, **ARMv8 SHA-256**) with zero-alloc hot paths. |
+| **Zero-Copy Domain Fronting** | Kernel-to-kernel Linux `splice(2)` pipe relay replaying verbatim ClientHello bytes to the cover origin, with automatic userspace fallback under restricted sandboxes. |
+| **Lock-Free & Sharded State** | Cache-line-aligned per-worker admission gate & live-connection shards, per-secret sharded `AddressRegistry`, compact 32-byte `CancelToken`, vDSO `CLOCK_REALTIME_COARSE`/`CLOCK_MONOTONIC_COARSE`, and `tikv-jemallocator` (`percpu_arena:percpu`, 1s dirty/muzzy decay). |
+
+### Interleaved Linux A/B Benchmarks (`Go v1.10.0` vs `Rust v2.0.0`)
+
+Measured with `mtg-bench ab` (interleaved rounds, wire-interop verified on both binaries, identical configs):
+
+| Workload | Legacy Go (`v1.10.0`, 15 MiB) | **Rust (`v2.0.0`, 9.6 MiB)** | Improvement |
+|---|---:|---:|---:|
+| **5,000 Idle FakeTLS Conns — Total RSS** | `307.6 MiB` | **`39.8 MiB`** | **7.7× less total RAM** |
+| **5,000 Idle FakeTLS Conns — Per Conn** | `58.92 KiB/conn` | **`5.38 KiB/conn`** | **10.95× less RAM/conn** |
+| **Marginal RAM Slope (`2k → 5k` conns)** | `60.05 KiB/conn` | **`4.58 KiB/conn`** | **13.1× less marginal RAM** |
+| **32-Stream Raw `dd` Throughput** | `4.92–5.67 GiB/s` | **`10.80–12.34 GiB/s`** | **2.0–2.2× faster** |
+| **32-Stream Raw `dd` CPU / `p99.9` Tail** | `1.01 CPU-s/GB` / `39.7 ms` | **`0.50–0.54 CPU-s/GB` / `1.31–1.58 ms`** | **1.9× less CPU, up to 30× tighter tail** |
+| **32-Stream FakeTLS `ee` Throughput** | `0.08–0.09 GiB/s` | **`9.68–10.70 GiB/s`** (`16 sys/MB`) | **~115× faster, 11.7× fewer syscalls** |
+| **5,000-Secret FakeTLS Scan (1-core bench)** | `~6.5 ms` | **`357.8 µs`** (4-way SHA-NI) | **~18× faster** |
+| **5,000-Secret Live Handshake Flood (`p50`)** | `3.9–6.0 ms` (`3.9k–5.5k hs/s`) | **`1.24–1.51 ms`** (peak **`9,710 hs/s`**) | **3–4× lower median latency** |
+
+---
+
+## How Clients Reach It
+
+Three entry paths share one set of users. A secret is 16 key bytes; the prefix tells the *client* which door to use, so one user keeps a single name, quota bucket, and counter set across every transport:
+
+| Transport | Listener | Secret Form | Network Appearance |
+|---|---|---|---|
+| **FakeTLS** | `bind-to` (default `:443`) | `ee…` | Realistic TLS 1.3 handshake to your fronting domain; unmatched or denied traffic is transparently `splice(2)`-fronted. |
+| **Obfuscated2** | `[[listener]]` | `dd…` or bare 32-hex | Raw obfuscated2 TCP stream (keep on loopback behind a carrier unless `public = true`). |
+| **WEB Proxy** | HTTPS origin via `web-relay` | `dd…` | Genuine TLS + browser WebView loading an HTTPS page and opening a WebSocket (Telegram Desktop 7.1.2+). |
+
+---
+
+## Quick Start
+
+### Option 1 — Download a Prebuilt Linux Binary
+
+Grab the latest `linux-amd64` or `linux-arm64` archive from [Releases](https://github.com/Arman2122/mtg-proxy/releases) and verify it (see [Verifying Releases](#verifying-releases)).
+
+### Option 2 — Build from Source (Linux `x86_64` or `aarch64`, Rust 1.89+)
+
+```bash
 git clone https://github.com/Arman2122/mtg-proxy.git
 cd mtg-proxy
-cargo build --release --bin mtg-proxy   # produces target/release/mtg-proxy (~9.5 MiB)
+cargo build --release --bin mtg-proxy
+# Produces target/release/mtg-proxy (~9.6 MiB, fat-LTO stripped)
 ```
 
-For production Linux nodes (bare metal or VM), hardened systemd and kernel
-tuning profiles are included in the repository:
+### Generate Secrets, Write a Config & Run
 
-```console
-sudo cp target/release/mtg-proxy /usr/local/bin/mtg-proxy
-sudo cp deploy/sysctl.d/99-mtg-proxy.conf /etc/sysctl.d/99-mtg-proxy.conf
-sudo sysctl --system
-sudo cp deploy/systemd/mtg-proxy.service /etc/systemd/system/mtg-proxy.service
-sudo systemctl daemon-reload && sudo systemctl enable --now mtg-proxy
-```
-
-Generate a secret for each user. The hostname is the site you front behind: it
-does not have to point at your server, but it should be a real, reachable HTTPS
-site — the classic choice is a large CDN such as `storage.googleapis.com`:
-
-```console
+```bash
+# Generate FakeTLS secrets (choose a real, reachable HTTPS CDN/domain)
 mtg-proxy generate-secret --hex storage.googleapis.com
 ```
 
-Write a minimal config:
-
 ```toml
+# /etc/mtg-proxy/config.toml
 bind-to = "0.0.0.0:443"
 api-bind-to = "127.0.0.1:9090"
+api-token = "replace-with-strong-random-token"
+usage-state-file = "/var/lib/mtg-proxy/usage.json"
 
 [throttle]
 max-connections = 5000
 
-# [secrets] must be the LAST section in the global scope. In TOML, every key
-# after a [section] header belongs to that table, so any top-level option
-# placed below [secrets] would be parsed as a secret.
+# [secrets] must appear after all top-level keys (TOML table scoping rule).
 [secrets]
 alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
 bob   = "ee0123456789abcdef0123456789abcd9573746f726167652e676f6f676c65617069732e636f6d"
 ```
 
-Run it:
+Validate, diagnose, run, and print client links:
 
-```console
-mtg-proxy run /etc/mtg/config.toml
+```bash
+mtg-proxy run --check /etc/mtg-proxy/config.toml
+mtg-proxy doctor /etc/mtg-proxy/config.toml
+mtg-proxy run /etc/mtg-proxy/config.toml
+mtg-proxy access /etc/mtg-proxy/config.toml
 ```
 
-Then print the connection links and QR codes for your users:
+---
 
-```console
-mtg-proxy access /etc/mtg/config.toml
-```
+## Verifying Releases
 
-## Verifying a download
+Every tagged release publishes:
 
-Every release publishes, alongside the ten platform archives:
+- `mtg-proxy-<version>-linux-amd64.tar.gz` and `mtg-proxy-<version>-linux-arm64.tar.gz`
+- `mtg-proxy-<version>-checksums.txt` (SHA-256)
+- `mtg-proxy-<version>-sbom.spdx.json` (SPDX 2.3 Rust Cargo SBOM)
+- Signed Sigstore / in-toto [build provenance attestations](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds)
 
-- `mtg-proxy-<version>-checksums.txt` — one SHA-256 line per asset;
-- `mtg-proxy-<version>-sbom.spdx.json` — an SPDX SBOM of the module graph the
-  binaries were built from;
-- a signed [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds)
-  covering every one of those files, including the checksums file itself.
-
-**Checksum** — catches a truncated download, a mangled CDN object or a
-mismatched version. Fetch the checksums file next to the archive and run:
-
-```console
-VERSION=1.2.3
+```bash
+VERSION=2.0.0
 PKG=mtg-proxy-${VERSION}-linux-amd64
+BASE="https://github.com/Arman2122/mtg-proxy/releases/download/v${VERSION}"
 
-curl -sfLO "https://github.com/Arman2122/mtg-proxy/releases/download/v${VERSION}/${PKG}.tar.gz"
-curl -sfLO "https://github.com/Arman2122/mtg-proxy/releases/download/v${VERSION}/mtg-proxy-${VERSION}-checksums.txt"
+# 1. Verify SHA-256 checksum
+curl -sfLO "${BASE}/${PKG}.tar.gz"
+curl -sfLO "${BASE}/mtg-proxy-${VERSION}-checksums.txt"
 sha256sum -c --ignore-missing "mtg-proxy-${VERSION}-checksums.txt"
-```
 
-`--ignore-missing` checks whichever listed files you actually downloaded, and
-exits non-zero if none of them matched.
-
-**Provenance** — catches a replaced asset. The checksums file is served from
-the same origin as the archive, so anyone who can swap one can swap the other;
-only the attestation is signed. It needs the [`gh`](https://cli.github.com) CLI
-(already present on GitHub Actions runners) and no secret:
-
-```console
+# 2. Verify signed Sigstore provenance attestation
 gh attestation verify "${PKG}.tar.gz" \
     --repo Arman2122/mtg-proxy \
-    --signer-workflow Arman2122/mtg-proxy/.github/workflows/go.yml
-```
+    --signer-workflow Arman2122/mtg-proxy/.github/workflows/release.yml
 
-`--signer-workflow` is the part that matters: without it, any workflow in the
-repository that can mint an OIDC token would satisfy the check.
-
-The container image carries the same attestation. Verify a released tag rather
-than `latest` — attestation started with the release below, so an older image
-still sitting under a floating tag has none to check:
-
-```console
-gh attestation verify oci://ghcr.io/arman2122/mtg-proxy:${VERSION} \
+# 3. Verify container image provenance
+gh attestation verify "oci://ghcr.io/arman2122/mtg-proxy:${VERSION}" \
     --repo Arman2122/mtg-proxy \
     --signer-workflow Arman2122/mtg-proxy/.github/workflows/docker-publish.yml
 ```
 
-If you package mtg-proxy for others — a panel, a distribution, an installer —
-please run at least the checksum, and preferably the attestation, and fail the
-build when it does not match.
+See [SECURITY.md](SECURITY.md) for the full verification & threat model specification.
+
+---
 
 ## Running with Docker
 
-The image is published to the GitHub Container Registry and ships a working
-default config, so it can be configured entirely from environment variables in
-the style of the official `telegrammessenger/proxy` image:
+Multi-arch images (`linux/amd64`, `linux/arm64`, `gcr.io/distroless/cc-debian12`) are published to GHCR and ship with a working default config at `/config/config.toml`, supporting zero-config env-var launches:
 
-```console
+```bash
 docker run -d --name mtg -p 443:443 \
     -e SECRET=00112233445566778899aabbccddeeff \
     -e SECRET_HOST=storage.googleapis.com \
@@ -244,336 +190,131 @@ docker run -d --name mtg -p 443:443 \
     ghcr.io/arman2122/mtg-proxy:latest
 ```
 
-To run with a full config file instead, mount it over the bundled default at
-`/config/config.toml`:
+Or mount your own config file (recommended with `--user 65534:65534` for non-root hardening):
 
-```console
-docker run -d --name mtg -p 443:443 \
-    -v /etc/mtg/config.toml:/config/config.toml:ro \
-    ghcr.io/arman2122/mtg-proxy:latest
-```
-
-See [Environment variables](#environment-variables) for the full list.
-
-`:latest` tracks the newest tagged release. Every push to `main` is published
-too, but only under its `sha-<commit>` tag, so `latest` never means "whatever
-landed an hour ago". Pin to `:1.2.3` if you want a specific build, and verify
-it with the command in [Verifying a download](#verifying-a-download).
-
-### Running the container as a non-root user
-
-The image runs as root, because dropping privileges by default would break two
-common setups on the next `docker pull`. If neither applies to you — and for a
-process parsing hostile input off port 443, it is worth checking — add
-`--user 65534:65534`:
-
-```console
+```bash
 docker run -d --name mtg -p 443:443 --user 65534:65534 \
-    -v /etc/mtg/config.toml:/config/config.toml:ro \
+    -v /etc/mtg-proxy/config.toml:/config/config.toml:ro \
     ghcr.io/arman2122/mtg-proxy:latest
 ```
 
-The two things to check first:
+> **Note for non-root containers & strict seccomp:** Make sure the mounted config is readable by uid `65534` (`0640`/`0644`), and if running under a strict seccomp profile that audits `io_uring_setup`, pass `run --epoll /config/config.toml`. `:latest` only moves on tagged releases; `main` builds publish under `sha-<commit>`.
 
-- **The config must be readable by uid 65534.** A root-owned `0600` config —
-  a reasonable thing to do with a file full of secrets — cannot be read after
-  the switch, and the proxy exits at startup. `0640` with a matching group, or
-  `0644` on a file whose directory is not world-traversable, both work.
-- **Binding a port below 1024 inside the container.** Docker sets
-  `net.ipv4.ip_unprivileged_port_start=0` in containers by default, so
-  `MTG_BIND_TO=0.0.0.0:443` still works. Kubernetes and some other runtimes do
-  not: there, bind a high port inside (`MTG_BIND_TO=0.0.0.0:8443`) and publish
-  it as 443 outside, or set the sysctl yourself.
+---
 
-If you set `usage-state-file`, its directory must also be writable by uid
-65534.
+## Production Linux Tuning (`systemd` & `sysctl`)
+
+Ready-to-deploy production templates are shipped in `deploy/`:
+
+- [deploy/sysctl.d/99-mtg-proxy.conf](deploy/sysctl.d/99-mtg-proxy.conf) — enables `fq` + `bbr`, 65,535 listen/SYN backlogs, 16 MiB TCP buffer auto-tuning, `tcp_fastopen = 3`, `tcp_notsent_lowat = 16384`, and `fs.file-max = 2097152`.
+- [deploy/systemd/mtg-proxy.service](deploy/systemd/mtg-proxy.service) — least-privilege systemd unit (`CAP_NET_BIND_SERVICE` only, `ProtectSystem=strict`, `MemoryDenyWriteExecute=yes`, `LimitNOFILE=1048576`, `ExecReload=/bin/kill -HUP $MAINPID`).
+- [deploy/systemd/mtg-web-relay.service](deploy/systemd/mtg-web-relay.service) — dedicated hardened systemd unit for `mtg-proxy web-relay`.
+
+```bash
+sudo install -m 0755 target/release/mtg-proxy /usr/local/bin/mtg-proxy
+sudo install -m 0644 deploy/sysctl.d/99-mtg-proxy.conf /etc/sysctl.d/99-mtg-proxy.conf
+sudo sysctl --system
+sudo install -m 0644 deploy/systemd/mtg-proxy.service /etc/systemd/system/mtg-proxy.service
+sudo systemctl daemon-reload && sudo systemctl enable --now mtg-proxy
+```
+
+---
 
 ## Features
 
-### Multiple secrets
+### Multiple Secrets & Hot Reload
 
-Define named secrets in the config, one per user. Each name is used as the label
-in per-user stats, and each secret may front behind a different hostname.
+Define one named secret per user under `[secrets]` (single-secret `secret = "..."` still works and maps to `default`). Reload changes without restarting or dropping active users via `SIGHUP` (`systemctl reload mtg-proxy`) or `POST /reload`:
 
-```toml
-[secrets]
-alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
-bob   = "ee0123456789abcdef0123456789abcd9573746f726167652e676f6f676c65617069732e636f6d"
+```bash
+curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:9090/reload
 ```
 
-The single-secret `secret = "..."` form from upstream still works and is treated
-as one secret named `default`.
+Hot reload atomically swaps `[secrets]`, `ad-tag`, `[secret-ad-tags]`, `[secret-limits]`, and `[[retiring-secret]]`. Removed or re-keyed secrets close immediately (unless covered by a `[[retiring-secret]]` overlap); untouched users remain connected with all counters preserved.
 
-### Per-user stats API
+### Management HTTP API & Stats
 
-Set `api-bind-to` to start a small HTTP server (bind it to loopback unless you
-also set an [API token](#api-authentication)):
+Configure `api-bind-to` (bind to loopback unless `api-token` is set — verified in constant time via `Authorization: Bearer <token>`):
 
-```toml
-api-bind-to = "127.0.0.1:9090"
-```
-
-```console
-curl http://127.0.0.1:9090/stats
-```
-
-```json
-{
-  "started_at": "2026-03-29T10:30:00Z",
-  "uptime_seconds": 3600,
-  "total_connections": 15,
-  "features": ["client-ips", "faketls", "handshake-budget", "listeners", "quota-reset", "secret-modes", "secrets-api"],
-  "listeners": [
-    { "bind": "0.0.0.0:443", "accept": ["ee"], "public": true },
-    { "bind": "127.0.0.1:2398", "accept": ["dd", "plain"], "public": false }
-  ],
-  "obfuscated": {
-    "trials": 412,
-    "misses": 7,
-    "denied": 7,
-    "draining": 0,
-    "rate_limited": 0
-  },
-  "faketls_handshake": {
-    "hinted": 3120,
-    "scanned": 842,
-    "unmatched": 29,
-    "denied_ip": 0,
-    "denied_global": 0,
-    "oversized": 0,
-    "over_budget_matched": 0,
-    "enforced": true,
-    "ns_per_block": 33.8
-  },
-  "users": {
-    "alice": {
-      "connections": 8,
-      "bytes_in": 1048576,
-      "bytes_out": 2097152,
-      "last_seen": "2026-03-29T11:25:30Z",
-      "quota_used": 3145728
-    }
-  }
-}
-```
-
-`last_seen` is `null` for a user who has never connected. The `throttle` object
-is included only when [throttling](#connection-throttling) is configured, and a
-user's `quota`, `quota_remaining`, `quota_reset`, `expires_at`, `disabled`,
-`speed_limit` and `ip_limit` fields appear only when that user has the
-corresponding [limit](#per-user-quotas-expiry--disable) set, and `throttled_ms`
-— the time a user's connections have spent held to their speed limit —
-`active_ips` — how many places they are in right now — and `ip_limit_refused`
-only once they are non-zero. The [per-address controls](#per-address-controls)
-add `client_conns`, `client_speed_limit` and `client_fair` when set, and
-`client_conns_refused`, `clients` and `clients_overflow` once non-zero, all
-inside the user object.
-
-`listeners` and `obfuscated` appear only when at least one
-[`[[listener]]`](#extra-listeners-listener) is configured — a deployment that
-serves `bind-to` alone sees exactly the response it saw before. `listeners`
-reports what each socket accepts; `obfuscated` counts the trial-decryption entry
-(`trials` connections tried, `misses` matched by no secret, `denied` refused for
-any reason, `rate_limited` turned away by the per-IP budget, and `draining` as a
-live gauge of refused connections currently being drained). A user also gains
-`ad_tag_skipped` once one of its ad-tagged streams took the direct path because
-its transport has no middle-proxy reframer, and `ad_tag_failed` once one did so
-because the middle proxy could not be reached or refused it — the first is by
-design, the second is an outage, apart from a few in the seconds after a restart
-while the middle-proxy config loads — see
-[Sponsored channel](#sponsored-channel-ad-tag).
-
-`faketls_handshake` appears once the FakeTLS door has counted something, and it is
-a top-level object, never under `users`. `hinted` and `scanned` are hellos matched
-to a secret (by an address's earlier match, or by the scan), `unmatched` matched
-none, and, under `enforce`, `denied_ip`, `denied_global` and `oversized` were
-turned away by the handshake budget, whose `[defense.handshake-budget]` table is
-on by default (under `observe` they count what would have been).
-`enforced` says whether a refusal is acted on, `over_budget_matched` is the
-number to watch while running it in `observe` mode, and `ns_per_block` is what
-the budget believes one SHA-256 block costs on this machine.
-
-`features` is a sorted list of capability names this build supports, meant to be
-read before a capability is used — it is how a panel can tell an older binary
-from a newer one without parsing version strings. Names are a public contract:
-existing ones are never renamed or removed, and new ones are only ever appended.
-
-#### Client addresses
-
-Off by default. With `track-client-ips = true`, each user also reports the
-addresses behind their connections:
-
-```json
-"alice": {
-  "connections": 2,
-  "connected_ips": ["198.51.100.7", "203.0.113.44"],
-  "last_ip": "203.0.113.44"
-}
-```
-
-`connected_ips` is the set of distinct addresses holding a live connection right
-now, sorted and deduplicated — it is derived from the connection registry rather
-than counted separately, so it cannot drift from `connections` beside it, and an
-entry disappears when its connection ends. `last_ip` is the most recent admitted
-connection's address and outlives that connection.
-
-**Why this is off by default.** This is a circumvention proxy: the people using
-it are frequently the reason it exists, and an operator's answer to "who
-connected from where" is also the answer available to whoever ends up with the
-server. `connected_ips` adds no retention — those addresses are already held for
-the life of the connection — but `last_ip` outlives the connection it came from,
-so a deployment that never asks for either never accumulates one. Neither is
-written to disk in any form; `usage-state-file` persists quota counters alone, so
-no address survives a restart. (That is about these two fields: the ee handshake
-budget keeps a separate anonymous per-address bucket in memory whatever
-`track-client-ips` says, as the wiki's Security page explains under *Client
-addresses*.) With tracking on, every secret's addresses are also kept in memory,
-with what each moved, until ten minutes after its last connection, and
-`GET /secrets/{name}/clients` lists them for up to about eleven minutes: further
-back than `connected_ips`.
-
-Behind a front proxy, both report what the PROXY header carried — the client's
-real address — which is what makes them useful for a WEB deployment. See
-[`proxy-protocol-listener`](#extra-listeners-listener).
-
-### Hot secret reload
-
-The `api-bind-to` listener also serves a reload endpoint, so the `[secrets]` set
-can change without restarting the proxy:
-
-```console
-curl -X POST http://127.0.0.1:9090/reload
-```
-
-On success it re-reads the same config file passed to `mtg-proxy run` and swaps
-the secret set in atomically:
-
-- added secrets start working immediately;
-- connections whose secret was removed or re-keyed are closed, except those on
-  a previous key a `[[retiring-secret]]` block keeps until its `until`;
-- every other user stays connected and their stats counters carry over.
-
-Only `[secrets]`, `ad-tag`, `[secret-ad-tags]`, `[secret-limits]` and
-`[[retiring-secret]]` are hot-applied. Changing the bind address, domain
-fronting, network, or throttle settings still needs a restart.
-
-Responses: `200 {"status":"ok"}` on success; `500` if the config cannot be read
-(the current set stays active); `503` when the proxy was started without a config
-file (`simple-run`); `405` for a non-POST request.
-
-The WEB relay is a second process and does not share this listener. It watches
-the config file and applies a changed `[secrets]` table by itself within a few
-seconds; `SIGHUP` applies it immediately — see
-[WEB proxy transport](#web-proxy-transport). A change made through this API
-alone, without writing the file, never reaches the relay.
-
-### Secrets & ad-tag management API
-
-The same listener exposes CRUD endpoints so you can manage secrets and the ad-tag
-at runtime, without editing the file or restarting:
-
-| Method & path | Action |
+| Method & Path | Description |
 |---|---|
-| `GET /secrets` | List secrets (`name`, `secret`, `host`, `mode`, `ad_tag`, `effective_ad_tag`, plus `unserved` and `quota`/`quota_used`/`quota_remaining`/`expires_at`/`disabled`/`speed_limit`/`ip_limit`/`client_conns`/`client_speed_limit`/`client_fair` when set). |
-| `POST /secrets` | Add or update one: `{"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?,"client_conns"?,"client_speed"?,"client_fair"?}`. |
-| `PUT /secrets` | Replace the whole set: `{"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?,ip_limit?,client_conns?,client_speed?,client_fair?}},"ad_tag"?}`. |
-| `GET /secrets/{name}` | One entry of the list above, by name, with the same live counters (`404` if unknown). |
-| `DELETE /secrets/{name}` | Remove one (`404` if unknown, `409` if it is the last one). |
-| `POST /secrets/{name}/reset-quota` | Zero the secret's used-bytes counter (`404` if unknown). |
-| `GET /secrets/{name}/external-ips` | The user's address view: `ip_limit`, `active_ips`, and the addresses when `track-client-ips` is on. |
-| `PUT /secrets/{name}/external-ips` | `{"ips":[...],"ttl":"90s"}` — report the addresses the user holds on other systems, so the address limit spans them. Expires after `ttl`. |
-| `DELETE /secrets/{name}/external-ips` | Clear that report. |
-| `GET /secrets/{name}/clients` | Per-address usage, most bytes first: `?limit=N` (default 100, at most 1,000). The counts always, the addresses only with `track-client-ips`. |
-| `POST /secrets/{name}/bans` | `{"ips":[...],"ttl":"1h","force"?}` — refuse those addresses this secret until `ttl` (at most `720h`), closing their live streams. In memory only. `409` when 4,096 bans are held. |
-| `GET /secrets/{name}/bans` | The secret's bans: a count, and the addresses only with `track-client-ips`. |
-| `DELETE /secrets/{name}/bans/{address}` | Lift one ban; an IPv6 ban may be named by its /64. |
-| `GET /adtag` | Read the global ad-tag: `{"ad_tag":"<hex>"\|null}`. |
-| `PUT /adtag` | Set the global ad-tag: `{"ad_tag":"<32 hex chars>"}`. |
-| `DELETE /adtag` | Clear the global ad-tag. |
+| `GET /stats` | Live global & per-user counters, `features` capability list, `listeners`, `obfuscated`, `faketls_handshake`, and `throttle` state. |
+| `POST /reload` | Atomically re-read the config file from disk (`503` under `simple-run`). |
+| `GET /secrets` | List all secrets with mode, host, effective ad-tag, limits, retiring info, and live usage. |
+| `POST /secrets` | Add or update one secret (key, optional `ad_tag`, and any governance limits). |
+| `PUT /secrets` | Atomically replace the entire secret set while keeping active retiring keys of retained names. |
+| `GET /secrets/{name}` | Inspect one named secret and its live counters (`404` if missing). |
+| `DELETE /secrets/{name}` | Delete one secret (`409` if it is the last remaining secret). |
+| `POST /secrets/{name}/reset-quota` | Reset a secret's `quota_used` counter to zero and restart its quota period. |
+| `POST /secrets/{name}/kick` | Immediately close live streams matching specified `ips` (O(K) indexed lookup). |
+| `GET /secrets/{name}/external-ips` | View local & externally reported active addresses and `ip_limit`. |
+| `PUT /secrets/{name}/external-ips` | Report external addresses (`{"ips":[...],"ttl":"90s"}`) counted toward `ip-limit`. |
+| `DELETE /secrets/{name}/external-ips` | Clear external address report. |
+| `GET /secrets/{name}/clients` | Per-address usage sorted by bytes moved (`?limit=N`, default 100, max 1,000). |
+| `POST /secrets/{name}/bans` | Temporarily ban addresses from a secret (`{"ips":[...],"ttl":"1h","force"?}`) and kick live streams. |
+| `GET /secrets/{name}/bans` | List active bans for a secret (addresses shown only when `track-client-ips = true`). |
+| `DELETE /secrets/{name}/bans/{address}` | Unban one IPv4 address or IPv6 `/64` prefix. |
+| `GET /adtag` / `PUT /adtag` / `DELETE /adtag` | Read, set (`32` hex chars), or clear the global sponsored-channel `ad_tag`. |
 
-These go through the same atomic-swap machinery as `/reload`: a changed secret
-key closes that user's connections, while an ad-tag-only change does not.
+> **Privacy default (`track-client-ips = false`):** Client IP addresses (`connected_ips`, `last_ip`, per-address IP listings) are omitted by default and never written to disk; `usage-state-file` persists byte quotas only.
 
-`mode` is the wire form the secret serialises to (`ee`, `dd` or `plain`), and
-`unserved` is `true` when no configured listener honours that form — a `dd` or
-`plain` secret on a proxy with no [`[[listener]]`](#extra-listeners-listener).
-Such a secret is stored and valid, it just has no door; that is deliberately not
-an error, so one odd client can never take an inbound offline. The request
-bodies carry no mode field: the mode rides inside the secret string itself, so
-these routes are unchanged.
+Prometheus (`/metrics`) and StatsD UDP exporters are also built in under `[stats.prometheus]` and `[stats.statsd]`.
 
-Direct API mutations are **in-memory only** — a later `POST /reload` (or a
-restart) re-reads the config file and overrides them. Treat the file as the
-source of truth and the API as a live override.
-
-### API authentication
-
-By default the API is unauthenticated and protected only by binding to loopback.
-Because it can mutate secrets, you can require a bearer token on **every**
-endpoint:
+### Per-User Quotas, Speed, IP Limits, Expiry & Disable
 
 ```toml
-api-token = "change-me"
+usage-state-file = "/var/lib/mtg-proxy/usage.json"
+
+[secret-limits.alice]
+quota = "10GB"            # human size or bare bytes
+quota-reset = "monthly"   # "none" (default) or "monthly"
+speed = "5mbit"           # combined up+down sustained cap (lock-free GCRA)
+speed-up = "2mbit"        # optional directional caps (speed-up / speed-down)
+speed-down = "5mbit"
+ip-limit = 2              # max simultaneous places (IPv4 or IPv6 /64)
+expires = "2026-12-31"    # RFC3339 or YYYY-MM-DD
+disabled = false
 ```
 
-```console
-curl -H "Authorization: Bearer change-me" http://127.0.0.1:9090/secrets
+- Exceeded quotas cut off live streams at the ceiling (`quota_cutoffs`) and transparently front new attempts to the cover site so probers cannot distinguish limited users from invalid secrets.
+- Speed limits pace without buffering (backpressure stays in the kernel TCP window) and update live on reload without dropping connections.
+
+### Per-Address Controls, Fair-Share & Bans
+
+Inside a shared secret, prevent a single heavy address from starving others:
+
+```toml
+[secret-limits.shared]
+speed = "50mbit"
+ip-limit = 30
+client-conns = 16         # max simultaneous connections per IPv4 / IPv6 /64
+client-speed = "10mbit"   # per-address static speed ceiling
+client-fair = true        # 1-second water-level fair-share across active addresses
 ```
 
-Missing or wrong tokens get `401`. When `api-token` is unset, behavior is
-unchanged (no auth). Always set a token if the API is reachable from anything but
-localhost.
+### Secret Rotation with Overlap
 
-### Sponsored channel (ad-tag)
+Rotate a leaked link without disconnecting legitimate users simultaneously:
 
-Upstream mtg v2 dropped the promoted-channel feature; mtg-proxy brings it back.
-When an ad-tag is set, matching clients are routed through Telegram **middle
-proxies** (the RPC protocol) instead of directly to the data centers, and your
-sponsored channel appears at the top of their chat list.
+```bash
+mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --overlap 24h --reload
+```
+
+Writes the new primary key into `[secrets]` (preserving comments and formatting via lossless TOML editing) and records the previous key in `[[retiring-secret]]` with an absolute `until` timestamp guarded by a monotonic `RotationClock`. Supports `--end-overlap`, `--prune`, `--host`, `--dry-run`, `--reload`, and `--force`.
+
+### Sponsored Channel (`ad-tag`)
 
 ```toml
 ad-tag = "0123456789abcdef0123456789abcdef"
-public-ipv4 = "1.2.3.4"   # this proxy's reachable public address
-```
+public-ipv4 = "1.2.3.4"
 
-One global tag applies to every secret; you can override it per secret:
-
-```toml
 [secret-ad-tags]
 bob = "fedcba9876543210fedcba9876543210"
 ```
 
-**Getting a tag.** Register your proxy with [@MTProxybot](https://t.me/MTProxybot)
-to obtain a 32-character hex `ad_tag`. When the bot asks for your secret, give it
-the **bare 16-byte key only** — 32 hex characters, without the `ee` prefix and
-without the appended hostname. For example, from the secret
-`ee`**`3610182353be658466cea76f358bf9bb`**`7777772e...` you paste only
-`3610182353be658466cea76f358bf9bb`. Pasting the full FakeTLS secret makes the bot
-reply *"Incorrect secret value. It must contain 32 hex characters"* — that is the
-bot's format requirement, not an error in your proxy.
+Register the **bare 32-hex key** (without `ee` or hostname) with [@MTProxybot](https://t.me/MTProxybot). `mtg-proxy` multiplexes eligible streams over persistent AES-256-CBC MiddleProxy carriers and falls back transparently to direct Telegram DCs if a carrier is unreachable.
 
-**Requirements and behavior.**
-
-- The middle-proxy path adds one network hop and needs a reachable **public IP**.
-  On a host behind NAT or with multiple addresses, set `public-ipv4` /
-  `public-ipv6` — the proxy's source address (and port) are mixed into the RPC
-  key schedule, so the middle proxy must see the address you advertise. A machine
-  behind a port-rewriting NAT cannot complete this handshake; run on a host with
-  a real public IP (a VPS).
-- If a middle proxy cannot be reached, that connection **falls back to a direct
-  DC connection** (logged as a warning) so the client stays online — the sponsored
-  channel just won't show for that session.
-- The middle-proxy secret and address list are fetched from Telegram lazily on
-  first use and refreshed hourly, so a proxy without an ad-tag never contacts
-  those endpoints.
-
-### Connection throttling
-
-Automatic per-user connection limits protect the server from overload. A
-background goroutine recomputes caps every few seconds using a fair-share
-algorithm: light users keep all their connections, and the remaining budget is
-split equally among heavy consumers. New connections from over-cap users are
-rejected; existing connections are never killed.
+### Connection Throttling
 
 ```toml
 [throttle]
@@ -581,404 +322,129 @@ max-connections = 5000
 check-interval = "5s"
 ```
 
-Example — limit 100, with users A=1, B=1, C=90, D=110: A and B stay at 1, and the
-remaining budget of 98 is split so C and D are each capped at 49.
+Recomputes per-user fair-share connection caps automatically: light users keep all their slots while heavy consumers share the remaining budget equally (existing streams are never killed).
 
-Throttle state is exposed in the stats response:
+### Extra Listeners (`[[listener]]`)
 
-```json
-{
-  "throttle": {
-    "active": true,
-    "limit": 5000,
-    "caps": { "heavy-user": 2450 }
-  }
-}
-```
-
-### Per-user quotas, expiry & disable
-
-Each named secret can carry governance limits — a data quota, a speed limit, an
-address limit, a validity deadline, and an on/off switch — so you can run
-mtg-proxy as a reseller or multi-tenant proxy. Add a `[secret-limits.<name>]`
-table for any secret in `[secrets]`; a secret without one is unlimited, never
-expires and is enabled.
-
-```toml
-# Persist quota usage across restarts (optional but recommended for quotas).
-usage-state-file = "/var/lib/mtg/usage.json"
-
-[secret-limits.alice]
-quota = "10GB"            # human size or a bare byte count; omit for unlimited
-quota-reset = "monthly"   # "none" (default, lifetime cap) or "monthly"
-speed = "5mbit"           # sustained cap, all of alice's connections together
-ip-limit = 2              # how many places alice may be at once; omit for unlimited
-expires = "2026-12-31"    # RFC3339 or YYYY-MM-DD; omit for never
-disabled = false          # true rejects the secret without removing it
-
-[secret-limits.bob]
-quota = "500MB"
-```
-
-**Speed is per user, not per connection.** Every connection alice has, on every
-door, draws from one allowance, so two of her devices share `5mbit`. It is a
-sustained rate with a one-second burst, upload and download combined, enforced
-by the proxy itself — the only hop that knows which user a byte belongs to —
-and it never buffers: the bucket only delays, so backpressure lands in the
-client's own TCP window. Bit units are decimal (`5mbit` is 625,000 bytes/s),
-byte units are base 2 (`1MB/s`), the minimum is `64kbit`. A change reaches
-live connections on reload without dropping them, and `throttled_ms` on `/stats`
-says how long a user has spent held to it.
-
-**An address limit counts places, not sockets.** All of a device's connections
-come from one address and count once; an IPv6 address counts as its /64. A
-connection from a place alice already holds is always admitted, one from a new
-place only while she is below the limit — refused at admission, after the secret
-matched, so only a holder of the valid secret can ever see it. The check and the
-registration are one atomic step, a slot is freed the moment the last connection
-from that place ends, and a limit lowered on a running proxy never drops anyone.
-A panel that also runs alice's VPN can report the addresses she holds there
-through `PUT /secrets/alice/external-ips`, and they count against the same
-limit until the report's `ttl` lapses. `ip_limit`, `active_ips` and
-`ip_limit_refused` on `/stats` show it working.
-
-When a user is over quota, past its expiry, or disabled, new connections are
-transparently routed to the **fronting domain** — exactly like a wrong secret —
-so a prober cannot tell a limited user from an invalid one. A quota is a
-ceiling: the stream that reaches it ends at that byte, the user's other streams
-end on their next byte, and `quota_cutoffs` on `/stats` counts them. Disabling
-or expiring a secret closes its live connections, at once via reload or the
-API and within five seconds when the clock crosses the expiry on its own.
-
-Usage is exposed per user in `/stats` and `/secrets`:
-
-```json
-{
-  "users": {
-    "alice": {
-      "connections": 2,
-      "bytes_in": 1048576,
-      "bytes_out": 2097152,
-      "quota_used": 3145728,
-      "quota": 10737418240,
-      "quota_remaining": 10734272512,
-      "quota_reset": "monthly",
-      "expires_at": "2026-12-31T00:00:00Z"
-    }
-  }
-}
-```
-
-Set `usage-state-file` so `quota_used` survives restarts; it is flushed
-atomically every ~30 seconds and on shutdown. With `quota-reset = "monthly"` the
-counter resets at the start of each calendar month. Clear a user's usage
-manually with `POST /secrets/{name}/reset-quota`. Limits set through the
-management API are in-memory only and are overridden by the next reload — the
-config file remains the source of truth.
-
-### Per-address controls
-
-A secret that many people share has one speed limit, one quota and one set of
-counters, so one heavy user can drain everyone's share. Three optional keys in
-`[secret-limits.<name>]` act on each source address inside the secret, where an
-address is an IPv4 address or an IPv6 /64:
-
-```toml
-[secret-limits.shared]
-speed = "50mbit"
-ip-limit = 30
-client-conns = 16         # live connections one address may hold
-client-speed = "10mbit"   # a ceiling on one address, both directions together
-client-fair = true        # divide speed among the addresses; needs a speed
-```
-
-`GET /secrets/{name}/clients` lists what each address moved (the addresses only
-with `track-client-ips`), and `/secrets/{name}/bans` refuses an address one
-secret for up to `720h`, in memory. All of it is off by default. One address may
-be many people behind a carrier's NAT, loopback and private addresses share one
-entry that is never capped, and behind a PROXY-protocol listener the address is
-whatever the header says, so the proxy warns at start when these keys meet such
-a listener. The panel does not write these keys. The details, and what fair
-share does at scale, are in the
-[Configuration](https://github.com/Arman2122/mtg-proxy/wiki/Configuration)
-and [Security](https://github.com/Arman2122/mtg-proxy/wiki/Security) pages of
-the wiki.
-
-### Secret rotation
-
-When a link leaks, re-keying its secret cuts every holder at once.
-`rotate-secret` gives the secret a new key and keeps the old one accepted until
-a time you choose (feature `secret-rotation`):
-
-```console
-mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --overlap 24h --reload
-```
-
-It writes the new key into `[secrets]` and the old one into a
-`[[retiring-secret]]` block with its `until`, prints the new value on stdout,
-and with `--reload` reloads the proxy through the management API and reads the
-rotation back. Until `until` the old link works exactly as the new one does —
-for whoever holds it, so keep the overlap short for a link posted in public, or
-use `--overlap 0` and bans (with the WEB relay, the old WEB link then goes to
-the cover site at once; see the wiki's WEB-Proxy-Setup page). Then the old key
-is refused and its connections close. `--end-overlap` ends an overlap early and
-`--prune` removes expired blocks. `/stats` and `GET /secrets` report
-`retiring_keys`, `retiring_until`,
-`retiring_connections` and `retiring_last_seen` while an overlap runs. The WEB
-transport has no overlap, and a file the Penhoon panel writes cannot be rotated
-this way. The details are on the
-[Multi-User-and-API](https://github.com/Arman2122/mtg-proxy/wiki/Multi-User-and-API)
-and [Security](https://github.com/Arman2122/mtg-proxy/wiki/Security) pages of
-the wiki.
-
-### WEB proxy transport
-
-Telegram Desktop 7.1 added a **WEB proxy** connection type. The client loads a
-page from your hostname inside its own WebView, and that page carries an MTProto
-stream over a WebSocket. On the wire it is a browser visiting a website over
-ordinary HTTPS — no obfuscated2 handshake to fingerprint and no FakeTLS to
-distinguish, because the TLS is real.
-
-`mtg-proxy` serves it from a **second process of the same binary**, reading the
-same configuration file:
-
-```bash
-mtg-proxy generate-web-key /etc/mtg-proxy/web.key
-mtg-proxy web-relay --check /etc/mtg-proxy/config.toml   # validates and exits
-mtg-proxy web-relay /etc/mtg-proxy/config.toml
-```
+`bind-to` is FakeTLS-only (`ee`). To also serve `dd` or `plain` obfuscated2 (for example, on loopback behind `web-relay` or `tproxy-server`), add `[[listener]]` blocks:
 
 ```toml
 [[listener]]
 bind-to = "127.0.0.1:2398"
 accept = ["dd", "plain"]
-proxy-protocol = true          # carries the browser's address to the proxy
-
-[web]
-enabled = true
-host = "web.example.com"       # real certificate, port 443, no IP literals
-bind-to = "127.0.0.1:8099"     # where the front proxy reaches the relay
-backend = "127.0.0.1:2398"     # must name the [[listener]] above
-token-key = "/etc/mtg-proxy/web.key"
-cover-dir = "/srv/site"        # or cover-upstream = "http://127.0.0.1:8080"
+proxy-protocol = true
 ```
 
-`mtg-proxy access` then prints a `web` object per secret. Four things are
-different from every other link in this README, and all four come from the
-client:
+Non-loopback listeners require explicit `public = true` and automatically arm a sharded per-IP failed-handshake rate limiter (`handshakes-per-ip`, default `30/s`, burst `2×`) plus `on-unknown-secret = "close" | "drain"`.
 
-- **The secret is the `dd` form.** A WEB-capable client refuses an `ee` secret
-  before it opens a socket. It is the same sixteen bytes; only the spelling
-  changes, so nothing has to be re-issued.
-- **There is no address and no port.** The client's form has one field, a
-  hostname, and forces `https` and 443. Changing the hostname invalidates every
-  WEB link ever issued, exactly like changing an `ee` secret's fronting domain.
-- **A real certificate is required.** The WebView validates it normally and
-  offers no way past an error, so this needs a front proxy that terminates TLS
-  — Caddy in the [deployment guide](contrib/web-relay/README.md).
-- **Telegram Desktop 7.1.2 or later.** Earlier 7.1 builds had a WebView2 bug
-  that broke some WEB proxies on Windows.
+### WEB Proxy Transport (`web-relay`)
 
-The hostname must also serve a plausible website. Everything that arrives without
-a credential the relay minted gets it — on every path, including the API ones
-— and nothing ships as a default, because a starter page many operators
-installed would be a better signature than anything the protocol leaks.
+Serves Telegram Desktop 7.1.2+ WEB proxies over genuine HTTPS + WebSocket from the same binary and config file:
 
-**Adding and removing users without a restart.** The relay watches its config
-file. A changed `[secrets]` table is applied by itself within a few seconds of
-the write settling, and swapped in atomically; nothing has to be told. `SIGHUP`
-applies it immediately rather than on the next look:
-
-```console
-systemctl reload mtg-proxy-web-relay        # or: kill -HUP <pid>
+```bash
+mtg-proxy generate-web-key /etc/mtg-proxy/web.key
+mtg-proxy web-relay --check /etc/mtg-proxy/config.toml
+mtg-proxy web-relay /etc/mtg-proxy/config.toml
 ```
-
-Live sessions keep running, a newly added secret is recognised on its next page
-load, and a removed one stops being recognised. Only the secret set is
-reloadable: any other change under `[web]`, or to the backend listener's
-`proxy-protocol`, is refused whole with `restart required` rather than
-half-applied — once, not again on every look. A reload that cannot read or
-validate the file keeps the running set — an emptied registry would serve the
-cover site to every real user while reporting nothing wrong. Windows has no
-`SIGHUP`; the watcher is the only trigger there, and it is enough.
-
-**Watching it.** The relay reports its own counters on a socket of its own:
 
 ```toml
 [web]
-stats-bind-to = "127.0.0.1:8100"
+enabled = true
+host = "web.example.com"
+bind-to = "127.0.0.1:8099"
+backend = "127.0.0.1:2398"
+token-key = "/etc/mtg-proxy/web.key"
+cover-dir = "/srv/site"           # or cover-upstream = "http://127.0.0.1:8080"
+stats-bind-to = "127.0.0.1:8100"  # loopback-only stats endpoint
 ```
 
-```console
-curl http://127.0.0.1:8100/stats
-```
+Features a 3-tier anti-oracle origin (unknown/retired/padded credentials serve the cover site identically), per-page 128-bit CSP nonces, strict RFC 6455 WebSocket framing, and automatic 2-second config-file watch + `SIGHUP` secret reloads. See [contrib/web-relay/README.md](contrib/web-relay/README.md) for the Caddy vhost setup.
 
-Sessions, streams, bytes in each direction, profile names, reload outcomes, and a
-breakdown of *why* requests were refused — `cover_served`, `not_found`,
-`bad_token`, `session_limit`. The breakdown is the point: a climb in
-`cover_served` alongside users reporting failures means a hostname or secret-set
-mismatch, and a climb in `session_limit` means capacity, and one number cannot
-tell those apart.
+### Doppelganger Cover Scouting & Traffic Mimicry
 
-It **must** be a loopback address and the relay refuses to start otherwise. It is
-deliberately a second socket rather than a path on `bind-to`: that one is
-published to the internet by the front proxy, where everything without a
-credential the relay minted is answered by the cover site — a real endpoint there
-would be a fingerprint however it was gated. It is off by default.
+Configure `[defense.doppelganger]` (`shaping = "record" | "burst"`, `drs = true`, `urls = [...]`, `scout-covers = true`) to enable Weibull-distributed TLS record pacing, Cloudflare/nginx-style Dynamic Record Sizing (DRS), and live background TLS scouting (`tokio-rustls`) that measures real cover-site certificate flights and inter-record arrival gaps to calibrate `ServerHello` noise and traffic shapes atomically.
 
-[contrib/web-relay/](contrib/web-relay/README.md) is the deployment: the Caddy
-vhost, the four hops that have to carry the client's address, and the acceptance
-checklist for a real client. `/stats` advertises `web-relay` in `features` when a
-binary can serve this.
-
-> **What this has been tried against.** Telegram Desktop 7.1.2 on Windows, end
-> to end through Caddy, with both connection types working from the same config,
-> and the `tg://webproxy` link opening the client's WEB proxy form filled in
-> (confirmed 2026-09-07). The other client platforms have not been through the
-> checklist yet; `mtg-proxy access`'s printed hostname and secret configure any
-> of them by hand.
-
-### Public IP override
-
-Useful when automatic detection via ifconfig.co is unavailable, or when the
-address the outside world sees differs from any local interface.
+### Public IP Override & Environment Variables
 
 ```toml
 public-ipv4 = "1.2.3.4"
 public-ipv6 = "2001:db8::1"
 ```
 
-These addresses are used by `mtg-proxy access` to build links, by
-`mtg-proxy doctor` to validate the SNI-to-DNS match, and — when an ad-tag is set
-— as this proxy's own address in the middle-proxy handshake.
+Environment variables always override the config file (re-applied on every reload):
 
-### Environment variables
+| Variable | Precedence Alias | Purpose |
+|---|---|---|
+| `SECRET` | `MTG_SECRET` | Full secret (`ee…`/base64) or bare 16-byte hex key (paired with `SECRET_HOST`). |
+| `SECRET_HOST` | `MTG_SECRET_HOST` | Fronting hostname when `SECRET` is a bare 16-byte hex key. |
+| `TAG` | `MTG_TAG` | Global sponsored-channel `ad-tag` (empty clears it). |
+| `MTG_BIND_TO` | — | Comma-separated `host:port` list overriding `bind-to`. |
 
-For parity with the official
-[telegrammessenger/proxy](https://hub.docker.com/r/telegrammessenger/proxy/)
-image, `mtg-proxy run` overlays a few environment variables on top of the config
-file. The environment always wins over the file, and it is re-applied on every
-config read, so an env-pinned secret or tag survives a `POST /reload`.
+---
 
-| Variable | Meaning |
-|---|---|
-| `SECRET` | Proxy secret. Either a full mtg secret (`ee…` hex or base64) or a bare 16-byte hex key in the official-image format — the latter also needs `SECRET_HOST`. Replaces the whole `[secrets]` set and `[secret-ad-tags]`. |
-| `SECRET_HOST` | Domain-fronting hostname combined with a bare 16-byte `SECRET` into a FakeTLS secret. Ignored when `SECRET` is already a full secret. |
-| `TAG` | Advertising tag from [@MTProxybot](https://t.me/MTProxybot); same as `ad-tag` in the config. An empty value clears the tag. Like the official image, it is not persisted — provide it on every run. |
-| `MTG_BIND_TO` | Comma-separated `host:port` list overriding `bind-to`. |
-
-The `MTG_`-prefixed variants (`MTG_SECRET`, `MTG_SECRET_HOST`, `MTG_TAG`) take
-precedence over the bare names, so a generic name like `SECRET` in a shell can't
-be captured by accident outside a container.
-
-`WORKERS` and `SECRET_COUNT` from the official image are not applicable — one Rust
-process automatically pins one worker thread per allowed Linux CPU core (respecting
-cgroup cpusets; overridable with `mtg-proxy run --workers N`), and multiple secrets
-are configured through `[secrets]` or the API. Setting either is ignored with a
-startup warning.
-
-## Command reference
+## CLI Command Reference
 
 | Command | Description |
 |---|---|
-| `mtg-proxy generate-secret [--hex] [--mode ee\|dd\|plain] [hostname]` | Generate a new secret for the given fronting hostname (required for `ee`). `--hex`/`-x` prints hex instead of base64. |
-| `mtg-proxy run [--check] [--workers N] [--epoll] <config>` | Run the proxy from a config file (full feature set and `SIGHUP` hot reload). `--check` strictly validates the file and exits without listening. `--epoll` skips the startup `io_uring` kernel probe (useful under strict container seccomp profiles). |
-| `mtg-proxy simple-run <bind-to> <secret>` | Run without a config file, from flags only (no `[secrets]`, no reload). |
-| `mtg-proxy access [--ipv4 IP] [--ipv6 IP] [--port N] [--hex] <config>` | Print `tg://` / `t.me` links and QR-code URLs for the configured secrets. |
-| `mtg-proxy doctor [--skip-native-check] <config>` | Check config, Linux kernel/CPU hardware crypto (`VAES`/`AES-NI`/`SHA-NI`/`ARMv8`), clock skew, fronting reachability, SNI self-loop guard, and live Telegram DC RPC connectivity. |
-| `mtg-proxy rotate-secret <config> <name> --overlap <duration>` | Give a secret a new key and keep the old one accepted until the overlap ends. Also `<name> --end-overlap`, `--prune`, `--host`, `--dry-run`, `--reload` and `--force`. |
-| `mtg-proxy web-relay [--check] <config>` | Run the WEB proxy relay for the secrets in a config file (supports `SIGHUP` + 2s file-watch reload). `--check` validates `[web]` and exits. |
-| `mtg-proxy generate-web-key <path>` | Write the WEB relay's 32-byte token signing key (mode `0600`). |
-| `mtg-proxy --version` / `-v` | Print the version. |
+| `mtg-proxy run [--check] [--workers N] [--epoll] <config>` | Run the full proxy with `SIGHUP` reload and API. `--check` strictly validates config & exits. `--workers N` overrides pinned core count. `--epoll` skips startup `io_uring` probing for strict seccomp sandboxes. |
+| `mtg-proxy simple-run <bind-to> <secret> [flags]` | Run a single-secret proxy directly from CLI flags without a config file. |
+| `mtg-proxy generate-secret [--hex] [--mode ee\|dd\|plain] [hostname]` | Generate a cryptographically random secret (`--hex`/`-x` for hex, default base64). |
+| `mtg-proxy access [--ipv4 IP] [--ipv6 IP] [--port N] [--hex] <config>` | Print `tg://` / `t.me` / `tg://webproxy` links and QR URLs as JSON. |
+| `mtg-proxy doctor [--skip-native-check] <config>` | Diagnose config, CPU hardware crypto (`VAES`/`AES-NI`/`SHA-NI`/`ARMv8`), cgroup CPU affinity, kernel capabilities, SNTP clock skew, fronting reachability, SNI self-loop check, and live Telegram DC RPC probes. |
+| `mtg-proxy rotate-secret <config> <name> [flags]` | Losslessly rotate a secret with optional `--overlap`, `--end-overlap`, `--prune`, `--dry-run`, `--reload`. |
+| `mtg-proxy web-relay [--check] <config>` | Run the standalone WEB proxy relay with `SIGHUP` + 2-second config watcher. |
+| `mtg-proxy generate-web-key <path>` | Generate a 32-byte WEB relay token signing key (`0600`). |
+| `mtg-proxy version` / `--version` / `-v` | Print version, target triple, and git revision. |
 
-## Configuration
+See [example.config.toml](example.config.toml) for every supported option and default value.
 
-[example.config.toml](example.config.toml) documents every option with its
-default value and inline notes. A real config only needs the options you actually
-change — every key has a sensible default.
+---
 
-### Extra listeners (`[[listener]]`)
+## Upgrading from v1.x (Go) to v2.0 (Rust)
 
-`bind-to` is, and stays, FakeTLS-only. To also serve the two pre-FakeTLS secret
-forms — `dd` (`dd` + 32 hex) and plain (a bare 32-hex key) — add a `[[listener]]`
-block. It is a separate socket: one port never serves both entry paths, and there
-is no sniffing.
+- **Config files & env vars:** Drop-in compatible. Run `mtg-proxy run --check /etc/mtg-proxy/config.toml` before swapping binaries.
+- **`usage-state-file`:** Identical JSON schema; existing quota counters carry over seamlessly.
+- **Management API & Penhoon panels:** All 19 endpoints, Bearer auth, status codes, and JSON payloads are unchanged.
+- **Platform note:** `v2.0.0` targets Linux (`x86_64` and `aarch64`) exclusively; macOS/Windows/BSD server builds are not provided.
 
-```toml
-bind-to = "0.0.0.0:443"        # unchanged, FakeTLS only
+---
 
-[[listener]]
-bind-to = "127.0.0.1:2398"
-accept  = ["dd", "plain"]
+## Workspace Architecture
+
+```text
+mtg-proxy/
+├── Cargo.toml                  # 11-crate Rust 2024 workspace (fat LTO, abort, strip)
+├── crates/
+│   ├── mtg-core/               # Secrets, IpUnit, limits, monotonic RotationClock
+│   ├── mtg-crypto/             # VAES/AES-NI/ARMv8-AES fused-CTR, 4-way SHA-NI / 8-way AVX2 / ARMv8-SHA2
+│   ├── mtg-protocol/           # TLS unframer, PROXY v1/v2, MiddleProxy RPC, Doppelganger MLE/DRS, dcprobe
+│   ├── mtg-net/                # Linux sockopts, cgroup affinity, epoll/io_uring, splice(2), DoH/DoT, DC router
+│   ├── mtg-governance/         # Sharded AddressRegistry, ClientTable, GCRA + fair-share, bans, anti-replay, FireHOL
+│   ├── mtg-webrelay/           # WEB proxy origin, strict RFC 6455 WS, bridge page/CSP, 2s live watcher
+│   ├── mtg-config/             # Strict TOML parser, env overlays, redaction, lossless toml_edit rotation
+│   ├── mtg-engine/             # Pinned workers, DirectRelay, splice fronting, live Doppelganger scout, metrics
+│   ├── mtg-api/                # 19-route Penhoon Management API, Prometheus & StatsD exporters
+│   ├── mtg-cli/                # mtg-proxy binary, tikv-jemallocator, SIGHUP reload, doctor
+│   └── mtg-bench/              # Interleaved Linux A/B benchmark & wire-interop verifier
+├── deploy/                     # Production systemd units & sysctl.d Linux kernel tuning
+├── fuzz/                       # 8 libFuzzer harnesses covering every untrusted parser
+├── test/webbridge/             # Live Chromium Playwright harness (36 checks)
+└── tests/golden/               # Byte-exact FakeTLS, obfs2, MiddleProxy, config & rotation golden fixtures
 ```
 
-The intended consumer is Telegram's own WEB proxy front-end
-([tproxy-server](https://github.com/telegramdesktop/tproxy-server)), whose backend
-address is restricted to loopback and which speaks plain obfuscated2 to it.
+---
 
-| key | type | default | meaning |
-|---|---|---|---|
-| `bind-to` | `host:port`, host must be a literal IP | *required* | address for this obfuscated2 listener |
-| `accept` | string array, non-empty subset of `{"dd","plain"}` | *required* | which secret forms this socket honours. `"ee"` is rejected — run two listeners if you need both |
-| `public` | bool | `false` | your acknowledgement that a non-loopback obfuscated2 port is fingerprintable as an MTProto proxy. Required on any non-loopback `bind-to` |
-| `proxy-protocol` | bool | `false` | expect a PROXY header on **this** listener. The top-level `proxy-protocol-listener` applies to `bind-to` only |
-| `on-unknown-secret` | `"close"` \| `"drain"` | `"close"` | disposal of a connection no secret matches. `drain` reads and discards under a bounded budget instead of resetting |
-| `handshakes-per-ip` | uint | `30` | per-IP failed-handshake budget per second (burst 2×). Armed only when `public = true`, because behind a loopback carrier every connection presents `127.0.0.1` and one shared bucket is a self-DoS |
+## Documentation, Security & Contributing
 
-Secrets are not per-listener. A secret is 16 key bytes, and the same key is valid
-in all three wire forms; the prefix only tells the *client* how to connect. So an
-existing `ee` user keeps one name, one quota bucket and one set of stats whichever
-door they arrive through — nothing needs to be re-issued.
+- **[Changelog](CHANGELOG.md)** — full release history and `v2.0.0` migration notes.
+- **[Wiki Documentation](https://github.com/Arman2122/mtg-proxy/wiki)** — deep guides on installation, configuration, WEB relay setup, monitoring, and security.
+- **[Security Policy](SECURITY.md)** — private vulnerability reporting, release attestation verification, and known side-channel notes.
+- **[Contributing Guide](CONTRIBUTING.md)** — Rust build/lint/test commands, ARM64 cross-checks, Playwright bridge harness, and performance guardrails.
 
-`mtg-proxy access` prints a `listeners` array alongside the usual links, with a
-ready-to-use link per user per accepted form:
+---
 
-```json
-"listeners": [
-  {
-    "bind_to": "0.0.0.0:8444",
-    "accept": ["dd"],
-    "public": true,
-    "ipv4": {
-      "ip": "203.0.113.9",
-      "port": 8444,
-      "secrets": {
-        "alice": {
-          "dd": {
-            "secret": "dd367a189aee18fa31c190054efd4a8e95",
-            "tg_url": "tg://proxy?port=8444&secret=dd367a…&server=203.0.113.9"
-          }
-        }
-      }
-    }
-  },
-  {
-    "bind_to": "127.0.0.1:2398",
-    "accept": ["dd"],
-    "public": false,
-    "unreachable": "bound to loopback, so it is reachable only from this host (a WEB relay backend is meant to look like this)"
-  }
-]
-```
+## Credits & License
 
-The secret in each link is the user's own sixteen key bytes, spelled the way that
-socket expects — so handing someone a `dd` link does not create a second account,
-and their quota, counters and limits are the ones they already had. A loopback
-listener gets no links and says why: that is the shape of a WEB relay backend,
-not a misconfiguration.
+`mtg-proxy` originated as a fork of [9seconds/mtg](https://github.com/9seconds/mtg) by Sergey Arkhipov and contributors, expanded with multi-user governance, the Penhoon Management API, MiddleProxy ad-tags, secret rotation, the WEB proxy transport, and completely re-architected in pure Rust for v2.0.
 
-> **TOML ordering.** `[[listener]]` is an array of tables, so every top-level key
-> written after it belongs to the listener rather than to the global scope — the
-> same rule that already forces `[secrets]` to come last. Put your `[[listener]]`
-> blocks after all global keys, and `[secrets]` after those.
-
-Older mtg-proxy binaries ignore unknown TOML keys, so a config carrying
-`[[listener]]` still runs on one that predates this feature: it simply serves
-`ee` on `bind-to` as before, and no user of any existing mode is affected.
-
-## Credits
-
-mtg-proxy is a fork of [9seconds/mtg](https://github.com/9seconds/mtg) by Sergey
-Arkhipov and contributors. All of the core proxy engineering is theirs; this fork
-adds the multi-user layer on top. The middle-proxy (ad-tag) implementation is
-ported from the last mtg v1 release that shipped it.
+Licensed under the [MIT License](LICENSE).

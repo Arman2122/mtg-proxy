@@ -36,7 +36,7 @@ Set `VERSION` to the release without its leading `v`, and `PKG` to the archive
 you want:
 
 ```console
-VERSION=1.2.3
+VERSION=2.0.0
 PKG=mtg-proxy-${VERSION}-linux-amd64
 BASE=https://github.com/Arman2122/mtg-proxy/releases/download/v${VERSION}
 ```
@@ -55,16 +55,16 @@ It does **not** catch a deliberate substitution: the checksums file is served
 from the same origin as the archive, so whoever can replace one can replace the
 other. Which is what the next check is for.
 
-**2. Build provenance.** Every release asset — the ten archives, the SBOM and
-the checksums file itself — is covered by a signed in-toto attestation binding
-it to this repository, this commit and the workflow run that produced it. It is
-recorded in Sigstore's public transparency log, so it cannot be quietly
-withdrawn or backdated.
+**2. Build provenance.** Every release asset — the Linux `amd64` and `arm64`
+archives, the SBOM and the checksums file itself — is covered by a signed
+in-toto attestation binding it to this repository, this commit and the workflow
+run that produced it. It is recorded in Sigstore's public transparency log, so
+it cannot be quietly withdrawn or backdated.
 
 ```console
 gh attestation verify "${PKG}.tar.gz" \
     --repo Arman2122/mtg-proxy \
-    --signer-workflow Arman2122/mtg-proxy/.github/workflows/go.yml
+    --signer-workflow Arman2122/mtg-proxy/.github/workflows/release.yml
 ```
 
 `--signer-workflow` is not optional in spirit. Without it the check accepts an
@@ -83,9 +83,9 @@ gh attestation verify oci://ghcr.io/arman2122/mtg-proxy:${VERSION} \
 `GH_TOKEN: ${{ github.token }}` on the step.
 
 **3. SBOM.** `mtg-proxy-<version>-sbom.spdx.json` is an SPDX 2.3 document
-describing the Go module graph the release was built from. Use it to answer
-"is this affected?" when an advisory lands, without re-deriving the dependency
-set from a tag.
+describing the Rust Cargo dependency graph the release was built from. Use it to
+answer "is this affected?" when an advisory lands, without re-deriving the
+dependency set from a tag.
 
 ### If you redistribute mtg-proxy
 

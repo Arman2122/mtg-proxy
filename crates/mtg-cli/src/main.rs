@@ -29,8 +29,8 @@ static GLOBAL: Jemalloc = Jemalloc;
 pub static MALLOC_CONF: &[u8] =
     b"percpu_arena:percpu,dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true\0";
 
-/// Build version string reported by `-v` / `--version` and CLI banners.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-rust (linux)");
+/// Build version string reported by `-v`, `--version`, `version`, and CLI banners.
+pub const VERSION: &str = env!("MTG_FULL_VERSION");
 
 #[derive(Debug, Parser)]
 #[command(
