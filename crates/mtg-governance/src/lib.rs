@@ -182,10 +182,52 @@ mod tests {
         assert_eq!(e1.fair_limiter(FairBucket::Speed).rate_bps(), 5_000_000);
         assert_eq!(e2.fair_limiter(FairBucket::Speed).rate_bps(), 5_000_000);
 
-        // Release and sweep after 11 minutes
+        // Release and sweep after 11 minutes (including exact chunk boundary `max_per_hold = 2`!)
         table.release_at(&e1, 1000);
         table.release_at(&e2, 1000);
-        assert_eq!(table.sweep(1000 + 660, 1024), 2);
+        assert_eq!(table.sweep(1000 + 660, 2), 2);
+    }
+
+    #[test]
+    fn sharded_client_table_handles_concurrent_multicore_admissions_and_sweeps() {
+        let table = Arc::new(ClientTable::new());
+        let mut handles = Vec::new();
+        for tid in 0..8usize {
+            let t = Arc::clone(&table);
+            handles.push(std::thread::spawn(move || {
+                let init = EntryInit::default();
+                for s in 0..25usize {
+                    let name: Arc<str> = Arc::from(format!("user-{tid}-{s}"));
+                    let mut entries = Vec::with_capacity(16);
+                    for host in 1..=16u8 {
+                        let ip: IpAddr = format!("198.51.{}.{}", (tid * 25 + s) % 250, host)
+                            .parse()
+                            .unwrap();
+                        let e = t.acquire_at(&name, Some(IpUnit::from_ip(ip)), true, init, 5_000);
+                        entries.push(e);
+                    }
+                    for e in &entries {
+                        t.release_at(e, 5_000);
+                    }
+                    if s % 5 == 0 {
+                        t.drop_secret(&name);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 8 threads * 20 retained secrets * 16 IPs = 2,560 retained keyed entries
+        let counts = table.counts();
+        let total_clients: usize = counts.values().map(|c| c.clients).sum();
+        assert_eq!(counts.len(), 160);
+        assert_eq!(total_clients, 2_560);
+
+        // Chunked sweep after idle retention clears every single remaining entry!
+        assert_eq!(table.sweep(5_000 + 700, 16), 2_560);
+        let after: usize = table.counts().values().map(|c| c.clients).sum();
+        assert_eq!(after, 0);
     }
 
     #[test]

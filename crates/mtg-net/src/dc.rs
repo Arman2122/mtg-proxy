@@ -28,6 +28,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
+use crate::dns::DnsResolver;
 use crate::proxy_pool::{ProxyPool, ProxyTarget};
 use crate::sockopts::{SocketConfig, tune_tokio_stream};
 use crate::timer::coarse_now_ns;
@@ -158,13 +159,14 @@ impl DcDirectory {
     }
 
     /// Return ordered direct DC addresses honoring `prefer_ip` and optional
-    /// fallback to [`DEFAULT_DC`] on unknown DC IDs.
-    pub fn direct_addresses(
+    /// fallback to [`DEFAULT_DC`] on unknown DC IDs, along with the effective DC
+    /// ID actually selected (`DEFAULT_DC` if fallback triggered, else `dc.abs()`).
+    pub fn direct_addresses_with_dc(
         &self,
         dc: i32,
         prefer_ip: PreferIp,
         allow_fallback: bool,
-    ) -> Vec<SocketAddr> {
+    ) -> (Vec<SocketAddr>, i32) {
         let abs_dc = dc.abs();
         let lookup = |d: i32| -> (Vec<SocketAddr>, Vec<SocketAddr>) {
             (
@@ -173,10 +175,24 @@ impl DcDirectory {
             )
         };
         let (mut v4, mut v6) = lookup(abs_dc);
+        let mut effective_dc = abs_dc;
         if v4.is_empty() && v6.is_empty() && allow_fallback && abs_dc != DEFAULT_DC {
             (v4, v6) = lookup(DEFAULT_DC);
+            effective_dc = DEFAULT_DC;
         }
-        order_by_prefer_ip(v4, v6, prefer_ip)
+        (order_by_prefer_ip(v4, v6, prefer_ip), effective_dc)
+    }
+
+    /// Return ordered direct DC addresses honoring `prefer_ip` and optional
+    /// fallback to [`DEFAULT_DC`] on unknown DC IDs.
+    pub fn direct_addresses(
+        &self,
+        dc: i32,
+        prefer_ip: PreferIp,
+        allow_fallback: bool,
+    ) -> Vec<SocketAddr> {
+        self.direct_addresses_with_dc(dc, prefer_ip, allow_fallback)
+            .0
     }
 
     /// Return ordered MiddleProxy addresses for `abs(dc)`, collecting both `+dc`
@@ -249,6 +265,7 @@ pub struct DcRouter {
     sock_cfg: SocketConfig,
     dial_timeout: Duration,
     proxy_pool: Option<ProxyPool>,
+    dns: Option<Arc<DnsResolver>>,
     /// Override URLs (defaults to official `core.telegram.org` endpoints; overridable in tests).
     secret_url: String,
     config_v4_url: String,
@@ -273,12 +290,21 @@ impl DcRouter {
             sock_cfg,
             dial_timeout,
             proxy_pool,
+            dns: None,
             secret_url: TELEGRAM_PROXY_SECRET_URL.to_owned(),
             config_v4_url: TELEGRAM_PROXY_CONFIG_V4_URL.to_owned(),
             config_v6_url: TELEGRAM_PROXY_CONFIG_V6_URL.to_owned(),
             first_fetch_done: Arc::new(tokio::sync::Notify::new()),
             first_fetch_finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Attach a configured [`DnsResolver`] (DoH/DoT/custom DNS + `PreferIp`) so
+    /// `getProxySecret` / `getProxyConfig` fetches obey operator DNS settings
+    /// even on censored or IPv4-only networks.
+    pub fn with_dns(mut self, dns: Arc<DnsResolver>) -> Self {
+        self.dns = Some(dns);
+        self
     }
 
     /// Override Telegram fetch URLs (for deterministic offline tests).
@@ -318,21 +344,28 @@ impl DcRouter {
     /// and `getProxyConfigV6`, atomically swapping into `DcDirectory` while
     /// preserving last-known-good state on failure!
     pub async fn refresh_once(&self) -> io::Result<()> {
+        let dns_ref = self.dns.as_deref();
         let (sec_res, v4_res, v6_res) = tokio::join!(
-            fetch_url_bytes(
+            fetch_url_bytes_with_dns(
                 &self.secret_url,
+                dns_ref,
+                self.prefer_ip,
                 self.proxy_pool.as_ref(),
                 self.sock_cfg,
                 FETCH_TIMEOUT
             ),
-            fetch_url_bytes(
+            fetch_url_bytes_with_dns(
                 &self.config_v4_url,
+                dns_ref,
+                self.prefer_ip,
                 self.proxy_pool.as_ref(),
                 self.sock_cfg,
                 FETCH_TIMEOUT
             ),
-            fetch_url_bytes(
+            fetch_url_bytes_with_dns(
                 &self.config_v6_url,
+                dns_ref,
+                self.prefer_ip,
                 self.proxy_pool.as_ref(),
                 self.sock_cfg,
                 FETCH_TIMEOUT
@@ -420,12 +453,19 @@ impl DcRouter {
         });
     }
 
+    /// Score-sorted candidate direct addresses for `dc` along with the effective
+    /// DC ID (`DEFAULT_DC` if unknown-DC fallback triggered).
+    pub fn ranked_direct_addresses_with_dc(&self, dc: i32) -> (Vec<SocketAddr>, i32) {
+        let dir = self.dir.load();
+        let (mut addrs, effective_dc) =
+            dir.direct_addresses_with_dc(dc, self.prefer_ip, self.allow_fallback);
+        self.sort_by_health(&mut addrs);
+        (addrs, effective_dc)
+    }
+
     /// Score-sorted candidate direct addresses for `dc`.
     pub fn ranked_direct_addresses(&self, dc: i32) -> Vec<SocketAddr> {
-        let dir = self.dir.load();
-        let mut addrs = dir.direct_addresses(dc, self.prefer_ip, self.allow_fallback);
-        self.sort_by_health(&mut addrs);
-        addrs
+        self.ranked_direct_addresses_with_dc(dc).0
     }
 
     /// Score-sorted candidate MiddleProxy addresses for `dc`.
@@ -479,10 +519,15 @@ impl DcRouter {
     }
 
     /// Dial a direct Telegram DC using RFC 8305 Happy Eyeballs (`250 ms` stagger
-    /// between primary and secondary address families when dual-stack), falling
-    /// back through upstream [`ProxyPool`] if configured.
-    pub async fn dial_direct(&self, dc: i32) -> io::Result<(TcpStream, SocketAddr)> {
-        let addrs = self.ranked_direct_addresses(dc);
+    /// between primary and secondary address families when dual-stack, with
+    /// immediate failover when the primary family returns a fast error such as
+    /// `ENETUNREACH` on IPv4-only Linux VPSs), falling back through upstream
+    /// [`ProxyPool`] if configured.
+    ///
+    /// Returns `(stream, remote_addr, effective_dc)` where `effective_dc` is
+    /// [`DEFAULT_DC`] if unknown-DC fallback triggered.
+    pub async fn dial_direct(&self, dc: i32) -> io::Result<(TcpStream, SocketAddr, i32)> {
+        let (addrs, effective_dc) = self.ranked_direct_addresses_with_dc(dc);
         if addrs.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
@@ -500,7 +545,7 @@ impl DcRouter {
                 match pool.dial(&ProxyTarget::SocketAddr(sa)).await {
                     Ok(s) => {
                         self.record_success(sa, coarse_now_ns().saturating_sub(started) / 1_000);
-                        return Ok((s, sa));
+                        return Ok((s, sa, effective_dc));
                     }
                     Err(e) => {
                         self.record_failure(sa);
@@ -511,7 +556,8 @@ impl DcRouter {
             return Err(last_err.unwrap_or_else(|| io::Error::other("upstream proxy dial failed")));
         }
 
-        self.happy_eyeballs_dial(&addrs).await
+        let (stream, addr) = self.happy_eyeballs_dial(&addrs).await?;
+        Ok((stream, addr, effective_dc))
     }
 
     /// Perform an active MTProto `req_pq_multi` -> `resPQ` probe over an
@@ -574,47 +620,7 @@ impl DcRouter {
         &self,
         addrs: &[SocketAddr],
     ) -> io::Result<(TcpStream, SocketAddr)> {
-        if addrs.len() == 1 {
-            return self.dial_single(addrs[0]).await;
-        }
-
-        // RFC 8305: interleave opposite address family as second candidate if present.
-        let primary = addrs[0];
-        let secondary_idx = addrs[1..]
-            .iter()
-            .position(|sa| sa.is_ipv4() != primary.is_ipv4())
-            .map_or(1, |i| i + 1);
-        let secondary = addrs[secondary_idx];
-
-        let mut f1 = std::pin::pin!(self.dial_single(primary));
-        tokio::select! {
-            res = &mut f1 => {
-                if let Ok(ok) = res {
-                    return Ok(ok);
-                }
-            }
-            () = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => {
-                let f2 = std::pin::pin!(self.dial_single(secondary));
-                match futures_race(f1, f2).await {
-                    Ok(ok) => return Ok(ok),
-                    Err(e) => {
-                        debug!(error = %e, "Happy Eyeballs pair failed; trying remaining endpoints");
-                    }
-                }
-            }
-        }
-
-        let mut last_err = io::Error::other("all DC addresses failed");
-        for (i, &sa) in addrs.iter().enumerate() {
-            if i == 0 || i == secondary_idx {
-                continue;
-            }
-            match self.dial_single(sa).await {
-                Ok(ok) => return Ok(ok),
-                Err(e) => last_err = e,
-            }
-        }
-        Err(last_err)
+        happy_eyeballs_connect_with(addrs, |sa| self.dial_single(sa)).await
     }
 
     async fn dial_single(&self, addr: SocketAddr) -> io::Result<(TcpStream, SocketAddr)> {
@@ -644,6 +650,107 @@ impl DcRouter {
             }
         }
     }
+}
+
+/// Generic RFC 8305 Happy Eyeballs connector:
+/// - Interleaves the first opposite-family candidate as `secondary`.
+/// - Races `secondary` after `HAPPY_EYEBALLS_DELAY` (250 ms) if `primary` is
+///   still in flight (e.g. blackholed IPv6 route).
+/// - If `primary` fails immediately (e.g. `ENETUNREACH` on IPv4-only Linux VPSs),
+///   IMMEDIATELY dials `secondary` without waiting for the 250 ms stagger or
+///   skipping `secondary`!
+pub async fn happy_eyeballs_connect_with<F, Fut>(
+    addrs: &[SocketAddr],
+    mut dial_fn: F,
+) -> io::Result<(TcpStream, SocketAddr)>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<(TcpStream, SocketAddr)>>,
+{
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no target addresses to connect",
+        ));
+    }
+    if addrs.len() == 1 {
+        return dial_fn(addrs[0]).await;
+    }
+
+    // RFC 8305: interleave opposite address family as second candidate if present.
+    let primary = addrs[0];
+    let secondary_idx = addrs[1..]
+        .iter()
+        .position(|sa| sa.is_ipv4() != primary.is_ipv4())
+        .map_or(1, |i| i + 1);
+    let secondary = addrs[secondary_idx];
+
+    let mut secondary_attempted = false;
+    let mut last_err;
+
+    {
+        let mut f1 = std::pin::pin!(dial_fn(primary));
+        tokio::select! {
+            res = &mut f1 => {
+                match res {
+                    Ok(ok) => return Ok(ok),
+                    Err(e) => {
+                        debug!(addr = %primary, error = %e, "Happy Eyeballs primary failed fast; failing over to secondary");
+                        last_err = e;
+                    }
+                }
+            }
+            () = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => {
+                secondary_attempted = true;
+                let f2 = std::pin::pin!(dial_fn(secondary));
+                match futures_race(f1, f2).await {
+                    Ok(ok) => return Ok(ok),
+                    Err(e) => {
+                        debug!(error = %e, "Happy Eyeballs pair failed; trying remaining endpoints");
+                        last_err = e;
+                    }
+                }
+            }
+        }
+    }
+
+    // CRITICAL: when `primary` failed BEFORE the 250ms stagger fired (e.g. instant
+    // `ENETUNREACH` on IPv4-only Linux VPSs), `secondary` has NOT been dialed yet!
+    if !secondary_attempted {
+        match dial_fn(secondary).await {
+            Ok(ok) => return Ok(ok),
+            Err(e) => last_err = e,
+        }
+    }
+
+    for (i, &sa) in addrs.iter().enumerate() {
+        if i == 0 || i == secondary_idx {
+            continue;
+        }
+        match dial_fn(sa).await {
+            Ok(ok) => return Ok(ok),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// Connect to the first reachable address in `addrs` using RFC 8305 Happy Eyeballs
+/// and tune the established socket with `sock_cfg`.
+pub async fn happy_eyeballs_connect(
+    addrs: &[SocketAddr],
+    sock_cfg: &SocketConfig,
+    timeout: Duration,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    let cfg = *sock_cfg;
+    happy_eyeballs_connect_with(addrs, move |sa| async move {
+        let stream = tokio::time::timeout(timeout, TcpStream::connect(sa))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timeout"))??;
+        let _ = tune_tokio_stream(&stream, &cfg);
+        Ok((stream, sa))
+    })
+    .await
 }
 
 /// Race two pinned futures returning the first `Ok`, or the second `Err` if both fail.
@@ -693,6 +800,27 @@ pub async fn fetch_url_bytes(
     sock_cfg: SocketConfig,
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
+    fetch_url_bytes_with_dns(
+        url,
+        None,
+        PreferIp::PreferIpv6,
+        proxy_pool,
+        sock_cfg,
+        timeout,
+    )
+    .await
+}
+
+/// HTTP/HTTPS GET client honoring an optional [`DnsResolver`] (DoH/DoT/custom
+/// DNS), [`PreferIp`], RFC 8305 Happy Eyeballs, and optional [`ProxyPool`].
+pub async fn fetch_url_bytes_with_dns(
+    url: &str,
+    dns: Option<&DnsResolver>,
+    prefer_ip: PreferIp,
+    proxy_pool: Option<&ProxyPool>,
+    sock_cfg: SocketConfig,
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
     const MAX_BODY: usize = 16 * 1024 * 1024;
     tokio::time::timeout(timeout, async {
         let uri: hyper::Uri = url
@@ -715,8 +843,23 @@ pub async fn fetch_url_bytes(
                 .await
                 .map_err(|e| io::Error::other(e.to_string()))?
         } else {
-            let s = TcpStream::connect((host.as_str(), port)).await?;
-            let _ = tune_tokio_stream(&s, &sock_cfg);
+            let addrs = if let Some(resolver) = dns {
+                resolver.resolve_socket_addrs(&host, port).await?
+            } else {
+                let raw: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+                    .await?
+                    .collect();
+                let (mut v4, mut v6) = (Vec::new(), Vec::new());
+                for sa in raw {
+                    match sa {
+                        SocketAddr::V4(_) => v4.push(sa),
+                        SocketAddr::V6(_) => v6.push(sa),
+                    }
+                }
+                order_by_prefer_ip(v4, v6, prefer_ip)
+            };
+            let per_addr_timeout = timeout.min(Duration::from_secs(10));
+            let (s, _) = happy_eyeballs_connect(&addrs, &sock_cfg, per_addr_timeout).await?;
             s
         };
 
@@ -852,9 +995,81 @@ mod tests {
             dir.direct_addresses(99, PreferIp::PreferIpv4, false)
                 .is_empty()
         );
-        assert!(
-            !dir.direct_addresses(99, PreferIp::PreferIpv4, true)
-                .is_empty()
+        let (fb_addrs, fb_dc) = dir.direct_addresses_with_dc(99, PreferIp::PreferIpv4, true);
+        assert!(!fb_addrs.is_empty());
+        assert_eq!(fb_dc, DEFAULT_DC);
+    }
+
+    /// Regression test for Showstopper #1: on IPv4-only Linux VPSs with default
+    /// `prefer-ip = "prefer-ipv6"`, DC 1/3/4/5/203 have `[IPv6, IPv4]` where the
+    /// primary returns an immediate error (`ENETUNREACH` / `ECONNREFUSED`).
+    /// Happy Eyeballs MUST immediately dial `secondary` (index 1) without
+    /// skipping it or stalling for the 250 ms stagger!
+    #[tokio::test]
+    async fn happy_eyeballs_falls_back_immediately_to_secondary_on_fast_primary_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_v4 = listener.local_addr().unwrap();
+
+        // Bind-and-drop a closed port (or use an unreachable IPv6 loopback port) so primary fails immediately.
+        let bad_primary: SocketAddr = {
+            let tmp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tmp.local_addr().unwrap()
+        };
+
+        let mut dir = DcDirectory::default();
+        dir.direct_v6.insert(1, vec!["[::1]:1".parse().unwrap()]);
+        dir.direct_v4.insert(1, vec![ok_v4]);
+
+        let router = DcRouter::new(
+            PreferIp::PreferIpv6,
+            false,
+            SocketConfig::default(),
+            Duration::from_secs(2),
+            None,
         );
+        router.set_directory(dir);
+
+        let started = std::time::Instant::now();
+        let (_stream, connected_addr, effective_dc) = router.dial_direct(1).await.unwrap();
+        assert_eq!(connected_addr, ok_v4);
+        assert_eq!(effective_dc, 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "expected immediate failover without waiting 250ms stagger, got {:?}",
+            started.elapsed()
+        );
+
+        // Also test direct 2-addr IPv4 fast-fail -> secondary path.
+        let (_s2, addr2) = happy_eyeballs_connect(
+            &[bad_primary, ok_v4],
+            &SocketConfig::default(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(addr2, ok_v4);
+    }
+
+    #[tokio::test]
+    async fn dial_direct_reports_effective_dc_on_unknown_dc_fallback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_dc2 = listener.local_addr().unwrap();
+
+        let mut dir = DcDirectory::default();
+        dir.direct_v4.insert(DEFAULT_DC, vec![ok_dc2]);
+        dir.direct_v6.remove(&DEFAULT_DC);
+
+        let router = DcRouter::new(
+            PreferIp::OnlyIpv4,
+            true,
+            SocketConfig::default(),
+            Duration::from_secs(2),
+            None,
+        );
+        router.set_directory(dir);
+
+        let (_stream, addr, effective_dc) = router.dial_direct(99).await.unwrap();
+        assert_eq!(addr, ok_dc2);
+        assert_eq!(effective_dc, DEFAULT_DC);
     }
 }

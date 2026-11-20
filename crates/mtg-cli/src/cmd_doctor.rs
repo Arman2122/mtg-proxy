@@ -151,7 +151,8 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
             sock_cfg,
             Duration::from_secs(10),
             proxy_pool,
-        );
+        )
+        .with_dns(std::sync::Arc::new(dns));
         let _ = router.refresh_once().await;
 
         let mut any_dc_ok = false;
@@ -260,12 +261,12 @@ async fn check_tcp_reachable(
 
 async fn probe_dc(router: &DcRouter, dc: i32, timeout: Duration) -> Result<Duration> {
     let start = Instant::now();
-    let (mut stream, _) = tokio::time::timeout(timeout, router.dial_direct(dc))
+    let (mut stream, _, effective_dc) = tokio::time::timeout(timeout, router.dial_direct(dc))
         .await
         .map_err(|_| anyhow::anyhow!("dial timeout"))??;
 
     let (frame, mut ciphers) = build_outbound_handshake(
-        dc as i16,
+        effective_dc as i16,
         mtg_core::ConnectionTag::PADDED_INTERMEDIATE,
         None,
     );

@@ -205,6 +205,38 @@ pub fn derive_middleproxy_ciphers(
     )
 }
 
+/// Derive the server-side MiddleProxy AES-256-CBC encryptor (`SERVER` purpose,
+/// middle -> proxy) and decryptor (`CLIENT` purpose, proxy -> middle) — the
+/// exact mirror of [`derive_middleproxy_ciphers`] for end-to-end tests.
+pub fn derive_middleproxy_server_ciphers(
+    req: &NonceRequest,
+    server_nonce: &[u8; 16],
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
+    proxy_secret: &[u8],
+) -> (Aes256CbcEncryptor, Aes256CbcDecryptor) {
+    let (enc_key, enc_iv) = derive_key_iv(
+        *b"SERVER",
+        req,
+        server_nonce,
+        client_addr,
+        server_addr,
+        proxy_secret,
+    );
+    let (dec_key, dec_iv) = derive_key_iv(
+        *b"CLIENT",
+        req,
+        server_nonce,
+        client_addr,
+        server_addr,
+        proxy_secret,
+    );
+    (
+        Aes256CbcEncryptor::new(&enc_key, &enc_iv),
+        Aes256CbcDecryptor::new(&dec_key, &dec_iv),
+    )
+}
+
 fn derive_key_iv(
     purpose: [u8; 6],
     req: &NonceRequest,

@@ -18,7 +18,7 @@ use mtg_governance::{ClientEntry, FairBucket, GcraLimiter};
 use mtg_net::{MiddleDownMsg, MiddleStream, TLS_HEADROOM, coarse_now_ns, coarse_unix_secs};
 use mtg_protocol::doppel::{DoppelConnState, DoppelParams};
 use mtg_protocol::tls_record::{MAX_TLS_RECORD_PAYLOAD, TlsUnframer, stamp_app_data_header};
-use tokio::io::{AsyncReadExt as _, AsyncWrite as _, AsyncWriteExt as _};
+use tokio::io::{AsyncWrite as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
 use crate::cancel::CancelToken;
@@ -31,8 +31,6 @@ const DOWNLOAD_BATCH_RECORDS: usize = 4;
 const DOWNLOAD_SCRATCH_CAP: usize = DOWNLOAD_BATCH_RECORDS * MAX_TLS_RECORD_PAYLOAD;
 /// Fairness burst cap per direction per poll turn (256 KiB keeps p99/p99.9 flat under 32+ streams).
 const POLL_BURST_CAP: usize = 256 * 1024;
-/// Buffer size with 5-byte leading FakeTLS header headroom (for MiddleProxy).
-const BUF_TOTAL_LEN: usize = TLS_HEADROOM + MAX_TLS_RECORD_PAYLOAD;
 /// Minimum interval between resetting the single reusable idle `Sleep` timer (1s).
 const IDLE_RESET_GRANULARITY_NS: u64 = 1_000_000_000;
 
@@ -896,49 +894,61 @@ async fn pace_and_flush_direct(state: &mut DirectRelay, is_upload: bool, bytes: 
 /// Relay traffic between a client socket and a multiplexed [`MiddleStream`]
 /// (carrying `ad_tag` over a persistent AES-256-CBC MiddleProxy carrier).
 ///
-/// Handles intermediate / padded-intermediate MTProto packet framing on both
-/// directions while enforcing identical speed limits, fair share, and quotas!
+/// Zero-idle-RAM design: owns `client: TcpStream` directly (no `into_split`),
+/// uses readiness-gated thread-local [`RELAY_SCRATCH`] for all socket reads &
+/// writes (0 bytes of permanent I/O buffers while idle!), resets one shared
+/// idle timer at 1s granularity, and implements byte-exact intermediate /
+/// padded-intermediate framing (including `FLAG_QUICK_ACK`, `FLAG_ENCRYPTED`,
+/// clean 4-byte `RPC_PROXY_ANS` lengths, and verbatim `RPC_SIMPLE_ACK` tokens).
 #[allow(clippy::too_many_arguments)]
 pub async fn relay_middleproxy(
-    client: TcpStream,
+    mut client: TcpStream,
     mut middle: MiddleStream,
     mut client_recv_initial: Vec<u8>,
     mut client_ciphers: (Aes256Ctr, Aes256Ctr), // (recv, send)
     padded_intermediate: bool,
     ctx: RelayContext,
 ) {
-    let (mut c_rd, mut c_wr) = client.into_split();
     ctx.dc_stats.active_conns.fetch_add(1, Ordering::Relaxed);
     let _dc_guard = DcActiveGuard(&ctx.dc_stats);
 
     let mut tls_unframer = ctx.tls_unframer;
-    let mut plain_in = Vec::with_capacity(16 * 1024);
-    let mut read_buf = vec![0u8; 16 * 1024];
-    let mut out_buf = vec![0u8; BUF_TOTAL_LEN];
+    // Reclaimed back to 0 capacity whenever empty so idle ad-tag streams use 0 B heap I/O!
+    let mut plain_in: Vec<u8> = Vec::new();
     let cancel = ctx.cancel;
     let mut doppel = ctx.doppel;
+    let idle_timeout = ctx.idle_timeout;
+    let mut last_reset_ns = coarse_now_ns();
+    let mut idle_sleep = std::pin::pin!(tokio::time::sleep(idle_timeout));
 
     // Seed any leftover unframed obfuscated2 ciphertext bytes already read during handshake.
     if !client_recv_initial.is_empty() {
         client_ciphers.0.apply_keystream(&mut client_recv_initial);
         plain_in.extend_from_slice(&client_recv_initial);
-        client_recv_initial.clear();
     }
+    drop(client_recv_initial);
 
     loop {
         // Flush any complete intermediate MTProto packets from `plain_in` -> MiddleProxy
-        while let Some(pkt) = take_intermediate_packet(&mut plain_in, padded_intermediate) {
-            let Ok(pkt) = pkt else { return };
+        let mut up_sent = 0usize;
+        while let Some(pkt_res) = take_intermediate_packet(&mut plain_in, padded_intermediate) {
+            let Ok((pkt, quick_ack)) = pkt_res else {
+                middle.close_graceful().await;
+                return;
+            };
             let n = pkt.len();
             if pace_transfer(n, true, &ctx.user, &ctx.client_entry, &cancel)
                 .await
                 .is_err()
             {
+                middle.close_graceful().await;
                 return;
             }
-            if middle.send_packet(&pkt).await.is_err() {
+            if middle.send_packet(&pkt, quick_ack).await.is_err() {
+                middle.close_graceful().await;
                 return;
             }
+            up_sent += n;
             let now_unix = coarse_unix_secs();
             ctx.client_entry
                 .bytes_in
@@ -949,7 +959,20 @@ pub async fn relay_middleproxy(
                 .fetch_add(n as u64, Ordering::Relaxed);
             if ctx.user.record_traffic(n as i64, true, now_unix) {
                 ctx.user.quota_cutoffs.fetch_add(1, Ordering::Relaxed);
+                middle.close_graceful().await;
                 return;
+            }
+        }
+        if plain_in.is_empty() && plain_in.capacity() > 0 {
+            plain_in = Vec::new();
+        }
+        if up_sent > 0 {
+            let now_ns = coarse_now_ns();
+            if now_ns.saturating_sub(last_reset_ns) >= IDLE_RESET_GRANULARITY_NS {
+                last_reset_ns = now_ns;
+                idle_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + idle_timeout);
             }
         }
 
@@ -957,34 +980,49 @@ pub async fn relay_middleproxy(
             () = cancel.cancelled() => {
                 break;
             }
-            rd = tokio::time::timeout(ctx.idle_timeout, c_rd.read(&mut read_buf)) => {
-                let Ok(Ok(n)) = rd else { break; };
-                if n == 0 {
+            () = idle_sleep.as_mut() => {
+                break;
+            }
+            rd_ready = client.readable() => {
+                if rd_ready.is_err() {
                     break;
                 }
-                let app_len = if ctx.is_faketls {
-                    let Ok(w) = tls_unframer.unframe_in_place(&mut read_buf[..n]) else {
-                        break;
-                    };
-                    w
-                } else {
-                    n
-                };
-                if app_len > 0 {
-                    client_ciphers.0.apply_keystream(&mut read_buf[..app_len]);
-                    plain_in.extend_from_slice(&read_buf[..app_len]);
+                let read_res = RELAY_SCRATCH.with(|cell| {
+                    let mut scratch = cell.borrow_mut();
+                    match client.try_read(&mut scratch[..UPLOAD_SCRATCH_CAP]) {
+                        Ok(0) => Ok(None),
+                        Ok(n) => {
+                            let app_len = if ctx.is_faketls {
+                                tls_unframer
+                                    .unframe_in_place(&mut scratch[..n])
+                                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad FakeTLS frame"))?
+                            } else {
+                                n
+                            };
+                            if app_len > 0 {
+                                client_ciphers.0.apply_keystream(&mut scratch[..app_len]);
+                                plain_in.extend_from_slice(&scratch[..app_len]);
+                            }
+                            Ok(Some(app_len))
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Some(0)),
+                        Err(e) => Err(e),
+                    }
+                });
+                match read_res {
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
                 }
             }
-            down = tokio::time::timeout(ctx.idle_timeout, middle.recv_msg()) => {
-                let Ok(Ok(Some(msg))) = down else { break; };
+            down = middle.recv_msg() => {
+                let Ok(Some(msg)) = down else { break; };
+                // Exact MTProto intermediate / padded-intermediate download framing:
+                // - `RPC_PROXY_ANS`: ALWAYS plain 4-byte LE payload length (NEVER OR QUICK_ACK_BIT!).
+                // - `RPC_SIMPLE_ACK`: verbatim 4-byte quick-ack token (no length prefix).
                 let wire_plain = match msg {
-                    MiddleDownMsg::Data { flags, payload } => {
-                        let mut len_val = payload.len() as u32;
-                        if (flags & mtg_protocol::middleproxy::FLAG_QUICK_ACK) != 0 {
-                            len_val |= mtg_protocol::middleproxy::QUICK_ACK_BIT;
-                        }
+                    MiddleDownMsg::Data { payload, .. } => {
                         let mut framed = Vec::with_capacity(4 + payload.len());
-                        framed.extend_from_slice(&len_val.to_le_bytes());
+                        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                         framed.extend_from_slice(&payload);
                         framed
                     }
@@ -1012,6 +1050,7 @@ pub async fn relay_middleproxy(
                             let (d, params) = &mut **d_box;
                             let (delay, cap) = d.next_record(params, coarse_now_ns());
                             if !delay.is_zero() && sleep_cancelable(delay, &cancel).await.is_err() {
+                                middle.close_graceful().await;
                                 return;
                             }
                             cap.clamp(1, MAX_TLS_RECORD_PAYLOAD)
@@ -1022,25 +1061,54 @@ pub async fn relay_middleproxy(
                         MAX_TLS_RECORD_PAYLOAD
                     };
                     let take = (wire_plain.len() - offset).min(max_chunk);
-                    let payload_dst = &mut out_buf[TLS_HEADROOM..TLS_HEADROOM + take];
-                    payload_dst.copy_from_slice(&wire_plain[offset..offset + take]);
-                    client_ciphers.1.apply_keystream(payload_dst);
+                    let tail = RELAY_SCRATCH.with(|cell| {
+                        let mut scratch = cell.borrow_mut();
+                        let payload_dst = &mut scratch[TLS_HEADROOM..TLS_HEADROOM + take];
+                        payload_dst.copy_from_slice(&wire_plain[offset..offset + take]);
+                        client_ciphers.1.apply_keystream(payload_dst);
 
-                    let write_slice = if ctx.is_faketls {
-                        let hdr: &mut [u8; TLS_HEADROOM] = (&mut out_buf[..TLS_HEADROOM])
-                            .try_into()
-                            .expect("5B headroom");
-                        stamp_app_data_header(hdr, take as u16);
-                        &out_buf[..TLS_HEADROOM + take]
-                    } else {
-                        &out_buf[TLS_HEADROOM..TLS_HEADROOM + take]
-                    };
-                    if c_wr.write_all(write_slice).await.is_err() {
-                        return;
+                        let write_slice = if ctx.is_faketls {
+                            let hdr: &mut [u8; TLS_HEADROOM] = (&mut scratch[..TLS_HEADROOM])
+                                .try_into()
+                                .expect("5B headroom");
+                            stamp_app_data_header(hdr, take as u16);
+                            &scratch[..TLS_HEADROOM + take]
+                        } else {
+                            &scratch[TLS_HEADROOM..TLS_HEADROOM + take]
+                        };
+                        match client.try_write(write_slice) {
+                            Ok(w) if w == write_slice.len() => Ok(None),
+                            Ok(0) => Err(io::Error::new(io::ErrorKind::WriteZero, "client closed")),
+                            Ok(w) => Ok(Some(write_slice[w..].to_vec())),
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                Ok(Some(write_slice.to_vec()))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    });
+                    match tail {
+                        Ok(None) => {}
+                        Ok(Some(rem)) => {
+                            if client.write_all(&rem).await.is_err() {
+                                middle.close_graceful().await;
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            middle.close_graceful().await;
+                            return;
+                        }
                     }
                     offset += take;
                 }
                 let n = wire_plain.len();
+                let now_ns = coarse_now_ns();
+                if now_ns.saturating_sub(last_reset_ns) >= IDLE_RESET_GRANULARITY_NS {
+                    last_reset_ns = now_ns;
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle_timeout);
+                }
                 let now_unix = coarse_unix_secs();
                 ctx.client_entry
                     .bytes_out
@@ -1060,15 +1128,24 @@ pub async fn relay_middleproxy(
 }
 
 /// Extract one length-prefixed MTProto intermediate / padded-intermediate packet
-/// from `buf`, rejecting unaligned plain-intermediate lengths (`len % 4 != 0`).
-fn take_intermediate_packet(buf: &mut Vec<u8>, padded: bool) -> Option<Result<Vec<u8>, ()>> {
+/// from `buf`, returning `(payload, quick_ack)` while rejecting oversized frames
+/// and unaligned plain-intermediate lengths (`len % 4 != 0`).
+fn take_intermediate_packet(
+    buf: &mut Vec<u8>,
+    padded: bool,
+) -> Option<Result<(Vec<u8>, bool), ()>> {
     if buf.len() < 4 {
         return None;
     }
-    let raw_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    // Quick-ack bit (0x80000000) may be set on client packets
-    let len = (raw_len & !mtg_protocol::middleproxy::QUICK_ACK_BIT) as usize;
-    if len == 0 || len > mtg_protocol::middleproxy::DEFAULT_MAX_CLIENT_PACKET {
+    let mut declared = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let quick_ack = if declared >= mtg_protocol::middleproxy::QUICK_ACK_BIT {
+        declared -= mtg_protocol::middleproxy::QUICK_ACK_BIT;
+        true
+    } else {
+        false
+    };
+    let len = declared as usize;
+    if len > mtg_protocol::middleproxy::DEFAULT_MAX_CLIENT_PACKET {
         return Some(Err(()));
     }
     if !padded && !len.is_multiple_of(4) {
@@ -1080,11 +1157,11 @@ fn take_intermediate_packet(buf: &mut Vec<u8>, padded: bool) -> Option<Result<Ve
     let mut pkt = buf[4..4 + len].to_vec();
     buf.drain(..4 + len);
     if padded {
-        // Trim 0..15 bytes of trailing padding to align to 4-byte word boundary for MiddleProxy!
+        // Trim 0..3 random trailing bytes to 4-byte alignment per MTProxy spec.
         let aligned = pkt.len() & !3;
         pkt.truncate(aligned);
     }
-    Some(Ok(pkt))
+    Some(Ok((pkt, quick_ack)))
 }
 
 enum ReadStep {

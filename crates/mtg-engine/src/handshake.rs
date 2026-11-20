@@ -173,7 +173,7 @@ async fn faketls_handshake_and_dial(
     }
 
     // 3. Incrementally read & parse FakeTLS ClientHello within handshake timeout
-    let (parsed, hello_wire, mut post_hello_buf) = if let Ok((parsed, consumed)) =
+    let (parsed, mut hello_wire, mut post_hello_buf) = if let Ok((parsed, consumed)) =
         read_faketls_client_hello(&mut stream, &mut raw_buf, engine.settings.handshake_timeout)
             .await
     {
@@ -200,6 +200,7 @@ async fn faketls_handshake_and_dial(
     let matched = match_faketls_secret(&parsed, client_ip, &engine).await;
     let Some(m) = matched else {
         let host = engine.fronting_host_for(&parsed.sni_hostnames);
+        hello_wire.extend_from_slice(&post_hello_buf);
         do_front(
             stream,
             client_addr,
@@ -220,6 +221,7 @@ async fn faketls_handshake_and_dial(
     {
         core_metrics.replay_attacks.fetch_add(1, Ordering::Relaxed);
         let host = engine.fronting_host_for(&parsed.sni_hostnames);
+        hello_wire.extend_from_slice(&post_hello_buf);
         do_front(
             stream,
             client_addr,
@@ -243,6 +245,7 @@ async fn faketls_handshake_and_dial(
         &m.limits,
     ) else {
         let host = engine.fronting_host_for(&parsed.sni_hostnames);
+        hello_wire.extend_from_slice(&post_hello_buf);
         do_front(
             stream,
             client_addr,
@@ -745,12 +748,13 @@ async fn dial_and_prepare_relay(
     }
 
     // 2. Direct Telegram DC dial via Happy Eyeballs + outbound obfuscated2 handshake
-    let Ok((mut dc_stream, dc_addr)) = engine.dc_router.dial_direct(dc).await else {
+    let Ok((mut dc_stream, dc_addr, effective_dc)) = engine.dc_router.dial_direct(dc).await else {
         debug!(secret = %secret_name, dc, "direct Telegram DC dial failed");
         return None;
     };
 
-    let (out_frame, out_ciphers) = build_outbound_handshake(dc as i16, obfs_match.tag, None);
+    let (out_frame, out_ciphers) =
+        build_outbound_handshake(effective_dc as i16, obfs_match.tag, None);
     // Fast non-blocking write path for 64B outbound obfuscated2 frame!
     let sent_direct = match dc_stream.try_write(&out_frame) {
         Ok(w) if w == out_frame.len() => true,
@@ -772,7 +776,7 @@ async fn dial_and_prepare_relay(
         return None;
     }
 
-    let dc_stats = engine.metrics.dc_endpoint(dc_addr.ip(), dc);
+    let dc_stats = engine.metrics.dc_endpoint(dc_addr.ip(), effective_dc);
     let ctx = RelayContext {
         is_faketls,
         tls_unframer,

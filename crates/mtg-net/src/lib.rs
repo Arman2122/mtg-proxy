@@ -21,6 +21,7 @@ pub use dc::{
     DEFAULT_DC, DcDirectory, DcRouter, FETCH_TIMEOUT, FIRST_FETCH_GRACE, HAPPY_EYEBALLS_DELAY,
     REFRESH_PERIOD, RETRY_PERIOD, TELEGRAM_PROXY_CONFIG_V4_URL, TELEGRAM_PROXY_CONFIG_V6_URL,
     TELEGRAM_PROXY_SECRET_URL, build_tls_client_config, default_core_addresses, fetch_url_bytes,
+    fetch_url_bytes_with_dns, happy_eyeballs_connect, happy_eyeballs_connect_with,
     parse_proxy_config,
 };
 pub use dns::DnsResolver;
@@ -31,7 +32,8 @@ pub use driver::{
 };
 pub use epoll::EpollDriver;
 pub use middleproxy_pool::{
-    DEFAULT_CARRIERS_PER_DC, MiddleDownMsg, MiddleProxyPool, MiddleStream, MiddleStreamParams,
+    DEFAULT_CARRIERS_PER_DC, MAX_CARRIERS_PER_DC, MiddleDownMsg, MiddleProxyPool, MiddleStream,
+    MiddleStreamParams,
 };
 pub use proxy_pool::{
     CircuitBreaker, DEFAULT_CB_HALF_OPEN_TIMEOUT, DEFAULT_CB_OPEN_THRESHOLD,

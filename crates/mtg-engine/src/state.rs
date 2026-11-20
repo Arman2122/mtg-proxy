@@ -289,13 +289,16 @@ impl ProxyEngine {
             _ => None,
         };
 
-        let dc_router = Arc::new(DcRouter::new(
-            prefer_ip,
-            cfg.allow_fallback_on_unknown_dc.unwrap_or(false),
-            sock_cfg,
-            tcp_timeout,
-            proxy_pool.clone(),
-        ));
+        let dc_router = Arc::new(
+            DcRouter::new(
+                prefer_ip,
+                cfg.allow_fallback_on_unknown_dc.unwrap_or(false),
+                sock_cfg,
+                tcp_timeout,
+                proxy_pool.clone(),
+            )
+            .with_dns(Arc::clone(&dns)),
+        );
 
         let middleproxy = Arc::new(MiddleProxyPool::new(
             Arc::clone(&dc_router),

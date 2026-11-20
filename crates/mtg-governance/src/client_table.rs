@@ -1,17 +1,24 @@
-//! Per-address client governance table (`IpUnit`-keyed, zero string allocations)
-//! with per-address static ceilings (`client-speed`), per-address fair-share
-//! limiters (`client-fair`), overflow/non-personal `rest` entry, chunked idle
-//! sweep, and zero-allocation 1-second fair-share ticker!
+//! Per-secret sharded, per-address client governance table (`IpUnit`-keyed,
+//! zero string allocations on admission) with per-address static ceilings
+//! (`client-speed`), per-address fair-share limiters (`client-fair`),
+//! overflow/non-personal `rest` entry, chunked idle sweep, and zero-allocation
+//! 1-second fair-share ticker!
+//!
+//! # Scalability Architecture
+//! Sharded per secret (`RwLock<FxHashMap<String, Arc<Mutex<SecretClients>>>>`)
+//! with lock-free global `MAX_CLIENTS` accounting (`AtomicUsize`), eliminating
+//! global admission lock contention across 20+ pinned worker cores and 10,000+
+//! concurrent users!
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mtg_core::{FairTotals, IpUnit, SecretLimits};
 use mtg_net::{coarse_now_ns, coarse_unix_secs};
-use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use parking_lot::{Mutex, RwLock};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::rate_limit::{
     BlockedTracker, FAIR_ACTIVE_WINDOW_NS, FairBucket, FairEntryInput, FairVerdict, GcraLimiter,
@@ -87,14 +94,14 @@ pub struct ClientEntry {
     /// Union blocked-wait trackers for `[Speed, Up, Down]`.
     pub blocked: [BlockedTracker; 3],
 
-    // Mutable table-owned metadata protected by `ClientTable::inner`.
+    // Mutable table-owned metadata protected by the entry's secret shard lock.
     meta: Mutex<EntryTableMeta>,
 }
 
 #[derive(Debug, Default)]
 struct EntryTableMeta {
     refs: u32,
-    all_index: Option<usize>,
+    shard_index: Option<usize>,
     fair_state: FairEntryState,
 }
 
@@ -217,15 +224,45 @@ impl FairSecretState {
 struct SecretClients {
     entries: FxHashMap<IpUnit, Arc<ClientEntry>>,
     rest: Option<Arc<ClientEntry>>,
+    /// Dense slab of all entries (keyed + `rest`) owned by this secret shard
+    /// for O(1) chunked idle sweeps without locking any other secret.
+    all: Vec<Arc<ClientEntry>>,
     overflow: u64,
     fair: FairSecretState,
+    /// Tombstone set by `drop_secret` so racing admissions re-fetch a fresh shard.
+    removed: bool,
 }
 
-#[derive(Debug, Default)]
-struct TableInner {
-    secrets: FxHashMap<String, SecretClients>,
-    all: Vec<Arc<ClientEntry>>,
-    keyed_count: usize,
+impl SecretClients {
+    fn forget_entry(&mut self, entry: &Arc<ClientEntry>) -> bool {
+        let idx = {
+            let mut m = entry.meta.lock();
+            let Some(i) = m.shard_index.take() else {
+                return false;
+            };
+            i
+        };
+        if idx < self.all.len() && Arc::ptr_eq(&self.all[idx], entry) {
+            let last = self.all.len() - 1;
+            self.all.swap_remove(idx);
+            if idx < last {
+                self.all[idx].meta.lock().shard_index = Some(idx);
+            }
+        }
+        if entry.rest {
+            if self.rest.as_ref().is_some_and(|r| Arc::ptr_eq(r, entry)) {
+                self.rest = None;
+            }
+            false
+        } else if let Some(u) = entry.key
+            && self.entries.get(&u).is_some_and(|e| Arc::ptr_eq(e, entry))
+        {
+            self.entries.remove(&u);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Reusable scratch buffers for zero-allocation 1-second fair-share ticks.
@@ -266,15 +303,60 @@ pub struct ClientsView {
     pub fair_levels: [i64; 3],
 }
 
-/// Per-secret, per-`IpUnit` client governance table.
+/// Per-secret sharded, per-`IpUnit` client governance table.
 #[derive(Debug, Default)]
 pub struct ClientTable {
-    inner: Mutex<TableInner>,
+    secrets: RwLock<FxHashMap<String, Arc<Mutex<SecretClients>>>>,
+    keyed_count: AtomicUsize,
 }
 
 impl ClientTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[inline]
+    fn get_shard(&self, name: &str) -> Option<Arc<Mutex<SecretClients>>> {
+        self.secrets.read().get(name).cloned()
+    }
+
+    fn get_or_create_shard(
+        &self,
+        secret_name: &str,
+        fair_totals: FairTotals,
+    ) -> Arc<Mutex<SecretClients>> {
+        if let Some(shard) = self.secrets.read().get(secret_name).cloned() {
+            return shard;
+        }
+        let mut w = self.secrets.write();
+        Arc::clone(w.entry(secret_name.to_owned()).or_insert_with(|| {
+            Arc::new(Mutex::new(SecretClients {
+                fair: FairSecretState {
+                    totals: fair_totals,
+                    ..FairSecretState::default()
+                },
+                ..SecretClients::default()
+            }))
+        }))
+    }
+
+    #[inline]
+    fn try_reserve_keyed_slot(&self) -> bool {
+        let mut cur = self.keyed_count.load(Ordering::Relaxed);
+        loop {
+            if cur >= MAX_CLIENTS {
+                return false;
+            }
+            match self.keyed_count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// Acquire or create the [`ClientEntry`] governing a new stream of `secret_name`.
@@ -302,87 +384,68 @@ impl ClientTable {
         init: EntryInit,
         now_unix: i64,
     ) -> Arc<ClientEntry> {
-        let mut g = self.inner.lock();
-        let keyed_count = g.keyed_count;
-        // Avoid allocating `secret_name.to_owned()` on every connection admission!
-        if !g.secrets.contains_key(secret_name.as_ref()) {
-            g.secrets.insert(
-                secret_name.as_ref().to_owned(),
-                SecretClients {
-                    fair: FairSecretState {
-                        totals: init.fair_totals,
-                        ..FairSecretState::default()
-                    },
-                    ..SecretClients::default()
-                },
-            );
-        }
-        let sc = g
-            .secrets
-            .get_mut(secret_name.as_ref())
-            .expect("inserted above");
-
-        if keyed && let Some(u) = unit {
-            if let Some(existing) = sc.entries.get(&u).cloned() {
-                let levels = sc.fair.levels;
-                Self::hold_returning(&existing, init.fair_totals, levels, now_unix);
-                return existing;
+        loop {
+            let shard = self.get_or_create_shard(secret_name.as_ref(), init.fair_totals);
+            let mut sc = shard.lock();
+            if sc.removed {
+                drop(sc);
+                continue;
             }
-            if sc.entries.len() < MAX_CLIENTS_PER_SECRET && keyed_count < MAX_CLIENTS {
-                let levels = sc.fair.levels;
-                let entry = Arc::new(ClientEntry::new(
-                    Arc::clone(secret_name),
-                    Some(u),
-                    false,
-                    init,
-                    levels,
-                    now_unix,
-                ));
-                let idx = g.all.len();
-                {
-                    let mut m = entry.meta.lock();
-                    m.refs = 1;
-                    m.all_index = Some(idx);
+
+            if keyed && let Some(u) = unit {
+                if let Some(existing) = sc.entries.get(&u).cloned() {
+                    let levels = sc.fair.levels;
+                    Self::hold_returning(&existing, init.fair_totals, levels, now_unix);
+                    return existing;
                 }
-                g.all.push(Arc::clone(&entry));
-                g.keyed_count += 1;
-                g.secrets
-                    .get_mut(secret_name.as_ref())
-                    .expect("inserted")
-                    .entries
-                    .insert(u, Arc::clone(&entry));
-                return entry;
+                if sc.entries.len() < MAX_CLIENTS_PER_SECRET && self.try_reserve_keyed_slot() {
+                    let levels = sc.fair.levels;
+                    let entry = Arc::new(ClientEntry::new(
+                        Arc::clone(secret_name),
+                        Some(u),
+                        false,
+                        init,
+                        levels,
+                        now_unix,
+                    ));
+                    let idx = sc.all.len();
+                    {
+                        let mut m = entry.meta.lock();
+                        m.refs = 1;
+                        m.shard_index = Some(idx);
+                    }
+                    sc.all.push(Arc::clone(&entry));
+                    sc.entries.insert(u, Arc::clone(&entry));
+                    return entry;
+                }
+                sc.overflow = sc.overflow.saturating_add(1);
             }
-            sc.overflow = sc.overflow.saturating_add(1);
-        }
 
-        // Fall back to secret's `rest` entry.
-        let levels = sc.fair.levels;
-        if let Some(rest) = sc.rest.clone() {
-            Self::hold_returning(&rest, init.fair_totals, levels, now_unix);
+            // Fall back to secret's `rest` entry.
+            let levels = sc.fair.levels;
+            if let Some(rest) = sc.rest.clone() {
+                Self::hold_returning(&rest, init.fair_totals, levels, now_unix);
+                return rest;
+            }
+
+            let rest = Arc::new(ClientEntry::new(
+                Arc::clone(secret_name),
+                None,
+                true,
+                init,
+                levels,
+                now_unix,
+            ));
+            let idx = sc.all.len();
+            {
+                let mut m = rest.meta.lock();
+                m.refs = 1;
+                m.shard_index = Some(idx);
+            }
+            sc.all.push(Arc::clone(&rest));
+            sc.rest = Some(Arc::clone(&rest));
             return rest;
         }
-
-        let rest = Arc::new(ClientEntry::new(
-            Arc::clone(secret_name),
-            None,
-            true,
-            init,
-            levels,
-            now_unix,
-        ));
-        let idx = g.all.len();
-        {
-            let mut m = rest.meta.lock();
-            m.refs = 1;
-            m.all_index = Some(idx);
-        }
-        g.all.push(Arc::clone(&rest));
-        g.secrets
-            .get_mut(secret_name.as_ref())
-            .expect("inserted")
-            .rest = Some(Arc::clone(&rest));
-        rest
     }
 
     fn hold_returning(entry: &ClientEntry, totals: FairTotals, levels: [i64; 3], now_unix: i64) {
@@ -413,81 +476,72 @@ impl ClientTable {
     }
 
     /// Sweep entries idle longer than `CLIENT_IDLE_RETENTION_SECS` (or stepped
-    /// more than `LAST_SEEN_STEP_BACK_SECS` into the future), releasing the
-    /// table lock every `max_per_hold` entries so admissions are never blocked.
+    /// more than `LAST_SEEN_STEP_BACK_SECS` into the future) per secret shard,
+    /// releasing each shard lock every `max_per_hold` entries so concurrent
+    /// admissions on all secrets stay unblocked!
     pub fn sweep(&self, now_unix: i64, max_per_hold: usize) -> usize {
         let max_per_hold = max_per_hold.max(1);
         let cutoff = now_unix - CLIENT_IDLE_RETENTION_SECS;
         let future = now_unix + LAST_SEEN_STEP_BACK_SECS;
-        let mut dropped = 0usize;
+        let shards: Vec<Arc<Mutex<SecretClients>>> =
+            self.secrets.read().values().cloned().collect();
 
-        let mut cursor = {
-            let g = self.inner.lock();
-            if g.all.is_empty() {
-                return 0;
-            }
-            g.all.len() - 1
-        };
+        let mut total_dropped = 0usize;
 
-        loop {
-            let mut g = self.inner.lock();
-            if g.all.is_empty() {
-                return dropped;
-            }
-            cursor = cursor.min(g.all.len() - 1);
-            let mut walked = 0usize;
+        for shard in shards {
+            let mut cursor = {
+                let sc = shard.lock();
+                if sc.removed || sc.all.is_empty() {
+                    continue;
+                }
+                sc.all.len() - 1
+            };
 
             loop {
-                walked += 1;
-                let entry = Arc::clone(&g.all[cursor]);
-                let seen = entry.last_seen_unix.load(Ordering::Relaxed);
-                let idle = {
-                    let m = entry.meta.lock();
-                    m.refs == 0 && (seen <= cutoff || seen > future)
-                };
-                if idle {
-                    Self::forget_locked(&mut g, &entry);
-                    dropped += 1;
+                let mut sc = shard.lock();
+                if sc.removed || sc.all.is_empty() {
+                    break;
                 }
-                if cursor == 0 {
-                    return dropped;
+                cursor = cursor.min(sc.all.len() - 1);
+                let mut walked = 0usize;
+                let mut keyed_evicted = 0usize;
+                let mut hit_zero = false;
+
+                loop {
+                    walked += 1;
+                    let entry = Arc::clone(&sc.all[cursor]);
+                    let seen = entry.last_seen_unix.load(Ordering::Relaxed);
+                    let idle = {
+                        let m = entry.meta.lock();
+                        m.refs == 0 && (seen <= cutoff || seen > future)
+                    };
+                    if idle {
+                        if sc.forget_entry(&entry) {
+                            keyed_evicted += 1;
+                        }
+                        total_dropped += 1;
+                    }
+                    if cursor == 0 {
+                        hit_zero = true;
+                        break;
+                    }
+                    cursor -= 1;
+                    if walked >= max_per_hold {
+                        break;
+                    }
                 }
-                cursor -= 1;
-                if walked >= max_per_hold {
+                if keyed_evicted > 0 {
+                    self.keyed_count.fetch_sub(keyed_evicted, Ordering::Relaxed);
+                }
+                let done = hit_zero || sc.all.is_empty();
+                drop(sc);
+                if done {
                     break;
                 }
             }
-            drop(g);
         }
-    }
 
-    fn forget_locked(g: &mut TableInner, entry: &Arc<ClientEntry>) {
-        let idx = {
-            let mut m = entry.meta.lock();
-            let Some(i) = m.all_index.take() else {
-                return;
-            };
-            i
-        };
-        if idx < g.all.len() && Arc::ptr_eq(&g.all[idx], entry) {
-            let last = g.all.len() - 1;
-            g.all.swap_remove(idx);
-            if idx < last {
-                g.all[idx].meta.lock().all_index = Some(idx);
-            }
-        }
-        if let Some(sc) = g.secrets.get_mut(entry.secret_name.as_ref()) {
-            if entry.rest {
-                if sc.rest.as_ref().is_some_and(|r| Arc::ptr_eq(r, entry)) {
-                    sc.rest = None;
-                }
-            } else if let Some(u) = entry.key
-                && sc.entries.get(&u).is_some_and(|e| Arc::ptr_eq(e, entry))
-            {
-                sc.entries.remove(&u);
-                g.keyed_count = g.keyed_count.saturating_sub(1);
-            }
-        }
+        total_dropped
     }
 
     /// Re-apply `client-speed` ceilings on live reload for retained secrets.
@@ -495,12 +549,21 @@ impl ClientTable {
     where
         F: FnMut(&str) -> Option<i64>,
     {
-        let g = self.inner.lock();
-        for (name, sc) in &g.secrets {
-            let Some(bps) = rate_of(name) else {
+        let shards: Vec<(String, Arc<Mutex<SecretClients>>)> = self
+            .secrets
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        for (name, shard) in shards {
+            let Some(bps) = rate_of(&name) else {
                 continue;
             };
             let burst = addr_burst(bps);
+            let sc = shard.lock();
+            if sc.removed {
+                continue;
+            }
             for entry in sc.entries.values() {
                 entry.ceiling.apply(bps, burst);
             }
@@ -512,11 +575,20 @@ impl ClientTable {
     where
         F: FnMut(&str) -> Option<FairTotals>,
     {
-        let mut g = self.inner.lock();
-        for (name, sc) in &mut g.secrets {
-            let Some(totals) = totals_of(name) else {
+        let shards: Vec<(String, Arc<Mutex<SecretClients>>)> = self
+            .secrets
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        for (name, shard) in shards {
+            let Some(totals) = totals_of(&name) else {
                 continue;
             };
+            let mut sc = shard.lock();
+            if sc.removed {
+                continue;
+            }
             let mut changed = sc.fair.totals != totals;
             for b in FairBucket::ALL {
                 if total_of(totals, b) != total_of(sc.fair.totals, b) {
@@ -576,12 +648,16 @@ impl ClientTable {
             return;
         }
 
+        let Some(shard) = self.get_shard(spec.name.as_ref()) else {
+            return;
+        };
+
         scratch.gathered.clear();
         let (epoch, last_tick_ns, mut levels) = {
-            let g = self.inner.lock();
-            let Some(sc) = g.secrets.get(spec.name.as_ref()) else {
+            let sc = shard.lock();
+            if sc.removed {
                 return;
-            };
+            }
             for entry in sc.entries.values() {
                 let m = entry.meta.lock();
                 scratch.gathered.push(GatheredEntry {
@@ -607,7 +683,7 @@ impl ClientTable {
             (sc.fair.epoch, sc.fair.last_tick_ns, sc.fair.levels)
         };
 
-        // Outside table lock: read byte deltas and snapshot blocked-wait trackers.
+        // Outside shard lock: read byte deltas and snapshot blocked-wait trackers.
         for item in &mut scratch.gathered {
             let cur_in = item.entry.bytes_in.load(Ordering::Relaxed);
             let cur_out = item.entry.bytes_out.load(Ordering::Relaxed);
@@ -683,12 +759,9 @@ impl ClientTable {
             }
         }
 
-        // Publish under table lock if epoch unchanged.
-        let mut g = self.inner.lock();
-        let Some(sc) = g.secrets.get_mut(spec.name.as_ref()) else {
-            return;
-        };
-        if sc.fair.epoch != epoch {
+        // Publish under shard lock if epoch unchanged and shard still live.
+        let mut sc = shard.lock();
+        if sc.removed || sc.fair.epoch != epoch {
             return;
         }
         for item in &scratch.gathered {
@@ -734,55 +807,57 @@ impl ClientTable {
 
     /// Forget all entries belonging to a removed secret.
     pub fn drop_secret(&self, name: &str) {
-        let mut g = self.inner.lock();
-        let Some(sc) = g.secrets.remove(name) else {
-            return;
-        };
-        let mut to_remove: Vec<Arc<ClientEntry>> = sc.entries.into_values().collect();
-        if let Some(rest) = sc.rest {
-            to_remove.push(rest);
-        }
-        for entry in &to_remove {
-            if !entry.rest {
-                g.keyed_count = g.keyed_count.saturating_sub(1);
+        let removed = self.secrets.write().remove(name);
+        if let Some(shard) = removed {
+            let mut sc = shard.lock();
+            sc.removed = true;
+            let keyed = sc.entries.len();
+            for entry in &sc.all {
+                entry.meta.lock().shard_index = None;
             }
-            let idx = entry.meta.lock().all_index.take();
-            if let Some(i) = idx
-                && i < g.all.len()
-                && Arc::ptr_eq(&g.all[i], entry)
-            {
-                let last = g.all.len() - 1;
-                g.all.swap_remove(i);
-                if i < last {
-                    g.all[i].meta.lock().all_index = Some(i);
-                }
+            sc.entries.clear();
+            sc.rest = None;
+            sc.all.clear();
+            if keyed > 0 {
+                self.keyed_count.fetch_sub(keyed, Ordering::Relaxed);
             }
         }
     }
 
-    /// Snapshot per-secret `(clients, overflow)` counts under a single lock hold.
+    /// Snapshot per-secret `(clients, overflow)` counts.
     pub fn counts(&self) -> FxHashMap<String, ClientCounts> {
-        let g = self.inner.lock();
-        g.secrets
+        let shards: Vec<(String, Arc<Mutex<SecretClients>>)> = self
+            .secrets
+            .read()
             .iter()
-            .map(|(k, sc)| {
-                (
-                    k.clone(),
-                    ClientCounts {
-                        clients: sc.entries.len(),
-                        overflow: sc.overflow,
-                    },
-                )
-            })
-            .collect()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        let mut out = FxHashMap::with_capacity_and_hasher(shards.len(), FxBuildHasher);
+        for (k, shard) in shards {
+            let sc = shard.lock();
+            if sc.removed {
+                continue;
+            }
+            out.insert(
+                k,
+                ClientCounts {
+                    clients: sc.entries.len(),
+                    overflow: sc.overflow,
+                },
+            );
+        }
+        out
     }
 
     /// Snapshot one secret's view for `GET /secrets/{name}/clients`.
     pub fn view(&self, name: &str, with_entries: bool) -> ClientsView {
-        let g = self.inner.lock();
-        let Some(sc) = g.secrets.get(name) else {
+        let Some(shard) = self.get_shard(name) else {
             return ClientsView::default();
         };
+        let sc = shard.lock();
+        if sc.removed {
+            return ClientsView::default();
+        }
         let mut view = ClientsView {
             entries: Vec::new(),
             rest: None,

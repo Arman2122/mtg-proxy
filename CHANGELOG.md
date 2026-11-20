@@ -6,6 +6,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [2.0.1] — 2026-11-20
+
+Critical production-correctness, `ad-tag` MiddleProxy wire-protocol, IPv4-only VPS Happy Eyeballs, and high-concurrency scalability hardening release.
+
+### Fixed
+- **IPv4-Only Linux VPS Direct-DC Failover (`mtg-net`):** Fixed a critical RFC 8305 Happy Eyeballs bug in `DcRouter::happy_eyeballs_dial` where an immediate primary error (`ENETUNREACH` on IPv4-only hosts using the default `prefer-ip = "prefer-ipv6"`) skipped the `secondary` IPv4 endpoint instead of failing over immediately. Extracted reusable `happy_eyeballs_connect` / `happy_eyeballs_connect_with` across direct DCs, MiddleProxy dialing, `getProxyConfig` / `getProxySecret` fetches, and domain fronting origins.
+- **`ad-tag` MiddleProxy `RPC_PROXY_ANS` Download Framing (`mtg-engine`):** Fixed a wire-level corruption bug in `relay_middleproxy` where `FLAG_QUICK_ACK` in server response flags was erroneously OR'd (`0x80000000`) into the client's 4-byte intermediate frame length prefix. `RPC_PROXY_ANS` now always emits a clean 4-byte LE payload length, while `RPC_SIMPLE_ACK` carries raw 4-byte quick-ack tokens verbatim (matching Telegram MTProxy & Go golden parity).
+- **`ad-tag` MiddleProxy Per-Packet `FLAG_ENCRYPTED` & `FLAG_QUICK_ACK` (`mtg-net`, `mtg-engine`):** Fixed `MiddleStream::send_packet` and `take_intermediate_packet` to stamp `FLAG_ENCRYPTED` (`0x2`) on unencrypted MTProto handshakes (`auth_key_id == 0`, e.g. `req_pq_multi`) and preserve client `FLAG_QUICK_ACK` (`0x80000000`) per packet instead of reusing static header flags.
+- **`ad-tag` MiddleProxy Head-of-Line Deadlock & Carrier Scaling (`mtg-net`):** Eliminated carrier reader head-of-line blocking by switching per-stream delivery to non-blocking `try_send` (`STREAM_RX_CAP = 256`) that cleanly evicts only a stalled client (`RPC_CLOSE_CONN`) without freezing sibling clients or delaying `RPC_PONG`. Added a dedicated `biased`-priority control channel (`RPC_PONG`, `RPC_PING`, `RPC_CLOSE_CONN`), proactive 30s `RPC_PING` keepalives, 64 KiB write coalescing, per-DC async dial locking (preventing thundering-herd carrier storms), P2C least-loaded selection, and dynamic scaling up to 32 carriers/DC.
+- **DoH/DoT & `prefer-ip` for Telegram Config Fetches (`mtg-net`, `mtg-engine`, `mtg-cli`):** Wired configured `DnsResolver` and `PreferIp` into `DcRouter` -> `fetch_url_bytes_with_dns` so `core.telegram.org/getProxySecret` and `getProxyConfig` honor custom DNS/DoH/DoT resolvers on censored or IPv4-only networks.
+- **Unknown-DC Fallback Effective DC ID (`mtg-net`, `mtg-engine`):** Propagated `effective_dc` (`DEFAULT_DC = 2`) from `DcRouter::dial_direct` into outbound obfuscated2 handshakes and DC metrics when `allow-fallback-on-unknown-dc = true` triggers.
+- **Lossless Domain Fronting (`mtg-engine`):** Concatenated any pipelined post-`ClientHello` bytes before replaying to the fronting origin so TLS 1.3 0-RTT or pipelined probes forward without byte loss.
+- **Release CI SBOM & Multi-Arch Docker Build Speed (`.github/workflows/release.yml`, `Dockerfile`):** Fixed `anchore/sbom-action` path (`Cargo.lock` -> `.`) for GitHub Release SBOM generation, and upgraded `Dockerfile` to native `$BUILDPLATFORM` cross-compilation (`linux/amd64` + `linux/arm64`) removing slow QEMU Rust LTO builds.
+
+### Performance & Scalability
+- **Zero-Idle-RAM `relay_middleproxy` (`mtg-engine`):** Eliminated permanent 48 KiB/conn heap buffers and `into_split()` overhead from `ad-tag` streams by switching to readiness-gated thread-local `RELAY_SCRATCH`, reclaimed `plain_in`, and a single amortized idle timer (saving ~480 MiB at 10,000 idle `ad-tag` connections).
+- **Per-Secret Sharded `ClientTable` (`mtg-governance`):** Replaced the single global `ClientTable` mutex with per-secret `Arc<Mutex<SecretClients>>` shards + lock-free atomic `MAX_CLIENTS` tracking and tombstone eviction safety, eliminating cross-core admission lock contention across 10,000+ users.
+
+### Tests
+- Added full-stack end-to-end FakeTLS -> `ProxyEngine` -> `MiddleProxyPool` -> mock Telegram MiddleProxy RPC server integration test verifying `ad_tag`, `FLAG_ENCRYPTED`, `FLAG_QUICK_ACK`, clean `RPC_PROXY_ANS` framing, `RPC_SIMPLE_ACK`, `RPC_PING`/`RPC_PONG`, and graceful `RPC_CLOSE_CONN` multiplexing.
+- Added regression tests for IPv4-only Happy Eyeballs instant failover, carrier HOL-stalled-stream eviction isolation, unknown-DC fallback effective DC propagation, and 8-thread concurrent sharded `ClientTable` admissions & chunked sweeps.
+
+---
+
 ## [2.0.0] — 2026-11-20
 
 Complete pure-Rust, Linux-native (`x86_64` and `aarch64`) architectural rewrite of `mtg-proxy`, delivering full drop-in parity for TOML configurations, FakeTLS (`ee`), obfuscated2 (`dd`/`plain`), MiddleProxy (`ad-tag`), the 19-route Penhoon Management HTTP API, per-address governance, secret rotation, and the WEB proxy relay — while dramatically increasing throughput and cutting memory usage by an order of magnitude.

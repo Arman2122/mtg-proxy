@@ -7,7 +7,9 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use mtg_net::{DnsResolver, ProxyPool, ProxyTarget, SocketConfig, SplicePipe, tune_tokio_stream};
+use mtg_net::{
+    DnsResolver, ProxyPool, ProxyTarget, SocketConfig, SplicePipe, happy_eyeballs_connect,
+};
 use mtg_protocol::proxyproto::encode_v2_tcp;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
@@ -142,20 +144,8 @@ async fn dial_fronting_origin(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fronting DNS timeout"))??;
 
-    let mut last_err = io::Error::other("no fronting address");
-    for sa in addrs {
-        match tokio::time::timeout(timeout, TcpStream::connect(sa)).await {
-            Ok(Ok(stream)) => {
-                let _ = tune_tokio_stream(&stream, sock_cfg);
-                return Ok(stream);
-            }
-            Ok(Err(e)) => last_err = e,
-            Err(_) => {
-                last_err = io::Error::new(io::ErrorKind::TimedOut, "fronting connect timeout");
-            }
-        }
-    }
-    Err(last_err)
+    let (stream, _) = happy_eyeballs_connect(&addrs, sock_cfg, timeout).await?;
+    Ok(stream)
 }
 
 /// Zero-copy bidirectional Linux `splice(2)` copy between two `TcpStream`s
