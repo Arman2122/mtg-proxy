@@ -16,10 +16,12 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use mtg_config::parse_duration;
 use mtg_core::{
-    IpUnit, Secret, SecretLimits, parse_expiry, parse_quota_bytes, parse_quota_reset, parse_speed,
+    GlobalLimits, IpUnit, Secret, SecretLimits, parse_expiry, parse_quota_bytes, parse_quota_reset,
+    parse_speed,
 };
 use mtg_engine::{
-    BatchUpsertSecret, EngineError, ProxyEngine, SUPPORTED_FEATURES, SecretPatch, is_secret_served,
+    BatchUpsertSecret, EngineError, GlobalLimitsPatch, ProxyEngine, SUPPORTED_FEATURES,
+    SecretPatch, is_secret_served,
 };
 use mtg_governance::{
     BanError, DEFAULT_EXTERNAL_ADDRESS_TTL, FairBucket, MAX_EXTERNAL_ADDRESS_TTL,
@@ -35,9 +37,9 @@ use crate::dto::{
     AddressReportJson, BanReq, BanResultJson, BansReportJson, BatchSecretsReq,
     BatchSecretsResultJson, ClientRowJson, ClientUsageJson, ClientsReportJson,
     DisconnectResultJson, ErrorBody, ExternalIpsReq, FakeTlsJson, FlushResultJson, HealthzResponse,
-    KickReq, KickResultJson, ObfuscatedJson, PatchSecretReq, PostSecretReq, PutAdTagReq,
-    PutSecretsReq, STATUS_OK, SecretInfoJson, SecretsListResponse, StatsResponse, ThrottleJson,
-    UnbanResultJson, UserStatsJson, quota_reset_str,
+    KickReq, KickResultJson, ObfuscatedJson, PatchGlobalLimitsReq, PatchSecretReq, PostSecretReq,
+    PutAdTagReq, PutGlobalLimitsReq, PutSecretsReq, STATUS_OK, SecretInfoJson, SecretsListResponse,
+    StatsResponse, ThrottleJson, UnbanResultJson, UserStatsJson, quota_reset_str,
 };
 
 const DEFAULT_CLIENTS_LIMIT: usize = 100;
@@ -197,7 +199,12 @@ pub async fn handle_stats(State(state): State<ApiState>) -> Response {
             max_connections: 0,
             client_conns_refused: rt.client_conns_refused.load(Ordering::Relaxed),
             client_speed_limit: 0,
+            client_speed_limit_up: 0,
+            client_speed_limit_down: 0,
             client_fair: false,
+            conn_speed_limit: 0,
+            conn_speed_limit_up: 0,
+            conn_speed_limit_down: 0,
             clients: 0,
             clients_overflow: 0,
             connected_ips: Vec::new(),
@@ -311,7 +318,12 @@ fn apply_limits_to_user_stats(u: &mut UserStatsJson, lim: &SecretLimits) {
     u.client_conns = lim.client_conns;
     u.max_connections = lim.max_connections;
     u.client_speed_limit = lim.client_speed_bytes_per_second;
+    u.client_speed_limit_up = lim.client_speed_up_bytes_per_second;
+    u.client_speed_limit_down = lim.client_speed_down_bytes_per_second;
     u.client_fair = lim.client_fair;
+    u.conn_speed_limit = lim.conn_speed_bytes_per_second;
+    u.conn_speed_limit_up = lim.conn_speed_up_bytes_per_second;
+    u.conn_speed_limit_down = lim.conn_speed_down_bytes_per_second;
 }
 
 fn retiring_view_for(
@@ -451,7 +463,12 @@ fn build_secret_info(
         client_conns: rec.limits.client_conns,
         max_connections: rec.limits.max_connections,
         client_speed_limit: rec.limits.client_speed_bytes_per_second,
+        client_speed_limit_up: rec.limits.client_speed_up_bytes_per_second,
+        client_speed_limit_down: rec.limits.client_speed_down_bytes_per_second,
         client_fair: rec.limits.client_fair,
+        conn_speed_limit: rec.limits.conn_speed_bytes_per_second,
+        conn_speed_limit_up: rec.limits.conn_speed_up_bytes_per_second,
+        conn_speed_limit_down: rec.limits.conn_speed_down_bytes_per_second,
         mode: rec.secret.mode().as_str().to_owned(),
         unserved: !is_secret_served(&rec.secret, eng.listener_modes),
         connections,
@@ -1151,6 +1168,58 @@ pub async fn handle_patch_secret(
             }
         }
     }
+    if let Some(sp) = req.client_speed_up {
+        match parse_speed(&sp) {
+            Ok(v) => patch.client_speed_up_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid client_speed_up: {e}"),
+                );
+            }
+        }
+    }
+    if let Some(sp) = req.client_speed_down {
+        match parse_speed(&sp) {
+            Ok(v) => patch.client_speed_down_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid client_speed_down: {e}"),
+                );
+            }
+        }
+    }
+    if let Some(sp) = req.conn_speed {
+        match parse_speed(&sp) {
+            Ok(v) => patch.conn_speed_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid conn_speed: {e}"));
+            }
+        }
+    }
+    if let Some(sp) = req.conn_speed_up {
+        match parse_speed(&sp) {
+            Ok(v) => patch.conn_speed_up_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid conn_speed_up: {e}"),
+                );
+            }
+        }
+    }
+    if let Some(sp) = req.conn_speed_down {
+        match parse_speed(&sp) {
+            Ok(v) => patch.conn_speed_down_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid conn_speed_down: {e}"),
+                );
+            }
+        }
+    }
     if let Some(v) = req.ip_limit {
         if v < 0 || v > i64::from(u32::MAX) {
             return json_error(StatusCode::BAD_REQUEST, "ip_limit out of range");
@@ -1373,4 +1442,232 @@ pub async fn handle_get_ip_filters(State(state): State<ApiState>) -> Response {
 pub async fn handle_refresh_ip_filters(State(state): State<ApiState>) -> Response {
     let report = state.engine.refresh_ip_filters_now().await;
     (StatusCode::OK, Json(report)).into_response()
+}
+
+pub async fn handle_get_limits(State(state): State<ApiState>) -> Response {
+    (StatusCode::OK, Json(state.engine.global_limits_report())).into_response()
+}
+
+pub async fn handle_patch_limits(State(state): State<ApiState>, body: Bytes) -> Response {
+    let req: PatchGlobalLimitsReq = match decode_strict_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let mut patch = GlobalLimitsPatch {
+        reset_quota: req.reset_quota,
+        ..GlobalLimitsPatch::default()
+    };
+
+    if let Some(v) = req.concurrency {
+        if v < 0 || v > i64::from(u32::MAX) {
+            return json_error(StatusCode::BAD_REQUEST, "concurrency out of range");
+        }
+        patch.concurrency = Some(v as u32);
+    }
+    if let Some(v) = req.throttle_max_connections {
+        if v < 0 || v > i64::from(u32::MAX) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "throttle_max_connections out of range",
+            );
+        }
+        patch.throttle_max_connections = Some(v as u32);
+    }
+    if let Some(sp) = req.speed {
+        match parse_speed(&sp) {
+            Ok(v) => patch.speed_bytes_per_second = Some(v),
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid speed: {e}")),
+        }
+    }
+    if let Some(sp) = req.speed_up {
+        match parse_speed(&sp) {
+            Ok(v) => patch.speed_up_bytes_per_second = Some(v),
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid speed_up: {e}")),
+        }
+    }
+    if let Some(sp) = req.speed_down {
+        match parse_speed(&sp) {
+            Ok(v) => patch.speed_down_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid speed_down: {e}"));
+            }
+        }
+    }
+    if let Some(q) = req.quota {
+        match parse_quota_bytes(&q) {
+            Ok(v) => patch.quota_bytes = Some(v),
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid quota: {e}")),
+        }
+    }
+    if let Some(add_q) = req.add_quota {
+        match parse_quota_bytes(&add_q) {
+            Ok(v) => patch.add_quota_bytes = Some(v),
+            Err(e) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid add_quota: {e}"));
+            }
+        }
+    }
+    if let Some(qr) = req.quota_reset {
+        match parse_quota_reset(&qr) {
+            Ok(v) => patch.quota_reset = Some(v),
+            Err(e) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid quota_reset: {e}"));
+            }
+        }
+    }
+    if let Some(v) = req.max_connections_per_ip {
+        if v < 0 || v > i64::from(u32::MAX) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "max_connections_per_ip out of range",
+            );
+        }
+        patch.max_connections_per_ip = Some(v as u32);
+    }
+    if let Some(v) = req.max_new_connections_per_ip {
+        if v < 0 || v > i64::from(u32::MAX) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "max_new_connections_per_ip out of range",
+            );
+        }
+        patch.max_new_connections_per_ip = Some(v as u32);
+    }
+    if let Some(sp) = req.conn_speed {
+        match parse_speed(&sp) {
+            Ok(v) => patch.conn_speed_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid conn_speed: {e}"));
+            }
+        }
+    }
+    if let Some(sp) = req.conn_speed_up {
+        match parse_speed(&sp) {
+            Ok(v) => patch.conn_speed_up_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid conn_speed_up: {e}"),
+                );
+            }
+        }
+    }
+    if let Some(sp) = req.conn_speed_down {
+        match parse_speed(&sp) {
+            Ok(v) => patch.conn_speed_down_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid conn_speed_down: {e}"),
+                );
+            }
+        }
+    }
+
+    let report = state.engine.patch_global_limits(patch);
+    (StatusCode::OK, Json(report)).into_response()
+}
+
+pub async fn handle_put_limits(State(state): State<ApiState>, body: Bytes) -> Response {
+    let req: PutGlobalLimitsReq = match decode_strict_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let concurrency = match req.concurrency {
+        Some(v) => match u32::try_from(v) {
+            Ok(c) => Some(c),
+            Err(_) => return json_error(StatusCode::BAD_REQUEST, "concurrency out of range"),
+        },
+        None => None,
+    };
+    let throttle = match req.throttle_max_connections {
+        Some(v) => match u32::try_from(v) {
+            Ok(t) => Some(t),
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "throttle_max_connections out of range",
+                );
+            }
+        },
+        None => None,
+    };
+    if req.max_connections_per_ip < 0 || req.max_connections_per_ip > i64::from(u32::MAX) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "max_connections_per_ip out of range",
+        );
+    }
+    if req.max_new_connections_per_ip < 0 || req.max_new_connections_per_ip > i64::from(u32::MAX) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "max_new_connections_per_ip out of range",
+        );
+    }
+
+    let speed = match parse_speed(&req.speed) {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid speed: {e}")),
+    };
+    let speed_up = match parse_speed(&req.speed_up) {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid speed_up: {e}")),
+    };
+    let speed_down = match parse_speed(&req.speed_down) {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid speed_down: {e}")),
+    };
+    let quota = match parse_quota_bytes(&req.quota) {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid quota: {e}")),
+    };
+    let quota_reset = match parse_quota_reset(&req.quota_reset) {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid quota_reset: {e}")),
+    };
+    let conn_speed = match parse_speed(&req.conn_speed) {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid conn_speed: {e}")),
+    };
+    let conn_speed_up = match parse_speed(&req.conn_speed_up) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid conn_speed_up: {e}"),
+            );
+        }
+    };
+    let conn_speed_down = match parse_speed(&req.conn_speed_down) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid conn_speed_down: {e}"),
+            );
+        }
+    };
+
+    let lim = GlobalLimits {
+        speed_bytes_per_second: speed,
+        speed_up_bytes_per_second: speed_up,
+        speed_down_bytes_per_second: speed_down,
+        quota_bytes: quota,
+        quota_reset,
+        max_connections_per_ip: req.max_connections_per_ip as u32,
+        max_new_connections_per_ip: req.max_new_connections_per_ip as u32,
+        conn_speed_bytes_per_second: conn_speed,
+        conn_speed_up_bytes_per_second: conn_speed_up,
+        conn_speed_down_bytes_per_second: conn_speed_down,
+    };
+    let report = state
+        .engine
+        .replace_global_limits(concurrency, throttle, &lim);
+    (StatusCode::OK, Json(report)).into_response()
+}
+
+pub async fn handle_reset_global_quota(State(state): State<ApiState>) -> Response {
+    (StatusCode::OK, Json(state.engine.reset_global_quota())).into_response()
 }

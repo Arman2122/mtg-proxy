@@ -35,6 +35,16 @@ pub fn build_api_router(engine: Arc<ProxyEngine>, token: &str) -> Router {
         .route("/reload", any(handlers::handle_reload))
         .route("/accounting", get(handlers::handle_get_accounting))
         .route("/accounting/flush", post(handlers::handle_flush_accounting))
+        .route(
+            "/limits",
+            get(handlers::handle_get_limits)
+                .put(handlers::handle_put_limits)
+                .patch(handlers::handle_patch_limits),
+        )
+        .route(
+            "/limits/reset-quota",
+            post(handlers::handle_reset_global_quota),
+        )
         .route("/ip-filters", get(handlers::handle_get_ip_filters))
         .route(
             "/ip-filters/refresh",
@@ -537,5 +547,87 @@ alice = "{ALICE_SECRET}"
 
         let (st, _) = send(&app, Method::POST, "/ip-filters/refresh", auth, None).await;
         assert_eq!(st, StatusCode::OK);
+
+        // 7. GET/PATCH/PUT /limits & POST /limits/reset-quota + directional client/conn speeds!
+        let (st, lim0) = send(&app, Method::GET, "/limits", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(lim0["speed_limit"], 0);
+
+        let (st, lim1) = send(
+            &app,
+            Method::PATCH,
+            "/limits",
+            auth,
+            Some(json!({
+                "concurrency": 16384,
+                "throttle_max_connections": 12000,
+                "speed": "500mbit",
+                "speed_down": "400mbit",
+                "quota": "900GB",
+                "quota_reset": "monthly",
+                "max_connections_per_ip": 64,
+                "max_new_connections_per_ip": 25,
+                "conn_speed_down": "5mbit",
+                "conn_speed_up": "1mbit"
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(lim1["concurrency"], 16384);
+        assert_eq!(lim1["throttle_max_connections"], 12000);
+        assert_eq!(lim1["speed_limit"], 62_500_000);
+        assert_eq!(lim1["speed_limit_down"], 50_000_000);
+        assert_eq!(lim1["quota"], 900i64 << 30);
+        assert_eq!(lim1["quota_reset"], "monthly");
+        assert_eq!(lim1["max_connections_per_ip"], 64);
+        assert_eq!(lim1["max_new_connections_per_ip"], 25);
+        assert_eq!(lim1["conn_speed_limit_down"], 625_000);
+        assert_eq!(lim1["conn_speed_limit_up"], 125_000);
+
+        // Top-up global quota via PATCH + reset via POST /limits/reset-quota
+        let (st, lim2) = send(
+            &app,
+            Method::PATCH,
+            "/limits",
+            auth,
+            Some(json!({ "add_quota": "100GB" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(lim2["quota"], 1000i64 << 30);
+
+        let (st, lim_reset) = send(&app, Method::POST, "/limits/reset-quota", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(lim_reset["quota_used"], 0);
+
+        // Full replace via PUT /limits
+        let (st, lim_put) = send(
+            &app,
+            Method::PUT,
+            "/limits",
+            auth,
+            Some(json!({ "max_connections_per_ip": 32, "conn_speed": "8mbit" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(lim_put["speed_limit"], 0);
+        assert_eq!(lim_put["max_connections_per_ip"], 32);
+        assert_eq!(lim_put["conn_speed_limit"], 1_000_000);
+
+        // Directional per-IP & per-connection speed patch on secret `bob`
+        let (st, _) = send(
+            &app,
+            Method::PATCH,
+            "/secrets/bob",
+            auth,
+            Some(json!({ "client_speed_up": "1mbit", "client_speed_down": "4mbit", "conn_speed_down": "2mbit" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, bob2) = send(&app, Method::GET, "/secrets/bob", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(bob2["client_speed_limit_up"], 125_000);
+        assert_eq!(bob2["client_speed_limit_down"], 500_000);
+        assert_eq!(bob2["conn_speed_limit_down"], 250_000);
     }
 }

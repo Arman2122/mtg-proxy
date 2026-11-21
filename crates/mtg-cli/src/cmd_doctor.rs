@@ -54,6 +54,20 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
             obfs_mux.sorted_names()
         );
     }
+    let gl = conf.get_global_limits();
+    if !gl.is_zero() {
+        println!(
+            "  ✅ Global [limits] active: speed={}B/s up={}B/s down={}B/s quota={}B ({}) max-conns/ip={} max-new/ip={}/s conn-speed={}B/s",
+            gl.speed_bytes_per_second,
+            gl.speed_up_bytes_per_second,
+            gl.speed_down_bytes_per_second,
+            gl.quota_bytes,
+            gl.quota_reset,
+            gl.max_connections_per_ip,
+            gl.max_new_connections_per_ip,
+            gl.conn_speed_bytes_per_second,
+        );
+    }
 
     // 2. Linux kernel, CPU affinity & hardware crypto capability probe
     println!("Checking Linux kernel & CPU capabilities...");

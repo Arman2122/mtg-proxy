@@ -34,6 +34,10 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 #   GET    /stats            per-user connection counts, traffic and quota usage
 #   GET    /accounting       enterprise billing & directional accounting ledger (bytes_in, bytes_out, total_connections, quota, cutoffs, speed/ip/conn limits)
 #   POST   /accounting/flush force an immediate crash-safe atomic flush of usage-state-file
+#   GET    /limits           inspect live server-wide [limits] (concurrency, global speed, global quota, per-IP conn/rate caps, CGNAT-safe conn-speed)
+#   PUT    /limits           replace server-wide [limits] live without restarting
+#   PATCH  /limits           partial atomic update of server-wide [limits] (including add_quota, speed, concurrency, max_connections_per_ip, conn_speed)
+#   POST   /limits/reset-quota  zero the server-wide [limits] quota counter immediately
 #   POST   /reload           full async hot-reload: [secrets], limits, ad-tags, retiring-secrets, [throttle], track-client-ips, tolerate-time-skewness, [domain-fronting], and [defense.allowlist]/[defense.blocklist]
 #   GET    /secrets          list secrets (name, secret, host, ad_tag, effective_ad_tag, quota/expiry/disabled/speed_limit/ip_limit/max_connections)
 #   GET    /secrets/{name}   one entry of that list, by name
@@ -516,10 +520,43 @@ allow-fallback-on-unknown-dc = false
 # ip-limit = 30
 # # Live connections one address may hold to this secret; omit or 0 for no cap.
 # client-conns = 16
-# # A ceiling on one address, both directions together; spelled like speed.
+# # A ceiling on one address, both directions together or directional; spelled like speed.
 # client-speed = "10mbit"
+# client-speed-up = "2mbit"
+# client-speed-down = "10mbit"
 # # Divide this secret's speed among its addresses; needs speed, speed-up or speed-down.
 # client-fair = true
+# # Per-TCP-connection speed cap (CGNAT-safe! Limits heavy media downloads without
+# # punishing other users sharing the same carrier NAT IPv4 address).
+# conn-speed = "8mbit"
+# conn-speed-up = "2mbit"
+# conn-speed-down = "6mbit"
+
+# Server-wide 4-tier connection & bandwidth governance (`[limits]`), hot-reloadable
+# via SIGHUP, POST /reload, or PUT/PATCH /limits with ZERO dropped connections!
+# [limits]
+# # Aggregate bandwidth cap across ALL secrets & ALL transports (lock-free GCRA).
+# speed = "800mbit"
+# speed-up = "400mbit"
+# speed-down = "800mbit"
+# # Server-wide data quota across ALL secrets (e.g. 950GB on a 1TB VPS prevents overage!).
+# quota = "950GB"
+# quota-reset = "monthly"       # "none" | "daily" | "weekly" | "monthly"
+# # Global per-IP concurrent TCP connection cap across all secrets (skips loopback/LAN).
+# max-connections-per-ip = 64
+# # Global per-IP new-connection rate shield (connections/sec, burst 2x; stops connect floods).
+# max-new-connections-per-ip = 25
+# # Global CGNAT-safe per-TCP-connection speed caps (overridable per secret).
+# conn-speed = "10mbit"
+# conn-speed-up = "2mbit"
+# conn-speed-down = "8mbit"
+#
+# # Optional defaults inherited by EVERY secret that does not override them in [secret-limits.<name>]:
+# [limits.default-secret]
+# client-conns = 16
+# client-speed-up = "2mbit"
+# client-speed-down = "10mbit"
+# max-connections = 500
 
 # This section is relevant to communication with fronting domain. Usually
 # you do not need to setup anything here but there are plenty of cases, especially

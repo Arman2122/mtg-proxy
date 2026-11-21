@@ -10,12 +10,12 @@ use std::net::{IpAddr, UdpSocket};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike as _, Utc};
 use mtg_config::StatsdTagFormat;
-use mtg_core::QuotaReset;
+use mtg_core::{GlobalLimits, QuotaReset};
 use mtg_governance::{GcraLimiter, secret_burst};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
@@ -247,6 +247,180 @@ pub struct DcEndpointStats {
     pub bytes_to_client: AtomicU64,
 }
 
+/// Reserved key inside `usage.json` for persisting server-wide `[limits]` quota
+/// without altering the backward-compatible `BTreeMap<String, UsageRecord>` schema.
+pub const GLOBAL_USAGE_KEY: &str = "__global__";
+
+/// Lock-free server-wide bandwidth, quota, per-IP guard knobs, and CGNAT-safe
+/// per-connection speed caps (`[limits]`), hot-reloadable with zero drops!
+#[derive(Debug)]
+pub struct GlobalLimitsRuntime {
+    pub speed: GcraLimiter,
+    pub speed_up: GcraLimiter,
+    pub speed_down: GcraLimiter,
+    pub quota_used: AtomicI64,
+    pub quota_ceiling: AtomicI64,
+    pub quota_reset: AtomicU8,
+    pub period_start_ns: AtomicI64,
+    pub quota_cutoffs: AtomicI64,
+    pub speed_throttled_ns: AtomicU64,
+    pub max_connections_per_ip: AtomicU32,
+    pub max_new_connections_per_ip: AtomicU32,
+    pub conn_speed: AtomicI64,
+    pub conn_speed_up: AtomicI64,
+    pub conn_speed_down: AtomicI64,
+    pub ip_conn_limited_total: AtomicU64,
+    pub ip_rate_limited_total: AtomicU64,
+}
+
+impl Default for GlobalLimitsRuntime {
+    fn default() -> Self {
+        Self {
+            speed: GcraLimiter::unlimited(),
+            speed_up: GcraLimiter::unlimited(),
+            speed_down: GcraLimiter::unlimited(),
+            quota_used: AtomicI64::new(0),
+            quota_ceiling: AtomicI64::new(0),
+            quota_reset: AtomicU8::new(0),
+            period_start_ns: AtomicI64::new(0),
+            quota_cutoffs: AtomicI64::new(0),
+            speed_throttled_ns: AtomicU64::new(0),
+            max_connections_per_ip: AtomicU32::new(0),
+            max_new_connections_per_ip: AtomicU32::new(0),
+            conn_speed: AtomicI64::new(0),
+            conn_speed_up: AtomicI64::new(0),
+            conn_speed_down: AtomicI64::new(0),
+            ip_conn_limited_total: AtomicU64::new(0),
+            ip_rate_limited_total: AtomicU64::new(0),
+        }
+    }
+}
+
+impl GlobalLimitsRuntime {
+    /// Atomically apply a new [`GlobalLimits`] configuration without dropping live streams.
+    pub fn apply(&self, lim: &GlobalLimits) {
+        self.speed.apply(
+            lim.speed_bytes_per_second,
+            secret_burst(lim.speed_bytes_per_second),
+        );
+        self.speed_up.apply(
+            lim.speed_up_bytes_per_second,
+            secret_burst(lim.speed_up_bytes_per_second),
+        );
+        self.speed_down.apply(
+            lim.speed_down_bytes_per_second,
+            secret_burst(lim.speed_down_bytes_per_second),
+        );
+        self.quota_ceiling
+            .store(lim.quota_bytes.max(0), Ordering::Release);
+        self.quota_reset
+            .store(lim.quota_reset.as_u8(), Ordering::Release);
+        self.max_connections_per_ip
+            .store(lim.max_connections_per_ip, Ordering::Release);
+        self.max_new_connections_per_ip
+            .store(lim.max_new_connections_per_ip, Ordering::Release);
+        self.conn_speed
+            .store(lim.conn_speed_bytes_per_second.max(0), Ordering::Release);
+        self.conn_speed_up
+            .store(lim.conn_speed_up_bytes_per_second.max(0), Ordering::Release);
+        self.conn_speed_down.store(
+            lim.conn_speed_down_bytes_per_second.max(0),
+            Ordering::Release,
+        );
+    }
+
+    /// Snapshot current configured [`GlobalLimits`].
+    pub fn snapshot(&self) -> GlobalLimits {
+        GlobalLimits {
+            speed_bytes_per_second: self.speed.rate_bps(),
+            speed_up_bytes_per_second: self.speed_up.rate_bps(),
+            speed_down_bytes_per_second: self.speed_down.rate_bps(),
+            quota_bytes: self.quota_ceiling.load(Ordering::Acquire),
+            quota_reset: QuotaReset::from_u8(self.quota_reset.load(Ordering::Acquire)),
+            max_connections_per_ip: self.max_connections_per_ip.load(Ordering::Acquire),
+            max_new_connections_per_ip: self.max_new_connections_per_ip.load(Ordering::Acquire),
+            conn_speed_bytes_per_second: self.conn_speed.load(Ordering::Acquire),
+            conn_speed_up_bytes_per_second: self.conn_speed_up.load(Ordering::Acquire),
+            conn_speed_down_bytes_per_second: self.conn_speed_down.load(Ordering::Acquire),
+        }
+    }
+
+    /// Check if server-wide bandwidth shaping is active for direction `is_upload` (2 relaxed loads).
+    #[inline]
+    pub fn is_speed_limited(&self, is_upload: bool) -> bool {
+        self.speed.is_limited()
+            || if is_upload {
+                self.speed_up.is_limited()
+            } else {
+                self.speed_down.is_limited()
+            }
+    }
+
+    /// Roll over global quota when the configured daily/weekly/monthly boundary crosses.
+    pub fn rollover_if_needed(&self, now: DateTime<Utc>) {
+        let reset = QuotaReset::from_u8(self.quota_reset.load(Ordering::Acquire));
+        if matches!(reset, QuotaReset::None) {
+            return;
+        }
+        let now_ns = now.timestamp_nanos_opt().unwrap_or(0);
+        let start_ns = self.period_start_ns.load(Ordering::Acquire);
+        if start_ns == 0 {
+            let _ = self.period_start_ns.compare_exchange(
+                0,
+                now_ns,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return;
+        }
+        let start_dt = DateTime::from_timestamp_nanos(start_ns);
+        let crossed = match reset {
+            QuotaReset::None => false,
+            QuotaReset::Daily => now.date_naive() != start_dt.date_naive(),
+            QuotaReset::Weekly => now.iso_week() != start_dt.iso_week(),
+            QuotaReset::Monthly => now.year() != start_dt.year() || now.month() != start_dt.month(),
+        };
+        if crossed
+            && self
+                .period_start_ns
+                .compare_exchange(start_ns, now_ns, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.quota_used.store(0, Ordering::Release);
+        }
+    }
+
+    /// Reset server-wide quota counter to 0 and restart the period from `now`.
+    pub fn reset_quota(&self, now: DateTime<Utc>) {
+        self.quota_used.store(0, Ordering::Release);
+        self.period_start_ns
+            .store(now.timestamp_nanos_opt().unwrap_or(0), Ordering::Release);
+    }
+
+    /// True if a global quota ceiling is configured and currently exceeded.
+    #[inline]
+    pub fn is_quota_exceeded(&self) -> bool {
+        let ceil = self.quota_ceiling.load(Ordering::Relaxed);
+        ceil > 0 && self.quota_used.load(Ordering::Acquire) >= ceil
+    }
+
+    /// Record moved bytes against server-wide quota (1 relaxed load when unlimited!).
+    /// Returns `true` if server-wide quota ceiling has been reached/exceeded.
+    #[inline]
+    pub fn record_traffic(&self, bytes: i64) -> bool {
+        let ceil = self.quota_ceiling.load(Ordering::Relaxed);
+        if ceil <= 0 {
+            return false;
+        }
+        let used = self.quota_used.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if used >= ceil {
+            self.quota_cutoffs.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+}
+
 /// Global metrics & observability store shared by engine, API, Prometheus, and StatsD.
 #[derive(Debug)]
 pub struct ProxyMetrics {
@@ -255,6 +429,7 @@ pub struct ProxyMetrics {
     pub cores: Box<[CoreMetrics]>,
     pub faketls: FakeTlsCounters,
     pub obfs: ObfsCounters,
+    pub global_limits: Arc<GlobalLimitsRuntime>,
     users: RwLock<FxHashMap<String, Arc<SecretRuntime>>>,
     dc_endpoints: RwLock<FxHashMap<(IpAddr, i32), Arc<DcEndpointStats>>>,
     pub blocklist_size: AtomicU64,
@@ -280,6 +455,7 @@ impl ProxyMetrics {
             cores,
             faketls: FakeTlsCounters::default(),
             obfs: ObfsCounters::default(),
+            global_limits: Arc::new(GlobalLimitsRuntime::default()),
             users: RwLock::new(FxHashMap::default()),
             dc_endpoints: RwLock::new(FxHashMap::default()),
             blocklist_size: AtomicU64::new(0),
@@ -418,6 +594,18 @@ impl ProxyMetrics {
         let records: BTreeMap<String, UsageRecord> = serde_json::from_slice(&data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         for (name, rec) in records {
+            if name == GLOBAL_USAGE_KEY {
+                self.global_limits
+                    .quota_used
+                    .store(rec.quota_used, Ordering::Release);
+                self.global_limits
+                    .period_start_ns
+                    .store(rec.period_start, Ordering::Release);
+                self.global_limits
+                    .quota_cutoffs
+                    .store(rec.quota_cutoffs, Ordering::Release);
+                continue;
+            }
             let u = self.user(&name);
             u.quota_used.store(rec.quota_used, Ordering::Release);
             u.period_start_ns.store(rec.period_start, Ordering::Release);
@@ -452,6 +640,18 @@ impl ProxyMetrics {
             mix(&mut acc, st.quota_cutoffs.load(Ordering::Relaxed) as u64);
             mix(&mut acc, st.last_seen_unix.load(Ordering::Relaxed) as u64);
         }
+        mix(
+            &mut acc,
+            self.global_limits.quota_used.load(Ordering::Relaxed) as u64,
+        );
+        mix(
+            &mut acc,
+            self.global_limits.period_start_ns.load(Ordering::Relaxed) as u64,
+        );
+        mix(
+            &mut acc,
+            self.global_limits.quota_cutoffs.load(Ordering::Relaxed) as u64,
+        );
         acc
     }
 
@@ -470,7 +670,7 @@ impl ProxyMetrics {
     /// `write_all` -> `sync_data` -> atomic `rename` -> parent dir `fsync`!
     pub fn flush_usage_atomic(&self, path: &Path) -> io::Result<()> {
         let digest = self.compute_usage_digest();
-        let records: BTreeMap<String, UsageRecord> = self
+        let mut records: BTreeMap<String, UsageRecord> = self
             .users
             .read()
             .iter()
@@ -489,6 +689,23 @@ impl ProxyMetrics {
                 )
             })
             .collect();
+
+        if self.global_limits.quota_ceiling.load(Ordering::Relaxed) > 0
+            || self.global_limits.quota_used.load(Ordering::Relaxed) > 0
+        {
+            records.insert(
+                GLOBAL_USAGE_KEY.to_owned(),
+                UsageRecord {
+                    quota_used: self.global_limits.quota_used.load(Ordering::Relaxed),
+                    period_start: self.global_limits.period_start_ns.load(Ordering::Relaxed),
+                    bytes_in: 0,
+                    bytes_out: 0,
+                    total_connections: 0,
+                    quota_cutoffs: self.global_limits.quota_cutoffs.load(Ordering::Relaxed),
+                    last_seen_unix: 0,
+                },
+            );
+        }
 
         let data = serde_json::to_vec(&records)
             .map_err(|e| io::Error::other(format!("marshal usage state: {e}")))?;
@@ -733,6 +950,61 @@ impl ProxyMetrics {
         let _ = writeln!(out, "# TYPE {p}_total_bytes counter");
         let _ = writeln!(out, "{p}_total_bytes{{direction=\"in\"}} {sum_in}");
         let _ = writeln!(out, "{p}_total_bytes{{direction=\"out\"}} {sum_out}");
+
+        let gl = &self.global_limits;
+        let _ = writeln!(
+            out,
+            "# HELP {p}_global_quota_used_bytes Bytes counted toward server-wide [limits] quota."
+        );
+        let _ = writeln!(out, "# TYPE {p}_global_quota_used_bytes gauge");
+        let _ = writeln!(
+            out,
+            "{p}_global_quota_used_bytes {}",
+            gl.quota_used.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP {p}_global_quota_limit_bytes Configured server-wide [limits] quota ceiling (0 = unlimited)."
+        );
+        let _ = writeln!(out, "# TYPE {p}_global_quota_limit_bytes gauge");
+        let _ = writeln!(
+            out,
+            "{p}_global_quota_limit_bytes {}",
+            gl.quota_ceiling.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP {p}_global_speed_throttled_seconds_total Cumulative pacing wait time spent at global speed limiters."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE {p}_global_speed_throttled_seconds_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "{p}_global_speed_throttled_seconds_total {:.6}",
+            gl.speed_throttled_ns.load(Ordering::Relaxed) as f64 / 1e9
+        );
+        let _ = writeln!(
+            out,
+            "# HELP {p}_global_ip_conn_limited_total Connections rejected by global max-connections-per-ip."
+        );
+        let _ = writeln!(out, "# TYPE {p}_global_ip_conn_limited_total counter");
+        let _ = writeln!(
+            out,
+            "{p}_global_ip_conn_limited_total {}",
+            gl.ip_conn_limited_total.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP {p}_global_ip_rate_limited_total Connections rejected by global max-new-connections-per-ip."
+        );
+        let _ = writeln!(out, "# TYPE {p}_global_ip_rate_limited_total counter");
+        let _ = writeln!(
+            out,
+            "{p}_global_ip_rate_limited_total {}",
+            gl.ip_rate_limited_total.load(Ordering::Relaxed)
+        );
 
         out
     }

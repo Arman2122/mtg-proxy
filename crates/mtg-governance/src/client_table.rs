@@ -43,6 +43,8 @@ pub const CLIENT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EntryInit {
     pub ceiling_rate: i64,
+    pub ceiling_up_rate: i64,
+    pub ceiling_down_rate: i64,
     pub fair_totals: FairTotals,
 }
 
@@ -51,6 +53,8 @@ impl EntryInit {
     pub fn from_limits(lim: &SecretLimits) -> Self {
         Self {
             ceiling_rate: lim.client_speed_bytes_per_second,
+            ceiling_up_rate: lim.client_speed_up_bytes_per_second,
+            ceiling_down_rate: lim.client_speed_down_bytes_per_second,
             fair_totals: lim.fair_totals(),
         }
     }
@@ -89,6 +93,10 @@ pub struct ClientEntry {
 
     /// Static per-address ceiling (`client-speed`, combined in+out; never installed on `rest`).
     pub ceiling: GcraLimiter,
+    /// Static per-address upload ceiling (`client-speed-up`; never installed on `rest`).
+    pub ceiling_up: GcraLimiter,
+    /// Static per-address download ceiling (`client-speed-down`; never installed on `rest`).
+    pub ceiling_down: GcraLimiter,
     /// Per-address fair-share limiters for `[Speed, Up, Down]`.
     pub fair: [GcraLimiter; 3],
     /// Union blocked-wait trackers for `[Speed, Up, Down]`.
@@ -119,6 +127,16 @@ impl ClientEntry {
         } else {
             GcraLimiter::unlimited()
         };
+        let ceiling_up = if !rest && init.ceiling_up_rate > 0 {
+            GcraLimiter::new(init.ceiling_up_rate, addr_burst(init.ceiling_up_rate))
+        } else {
+            GcraLimiter::unlimited()
+        };
+        let ceiling_down = if !rest && init.ceiling_down_rate > 0 {
+            GcraLimiter::new(init.ceiling_down_rate, addr_burst(init.ceiling_down_rate))
+        } else {
+            GcraLimiter::unlimited()
+        };
 
         let make_fair = |b: FairBucket, total: i64| -> GcraLimiter {
             if total <= 0 {
@@ -145,6 +163,8 @@ impl ClientEntry {
             last_seen_unix: AtomicI64::new(now_unix),
             throttled_nanos: AtomicU64::new(0),
             ceiling,
+            ceiling_up,
+            ceiling_down,
             fair,
             blocked: [
                 BlockedTracker::new(),
@@ -544,10 +564,11 @@ impl ClientTable {
         total_dropped
     }
 
-    /// Re-apply `client-speed` ceilings on live reload for retained secrets.
+    /// Re-apply `client-speed`, `client-speed-up`, and `client-speed-down` ceilings
+    /// on live reload for retained secrets.
     pub fn apply_ceilings<F>(&self, mut rate_of: F)
     where
-        F: FnMut(&str) -> Option<i64>,
+        F: FnMut(&str) -> Option<(i64, i64, i64)>,
     {
         let shards: Vec<(String, Arc<Mutex<SecretClients>>)> = self
             .secrets
@@ -556,16 +577,20 @@ impl ClientTable {
             .map(|(k, v)| (k.clone(), Arc::clone(v)))
             .collect();
         for (name, shard) in shards {
-            let Some(bps) = rate_of(&name) else {
+            let Some((bps, up_bps, down_bps)) = rate_of(&name) else {
                 continue;
             };
             let burst = addr_burst(bps);
+            let up_burst = addr_burst(up_bps);
+            let down_burst = addr_burst(down_bps);
             let sc = shard.lock();
             if sc.removed {
                 continue;
             }
             for entry in sc.entries.values() {
                 entry.ceiling.apply(bps, burst);
+                entry.ceiling_up.apply(up_bps, up_burst);
+                entry.ceiling_down.apply(down_bps, down_burst);
             }
         }
     }

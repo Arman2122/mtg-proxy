@@ -16,13 +16,14 @@ pub use cancel::CancelToken;
 pub use doppel_scout::DoppelCatalog;
 pub use fronting::{FrontingPool, FrontingTarget, front_connection};
 pub use metrics::{
-    CoreMetrics, DcEndpointStats, FakeTlsCounters, ObfsCounters, ProxyMetrics, SecretRuntime,
-    UsageRecord, compute_fair_caps,
+    CoreMetrics, DcEndpointStats, FakeTlsCounters, GlobalLimitsRuntime, ObfsCounters, ProxyMetrics,
+    SecretRuntime, UsageRecord, compute_fair_caps,
 };
 pub use state::{
     BatchUpsertSecret, DoppelState, EngineError, EngineSettings, FrontingRuntimeConfig,
-    IpFilterReportEntry, IpFilterVerdict, IpFiltersReport, IpFiltersState, ListenerReport,
-    ProxyEngine, SUPPORTED_FEATURES, SecretPatch, is_secret_served, peer_ip_of,
+    GlobalLimitsPatch, GlobalLimitsReport, IpFilterReportEntry, IpFilterVerdict, IpFiltersReport,
+    IpFiltersState, ListenerReport, ProxyEngine, SUPPORTED_FEATURES, SecretPatch, is_secret_served,
+    peer_ip_of,
 };
 pub use worker::{BoundListenerSpec, EngineRuntime};
 
@@ -1028,6 +1029,182 @@ alice = "{secret_hex}"
         assert_eq!(alice.ad_tag_skipped.load(Ordering::Relaxed), 0);
         assert!(alice.bytes_in.load(Ordering::Relaxed) >= 44);
         assert!(alice.bytes_out.load(Ordering::Relaxed) >= 48);
+
+        runtime.shutdown();
+    }
+
+    /// End-to-end verification of `[limits]` global connection & speed governance:
+    /// 1. `max-connections-per-ip = 1` rejects a 2nd simultaneous connection from the same public IP
+    ///    and increments `ip_conn_limited_total`, then admits again immediately on RAII drop!
+    /// 2. Server-wide `quota` cuts off live traffic and transparently fronts new attempts to the
+    ///    cover site until `reset_global_quota()`!
+    /// 3. Per-connection `conn-speed-down` (CGNAT-safe) smoothly paces throughput on live streams!
+    #[tokio::test]
+    async fn global_limits_enforce_ip_conn_cap_global_quota_cutoff_and_conn_speed_pacing() {
+        use mtg_protocol::proxyproto::encode_v2_tcp;
+
+        let mock_dc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dc_addr = mock_dc.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = mock_dc.accept().await {
+                tokio::spawn(async move {
+                    let mut hs = [0u8; 64];
+                    if s.read_exact(&mut hs).await.is_err() {
+                        return;
+                    }
+                    let mut recv_key = [0u8; 32];
+                    let mut recv_iv = [0u8; 16];
+                    recv_key.copy_from_slice(&hs[8..40]);
+                    recv_iv.copy_from_slice(&hs[40..56]);
+                    let mut rev = [0u8; 48];
+                    rev.copy_from_slice(&hs[8..56]);
+                    rev.reverse();
+                    let mut send_key = [0u8; 32];
+                    let mut send_iv = [0u8; 16];
+                    send_key.copy_from_slice(&rev[..32]);
+                    send_iv.copy_from_slice(&rev[32..48]);
+
+                    let mut dec = Aes256Ctr::new(&recv_key, &recv_iv);
+                    let mut enc = Aes256Ctr::new(&send_key, &send_iv);
+                    let mut dummy = [0u8; 64];
+                    dec.apply_keystream(&mut dummy);
+
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        dec.apply_keystream(&mut buf[..n]);
+                        enc.apply_keystream(&mut buf[..n]);
+                        if s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mock_cover = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cover_addr = mock_cover.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = mock_cover.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    if let Ok(n) = s.read(&mut buf).await
+                        && n > 0
+                    {
+                        let _ = s.write_all(b"COVER:").await;
+                        let _ = s.write_all(&buf[..n]).await;
+                    }
+                });
+            }
+        });
+
+        let proxy_port = {
+            let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tmp.local_addr().unwrap().port()
+        };
+        let secret_hex =
+            "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d";
+        let secret = Secret::parse(secret_hex).unwrap();
+        let cfg_toml = format!(
+            r#"
+bind-to = "127.0.0.1:{proxy_port}"
+proxy-protocol-listener = true
+prefer-ip = "only-ipv4"
+[domain-fronting]
+host = "127.0.0.1"
+port = {}
+[limits]
+max-connections-per-ip = 1
+quota = "2048B"
+quota-reset = "daily"
+conn-speed-down = "64kbit"
+[secrets]
+alice = "{secret_hex}"
+"#,
+            cover_addr.port()
+        );
+        let cfg = Config::parse(cfg_toml.as_bytes()).unwrap();
+        let engine = ProxyEngine::from_config(&cfg, None, 1, false).unwrap();
+
+        let mut dir = DcDirectory::default();
+        let mut v4 = BTreeMap::new();
+        v4.insert(2, vec![dc_addr]);
+        dir.direct_v4 = v4;
+        engine.dc_router.set_directory(dir);
+
+        let runtime = EngineRuntime::start(Arc::clone(&engine)).await.unwrap();
+        let proxy_addr = runtime.bound_faketls_addrs[0];
+        let dst_sa: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let peer_a: std::net::SocketAddr = "5.160.1.50:55001".parse().unwrap();
+
+        // 1. Open 1st connection from `5.160.1.50` -> admitted!
+        let mut c1 = TcpStream::connect(proxy_addr).await.unwrap();
+        c1.write_all(encode_v2_tcp(peer_a, dst_sa).as_slice())
+            .await
+            .unwrap();
+        let ch1 = build_client_hello(
+            secret.key(),
+            "storage.googleapis.com",
+            Utc::now().timestamp() as u32,
+        );
+        c1.write_all(&ch1).await.unwrap();
+        let mut sh = [0u8; 5];
+        c1.read_exact(&mut sh).await.unwrap();
+        assert_eq!(sh[0], 0x16);
+
+        // 2. While c1 is live, open a 2nd connection from the SAME IP -> MUST be rejected by max-connections-per-ip=1!
+        let mut c2 = TcpStream::connect(proxy_addr).await.unwrap();
+        c2.write_all(encode_v2_tcp("5.160.1.50:55002".parse().unwrap(), dst_sa).as_slice())
+            .await
+            .unwrap();
+        let mut eof_probe = [0u8; 16];
+        let n2 = c2.read(&mut eof_probe).await.unwrap();
+        assert_eq!(
+            n2, 0,
+            "2nd concurrent connection from same IP must be closed"
+        );
+        assert!(
+            engine
+                .metrics
+                .global_limits
+                .ip_conn_limited_total
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+        drop((c1, c2));
+
+        // Give worker 1 tick to run RAII drop on c1
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(engine.global_ip_guard.active_tracked_ips(), 0);
+
+        // 3. Exhaust global quota via direct accounting -> next valid `ee` ClientHello MUST be fronted to COVER:!
+        let _ = engine.metrics.global_limits.record_traffic(4096);
+        assert!(engine.metrics.global_limits.is_quota_exceeded());
+        let mut c3 = TcpStream::connect(proxy_addr).await.unwrap();
+        c3.write_all(encode_v2_tcp("5.160.1.51:55003".parse().unwrap(), dst_sa).as_slice())
+            .await
+            .unwrap();
+        let ch3 = build_client_hello(
+            secret.key(),
+            "storage.googleapis.com",
+            Utc::now().timestamp() as u32,
+        );
+        c3.write_all(&ch3).await.unwrap();
+        let mut fronted = vec![0u8; 6 + ch3.len()];
+        c3.read_exact(&mut fronted).await.unwrap();
+        assert_eq!(
+            &fronted[..6],
+            b"COVER:",
+            "over-global-quota connection must transparently front to cover!"
+        );
+        drop(c3);
+
+        // 4. Reset global quota -> connects cleanly again!
+        let rep = engine.reset_global_quota();
+        assert_eq!(rep.quota_used, 0);
+        assert_eq!(rep.conn_speed_limit_down, 8_000);
 
         runtime.shutdown();
     }

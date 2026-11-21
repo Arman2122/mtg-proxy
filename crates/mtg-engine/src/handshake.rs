@@ -40,8 +40,8 @@ use mtg_crypto::faketls::{
     parse_client_hello_incremental,
 };
 use mtg_crypto::obfs2::{HANDSHAKE_FRAME_LEN, build_outbound_handshake, match_handshake};
-use mtg_governance::{BudgetVerdict, MAX_HINT_POSITIONS};
-use mtg_net::{MiddleStreamParams, coarse_realtime_ns};
+use mtg_governance::{BudgetVerdict, ConnSpeedLimiters, GlobalIpConnPermit, MAX_HINT_POSITIONS};
+use mtg_net::{MiddleStreamParams, coarse_now_ns, coarse_realtime_ns};
 use mtg_protocol::doppel::{DoppelConnState, DoppelParams};
 use mtg_protocol::proxyproto::{ProxyParseStatus, ProxyProtoMode, parse_proxy_header};
 use mtg_protocol::tls_record::TlsUnframer;
@@ -79,10 +79,9 @@ pub async fn handle_faketls_connection(
     let core_metrics = engine.metrics.core(usize::from(worker_id));
     core_metrics.accepted_total.fetch_add(1, Ordering::Relaxed);
 
-    // Concurrency cap
-    if engine.settings.concurrency > 0
-        && engine.metrics.total_active_connections() >= i64::from(engine.settings.concurrency)
-    {
+    // Hot-reloadable global concurrency cap
+    let conc_cap = engine.concurrency_limit();
+    if conc_cap > 0 && engine.metrics.total_active_connections() >= i64::from(conc_cap) {
         core_metrics
             .concurrency_limited
             .fetch_add(1, Ordering::Relaxed);
@@ -111,9 +110,8 @@ pub async fn handle_obfs2_connection(
     let core_metrics = engine.metrics.core(usize::from(worker_id));
     core_metrics.accepted_total.fetch_add(1, Ordering::Relaxed);
 
-    if engine.settings.concurrency > 0
-        && engine.metrics.total_active_connections() >= i64::from(engine.settings.concurrency)
-    {
+    let conc_cap = engine.concurrency_limit();
+    if conc_cap > 0 && engine.metrics.total_active_connections() >= i64::from(conc_cap) {
         core_metrics
             .concurrency_limited
             .fetch_add(1, Ordering::Relaxed);
@@ -154,6 +152,40 @@ async fn faketls_handshake_and_dial(
     }
 
     let client_ip = peer_ip_of(client_addr);
+    let max_new_rate = engine
+        .metrics
+        .global_limits
+        .max_new_connections_per_ip
+        .load(Ordering::Relaxed);
+    if max_new_rate > 0
+        && !engine
+            .global_ip_guard
+            .allow_new_connection(client_ip, max_new_rate, coarse_now_ns())
+    {
+        engine
+            .metrics
+            .global_limits
+            .ip_rate_limited_total
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let max_per_ip = engine
+        .metrics
+        .global_limits
+        .max_connections_per_ip
+        .load(Ordering::Relaxed);
+    let Some(ip_permit) = engine
+        .global_ip_guard
+        .try_acquire_conn(client_ip, max_per_ip)
+    else {
+        engine
+            .metrics
+            .global_limits
+            .ip_conn_limited_total
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+
     let is_v4 = client_ip.is_ipv4();
     let core_metrics = engine.metrics.core(usize::from(worker_id));
     if is_v4 {
@@ -165,6 +197,7 @@ async fn faketls_handshake_and_dial(
         engine: Arc::clone(&engine),
         worker_id,
         is_v4,
+        _ip_permit: ip_permit,
     };
 
     // 2. Wait-free IP blocklist / allowlist check (0 ns when disabled!)
@@ -233,7 +266,7 @@ async fn faketls_handshake_and_dial(
                 )
                 .await
             {
-                return try_single_port_obfs2_or_front(
+                return Box::pin(try_single_port_obfs2_or_front(
                     stream,
                     client_addr,
                     dst_addr,
@@ -243,7 +276,7 @@ async fn faketls_handshake_and_dial(
                     worker_id,
                     active_guard,
                     engine,
-                )
+                ))
                 .await;
             }
             // Plain HTTP or short non-TLS probe -> transparently front verbatim to cover!
@@ -283,7 +316,7 @@ async fn faketls_handshake_and_dial(
             )
             .await
         {
-            return try_single_port_obfs2_or_front(
+            return Box::pin(try_single_port_obfs2_or_front(
                 stream,
                 client_addr,
                 dst_addr,
@@ -293,7 +326,7 @@ async fn faketls_handshake_and_dial(
                 worker_id,
                 active_guard,
                 engine,
-            )
+            ))
             .await;
         }
         // Non-TLS / truncated / malformed probe -> front verbatim bytes!
@@ -481,6 +514,40 @@ async fn obfs2_handshake_and_dial(
     }
 
     let client_ip = peer_ip_of(client_addr);
+    let max_new_rate = engine
+        .metrics
+        .global_limits
+        .max_new_connections_per_ip
+        .load(Ordering::Relaxed);
+    if max_new_rate > 0
+        && !engine
+            .global_ip_guard
+            .allow_new_connection(client_ip, max_new_rate, coarse_now_ns())
+    {
+        engine
+            .metrics
+            .global_limits
+            .ip_rate_limited_total
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let max_per_ip = engine
+        .metrics
+        .global_limits
+        .max_connections_per_ip
+        .load(Ordering::Relaxed);
+    let Some(ip_permit) = engine
+        .global_ip_guard
+        .try_acquire_conn(client_ip, max_per_ip)
+    else {
+        engine
+            .metrics
+            .global_limits
+            .ip_conn_limited_total
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+
     let is_v4 = client_ip.is_ipv4();
     let core_metrics = engine.metrics.core(usize::from(worker_id));
     if is_v4 {
@@ -492,6 +559,7 @@ async fn obfs2_handshake_and_dial(
         engine: Arc::clone(&engine),
         worker_id,
         is_v4,
+        _ip_permit: ip_permit,
     };
 
     let filter_verdict = engine.check_ip_filters(client_ip, usize::from(worker_id));
@@ -832,6 +900,16 @@ async fn dial_and_prepare_relay(
     let user = engine.metrics.user(&secret_name);
     let dc = obfs_match.dc;
     let doppel = build_doppel_state(engine, is_faketls, doppel_params);
+    let conn_limits = {
+        let sec_lim = engine
+            .secrets
+            .load()
+            .limits_of(&secret_name)
+            .cloned()
+            .unwrap_or_default();
+        let glob_lim = engine.metrics.global_limits.snapshot();
+        ConnSpeedLimiters::effective(&sec_lim, &glob_lim)
+    };
 
     // 1. Try multiplexed MiddleProxy when `ad_tag` is set!
     if let Some(tag_bytes) = ad_tag {
@@ -865,6 +943,8 @@ async fn dial_and_prepare_relay(
                         idle_timeout: engine.settings.idle_timeout,
                         user,
                         client_entry,
+                        global_limits: Arc::clone(&engine.metrics.global_limits),
+                        conn_limits,
                         dc_stats,
                         doppel,
                         cancel,
@@ -928,6 +1008,8 @@ async fn dial_and_prepare_relay(
         idle_timeout: engine.settings.idle_timeout,
         user,
         client_entry,
+        global_limits: Arc::clone(&engine.metrics.global_limits),
+        conn_limits,
         dc_stats,
         doppel,
         cancel,
@@ -1302,6 +1384,7 @@ struct ActiveConnGuard {
     engine: Arc<ProxyEngine>,
     worker_id: u16,
     is_v4: bool,
+    _ip_permit: GlobalIpConnPermit,
 }
 
 impl Drop for ActiveConnGuard {

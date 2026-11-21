@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mtg_core::{
-    ModeSet, QuotaReset, Secret, SecretLimits, SecretMode, parse_expiry, parse_quota_reset,
-    parse_speed,
+    GlobalLimits, ModeSet, QuotaReset, Secret, SecretLimits, SecretMode, parse_expiry,
+    parse_quota_reset, parse_speed,
 };
 use mtg_protocol::doppel::ShapingMode;
 use serde_json::{Map, Value, json};
@@ -114,7 +114,7 @@ impl ConfigListener {
     }
 }
 
-/// One `[secret-limits.<name>]` table.
+/// One `[secret-limits.<name>]` (or `[limits.default-secret]`) table.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConfigSecretLimit {
     pub quota: Option<u64>,
@@ -128,7 +128,69 @@ pub struct ConfigSecretLimit {
     pub client_conns: Option<u32>,
     pub max_connections: Option<u32>,
     pub client_speed: Option<i64>,
+    pub client_speed_up: Option<i64>,
+    pub client_speed_down: Option<i64>,
     pub client_fair: Option<bool>,
+    pub conn_speed: Option<i64>,
+    pub conn_speed_up: Option<i64>,
+    pub conn_speed_down: Option<i64>,
+}
+
+impl ConfigSecretLimit {
+    pub fn to_secret_limits(&self) -> SecretLimits {
+        SecretLimits {
+            quota_bytes: self.quota.unwrap_or(0) as i64,
+            quota_reset: self.quota_reset.unwrap_or(QuotaReset::None),
+            expires_at: self.expires,
+            disabled: self.disabled.unwrap_or(false),
+            speed_bytes_per_second: self.speed.unwrap_or(0),
+            speed_up_bytes_per_second: self.speed_up.unwrap_or(0),
+            speed_down_bytes_per_second: self.speed_down.unwrap_or(0),
+            ip_limit: self.ip_limit.unwrap_or(0),
+            client_conns: self.client_conns.unwrap_or(0),
+            max_connections: self.max_connections.unwrap_or(0),
+            client_speed_bytes_per_second: self.client_speed.unwrap_or(0),
+            client_speed_up_bytes_per_second: self.client_speed_up.unwrap_or(0),
+            client_speed_down_bytes_per_second: self.client_speed_down.unwrap_or(0),
+            client_fair: self.client_fair.unwrap_or(false),
+            conn_speed_bytes_per_second: self.conn_speed.unwrap_or(0),
+            conn_speed_up_bytes_per_second: self.conn_speed_up.unwrap_or(0),
+            conn_speed_down_bytes_per_second: self.conn_speed_down.unwrap_or(0),
+        }
+    }
+}
+
+/// `[limits]` — server-wide bandwidth, quota, per-IP connection/rate shields,
+/// CGNAT-safe per-connection speed caps, and `[limits.default-secret]` defaults.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GlobalLimitsConfig {
+    pub speed: Option<i64>,
+    pub speed_up: Option<i64>,
+    pub speed_down: Option<i64>,
+    pub quota: Option<u64>,
+    pub quota_reset: Option<QuotaReset>,
+    pub max_connections_per_ip: Option<u32>,
+    pub max_new_connections_per_ip: Option<u32>,
+    pub conn_speed: Option<i64>,
+    pub conn_speed_up: Option<i64>,
+    pub conn_speed_down: Option<i64>,
+    pub default_secret: ConfigSecretLimit,
+}
+
+impl GlobalLimitsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.speed.is_none()
+            && self.speed_up.is_none()
+            && self.speed_down.is_none()
+            && self.quota.is_none()
+            && self.quota_reset.is_none()
+            && self.max_connections_per_ip.is_none()
+            && self.max_new_connections_per_ip.is_none()
+            && self.conn_speed.is_none()
+            && self.conn_speed_up.is_none()
+            && self.conn_speed_down.is_none()
+            && self.default_secret.to_secret_limits().is_zero()
+    }
 }
 
 /// One raw `[[retiring-secret]]` block prior to [`Config::get_retiring_secrets`].
@@ -340,6 +402,7 @@ pub struct Config {
     pub defense: DefenseConfig,
     pub network: NetworkConfig,
     pub api_bind_to: Option<HostPort>,
+    pub limits: GlobalLimitsConfig,
     pub throttle: ThrottleConfig,
     pub stats: StatsConfig,
 }
@@ -494,23 +557,54 @@ impl Config {
             .collect()
     }
 
-    /// Return per-secret engine-level [`SecretLimits`] (omitting all-zero entries).
+    /// Return server-wide [`GlobalLimits`] parsed from `[limits]`.
+    pub fn get_global_limits(&self) -> GlobalLimits {
+        GlobalLimits {
+            speed_bytes_per_second: self.limits.speed.unwrap_or(0),
+            speed_up_bytes_per_second: self.limits.speed_up.unwrap_or(0),
+            speed_down_bytes_per_second: self.limits.speed_down.unwrap_or(0),
+            quota_bytes: self.limits.quota.unwrap_or(0) as i64,
+            quota_reset: self.limits.quota_reset.unwrap_or(QuotaReset::None),
+            max_connections_per_ip: self.limits.max_connections_per_ip.unwrap_or(0),
+            max_new_connections_per_ip: self.limits.max_new_connections_per_ip.unwrap_or(0),
+            conn_speed_bytes_per_second: self.limits.conn_speed.unwrap_or(0),
+            conn_speed_up_bytes_per_second: self.limits.conn_speed_up.unwrap_or(0),
+            conn_speed_down_bytes_per_second: self.limits.conn_speed_down.unwrap_or(0),
+        }
+    }
+
+    /// Return default per-secret limits from `[limits.default-secret]`.
+    pub fn get_default_secret_limits(&self) -> SecretLimits {
+        self.limits.default_secret.to_secret_limits()
+    }
+
+    /// Return per-secret engine-level [`SecretLimits`] (merging `[limits.default-secret]`
+    /// onto every served secret and omitting all-zero entries).
     pub fn get_secret_limits(&self) -> BTreeMap<String, SecretLimits> {
+        let defaults = self.get_default_secret_limits();
+        let has_defaults = !defaults.is_zero();
         let mut out = BTreeMap::new();
+
+        if has_defaults {
+            for name in self.get_secrets().keys() {
+                let merged = self.secret_limits.get(name).map_or_else(
+                    || defaults.clone(),
+                    |c| c.to_secret_limits().merge_defaults(&defaults),
+                );
+                if !merged.is_zero() {
+                    out.insert(name.clone(), merged);
+                }
+            }
+        }
+
         for (name, cfg) in &self.secret_limits {
-            let lim = SecretLimits {
-                quota_bytes: cfg.quota.unwrap_or(0) as i64,
-                quota_reset: cfg.quota_reset.unwrap_or(QuotaReset::None),
-                expires_at: cfg.expires,
-                disabled: cfg.disabled.unwrap_or(false),
-                speed_bytes_per_second: cfg.speed.unwrap_or(0),
-                speed_up_bytes_per_second: cfg.speed_up.unwrap_or(0),
-                speed_down_bytes_per_second: cfg.speed_down.unwrap_or(0),
-                ip_limit: cfg.ip_limit.unwrap_or(0),
-                client_conns: cfg.client_conns.unwrap_or(0),
-                max_connections: cfg.max_connections.unwrap_or(0),
-                client_speed_bytes_per_second: cfg.client_speed.unwrap_or(0),
-                client_fair: cfg.client_fair.unwrap_or(false),
+            if out.contains_key(name) {
+                continue;
+            }
+            let lim = if has_defaults {
+                cfg.to_secret_limits().merge_defaults(&defaults)
+            } else {
+                cfg.to_secret_limits()
             };
             if !lim.is_zero() {
                 out.insert(name.clone(), lim);
@@ -701,6 +795,19 @@ impl Config {
             }
         }
 
+        let def_lim = self.get_default_secret_limits();
+        if def_lim.client_fair
+            && def_lim.speed_bytes_per_second == 0
+            && def_lim.speed_up_bytes_per_second == 0
+            && def_lim.speed_down_bytes_per_second == 0
+        {
+            return Err(ConfigError::Validation(
+                "limits.default-secret: client-fair divides the secret's speed among its addresses \
+                 and needs speed, speed-up or speed-down beside it"
+                    .to_owned(),
+            ));
+        }
+
         for (name, lim) in &self.secret_limits {
             if !known.contains(name.as_str()) {
                 return Err(ConfigError::Validation(format!(
@@ -708,10 +815,11 @@ impl Config {
                     shown_name(name)
                 )));
             }
-            if lim.client_fair.unwrap_or(false)
-                && lim.speed.unwrap_or(0) == 0
-                && lim.speed_up.unwrap_or(0) == 0
-                && lim.speed_down.unwrap_or(0) == 0
+            let eff = lim.to_secret_limits().merge_defaults(&def_lim);
+            if eff.client_fair
+                && eff.speed_bytes_per_second == 0
+                && eff.speed_up_bytes_per_second == 0
+                && eff.speed_down_bytes_per_second == 0
             {
                 return Err(ConfigError::Validation(format!(
                     "secret-limits.{}: client-fair divides the secret's speed among its addresses \
@@ -1232,6 +1340,31 @@ impl Config {
                     {
                         lm.insert("clientSpeed".into(), Value::String(format!("{cs}B/s")));
                     }
+                    if let Some(csu) = lim.client_speed_up
+                        && csu > 0
+                    {
+                        lm.insert("clientSpeedUp".into(), Value::String(format!("{csu}B/s")));
+                    }
+                    if let Some(csd) = lim.client_speed_down
+                        && csd > 0
+                    {
+                        lm.insert("clientSpeedDown".into(), Value::String(format!("{csd}B/s")));
+                    }
+                    if let Some(cs) = lim.conn_speed
+                        && cs > 0
+                    {
+                        lm.insert("connSpeed".into(), Value::String(format!("{cs}B/s")));
+                    }
+                    if let Some(csu) = lim.conn_speed_up
+                        && csu > 0
+                    {
+                        lm.insert("connSpeedUp".into(), Value::String(format!("{csu}B/s")));
+                    }
+                    if let Some(csd) = lim.conn_speed_down
+                        && csd > 0
+                    {
+                        lm.insert("connSpeedDown".into(), Value::String(format!("{csd}B/s")));
+                    }
                     lm.insert(
                         "disabled".into(),
                         Value::Bool(lim.disabled.unwrap_or(false)),
@@ -1372,6 +1505,41 @@ impl Config {
             json!(self.throttle.max_connections.unwrap_or(0)),
         );
         root.insert("throttle".into(), Value::Object(thr));
+
+        if !self.limits.is_empty() {
+            let mut gl = Map::new();
+            if let Some(s) = self.limits.speed {
+                gl.insert("speed".into(), Value::String(format!("{s}B/s")));
+            }
+            if let Some(s) = self.limits.speed_up {
+                gl.insert("speedUp".into(), Value::String(format!("{s}B/s")));
+            }
+            if let Some(s) = self.limits.speed_down {
+                gl.insert("speedDown".into(), Value::String(format!("{s}B/s")));
+            }
+            if let Some(q) = self.limits.quota {
+                gl.insert("quota".into(), Value::String(format_bytes_go(q)));
+            }
+            if let Some(qr) = self.limits.quota_reset {
+                gl.insert("quotaReset".into(), Value::String(qr.as_str().to_owned()));
+            }
+            if let Some(mc) = self.limits.max_connections_per_ip {
+                gl.insert("maxConnectionsPerIp".into(), json!(mc));
+            }
+            if let Some(mr) = self.limits.max_new_connections_per_ip {
+                gl.insert("maxNewConnectionsPerIp".into(), json!(mr));
+            }
+            if let Some(s) = self.limits.conn_speed {
+                gl.insert("connSpeed".into(), Value::String(format!("{s}B/s")));
+            }
+            if let Some(s) = self.limits.conn_speed_up {
+                gl.insert("connSpeedUp".into(), Value::String(format!("{s}B/s")));
+            }
+            if let Some(s) = self.limits.conn_speed_down {
+                gl.insert("connSpeedDown".into(), Value::String(format!("{s}B/s")));
+            }
+            root.insert("limits".into(), Value::Object(gl));
+        }
 
         root.insert(
             "tolerateTimeSkewness".into(),
@@ -1833,6 +2001,12 @@ fn parse_root_table(
                     );
                 }
             }
+            "limits" => {
+                let tbl = item.as_table_like().ok_or_else(|| {
+                    ConfigError::FieldParse("[limits] must be a table".to_owned())
+                })?;
+                parse_global_limits(doc, tbl, &mut cfg.limits, unknown)?;
+            }
             "throttle" => {
                 let tbl = item.as_table_like().ok_or_else(|| {
                     ConfigError::FieldParse("[throttle] must be a table".to_owned())
@@ -1946,11 +2120,151 @@ fn parse_secret_limit(
                     );
                 }
             }
+            "client-speed-up" => {
+                let s = expect_str(v, "client-speed-up")?;
+                if !s.is_empty() {
+                    lim.client_speed_up =
+                        Some(parse_speed(s).map_err(|e| {
+                            ConfigError::FieldParse(format!("client-speed-up: {e}"))
+                        })?);
+                }
+            }
+            "client-speed-down" => {
+                let s = expect_str(v, "client-speed-down")?;
+                if !s.is_empty() {
+                    lim.client_speed_down =
+                        Some(parse_speed(s).map_err(|e| {
+                            ConfigError::FieldParse(format!("client-speed-down: {e}"))
+                        })?);
+                }
+            }
             "client-fair" => lim.client_fair = Some(expect_bool(v, "client-fair")?),
+            "conn-speed" => {
+                let s = expect_str(v, "conn-speed")?;
+                if !s.is_empty() {
+                    lim.conn_speed = Some(
+                        parse_speed(s)
+                            .map_err(|e| ConfigError::FieldParse(format!("conn-speed: {e}")))?,
+                    );
+                }
+            }
+            "conn-speed-up" => {
+                let s = expect_str(v, "conn-speed-up")?;
+                if !s.is_empty() {
+                    lim.conn_speed_up = Some(
+                        parse_speed(s)
+                            .map_err(|e| ConfigError::FieldParse(format!("conn-speed-up: {e}")))?,
+                    );
+                }
+            }
+            "conn-speed-down" => {
+                let s = expect_str(v, "conn-speed-down")?;
+                if !s.is_empty() {
+                    lim.conn_speed_down =
+                        Some(parse_speed(s).map_err(|e| {
+                            ConfigError::FieldParse(format!("conn-speed-down: {e}"))
+                        })?);
+                }
+            }
             _ => record_unknown(doc, unknown, &["secret-limits", name], k, v),
         }
     }
     Ok(lim)
+}
+
+fn parse_global_limits(
+    doc: &[u8],
+    tbl: &dyn TableLike,
+    gl: &mut GlobalLimitsConfig,
+    unknown: &mut BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    for (k, v) in tbl.iter() {
+        match k {
+            "speed" => {
+                let s = expect_str(v, "limits.speed")?;
+                if !s.is_empty() {
+                    gl.speed = Some(
+                        parse_speed(s)
+                            .map_err(|e| ConfigError::FieldParse(format!("limits.speed: {e}")))?,
+                    );
+                }
+            }
+            "speed-up" => {
+                let s = expect_str(v, "limits.speed-up")?;
+                if !s.is_empty() {
+                    gl.speed_up =
+                        Some(parse_speed(s).map_err(|e| {
+                            ConfigError::FieldParse(format!("limits.speed-up: {e}"))
+                        })?);
+                }
+            }
+            "speed-down" => {
+                let s = expect_str(v, "limits.speed-down")?;
+                if !s.is_empty() {
+                    gl.speed_down =
+                        Some(parse_speed(s).map_err(|e| {
+                            ConfigError::FieldParse(format!("limits.speed-down: {e}"))
+                        })?);
+                }
+            }
+            "quota" => {
+                if let Some(s) = v.as_str()
+                    && s.trim().is_empty()
+                {
+                    continue;
+                }
+                gl.quota = Some(expect_bytes(v, "limits.quota")?);
+            }
+            "quota-reset" => {
+                let s = expect_str(v, "limits.quota-reset")?;
+                if !s.is_empty() {
+                    gl.quota_reset = Some(parse_quota_reset(s).map_err(|e| {
+                        ConfigError::FieldParse(format!("limits.quota-reset: {e}"))
+                    })?);
+                }
+            }
+            "max-connections-per-ip" => {
+                gl.max_connections_per_ip = Some(expect_u32(v, "limits.max-connections-per-ip")?);
+            }
+            "max-new-connections-per-ip" => {
+                gl.max_new_connections_per_ip =
+                    Some(expect_u32(v, "limits.max-new-connections-per-ip")?);
+            }
+            "conn-speed" => {
+                let s = expect_str(v, "limits.conn-speed")?;
+                if !s.is_empty() {
+                    gl.conn_speed =
+                        Some(parse_speed(s).map_err(|e| {
+                            ConfigError::FieldParse(format!("limits.conn-speed: {e}"))
+                        })?);
+                }
+            }
+            "conn-speed-up" => {
+                let s = expect_str(v, "limits.conn-speed-up")?;
+                if !s.is_empty() {
+                    gl.conn_speed_up = Some(parse_speed(s).map_err(|e| {
+                        ConfigError::FieldParse(format!("limits.conn-speed-up: {e}"))
+                    })?);
+                }
+            }
+            "conn-speed-down" => {
+                let s = expect_str(v, "limits.conn-speed-down")?;
+                if !s.is_empty() {
+                    gl.conn_speed_down = Some(parse_speed(s).map_err(|e| {
+                        ConfigError::FieldParse(format!("limits.conn-speed-down: {e}"))
+                    })?);
+                }
+            }
+            "default-secret" => {
+                let dtbl = v.as_table_like().ok_or_else(|| {
+                    ConfigError::FieldParse("[limits.default-secret] must be a table".to_owned())
+                })?;
+                gl.default_secret = parse_secret_limit(doc, "default-secret", dtbl, unknown)?;
+            }
+            _ => record_unknown(doc, unknown, &["limits"], k, v),
+        }
+    }
+    Ok(())
 }
 
 fn parse_retiring_secret_item(

@@ -6,6 +6,7 @@ pub mod address_ledger;
 pub mod antireplay;
 pub mod bans;
 pub mod client_table;
+pub mod global_guard;
 pub mod hints;
 pub mod ipfilter;
 pub mod rate_limit;
@@ -26,6 +27,7 @@ pub use client_table::{
     ClientEntry, ClientTable, ClientsView, EntryInit, FairShareScratch, MAX_CLIENTS,
     MAX_CLIENTS_PER_SECRET,
 };
+pub use global_guard::{ConnSpeedLimiters, GlobalIpConnPermit, GlobalIpGuard};
 pub use hints::{
     HANDSHAKE_BUCKET_ROTATION, HANDSHAKE_BURST_FACTOR, HINT_ROTATION, MAX_HINT_ADDRESSES,
     MAX_HINT_NAMES, MAX_HINT_POSITIONS, MAX_SCAN_BLOCKS, MAX_TRACKED_HANDSHAKE_IPS, MatchHints,
@@ -157,6 +159,7 @@ mod tests {
         let init = EntryInit {
             ceiling_rate: 0,
             fair_totals: totals,
+            ..EntryInit::default()
         };
         let u1 = IpUnit::from_ip("198.51.100.1".parse().unwrap());
         let u2 = IpUnit::from_ip("198.51.100.2".parse().unwrap());

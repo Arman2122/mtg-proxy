@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [2.4.0] — 2026-11-22
+
+Carrier-grade 4-tier connection & speed governance engine: server-wide bandwidth shaping & VPS-safe global data quotas (`[limits]`), 64-way sharded global per-IP connection & connect-rate flood shields, Iranian CGNAT-safe per-connection speed caps (`conn-speed*`), directional per-IP ceilings (`client-speed-up`/`down`), `[limits.default-secret]` policy inheritance, hot-reloadable `concurrency`, and live `/limits` Management API.
+
+### Added
+- **Server-Wide Global Traffic & Connection Shaping (`[limits]` across `mtg-core`, `mtg-governance`, `mtg-config`, `mtg-engine`, `mtg-api`, `mtg-cli`):**
+  - **Global Bandwidth Shaper (`speed`, `speed-up`, `speed-down`):** Lock-free `AtomicI64` GCRA rate limiters shared across all secrets, workers, and transports (`DirectRelay` & `MiddleProxy`), adding ~4 ns fast-path bypass when unlimited.
+  - **Server-Wide Data Quota (`quota`, `quota-reset = "none" | "daily" | "weekly" | "monthly"`):** Prevents unexpected VPS bandwidth overages (e.g., `950GB` monthly cap on a 1 TB droplet); cuts off live streams cleanly at the ceiling, transparently fronts new attempts to the cover site, and persists backward-compatibly inside `usage.json`.
+  - **64-Way Sharded Global Per-IP Guard (`GlobalIpGuard`):** Enforces `max-connections-per-ip` via leak-proof RAII `GlobalIpConnPermit` handles and `max-new-connections-per-ip` via bounded-RAM GCRA connect-rate limiting (`burst = 2×`, max `4096` entries/shard with 60s idle sweeping), protecting single-core droplets from accept/connection-churn floods before spending any FakeTLS HMAC CPU.
+  - **CGNAT-Safe Per-Connection Speed Caps (`conn-speed`, `conn-speed-up`, `conn-speed-down`):** Boxed per-TCP-connection GCRA limiters (`0 B` heap allocated when unset; `DirectRelay` stays well below future-size firewall!) configurable globally in `[limits]` or overridden per secret — smoothly paces heavy media downloads without punishing innocent users sharing a carrier-grade NAT IPv4 address.
+  - **Directional Per-IP Ceilings (`client-speed-up`, `client-speed-down`) & `[limits.default-secret]` Inheritance:** Asymmetric per-address download/upload caps inside `[secret-limits.<name>]` plus global default secret policy inheritance (`SecretLimits::merge_defaults`) so multi-tenant & public proxies configure baseline policies once.
+- **Hot-Reloadable `concurrency` & Live `/limits` Management API (`mtg-engine`, `mtg-api`):**
+  - Upgraded `concurrency` to an `AtomicU32` hot-reloadable via `SIGHUP`, `POST /reload`, or `PUT`/`PATCH /limits`.
+  - Added `GET /limits`, `PUT /limits`, `PATCH /limits`, and `POST /limits/reset-quota` alongside 5 new Prometheus metrics (`mtg_global_quota_used_bytes`, `mtg_global_quota_limit_bytes`, `mtg_global_speed_throttled_seconds_total`, `mtg_global_ip_conn_limited_total`, `mtg_global_ip_rate_limited_total`) and `mtg-proxy doctor` `[limits]` reporting.
+
+### Performance & Quality Gates
+- Boxed the single-port `try_single_port_obfs2_or_front` branch inside `faketls_handshake_and_dial`, cutting handshake future stack usage by 16 KiB.
+- `110/110` Rust workspace tests passing, `0` clippy warnings (`-D warnings`), `panel-config-string.golden` byte-exact, `steady_state_connection_future_size_guard` passing.
+
+---
+
 ## [2.3.0] — 2026-11-22
 
 Unified single-port multi-transport multiplexing (`ee` + `dd`/`plain` + integrated in-process TLS `web-relay` + cover site on ONE port `:443`), CDN-aware spoof-proof Geo-Stealth (`cdn = "cloudflare" | "arvancloud"`), enterprise multi-tenant accounting & full async hot-reload, conditional HTTP `ETag`/`304` + SHA-256 IP filter auto-updates, and Node.js 24 GitHub Actions workflow upgrades.

@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use mtg_crypto::aes_ctr::{Aes256Ctr, FusedCtrPair};
-use mtg_governance::{ClientEntry, FairBucket, GcraLimiter};
+use mtg_governance::{ClientEntry, ConnSpeedLimiters, FairBucket, GcraLimiter};
 use mtg_net::{MiddleDownMsg, MiddleStream, TLS_HEADROOM, coarse_now_ns, coarse_unix_secs};
 use mtg_protocol::doppel::{DoppelConnState, DoppelParams};
 use mtg_protocol::tls_record::{MAX_TLS_RECORD_PAYLOAD, TlsUnframer, stamp_app_data_header};
@@ -22,7 +22,7 @@ use tokio::io::{AsyncWrite as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
 use crate::cancel::CancelToken;
-use crate::metrics::{DcEndpointStats, SecretRuntime};
+use crate::metrics::{DcEndpointStats, GlobalLimitsRuntime, SecretRuntime};
 
 /// Upload read batch capacity (128 KiB — up to 8 FakeTLS records per read(2) syscall).
 const UPLOAD_SCRATCH_CAP: usize = 128 * 1024;
@@ -51,6 +51,8 @@ pub struct RelayContext {
     pub idle_timeout: Duration,
     pub user: Arc<SecretRuntime>,
     pub client_entry: Arc<ClientEntry>,
+    pub global_limits: Arc<GlobalLimitsRuntime>,
+    pub conn_limits: Option<Box<ConnSpeedLimiters>>,
     pub dc_stats: Arc<DcEndpointStats>,
     pub doppel: Option<Box<(DoppelConnState, DoppelParams)>>,
     pub cancel: CancelToken,
@@ -97,6 +99,8 @@ pub struct DirectRelay {
     last_reset_ns: u64,
     user: Arc<SecretRuntime>,
     client_entry: Arc<ClientEntry>,
+    global_limits: Arc<GlobalLimitsRuntime>,
+    conn_limits: Option<Box<ConnSpeedLimiters>>,
     dc_stats: Arc<DcEndpointStats>,
     cancel: CancelToken,
     doppel: Option<Box<DoppelRelayState>>,
@@ -145,6 +149,8 @@ impl DirectRelay {
             last_reset_ns: coarse_now_ns(),
             user: ctx.user,
             client_entry: ctx.client_entry,
+            global_limits: ctx.global_limits,
+            conn_limits: ctx.conn_limits,
             dc_stats: ctx.dc_stats,
             cancel: ctx.cancel,
             doppel,
@@ -227,6 +233,9 @@ impl DirectRelay {
                 self.user.quota_cutoffs.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
+            if self.global_limits.record_traffic(up_moved as i64) {
+                return true;
+            }
         }
         if down_moved > 0 {
             self.client_entry
@@ -237,6 +246,9 @@ impl DirectRelay {
                 .fetch_add(down_moved as u64, Ordering::Relaxed);
             if self.user.record_traffic(down_moved as i64, false, now_unix) {
                 self.user.quota_cutoffs.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            if self.global_limits.record_traffic(down_moved as i64) {
                 return true;
             }
         }
@@ -282,7 +294,13 @@ impl DirectRelay {
                 }
                 Poll::Ready(Err(_)) => return Poll::Ready(StepOutcome::Done),
                 Poll::Ready(Ok(())) => {
-                    let up_paced = has_pacing(true, &self.user, &self.client_entry);
+                    let up_paced = has_pacing(
+                        true,
+                        &self.user,
+                        &self.client_entry,
+                        &self.global_limits,
+                        self.conn_limits.as_deref(),
+                    );
                     let mut spurious_wb = 0u8;
 
                     loop {
@@ -643,7 +661,13 @@ impl DirectRelay {
                         return Poll::Ready(StepOutcome::Done);
                     }
                     Poll::Ready(Ok(())) => {
-                        let down_paced = has_pacing(false, &self.user, &self.client_entry);
+                        let down_paced = has_pacing(
+                            false,
+                            &self.user,
+                            &self.client_entry,
+                            &self.global_limits,
+                            self.conn_limits.as_deref(),
+                        );
                         let mut spurious_wb = 0u8;
 
                         loop {
@@ -945,9 +969,17 @@ impl DirectRelay {
 /// Obfuscated2 handshake (boxed cold path — zero steady-state frame bloat!).
 async fn flush_initial_app(state: &mut DirectRelay, mut initial_app: Vec<u8>) -> bool {
     let n = initial_app.len();
-    if pace_transfer(n, true, &state.user, &state.client_entry, &state.cancel)
-        .await
-        .is_err()
+    if pace_transfer(
+        n,
+        true,
+        &state.user,
+        &state.client_entry,
+        &state.global_limits,
+        state.conn_limits.as_deref(),
+        &state.cancel,
+    )
+    .await
+    .is_err()
     {
         return false;
     }
@@ -969,7 +1001,7 @@ async fn flush_initial_app(state: &mut DirectRelay, mut initial_app: Vec<u8>) ->
         state.user.quota_cutoffs.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    true
+    !state.global_limits.record_traffic(n as i64)
 }
 
 /// Paced transfer flush path (boxed cold path — only allocated when speed/fair
@@ -980,6 +1012,8 @@ async fn pace_and_flush_direct(state: &mut DirectRelay, is_upload: bool, bytes: 
         is_upload,
         &state.user,
         &state.client_entry,
+        &state.global_limits,
+        state.conn_limits.as_deref(),
         &state.cancel,
     )
     .await
@@ -1008,6 +1042,9 @@ async fn pace_and_flush_direct(state: &mut DirectRelay, is_upload: bool, bytes: 
             .fetch_add(bytes as u64, Ordering::Relaxed);
         if state.user.record_traffic(bytes as i64, true, now_unix) {
             state.user.quota_cutoffs.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if state.global_limits.record_traffic(bytes as i64) {
             return false;
         }
     } else {
@@ -1048,6 +1085,9 @@ async fn pace_and_flush_direct(state: &mut DirectRelay, is_upload: bool, bytes: 
             .fetch_add(bytes as u64, Ordering::Relaxed);
         if state.user.record_traffic(bytes as i64, false, now_unix) {
             state.user.quota_cutoffs.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if state.global_limits.record_traffic(bytes as i64) {
             return false;
         }
     }
@@ -1100,9 +1140,17 @@ pub async fn relay_middleproxy(
                 return;
             };
             let n = pkt.len();
-            if pace_transfer(n, true, &ctx.user, &ctx.client_entry, &cancel)
-                .await
-                .is_err()
+            if pace_transfer(
+                n,
+                true,
+                &ctx.user,
+                &ctx.client_entry,
+                &ctx.global_limits,
+                ctx.conn_limits.as_deref(),
+                &cancel,
+            )
+            .await
+            .is_err()
             {
                 middle.close_graceful().await;
                 return;
@@ -1122,6 +1170,10 @@ pub async fn relay_middleproxy(
                 .fetch_add(n as u64, Ordering::Relaxed);
             if ctx.user.record_traffic(n as i64, true, now_unix) {
                 ctx.user.quota_cutoffs.fetch_add(1, Ordering::Relaxed);
+                middle.close_graceful().await;
+                return;
+            }
+            if ctx.global_limits.record_traffic(n as i64) {
                 middle.close_graceful().await;
                 return;
             }
@@ -1199,6 +1251,8 @@ pub async fn relay_middleproxy(
                     false,
                     &ctx.user,
                     &ctx.client_entry,
+                    &ctx.global_limits,
+                    ctx.conn_limits.as_deref(),
                     &cancel,
                 )
                 .await
@@ -1284,6 +1338,9 @@ pub async fn relay_middleproxy(
                     ctx.user.quota_cutoffs.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
+                if ctx.global_limits.record_traffic(n as i64) {
+                    break;
+                }
             }
         }
     }
@@ -1358,7 +1415,13 @@ async fn sleep_cancelable(delay: Duration, cancel: &CancelToken) -> Result<(), (
 }
 
 #[inline]
-fn has_pacing(is_upload: bool, user: &SecretRuntime, entry: &ClientEntry) -> bool {
+fn has_pacing(
+    is_upload: bool,
+    user: &SecretRuntime,
+    entry: &ClientEntry,
+    global: &GlobalLimitsRuntime,
+    conn: Option<&ConnSpeedLimiters>,
+) -> bool {
     let dir_bucket = if is_upload {
         FairBucket::Up
     } else {
@@ -1369,23 +1432,37 @@ fn has_pacing(is_upload: bool, user: &SecretRuntime, entry: &ClientEntry) -> boo
     } else {
         &user.speed_down
     };
-    user.speed.is_limited()
+    let client_dir = if is_upload {
+        &entry.ceiling_up
+    } else {
+        &entry.ceiling_down
+    };
+    global.is_speed_limited(is_upload)
+        || user.speed.is_limited()
         || user_dir.is_limited()
         || entry.ceiling.is_limited()
+        || client_dir.is_limited()
         || entry.fair_limiter(FairBucket::Speed).is_limited()
         || entry.fair_limiter(dir_bucket).is_limited()
+        || conn.is_some_and(|c| c.is_limited(is_upload))
 }
 
-/// Lock-free GCRA pacing across user aggregate buckets (`speed`, `speed_up`/`speed_down`)
-/// and per-address limiters (`ceiling`, `fair[Speed]`, `fair[Up|Down]`).
+/// Lock-free GCRA pacing across all 4 governance tiers:
+/// 1. Server-wide global bandwidth (`[limits] speed`, `speed-up`, `speed-down`)
+/// 2. Secret aggregate bandwidth (`speed`, `speed-up`, `speed-down`)
+/// 3. Per-address ceilings (`client-speed`, `client-speed-up`, `client-speed-down`)
+///    and water-level fair-share (`client-fair`)
+/// 4. CGNAT-safe per-connection bandwidth (`conn-speed`, `conn-speed-up`, `conn-speed-down`)
 ///
-/// Fast-path optimized: when unlimited (`is_limited() == false`), pays only 1
-/// relaxed atomic load per bucket — ZERO locks and ZERO `BlockedTracker` calls!
+/// Fast-path optimized: when unlimited, pays only relaxed atomic loads — ZERO locks!
+#[allow(clippy::too_many_arguments)]
 async fn pace_transfer(
     bytes: usize,
     is_upload: bool,
     user: &SecretRuntime,
     entry: &ClientEntry,
+    global: &GlobalLimitsRuntime,
+    conn: Option<&ConnSpeedLimiters>,
     cancel: &CancelToken,
 ) -> io::Result<()> {
     let dir_bucket = if is_upload {
@@ -1398,16 +1475,50 @@ async fn pace_transfer(
     } else {
         &user.speed_down
     };
+    let global_dir = if is_upload {
+        &global.speed_up
+    } else {
+        &global.speed_down
+    };
+    let client_dir = if is_upload {
+        &entry.ceiling_up
+    } else {
+        &entry.ceiling_down
+    };
 
-    // Fast exit when all 5 limiters are unlimited (~5 relaxed atomic loads, ~3 ns!)
-    if !user.speed.is_limited()
+    // Fast exit when all tiers are unlimited (~8 relaxed atomic loads, ~4 ns!)
+    if !global.is_speed_limited(is_upload)
+        && !user.speed.is_limited()
         && !user_dir.is_limited()
         && !entry.ceiling.is_limited()
+        && !client_dir.is_limited()
         && !entry.fair_limiter(FairBucket::Speed).is_limited()
         && !entry.fair_limiter(dir_bucket).is_limited()
+        && conn.is_none_or(|c| !c.is_limited(is_upload))
     {
         return Ok(());
     }
+
+    // 0. Server-wide global bandwidth shaper (`[limits] speed`, `speed-up`, `speed-down`)
+    pace_one(
+        bytes,
+        &global.speed,
+        None,
+        &global.speed_throttled_ns,
+        None,
+        cancel,
+    )
+    .await?;
+
+    pace_one(
+        bytes,
+        global_dir,
+        None,
+        &global.speed_throttled_ns,
+        None,
+        cancel,
+    )
+    .await?;
 
     // 1. User aggregate combined + directional buckets (count toward fair-share duty!)
     pace_one(
@@ -1430,10 +1541,21 @@ async fn pace_transfer(
     )
     .await?;
 
-    // 2. Per-address static ceiling (`client-speed`) — NEVER counts toward fair-share duty!
+    // 2. Per-address static ceilings (`client-speed`, `client-speed-up`, `client-speed-down`)
+    //    — NEVER count toward fair-share duty!
     pace_one(
         bytes,
         &entry.ceiling,
+        None,
+        &user.client_throttled_ns,
+        Some(&entry.throttled_nanos),
+        cancel,
+    )
+    .await?;
+
+    pace_one(
+        bytes,
+        client_dir,
         None,
         &user.client_throttled_ns,
         Some(&entry.throttled_nanos),
@@ -1461,6 +1583,29 @@ async fn pace_transfer(
         cancel,
     )
     .await?;
+
+    // 4. CGNAT-safe per-connection speed cap (`conn-speed`, `conn-speed-up`, `conn-speed-down`)
+    if let Some(c) = conn {
+        let conn_dir = if is_upload { &c.up } else { &c.down };
+        pace_one(
+            bytes,
+            &c.combined,
+            None,
+            &user.client_throttled_ns,
+            Some(&entry.throttled_nanos),
+            cancel,
+        )
+        .await?;
+        pace_one(
+            bytes,
+            conn_dir,
+            None,
+            &user.client_throttled_ns,
+            Some(&entry.throttled_nanos),
+            cancel,
+        )
+        .await?;
+    }
 
     Ok(())
 }

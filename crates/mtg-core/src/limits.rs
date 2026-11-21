@@ -55,6 +55,24 @@ impl QuotaReset {
             Self::Monthly => "monthly",
         }
     }
+
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Daily => 1,
+            Self::Weekly => 2,
+            Self::Monthly => 3,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Daily,
+            2 => Self::Weekly,
+            3 => Self::Monthly,
+            _ => Self::None,
+        }
+    }
 }
 
 impl fmt::Display for QuotaReset {
@@ -124,8 +142,18 @@ pub struct SecretLimits {
     pub max_connections: u32,
     /// Per-address combined speed ceiling in bytes/s (`0` = unlimited).
     pub client_speed_bytes_per_second: i64,
+    /// Per-address upload speed ceiling in bytes/s (`0` = unlimited).
+    pub client_speed_up_bytes_per_second: i64,
+    /// Per-address download speed ceiling in bytes/s (`0` = unlimited).
+    pub client_speed_down_bytes_per_second: i64,
     /// Work-conserving fair share of secret speed limits across active addresses.
     pub client_fair: bool,
+    /// Per-TCP-connection combined speed cap in bytes/s (`0` = unlimited; CGNAT-safe!).
+    pub conn_speed_bytes_per_second: i64,
+    /// Per-TCP-connection upload speed cap in bytes/s (`0` = unlimited).
+    pub conn_speed_up_bytes_per_second: i64,
+    /// Per-TCP-connection download speed cap in bytes/s (`0` = unlimited).
+    pub conn_speed_down_bytes_per_second: i64,
 }
 
 impl SecretLimits {
@@ -142,12 +170,102 @@ impl SecretLimits {
             && self.client_conns == 0
             && self.max_connections == 0
             && self.client_speed_bytes_per_second == 0
+            && self.client_speed_up_bytes_per_second == 0
+            && self.client_speed_down_bytes_per_second == 0
             && !self.client_fair
+            && self.conn_speed_bytes_per_second == 0
+            && self.conn_speed_up_bytes_per_second == 0
+            && self.conn_speed_down_bytes_per_second == 0
     }
 
-    /// True if any per-address control (`client-conns`, `client-speed`, `client-fair`) is active.
+    /// True if any per-address control (`client-conns`, `client-speed*`, `client-fair`) is active.
     pub const fn has_client_control(&self) -> bool {
-        self.client_conns > 0 || self.client_speed_bytes_per_second > 0 || self.client_fair
+        self.client_conns > 0
+            || self.client_speed_bytes_per_second > 0
+            || self.client_speed_up_bytes_per_second > 0
+            || self.client_speed_down_bytes_per_second > 0
+            || self.client_fair
+    }
+
+    /// Merge unset (`0` / `None` / `false`) fields from `defaults` (used for `[limits.default-secret]`).
+    /// Explicit per-secret overrides always take precedence.
+    #[must_use]
+    pub fn merge_defaults(&self, defaults: &Self) -> Self {
+        Self {
+            quota_bytes: if self.quota_bytes > 0 {
+                self.quota_bytes
+            } else {
+                defaults.quota_bytes
+            },
+            quota_reset: if matches!(self.quota_reset, QuotaReset::None) {
+                defaults.quota_reset
+            } else {
+                self.quota_reset
+            },
+            expires_at: self.expires_at.or(defaults.expires_at),
+            disabled: self.disabled || defaults.disabled,
+            speed_bytes_per_second: if self.speed_bytes_per_second > 0 {
+                self.speed_bytes_per_second
+            } else {
+                defaults.speed_bytes_per_second
+            },
+            speed_up_bytes_per_second: if self.speed_up_bytes_per_second > 0 {
+                self.speed_up_bytes_per_second
+            } else {
+                defaults.speed_up_bytes_per_second
+            },
+            speed_down_bytes_per_second: if self.speed_down_bytes_per_second > 0 {
+                self.speed_down_bytes_per_second
+            } else {
+                defaults.speed_down_bytes_per_second
+            },
+            ip_limit: if self.ip_limit > 0 {
+                self.ip_limit
+            } else {
+                defaults.ip_limit
+            },
+            client_conns: if self.client_conns > 0 {
+                self.client_conns
+            } else {
+                defaults.client_conns
+            },
+            max_connections: if self.max_connections > 0 {
+                self.max_connections
+            } else {
+                defaults.max_connections
+            },
+            client_speed_bytes_per_second: if self.client_speed_bytes_per_second > 0 {
+                self.client_speed_bytes_per_second
+            } else {
+                defaults.client_speed_bytes_per_second
+            },
+            client_speed_up_bytes_per_second: if self.client_speed_up_bytes_per_second > 0 {
+                self.client_speed_up_bytes_per_second
+            } else {
+                defaults.client_speed_up_bytes_per_second
+            },
+            client_speed_down_bytes_per_second: if self.client_speed_down_bytes_per_second > 0 {
+                self.client_speed_down_bytes_per_second
+            } else {
+                defaults.client_speed_down_bytes_per_second
+            },
+            client_fair: self.client_fair || defaults.client_fair,
+            conn_speed_bytes_per_second: if self.conn_speed_bytes_per_second > 0 {
+                self.conn_speed_bytes_per_second
+            } else {
+                defaults.conn_speed_bytes_per_second
+            },
+            conn_speed_up_bytes_per_second: if self.conn_speed_up_bytes_per_second > 0 {
+                self.conn_speed_up_bytes_per_second
+            } else {
+                defaults.conn_speed_up_bytes_per_second
+            },
+            conn_speed_down_bytes_per_second: if self.conn_speed_down_bytes_per_second > 0 {
+                self.conn_speed_down_bytes_per_second
+            } else {
+                defaults.conn_speed_down_bytes_per_second
+            },
+        }
     }
 
     /// Speed totals divided by fair-share when `client_fair` is enabled.
@@ -164,6 +282,46 @@ impl SecretLimits {
             up: self.speed_up_bytes_per_second,
             down: self.speed_down_bytes_per_second,
         }
+    }
+}
+
+/// Server-wide traffic, connection, and CGNAT-safe per-connection governance limits (`[limits]`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GlobalLimits {
+    /// Server-wide combined (up + down) bandwidth cap in bytes/s across all secrets (`0` = unlimited).
+    pub speed_bytes_per_second: i64,
+    /// Server-wide upload bandwidth cap in bytes/s (`0` = unlimited).
+    pub speed_up_bytes_per_second: i64,
+    /// Server-wide download bandwidth cap in bytes/s (`0` = unlimited).
+    pub speed_down_bytes_per_second: i64,
+    /// Server-wide data quota across all secrets in bytes (`0` = unlimited; e.g. 950GB on 1TB VPS).
+    pub quota_bytes: i64,
+    /// Server-wide quota reset schedule.
+    pub quota_reset: QuotaReset,
+    /// Global maximum concurrent TCP connections per IPv4 / IPv6 `/64` across all secrets (`0` = unlimited).
+    pub max_connections_per_ip: u32,
+    /// Global maximum new connections per second per IPv4 / IPv6 `/64` (burst 2×; `0` = unlimited).
+    pub max_new_connections_per_ip: u32,
+    /// Global per-TCP-connection combined speed cap in bytes/s (`0` = unlimited; CGNAT-safe!).
+    pub conn_speed_bytes_per_second: i64,
+    /// Global per-TCP-connection upload speed cap in bytes/s (`0` = unlimited).
+    pub conn_speed_up_bytes_per_second: i64,
+    /// Global per-TCP-connection download speed cap in bytes/s (`0` = unlimited).
+    pub conn_speed_down_bytes_per_second: i64,
+}
+
+impl GlobalLimits {
+    pub const fn is_zero(&self) -> bool {
+        self.speed_bytes_per_second == 0
+            && self.speed_up_bytes_per_second == 0
+            && self.speed_down_bytes_per_second == 0
+            && self.quota_bytes == 0
+            && matches!(self.quota_reset, QuotaReset::None)
+            && self.max_connections_per_ip == 0
+            && self.max_new_connections_per_ip == 0
+            && self.conn_speed_bytes_per_second == 0
+            && self.conn_speed_up_bytes_per_second == 0
+            && self.conn_speed_down_bytes_per_second == 0
     }
 }
 

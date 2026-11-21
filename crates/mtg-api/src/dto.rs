@@ -144,8 +144,18 @@ pub struct UserStatsJson {
     pub client_conns_refused: i64,
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub client_speed_limit: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub client_speed_limit_up: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub client_speed_limit_down: i64,
     #[serde(skip_serializing_if = "is_false")]
     pub client_fair: bool,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub conn_speed_limit: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub conn_speed_limit_up: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub conn_speed_limit_down: i64,
 
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub clients: usize,
@@ -215,8 +225,18 @@ pub struct SecretInfoJson {
     pub max_connections: u32,
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub client_speed_limit: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub client_speed_limit_up: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub client_speed_limit_down: i64,
     #[serde(skip_serializing_if = "is_false")]
     pub client_fair: bool,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub conn_speed_limit: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub conn_speed_limit_up: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub conn_speed_limit_down: i64,
 
     pub mode: String,
     #[serde(skip_serializing_if = "is_false")]
@@ -392,7 +412,17 @@ pub struct LimitFieldsReq {
     #[serde(default)]
     pub client_speed: String,
     #[serde(default)]
+    pub client_speed_up: String,
+    #[serde(default)]
+    pub client_speed_down: String,
+    #[serde(default)]
     pub client_fair: bool,
+    #[serde(default)]
+    pub conn_speed: String,
+    #[serde(default)]
+    pub conn_speed_up: String,
+    #[serde(default)]
+    pub conn_speed_down: String,
 }
 
 impl LimitFieldsReq {
@@ -420,6 +450,15 @@ impl LimitFieldsReq {
         let speed_down = parse_speed(&self.speed_down).map_err(|e| format!("speed_down: {e}"))?;
         let client_speed =
             parse_speed(&self.client_speed).map_err(|e| format!("client_speed: {e}"))?;
+        let client_speed_up =
+            parse_speed(&self.client_speed_up).map_err(|e| format!("client_speed_up: {e}"))?;
+        let client_speed_down =
+            parse_speed(&self.client_speed_down).map_err(|e| format!("client_speed_down: {e}"))?;
+        let conn_speed = parse_speed(&self.conn_speed).map_err(|e| format!("conn_speed: {e}"))?;
+        let conn_speed_up =
+            parse_speed(&self.conn_speed_up).map_err(|e| format!("conn_speed_up: {e}"))?;
+        let conn_speed_down =
+            parse_speed(&self.conn_speed_down).map_err(|e| format!("conn_speed_down: {e}"))?;
 
         let lim = SecretLimits {
             quota_bytes,
@@ -433,7 +472,12 @@ impl LimitFieldsReq {
             client_conns: self.client_conns as u32,
             max_connections: self.max_connections as u32,
             client_speed_bytes_per_second: client_speed,
+            client_speed_up_bytes_per_second: client_speed_up,
+            client_speed_down_bytes_per_second: client_speed_down,
             client_fair: self.client_fair,
+            conn_speed_bytes_per_second: conn_speed,
+            conn_speed_up_bytes_per_second: conn_speed_up,
+            conn_speed_down_bytes_per_second: conn_speed_down,
         };
 
         if lim.client_fair && !lim.fair_totals().is_active() {
@@ -478,7 +522,17 @@ pub struct SecretEntryReq {
     #[serde(default)]
     pub client_speed: String,
     #[serde(default)]
+    pub client_speed_up: String,
+    #[serde(default)]
+    pub client_speed_down: String,
+    #[serde(default)]
     pub client_fair: bool,
+    #[serde(default)]
+    pub conn_speed: String,
+    #[serde(default)]
+    pub conn_speed_up: String,
+    #[serde(default)]
+    pub conn_speed_down: String,
 }
 
 impl SecretEntryReq {
@@ -495,7 +549,12 @@ impl SecretEntryReq {
             client_conns: self.client_conns,
             max_connections: self.max_connections,
             client_speed: self.client_speed.clone(),
+            client_speed_up: self.client_speed_up.clone(),
+            client_speed_down: self.client_speed_down.clone(),
             client_fair: self.client_fair,
+            conn_speed: self.conn_speed.clone(),
+            conn_speed_up: self.conn_speed_up.clone(),
+            conn_speed_down: self.conn_speed_down.clone(),
         }
         .parse_limits()
     }
@@ -544,7 +603,17 @@ pub struct PostSecretReq {
     #[serde(default)]
     pub client_speed: String,
     #[serde(default)]
+    pub client_speed_up: String,
+    #[serde(default)]
+    pub client_speed_down: String,
+    #[serde(default)]
     pub client_fair: bool,
+    #[serde(default)]
+    pub conn_speed: String,
+    #[serde(default)]
+    pub conn_speed_up: String,
+    #[serde(default)]
+    pub conn_speed_down: String,
 }
 
 impl PostSecretReq {
@@ -561,7 +630,12 @@ impl PostSecretReq {
             client_conns: self.client_conns,
             max_connections: self.max_connections,
             client_speed: self.client_speed.clone(),
+            client_speed_up: self.client_speed_up.clone(),
+            client_speed_down: self.client_speed_down.clone(),
             client_fair: self.client_fair,
+            conn_speed: self.conn_speed.clone(),
+            conn_speed_up: self.conn_speed_up.clone(),
+            conn_speed_down: self.conn_speed_down.clone(),
         }
         .parse_limits()
     }
@@ -656,7 +730,12 @@ pub struct PatchSecretReq {
     pub client_conns: Option<i64>,
     pub max_connections: Option<i64>,
     pub client_speed: Option<String>,
+    pub client_speed_up: Option<String>,
+    pub client_speed_down: Option<String>,
     pub client_fair: Option<bool>,
+    pub conn_speed: Option<String>,
+    pub conn_speed_up: Option<String>,
+    pub conn_speed_down: Option<String>,
 }
 
 /// `POST /secrets/{name}/disconnect` response.
@@ -743,4 +822,53 @@ pub struct AccountingResponse {
 pub struct FlushResultJson {
     pub status: &'static str,
     pub flushed: bool,
+}
+
+/// `PATCH /limits` partial live update payload.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchGlobalLimitsReq {
+    pub concurrency: Option<i64>,
+    pub throttle_max_connections: Option<i64>,
+    pub speed: Option<String>,
+    pub speed_up: Option<String>,
+    pub speed_down: Option<String>,
+    pub quota: Option<String>,
+    pub add_quota: Option<String>,
+    #[serde(default)]
+    pub reset_quota: bool,
+    pub quota_reset: Option<String>,
+    pub max_connections_per_ip: Option<i64>,
+    pub max_new_connections_per_ip: Option<i64>,
+    pub conn_speed: Option<String>,
+    pub conn_speed_up: Option<String>,
+    pub conn_speed_down: Option<String>,
+}
+
+/// `PUT /limits` full replacement payload (omitted fields reset to unlimited).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutGlobalLimitsReq {
+    pub concurrency: Option<i64>,
+    pub throttle_max_connections: Option<i64>,
+    #[serde(default)]
+    pub speed: String,
+    #[serde(default)]
+    pub speed_up: String,
+    #[serde(default)]
+    pub speed_down: String,
+    #[serde(default)]
+    pub quota: String,
+    #[serde(default)]
+    pub quota_reset: String,
+    #[serde(default)]
+    pub max_connections_per_ip: i64,
+    #[serde(default)]
+    pub max_new_connections_per_ip: i64,
+    #[serde(default)]
+    pub conn_speed: String,
+    #[serde(default)]
+    pub conn_speed_up: String,
+    #[serde(default)]
+    pub conn_speed_down: String,
 }

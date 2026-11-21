@@ -35,7 +35,7 @@ Unlike single-secret proxies, `mtg-proxy` gives every user their own named secre
 - [Features](#features)
   - [Multiple Secrets & Hot Reload](#multiple-secrets--hot-reload)
   - [Management HTTP API & Stats](#management-http-api--stats)
-  - [Per-User Quotas, Speed, IP Limits, Expiry & Disable](#per-user-quotas-speed-ip-limits-expiry--disable)
+  - [4-Tier Connection & Speed Governance](#4-tier-connection--speed-governance-global-per-secret-per-ip--cgnat-safe-per-connection)
   - [Per-Address Controls, Fair-Share & Bans](#per-address-controls-fair-share--bans)
   - [Secret Rotation with Overlap](#secret-rotation-with-overlap)
   - [Sponsored Channel (`ad-tag`)](#sponsored-channel-ad-tag)
@@ -244,6 +244,9 @@ Configure `api-bind-to` (bind to loopback unless `api-token` is set — verified
 | `GET /stats` | Live global & per-user counters, `features` capability list, `listeners`, `obfuscated`, `faketls_handshake`, and `throttle` state. |
 | `GET /accounting` | Enterprise multi-tenant billing ledger (`bytes_in`, `bytes_out`, `total_connections`, `quota_used`/`remaining`, `quota_cutoffs`, `last_seen`, all limits). |
 | `POST /accounting/flush` | Force an immediate crash-safe atomic flush of `usage-state-file` to disk. |
+| `GET /limits` | Inspect live server-wide `[limits]` (concurrency, global speed/quota, per-IP conn/rate caps, CGNAT-safe `conn-speed`, rejection counts). |
+| `PUT /limits` / `PATCH /limits` | Live atomic update of global `concurrency`, `throttle_max_connections`, `speed*`, `quota`, `max_connections_per_ip`, `max_new_connections_per_ip`, and `conn_speed*`. |
+| `POST /limits/reset-quota` | Reset the server-wide `[limits]` quota counter to zero immediately. |
 | `POST /reload` | Full async hot-reload: `[secrets]`, limits, ad-tags, retiring-secrets, `[throttle]`, `track-client-ips`, `tolerate-time-skewness`, `[domain-fronting]`, and `[defense.allowlist]`/`[defense.blocklist]`. |
 | `GET /secrets` | List all secrets with mode, host, effective ad-tag, limits, retiring info, and live usage. |
 | `POST /secrets` | Add or update one secret (key, optional `ad_tag`, and any governance limits). |
@@ -270,10 +273,30 @@ Configure `api-bind-to` (bind to loopback unless `api-token` is set — verified
 
 Prometheus (`/metrics`) and StatsD UDP exporters are also built in under `[stats.prometheus]` and `[stats.statsd]`.
 
-### Per-User Quotas, Speed, IP Limits, Expiry & Disable
+### 4-Tier Connection & Speed Governance (Global, Per-Secret, Per-IP & CGNAT-Safe Per-Connection)
+
+Enforce lock-free GCRA bandwidth shaping, connection limits, and data quotas across **all four tiers** — hot-reloadable via `SIGHUP`, `POST /reload`, or live `PUT/PATCH /limits` with zero dropped connections:
 
 ```toml
 usage-state-file = "/var/lib/mtg-proxy/usage.json"
+concurrency = 32768               # Hot-reloadable global hard TCP cap
+
+[limits]
+speed = "800mbit"                 # Server-wide combined bandwidth cap (up + down)
+speed-up = "400mbit"              # Server-wide upload cap
+speed-down = "800mbit"            # Server-wide download cap
+quota = "950GB"                   # Server-wide monthly data ceiling (prevents VPS overage!)
+quota-reset = "monthly"           # "none" | "daily" | "weekly" | "monthly"
+max-connections-per-ip = 64       # Global concurrent connections per IPv4 / IPv6 /64
+max-new-connections-per-ip = 25   # Global connect-rate flood shield (conns/sec, burst 2x)
+conn-speed-up = "2mbit"           # CGNAT-safe per-connection upload cap
+conn-speed-down = "8mbit"         # CGNAT-safe per-connection download cap
+
+# Optional defaults inherited by EVERY secret unless overridden in [secret-limits.<name>]:
+[limits.default-secret]
+client-conns = 16
+client-speed-up = "2mbit"
+client-speed-down = "10mbit"
 
 [secret-limits.alice]
 quota = "10GB"            # human size or bare bytes
@@ -283,6 +306,7 @@ speed = "5mbit"           # combined up+down sustained cap (lock-free GCRA)
 speed-up = "2mbit"        # optional directional caps (speed-up / speed-down)
 speed-down = "5mbit"
 ip-limit = 2              # max simultaneous places (IPv4 or IPv6 /64)
+conn-speed-down = "4mbit" # per-connection override for this secret
 expires = "2026-12-31"    # RFC3339 or YYYY-MM-DD
 disabled = false
 ```

@@ -8,7 +8,7 @@ use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -17,14 +17,15 @@ use mtg_config::{
     Config, HandshakeBudgetMode, IpFilterAction, ListConfig, ListenerPolicy, PreferIp,
 };
 use mtg_core::{
-    IpUnit, ModeSet, QuotaReset, RetiringSecret, RotationClock, Secret, SecretLimits, SecretMode,
-    is_personal_ip,
+    GlobalLimits, IpUnit, ModeSet, QuotaReset, RetiringSecret, RotationClock, Secret, SecretLimits,
+    SecretMode, is_personal_ip,
 };
 use mtg_crypto::faketls::X25519KeyRing;
 use mtg_governance::{
     AddressRegistry, BanEntryJson, BanError, BanList, ClientEntry, ClientTable, ConnHandle,
-    EntryInit, FairShareScratch, FakeTlsAntiReplay, LedgerDeny, LiveIpFilter, LiveIpFilterStatus,
-    MatchHints, Obfs2AntiReplay, ObfuscatedLimiter, ScanBudget, ScanBudgetConfig, SecretSet,
+    EntryInit, FairShareScratch, FakeTlsAntiReplay, GlobalIpGuard, LedgerDeny, LiveIpFilter,
+    LiveIpFilterStatus, MatchHints, Obfs2AntiReplay, ObfuscatedLimiter, ScanBudget,
+    ScanBudgetConfig, SecretSet,
 };
 use mtg_net::{
     DEFAULT_CARRIERS_PER_DC, DcRouter, DnsResolver, MiddleProxyPool, ProxyPool, SocketConfig,
@@ -201,7 +202,62 @@ pub struct SecretPatch {
     pub client_conns: Option<u32>,
     pub max_connections: Option<u32>,
     pub client_speed_bytes_per_second: Option<i64>,
+    pub client_speed_up_bytes_per_second: Option<i64>,
+    pub client_speed_down_bytes_per_second: Option<i64>,
     pub client_fair: Option<bool>,
+    pub conn_speed_bytes_per_second: Option<i64>,
+    pub conn_speed_up_bytes_per_second: Option<i64>,
+    pub conn_speed_down_bytes_per_second: Option<i64>,
+}
+
+/// Partial live update payload for `PATCH /limits` (updates only specified global knobs).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GlobalLimitsPatch {
+    pub concurrency: Option<u32>,
+    pub throttle_max_connections: Option<u32>,
+    pub speed_bytes_per_second: Option<i64>,
+    pub speed_up_bytes_per_second: Option<i64>,
+    pub speed_down_bytes_per_second: Option<i64>,
+    pub quota_bytes: Option<i64>,
+    pub add_quota_bytes: Option<i64>,
+    pub reset_quota: bool,
+    pub quota_reset: Option<QuotaReset>,
+    pub max_connections_per_ip: Option<u32>,
+    pub max_new_connections_per_ip: Option<u32>,
+    pub conn_speed_bytes_per_second: Option<i64>,
+    pub conn_speed_up_bytes_per_second: Option<i64>,
+    pub conn_speed_down_bytes_per_second: Option<i64>,
+}
+
+/// Live server-wide connection & speed shaping report returned by `GET /limits`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GlobalLimitsReport {
+    pub concurrency: u32,
+    pub active_connections: i64,
+    pub concurrency_limited_total: u64,
+    pub throttle_max_connections: i64,
+    pub throttle_active: bool,
+    pub speed_limit: i64,
+    pub speed_limit_up: i64,
+    pub speed_limit_down: i64,
+    pub throttled_ms: i64,
+    pub quota: i64,
+    pub quota_used: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_remaining: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub quota_reset: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period_start: Option<DateTime<Utc>>,
+    pub quota_cutoffs: i64,
+    pub max_connections_per_ip: u32,
+    pub max_new_connections_per_ip: u32,
+    pub active_tracked_ips: usize,
+    pub ip_conn_limited_total: u64,
+    pub ip_rate_limited_total: u64,
+    pub conn_speed_limit: i64,
+    pub conn_speed_limit_up: i64,
+    pub conn_speed_limit_down: i64,
 }
 
 /// One upsert entry for atomic `POST /secrets/batch`.
@@ -299,10 +355,12 @@ pub struct ProxyEngine {
     pub hints: MatchHints,
     pub scan_budget: ScanBudget,
     pub obfs_limiter: ObfuscatedLimiter,
+    pub global_ip_guard: Arc<GlobalIpGuard>,
     pub faketls_replay: FakeTlsAntiReplay,
     pub obfs2_replay: Obfs2AntiReplay,
     pub ip_filters: ArcSwap<IpFiltersState>,
     pub fronting_cfg: ArcSwap<FrontingRuntimeConfig>,
+    pub concurrency_live: AtomicU32,
     pub track_client_ips_live: AtomicBool,
     pub tolerate_time_skewness_ms: AtomicU64,
     pub dns: Arc<DnsResolver>,
@@ -476,6 +534,7 @@ impl ProxyEngine {
                 .check_interval
                 .unwrap_or(Duration::from_secs(5)),
         ));
+        metrics.global_limits.apply(&cfg.get_global_limits());
 
         // Pre-register every configured secret & sync ceilings/speed limits.
         for (name, rec) in &secret_set.records {
@@ -593,10 +652,12 @@ impl ProxyEngine {
             hints: MatchHints::new(hints_enabled),
             scan_budget,
             obfs_limiter: ObfuscatedLimiter::new(),
+            global_ip_guard: Arc::new(GlobalIpGuard::new()),
             faketls_replay,
             obfs2_replay,
             ip_filters: ArcSwap::from_pointee(ip_filters),
             fronting_cfg: ArcSwap::from_pointee(fronting_init),
+            concurrency_live: AtomicU32::new(cfg.concurrency.unwrap_or(8192)),
             track_client_ips_live: AtomicBool::new(track_client_ips),
             tolerate_time_skewness_ms: AtomicU64::new(
                 tolerate_time_skewness.as_millis().min(u128::from(u64::MAX)) as u64,
@@ -621,6 +682,136 @@ impl ProxyEngine {
             background_started: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
         }))
+    }
+
+    /// Current hot-reloadable global hard concurrency cap (`0` = unlimited).
+    #[inline]
+    pub fn concurrency_limit(&self) -> u32 {
+        self.concurrency_live.load(Ordering::Acquire)
+    }
+
+    /// Hot-reload global concurrency cap without dropping live streams.
+    pub fn set_concurrency_limit(&self, cap: u32) {
+        self.concurrency_live.store(cap, Ordering::Release);
+    }
+
+    /// Snapshot live global limits, usage, throttled time & rejection counts (`GET /limits`).
+    pub fn global_limits_report(&self) -> GlobalLimitsReport {
+        let gl = &self.metrics.global_limits;
+        let snap = gl.snapshot();
+        let now = Utc::now();
+        gl.rollover_if_needed(now);
+        let used = gl.quota_used.load(Ordering::Relaxed);
+        let remaining = (snap.quota_bytes > 0).then(|| (snap.quota_bytes - used).max(0));
+        let pstart_ns = gl.period_start_ns.load(Ordering::Relaxed);
+        let period_start = (pstart_ns > 0).then(|| DateTime::from_timestamp_nanos(pstart_ns));
+        let conc_lim: u64 = self
+            .metrics
+            .cores
+            .iter()
+            .map(|c| c.concurrency_limited.load(Ordering::Relaxed))
+            .sum();
+        GlobalLimitsReport {
+            concurrency: self.concurrency_limit(),
+            active_connections: self.metrics.total_active_connections(),
+            concurrency_limited_total: conc_lim,
+            throttle_max_connections: self.metrics.throttle_limit.load(Ordering::Acquire),
+            throttle_active: self.metrics.throttle_active.load(Ordering::Acquire),
+            speed_limit: snap.speed_bytes_per_second,
+            speed_limit_up: snap.speed_up_bytes_per_second,
+            speed_limit_down: snap.speed_down_bytes_per_second,
+            throttled_ms: (gl.speed_throttled_ns.load(Ordering::Relaxed) / 1_000_000) as i64,
+            quota: snap.quota_bytes,
+            quota_used: used,
+            quota_remaining: remaining,
+            quota_reset: if matches!(snap.quota_reset, QuotaReset::None) {
+                String::new()
+            } else {
+                snap.quota_reset.as_str().to_owned()
+            },
+            period_start,
+            quota_cutoffs: gl.quota_cutoffs.load(Ordering::Relaxed),
+            max_connections_per_ip: snap.max_connections_per_ip,
+            max_new_connections_per_ip: snap.max_new_connections_per_ip,
+            active_tracked_ips: self.global_ip_guard.active_tracked_ips(),
+            ip_conn_limited_total: gl.ip_conn_limited_total.load(Ordering::Relaxed),
+            ip_rate_limited_total: gl.ip_rate_limited_total.load(Ordering::Relaxed),
+            conn_speed_limit: snap.conn_speed_bytes_per_second,
+            conn_speed_limit_up: snap.conn_speed_up_bytes_per_second,
+            conn_speed_limit_down: snap.conn_speed_down_bytes_per_second,
+        }
+    }
+
+    /// Atomically apply a partial or full live update to global connection & speed limits (`PATCH/PUT /limits`).
+    pub fn patch_global_limits(&self, patch: GlobalLimitsPatch) -> GlobalLimitsReport {
+        if let Some(c) = patch.concurrency {
+            self.set_concurrency_limit(c);
+        }
+        if let Some(t) = patch.throttle_max_connections {
+            self.metrics.set_throttle_limit(i64::from(t));
+        }
+        let mut next = self.metrics.global_limits.snapshot();
+        if let Some(s) = patch.speed_bytes_per_second {
+            next.speed_bytes_per_second = s.max(0);
+        }
+        if let Some(s) = patch.speed_up_bytes_per_second {
+            next.speed_up_bytes_per_second = s.max(0);
+        }
+        if let Some(s) = patch.speed_down_bytes_per_second {
+            next.speed_down_bytes_per_second = s.max(0);
+        }
+        if let Some(q) = patch.quota_bytes {
+            next.quota_bytes = q.max(0);
+        }
+        if let Some(add) = patch.add_quota_bytes {
+            next.quota_bytes = next.quota_bytes.saturating_add(add).max(0);
+        }
+        if let Some(qr) = patch.quota_reset {
+            next.quota_reset = qr;
+        }
+        if let Some(mc) = patch.max_connections_per_ip {
+            next.max_connections_per_ip = mc;
+        }
+        if let Some(mr) = patch.max_new_connections_per_ip {
+            next.max_new_connections_per_ip = mr;
+        }
+        if let Some(s) = patch.conn_speed_bytes_per_second {
+            next.conn_speed_bytes_per_second = s.max(0);
+        }
+        if let Some(s) = patch.conn_speed_up_bytes_per_second {
+            next.conn_speed_up_bytes_per_second = s.max(0);
+        }
+        if let Some(s) = patch.conn_speed_down_bytes_per_second {
+            next.conn_speed_down_bytes_per_second = s.max(0);
+        }
+        self.metrics.global_limits.apply(&next);
+        if patch.reset_quota {
+            self.metrics.global_limits.reset_quota(Utc::now());
+        }
+        self.global_limits_report()
+    }
+
+    /// Replace all server-wide limits (`PUT /limits`).
+    pub fn replace_global_limits(
+        &self,
+        concurrency: Option<u32>,
+        throttle_max_connections: Option<u32>,
+        limits: &GlobalLimits,
+    ) -> GlobalLimitsReport {
+        if let Some(c) = concurrency {
+            self.set_concurrency_limit(c);
+        }
+        if let Some(t) = throttle_max_connections {
+            self.metrics.set_throttle_limit(i64::from(t));
+        }
+        self.metrics.global_limits.apply(limits);
+        self.global_limits_report()
+    }
+
+    /// Reset server-wide quota usage counter to 0 (`POST /limits/reset-quota`).
+    pub fn reset_global_quota(&self) -> GlobalLimitsReport {
+        self.metrics.global_limits.reset_quota(Utc::now());
+        self.global_limits_report()
     }
 
     /// Current hot-reloadable `track-client-ips` state.
@@ -922,6 +1113,11 @@ impl ProxyEngine {
     ) -> Result<(ConnHandle, Arc<ClientEntry>, CancelToken), ()> {
         let now = coarse_utc_now();
 
+        self.metrics.global_limits.rollover_if_needed(now);
+        if self.metrics.global_limits.is_quota_exceeded() {
+            return Err(());
+        }
+
         if limits.disabled {
             return Err(());
         }
@@ -1181,6 +1377,8 @@ impl ProxyEngine {
         )?;
 
         // Hot-reload live operational knobs atomically with zero connection drops!
+        self.set_concurrency_limit(cfg.concurrency.unwrap_or(8192));
+        self.metrics.global_limits.apply(&cfg.get_global_limits());
         self.metrics
             .set_throttle_limit(i64::from(cfg.throttle.max_connections.unwrap_or(0)));
         self.track_client_ips_live
@@ -1295,8 +1493,23 @@ impl ProxyEngine {
         if let Some(cs) = patch.client_speed_bytes_per_second {
             lim.client_speed_bytes_per_second = cs;
         }
+        if let Some(csu) = patch.client_speed_up_bytes_per_second {
+            lim.client_speed_up_bytes_per_second = csu;
+        }
+        if let Some(csd) = patch.client_speed_down_bytes_per_second {
+            lim.client_speed_down_bytes_per_second = csd;
+        }
         if let Some(cf) = patch.client_fair {
             lim.client_fair = cf;
+        }
+        if let Some(cs) = patch.conn_speed_bytes_per_second {
+            lim.conn_speed_bytes_per_second = cs;
+        }
+        if let Some(csu) = patch.conn_speed_up_bytes_per_second {
+            lim.conn_speed_up_bytes_per_second = csu;
+        }
+        if let Some(csd) = patch.conn_speed_down_bytes_per_second {
+            lim.conn_speed_down_bytes_per_second = csd;
         }
         if lim.client_fair && !lim.fair_totals().is_active() {
             return Err(EngineError::Invalid(
@@ -1652,10 +1865,13 @@ impl ProxyEngine {
             let _live_guard = self.live_gate.write_all();
 
             self.clients.apply_ceilings(|name| {
-                new_set
-                    .records
-                    .get(name)
-                    .map(|r| r.limits.client_speed_bytes_per_second)
+                new_set.records.get(name).map(|r| {
+                    (
+                        r.limits.client_speed_bytes_per_second,
+                        r.limits.client_speed_up_bytes_per_second,
+                        r.limits.client_speed_down_bytes_per_second,
+                    )
+                })
             });
             self.clients.apply_fair(now_ns, |name| {
                 new_set.records.get(name).map(|r| r.limits.fair_totals())
@@ -1897,6 +2113,7 @@ impl ProxyEngine {
                         _ = sweep_tick.tick() => {
                             let now_unix = Utc::now().timestamp();
                             engine.clients.sweep(now_unix, mtg_governance::CLIENT_SWEEP_CHUNK);
+                            engine.global_ip_guard.sweep_stale_rates(coarse_now_ns());
                             // Also close streams of newly-expired retiring keys or expired users
                             engine.sweep_expired_streams();
                         }

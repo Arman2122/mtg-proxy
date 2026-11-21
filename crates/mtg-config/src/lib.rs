@@ -15,9 +15,9 @@ pub use rotation::{
 pub use schema::{
     AntiReplayConfig, Config, ConfigError, ConfigListener, ConfigRetiringSecret, ConfigSecretLimit,
     ConfigWeb, DEFAULT_HANDSHAKES_PER_IP, DefenseConfig, DomainFrontingConfig, DoppelgangerConfig,
-    ENV_AD_TAG, ENV_BIND_TO, ENV_SECRET, ENV_SECRET_HOST, HandshakeBudgetConfig, KeepAliveConfig,
-    ListConfig, ListenerPolicy, MISPLACED_RETIRING_USER, NetworkConfig, PrometheusConfig,
-    StatsConfig, StatsdConfig, ThrottleConfig, TimeoutConfig,
+    ENV_AD_TAG, ENV_BIND_TO, ENV_SECRET, ENV_SECRET_HOST, GlobalLimitsConfig,
+    HandshakeBudgetConfig, KeepAliveConfig, ListConfig, ListenerPolicy, MISPLACED_RETIRING_USER,
+    NetworkConfig, PrometheusConfig, StatsConfig, StatsdConfig, ThrottleConfig, TimeoutConfig,
 };
 pub use scrub::{
     UNKNOWN_KEY_LINE, VALUE_NOT_SHOWN, holds_a_value, reads_as_a_value, scrub_error_against_doc,
@@ -343,5 +343,73 @@ cidrs = ["192.0.2.0/33"]
 "#;
         let parsed = Config::parse(bad_cidr).unwrap();
         assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn global_limits_and_default_secret_inheritance_parse_and_validate() {
+        let raw = br#"
+bind-to = "0.0.0.0:443"
+
+[limits]
+speed = "500mbit"
+speed-up = "200mbit"
+speed-down = "400mbit"
+quota = "950GB"
+quota-reset = "monthly"
+max-connections-per-ip = 64
+max-new-connections-per-ip = 25
+conn-speed = "10mbit"
+conn-speed-up = "2mbit"
+conn-speed-down = "8mbit"
+
+[limits.default-secret]
+client-conns = 12
+client-speed-up = "1mbit"
+client-speed-down = "5mbit"
+max-connections = 200
+
+[secrets]
+alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+bob   = "ee0123456789abcdef0123456789abcd9573746f726167652e676f6f676c65617069732e636f6d"
+
+[secret-limits.alice]
+client-speed-down = "20mbit"
+conn-speed-down = "15mbit"
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(
+            cfg.unknown_keys.is_empty(),
+            "unknown: {:?}",
+            cfg.unknown_keys
+        );
+
+        let gl = cfg.get_global_limits();
+        assert_eq!(gl.speed_bytes_per_second, 62_500_000);
+        assert_eq!(gl.speed_up_bytes_per_second, 25_000_000);
+        assert_eq!(gl.speed_down_bytes_per_second, 50_000_000);
+        assert_eq!(gl.quota_bytes, 950 * (1i64 << 30));
+        assert_eq!(gl.quota_reset, mtg_core::QuotaReset::Monthly);
+        assert_eq!(gl.max_connections_per_ip, 64);
+        assert_eq!(gl.max_new_connections_per_ip, 25);
+        assert_eq!(gl.conn_speed_bytes_per_second, 1_250_000);
+        assert_eq!(gl.conn_speed_up_bytes_per_second, 250_000);
+        assert_eq!(gl.conn_speed_down_bytes_per_second, 1_000_000);
+
+        let sl = cfg.get_secret_limits();
+        // bob inherits 100% of [limits.default-secret]
+        let bob = &sl["bob"];
+        assert_eq!(bob.client_conns, 12);
+        assert_eq!(bob.max_connections, 200);
+        assert_eq!(bob.client_speed_up_bytes_per_second, 125_000);
+        assert_eq!(bob.client_speed_down_bytes_per_second, 625_000);
+
+        // alice overrides client-speed-down & conn-speed-down while inheriting the rest!
+        let alice = &sl["alice"];
+        assert_eq!(alice.client_conns, 12);
+        assert_eq!(alice.max_connections, 200);
+        assert_eq!(alice.client_speed_up_bytes_per_second, 125_000);
+        assert_eq!(alice.client_speed_down_bytes_per_second, 2_500_000);
+        assert_eq!(alice.conn_speed_down_bytes_per_second, 1_875_000);
     }
 }
