@@ -13,7 +13,8 @@ pub mod state;
 pub mod worker;
 
 pub use cancel::CancelToken;
-pub use fronting::{FrontingTarget, front_connection};
+pub use doppel_scout::DoppelCatalog;
+pub use fronting::{FrontingPool, FrontingTarget, front_connection};
 pub use metrics::{
     CoreMetrics, DcEndpointStats, FakeTlsCounters, ObfsCounters, ProxyMetrics, SecretRuntime,
     UsageRecord, compute_fair_caps,

@@ -6,6 +6,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [2.1.0] — 2026-11-21
+
+Major FakeTLS (`ee`) hot-path acceleration, Iranian/GFW DPI anti-fingerprinting & stealth-at-wire-speed upgrade, Zero-RTT multi-cover domain fronting engine, and high-throughput `mtg-webrelay` Web Transport overhaul — all verified head-to-head on real Linux Intel Xeon hardware.
+
+### Added
+- **Zero-RTT Warm Domain Fronting Pool (`mtg-engine` — `FrontingPool`):**
+  - Pre-warms clean idle standby TCP sockets to hosted cover origins (verified live & unread via non-blocking `recv(MSG_PEEK | MSG_DONTWAIT)` before handoff) and triggers wait-free, 2-second-throttled reactive pre-warming after legitimate FakeTLS handshakes so reactive DPI replay/active probes experience **0 ms proxy→cover TCP connect RTT** without spamming CDNs when idle.
+  - Added **multi-cover SNI-matched failover** (`fronting_hosts_for`): strictly prioritizes the exact hosted secret cover matching the client's SNI (100% matching TLS certificate, zero SSRF), falling back across configured explicit & alternate hosted covers so active probers never see a bare TCP RST.
+  - Added **anti-self-loop IP filtering** (`filter_self_ips`) stripping `public-ipv4`/`public-ipv6` from resolved fronting addresses, plus per-origin EWMA RTT & failure-cooldown health tracking.
+- **Per-SNI Calibrated Doppelganger Scouting (`mtg-engine` — `DoppelCatalog`):**
+  - Multi-domain proxies now concurrently probe up to `16` distinct cover hosts via `JoinSet` + RFC 8305 Happy Eyeballs and publish per-SNI calibrated TLS certificate-flight noise, Weibull arrival parameters, and DRS flags atomically via `ArcSwap`.
+- **Fresh Ephemeral X25519 Key Exchange per FakeTLS Handshake (`mtg-crypto`):**
+  - Replaced the static 256-entry `X25519KeyRing` (which repeated identical 32-byte `key_share` public keys every 257 connections, creating a DPI fingerprinting distinguisher) with zero-syscall thread-local CSPRNG ephemeral Curve25519 generation on every handshake.
+- **High-Performance Web Transport Covers (`mtg-webrelay`):**
+  - Added a bounded **16 MiB in-memory cache with 5-second mtime revalidation** to `StaticCover` (zero disk syscalls & zero `spawn_blocking` hops on hot hits).
+  - Upgraded `UpstreamCover` with **RFC 8305 Happy Eyeballs dialing**, a **warm HTTP/1.1 keep-alive connection pool** (max 8 idle, 30s TTL, automatic stale-socket retry), and accurate `Host` header rewriting for external HTTPS CDNs.
+
+### Performance & Scalability
+- **Zero-Memmove FakeTLS `ee` Upload & 128 KiB 8-Record Download Coalescing (`mtg-protocol`, `mtg-engine`):**
+  - Added `TlsUnframer::unframe_spans` to locate decrypted TLS record payload slices in-place without `copy_within` memmoves, pairing directly with in-place VAES/AES-NI fused-CTR encryption and vectored writes.
+  - Expanded thread-local `RELAY_SCRATCH` to **128 KiB** (`8 × 16 KiB` FakeTLS records per `writev(2)` batch), halving streaming FakeTLS `ee` download syscalls (`16.02 → 8.03 sys/MB`) while preserving **`0 B` idle I/O RAM** per connection.
+- **Doppelganger Stealth-at-Wire-Speed (`mtg-protocol`, `mtg-engine`):**
+  - Upgraded `DoppelConnState` & `DoppelRelayState` so `shaping = "burst"` + `drs = true` delivers authentic TTFB pacing and Cloudflare/nginx Dynamic Record Sizing (`1450 → 4096 → 16384 B`) after every `> 1s` idle gap, then unlocks full 8-record 128 KiB `writev(2)` wire speed using a single reused pinned `Sleep` (zero per-record heap `Box::pin(sleep)` allocations, cutting syscalls **7.2×** from `64.86 → 8.98 sys/MB`!).
+- **Zero-Alloc, Lock-Free `mtg-webrelay` WebSocket Multiplexer (`mtg-webrelay`):**
+  - Replaced per-session permanent 64 KiB `read_scratch` with thread-local `WEBRELAY_READ_SCRATCH` (**`0 B` idle read buffer per session**, saving ~320 MiB at 5,000 idle sessions).
+  - Replaced `tokio::io::split` (`Arc<BiLock>` mutex on every read/write) with lock-free `PrefixedStream::into_owned_split()` via `TcpStream::into_split()`.
+  - Eliminated per-batch heap allocations in `Outbox`, `write_frame_batch`, and `WsWriter::write_binary_vectored` via reusable `SessionScratch` + stack `[IoSlice; 64]`, hoisted a single throttled pinned idle timer, added fair round-robin stream polling with `batch_budget` burst coalescing, hardened `http1::Builder` with `header_read_timeout(10s)` + `pipeline_flush(true)`, and enabled multi-acceptor `SO_REUSEPORT` scaling.
+
+### Measured Benchmarks (`v2.0.1` vs `v2.1.0` on DigitalOcean `s-2vcpu-2gb-intel`, Xeon Cascade Lake)
+- **FakeTLS `ee` 32-Stream CPU Efficiency:** `2.03 → 1.62 CPU-s/GB` (**`1.26×` less CPU** — matching raw `dd` `1.63 CPU-s/GB`!)
+- **FakeTLS `ee` 1-Stream / 32-Stream Throughput & Tail (`p99`):** `0.22 → 0.25 GiB/s` (`+12%`) / `0.43 → 0.48 GiB/s` (`+12%`), `p99` `14.13 → 11.97 ms` (**`1.18×` tighter**)
+- **Streaming FakeTLS `ee` Download Syscalls:** `16.02 → 8.03 sys/MB` (**`2.00×` fewer syscalls**)
+- **Doppelganger `shaping = "burst" + drs = true` Syscalls:** `64.86 → 8.98 sys/MB` (**`7.22×` fewer syscalls** with authentic DRS ramp `[1371..1439 B]` → `16 KiB`)
+- **5,000-Secret Handshake Rate (with fresh ephemeral X25519):** `970 → 992 hs/s` (`+2%`, zero performance penalty for fresh keys)
+- **WebRelay 4-Stream Shared-Frame v1 Syscalls:** `7.29 → 4.49 sys/MB` (**`1.62×` fewer syscalls**)
+- **WebRelay `StaticCover` (16 MiB cache):** `3,859 → 6,122 req/s` (**`1.59×` faster**), `p50` `246.6 → 150.1 µs`, `p99` `456.7 → 314.3 µs`
+- **WebRelay `UpstreamCover` (keep-alive pool):** `1,397 → 2,808 req/s` (**`2.01×` faster**), `200 → 1` TCP dials per 200 requests (**`200×` fewer upstream handshakes**)
+- **Playwright Real-Chromium WebBridge Harness:** `36/36` checks passing, `0` CSP violations.
+
+---
+
 ## [2.0.1] — 2026-11-20
 
 Critical production-correctness, `ad-tag` MiddleProxy wire-protocol, IPv4-only VPS Happy Eyeballs, and high-concurrency scalability hardening release.

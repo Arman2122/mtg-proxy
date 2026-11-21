@@ -60,9 +60,10 @@ Unlike single-secret proxies, `mtg-proxy` gives every user their own named secre
 |---|---|
 | **Thread-per-Core Runtime** | Pinned single-threaded `LocalSet` workers respecting Linux `sched_getaffinity(0)` (Docker/Kubernetes/systemd `AllowedCPUs=` cpusets) with independent per-core `SO_REUSEPORT` listen queues. |
 | **Zero-Syscall Socket Inheritance** | Tunes `TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_KEEP*`, `TCP_USER_TIMEOUT`, `TCP_NOTSENT_LOWAT`, `TCP_FASTOPEN`, and best-effort `TCP_CONGESTION=bbr` once on each listener before `listen(2)` — **0 `setsockopt` syscalls per accepted connection**. |
-| **Single-Poll Full-Duplex `DirectRelay`** | Owns `(client, dc)` directly (no `into_split()` `Arc`s), shares 1 amortized idle timer, uses L1-hot 64 KiB thread-local scratch (`0 B` idle I/O buffers), batches up to 4 × 16 KiB FakeTLS records per `writev(2)`, and locks live task frame size to **`1,776 B`** via CI unit-test guard. |
-| **Multi-Arch Hardware Crypto** | Single-pass in-place fused double-CTR (`x86_64` **VAES+AVX2** 8-block, **AES-NI** 4-block; `aarch64` **ARMv8 AES** 4-block) + multi-secret FakeTLS HMAC-SHA256 (**4-way interleaved SHA-NI**, **8-way AVX2**, **ARMv8 SHA-256**) with zero-alloc hot paths. |
-| **Zero-Copy Domain Fronting** | Kernel-to-kernel Linux `splice(2)` pipe relay replaying verbatim ClientHello bytes to the cover origin, with automatic userspace fallback under restricted sandboxes. |
+| **Single-Poll Full-Duplex `DirectRelay`** | Owns `(client, dc)` directly (no `into_split()` `Arc`s), shares 1 amortized idle timer, uses zero-memmove `TlsUnframer::unframe_spans` + L1/L2-hot 128 KiB thread-local scratch (`0 B` idle I/O buffers), batches up to 8 × 16 KiB FakeTLS records per `writev(2)` (`8 sys/MB`), and locks live task frame size to **`1,776 B`** via CI unit-test guard. |
+| **Multi-Arch Hardware Crypto** | Single-pass in-place fused double-CTR (`x86_64` **VAES+AVX2** 8-block, **AES-NI** 4-block; `aarch64` **ARMv8 AES** 4-block), per-handshake ephemeral X25519 key shares (zero repeated TLS keys), and multi-secret FakeTLS HMAC-SHA256 (**4-way interleaved SHA-NI**, **8-way AVX2**, **ARMv8 SHA-256**) with zero-alloc hot paths. |
+| **Zero-RTT Domain Fronting (`FrontingPool`)** | Pre-warmed standby TCP pool (liveness-checked via `MSG_PEEK \| MSG_DONTWAIT`) with reactive cover pre-warming for 0 ms proxy→cover connect RTT against active DPI probes, SNI-matched multi-cover failover, anti-self-loop IP filtering, and zero-copy Linux `splice(2)` kernel pipe relay. |
+| **High-Throughput WEB Transport (`mtg-webrelay`)** | Lock-free `TcpStream::into_split()`, `0 B` idle per-session scratch, stack-vectored `writev(2)` Shared-Frame v1 batching, fair round-robin stream coalescing, multi-acceptor `SO_REUSEPORT`, Slowloris-hardened HTTP/1.1, 16 MiB cached `StaticCover`, and Happy-Eyeballs keep-alive pooled `UpstreamCover`. |
 | **Lock-Free & Sharded State** | Cache-line-aligned per-worker admission gate & live-connection shards, per-secret sharded `AddressRegistry`, compact 32-byte `CancelToken`, vDSO `CLOCK_REALTIME_COARSE`/`CLOCK_MONOTONIC_COARSE`, and `tikv-jemallocator` (`percpu_arena:percpu`, 1s dirty/muzzy decay). |
 
 ### Interleaved Linux A/B Benchmarks (`Go v1.10.0` vs `Rust v2.0.0`)
@@ -362,7 +363,16 @@ Features a 3-tier anti-oracle origin (unknown/retired/padded credentials serve t
 
 ### Doppelganger Cover Scouting & Traffic Mimicry
 
-Configure `[defense.doppelganger]` (`shaping = "record" | "burst"`, `drs = true`, `urls = [...]`, `scout-covers = true`) to enable Weibull-distributed TLS record pacing, Cloudflare/nginx-style Dynamic Record Sizing (DRS), and live background TLS scouting (`tokio-rustls`) that measures real cover-site certificate flights and inter-record arrival gaps to calibrate `ServerHello` noise and traffic shapes atomically.
+Configure `[defense.doppelganger]` (`shaping = "burst" | "record"`, `drs = true`, `urls = [...]`, `scout-covers = true`) for DPI-resistant TLS mimicry. Recommended high-throughput stealth configuration:
+
+```toml
+[defense.doppelganger]
+shaping = "burst"    # Authentic TTFB pacing + Cloudflare/nginx DRS ramp after >1s idle, then full 128 KiB wire speed
+drs = true           # Dynamic Record Sizing (1450 -> 4096 -> 16384 B)
+scout-covers = true  # Concurrent per-SNI live TLS scouting (up to 16 cover domains)
+```
+
+Live background TLS scouting (`tokio-rustls` + Happy Eyeballs) measures each hosted cover domain's actual certificate-flight size, jitter, Weibull arrival gaps, and DRS behavior independently (`DoppelCatalog`) and publishes calibrated per-SNI profiles atomically via `ArcSwap`.
 
 ### Public IP Override & Environment Variables
 

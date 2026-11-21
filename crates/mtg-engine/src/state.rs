@@ -160,7 +160,16 @@ pub struct DoppelState {
     pub drs: bool,
     pub scout_covers: bool,
     pub scout_urls: Vec<String>,
-    pub params: ArcSwap<DoppelParams>,
+    pub catalog: ArcSwap<crate::doppel_scout::DoppelCatalog>,
+}
+
+impl DoppelState {
+    /// Look up the live-calibrated [`DoppelParams`] matching the client's SNI
+    /// cover domain (or the aggregated default profile if not scouted per-host).
+    #[inline]
+    pub fn params_for_sni(&self, sni_list: &[String]) -> DoppelParams {
+        self.catalog.load().params_for_sni(sni_list)
+    }
 }
 
 /// Configured proxy runtime parameters derived from [`Config`].
@@ -213,6 +222,7 @@ pub struct ProxyEngine {
     pub proxy_pool: Option<ProxyPool>,
     pub dc_router: Arc<DcRouter>,
     pub middleproxy: Arc<MiddleProxyPool>,
+    pub fronting_pool: Arc<crate::fronting::FrontingPool>,
     pub x25519_keys: X25519KeyRing,
     pub doppel: DoppelState,
     pub metrics: Arc<ProxyMetrics>,
@@ -466,6 +476,11 @@ impl ProxyEngine {
             force_epoll,
         };
 
+        let fronting_pool = Arc::new(crate::fronting::FrontingPool::new(
+            cfg.public_ipv4,
+            cfg.public_ipv6,
+        ));
+
         let doppel_shaping = cfg
             .defense
             .doppelganger
@@ -484,11 +499,13 @@ impl ProxyEngine {
             drs: doppel_drs,
             scout_covers: doppel_scout_covers,
             scout_urls: doppel_scout_urls,
-            params: ArcSwap::from_pointee(DoppelParams {
-                drs: doppel_drs,
-                shaping: doppel_shaping,
-                ..DoppelParams::default()
-            }),
+            catalog: ArcSwap::from_pointee(crate::doppel_scout::DoppelCatalog::from_default(
+                DoppelParams {
+                    drs: doppel_drs,
+                    shaping: doppel_shaping,
+                    ..DoppelParams::default()
+                },
+            )),
         };
 
         Ok(Arc::new(Self {
@@ -511,6 +528,7 @@ impl ProxyEngine {
             proxy_pool,
             dc_router,
             middleproxy,
+            fronting_pool,
             x25519_keys: X25519KeyRing::default(),
             doppel,
             metrics,
@@ -550,23 +568,81 @@ impl ProxyEngine {
         true
     }
 
-    /// Resolve fronting hostname for an unmatched or denied FakeTLS handshake.
-    pub fn fronting_host_for(&self, sni_candidates: &[String]) -> String {
-        if !self.settings.fronting_host.is_empty() {
-            return self.settings.fronting_host.clone();
+    /// Resolve ordered fronting candidate hostnames (primary SNI-matched cover
+    /// first, followed by configured fallback & alternate hosted covers for
+    /// automatic failover without ever accepting arbitrary SSRF targets).
+    pub fn fronting_hosts_for(&self, sni_candidates: &[String]) -> Vec<String> {
+        let explicit = &self.settings.fronting_host;
+        // Dedicated local/reverse-proxy cover (e.g., nginx/caddy on non-443 or loopback/IP literal)
+        // always takes strict precedence over public hosted SNI covers.
+        if !explicit.is_empty()
+            && (self.settings.fronting_port != 443
+                || explicit.eq_ignore_ascii_case("localhost")
+                || explicit.parse::<IpAddr>().is_ok())
+        {
+            return vec![explicit.clone()];
         }
+
+        let mut out: Vec<String> = Vec::with_capacity(4);
+        let push_unique = |list: &mut Vec<String>, host: &str| {
+            if host.is_empty() {
+                return;
+            }
+            if !list.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                list.push(host.to_owned());
+            }
+        };
+
         let set = self.secrets.load();
+        // 1. Exact SNI-matched hosted secret cover (guarantees matching TLS certificate!).
         for sni in sni_candidates {
             if set.sni_bucket(sni).is_some() {
-                return sni.clone();
+                push_unique(&mut out, sni);
+                break;
             }
         }
+        // 2. Configured explicit `[domain-fronting].host` fallback.
+        if !explicit.is_empty() {
+            push_unique(&mut out, explicit);
+        }
+        // 3. Up to 3 total distinct hosted secret covers for automatic failover.
         for rec in set.records.values() {
+            if out.len() >= 3 {
+                break;
+            }
             if rec.secret.is_hosted() {
-                return rec.secret.host().to_owned();
+                push_unique(&mut out, rec.secret.host());
             }
         }
-        String::new()
+        out
+    }
+
+    /// Resolve primary fronting hostname for an unmatched or denied FakeTLS handshake.
+    pub fn fronting_host_for(&self, sni_candidates: &[String]) -> String {
+        self.fronting_hosts_for(sni_candidates)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+
+    /// Trigger non-blocking background pre-warming of a standby TCP socket to
+    /// the cover origin for `sni_candidates`. Called after valid FakeTLS
+    /// handshakes so reactive active DPI probes (replay or fresh TLS probe
+    /// arriving seconds later) experience **0 ms proxy->cover TCP RTT**!
+    pub fn prewarm_fronting_cover(&self, sni_candidates: &[String]) {
+        if self.settings.fronting_port != 443 || !self.fronting_pool.try_claim_prewarm_tick() {
+            return;
+        }
+        if let Some(primary) = self.fronting_hosts_for(sni_candidates).into_iter().next() {
+            self.fronting_pool.schedule_warm_refill(
+                &primary,
+                self.settings.fronting_port,
+                self.settings.tcp_timeout,
+                Arc::clone(&self.dns),
+                self.proxy_pool.clone(),
+                self.settings.sock_cfg,
+            );
+        }
     }
 
     /// Atomically admit a matched connection across all governance checks:
@@ -1325,7 +1401,7 @@ impl ProxyEngine {
                             )
                             .await
                             {
-                                engine.doppel.params.store(Arc::new(updated));
+                                engine.doppel.catalog.store(Arc::new(updated));
                             }
                         }
                         _ = sd.changed() => {

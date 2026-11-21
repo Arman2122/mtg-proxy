@@ -274,6 +274,26 @@ impl DoppelConnState {
         }
     }
 
+    /// True when the connection is inside an active [`ShapingMode::Burst`] and
+    /// has already completed both the idle wake-up pacing delay and any DRS
+    /// ramp (`record_count >= DRS_MAX_AFTER` or `!drs`), allowing the relay to
+    /// stream full-speed multi-record `writev(2)` batches with zero per-record
+    /// timer overhead while preserving authentic burst TTFB + DRS stealth!
+    #[inline]
+    pub const fn is_burst_full_speed(&self, now_ns: u64) -> bool {
+        matches!(self.shaping, ShapingMode::Burst)
+            && self.last_write_ns > 0
+            && now_ns.saturating_sub(self.last_write_ns) <= DRS_IDLE_RESET_NS
+            && (!self.drs || self.record_count >= DRS_MAX_AFTER)
+    }
+
+    /// Update burst activity timestamp during full-speed multi-record batches.
+    #[inline]
+    pub const fn touch_burst_write(&mut self, now_ns: u64, records_sent: u32) {
+        self.last_write_ns = now_ns;
+        self.record_count = self.record_count.saturating_add(records_sent);
+    }
+
     /// Compute `(pacing_delay, max_record_payload)` for the next outbound TLS
     /// ApplicationData record at `now_ns`, updating DRS and idle state cleanly.
     ///

@@ -19,7 +19,7 @@ use http::Request;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use mtg_config::{ClientIpSource, Config, ConfigWeb};
 use mtg_core::Secret;
 use mtg_protocol::proxyproto::{ProxyParseStatus, ProxyProtoMode, parse_proxy_header};
@@ -48,9 +48,55 @@ pub struct PrefixedStream {
     inner: TcpStream,
 }
 
+/// Lock-free read half preserving any leftover prefix bytes alongside
+/// `TcpStream::into_split()`'s `OwnedReadHalf`.
+#[derive(Debug)]
+struct PrefixedReadHalf {
+    prefix: Bytes,
+    inner: tokio::net::tcp::OwnedReadHalf,
+}
+
+impl AsyncRead for PrefixedReadHalf {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.prefix.is_empty() {
+            let n = self.prefix.len().min(buf.remaining());
+            buf.put_slice(&self.prefix.split_to(n));
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
 impl PrefixedStream {
     pub fn new(inner: TcpStream, prefix: Bytes) -> Self {
         Self { prefix, inner }
+    }
+
+    /// Split into lock-free owned read/write halves via `TcpStream::into_split()`
+    /// (completely eliminates `tokio::io::split`'s `Arc<BiLock>` mutex on every
+    /// WebSocket read and write!).
+    pub fn into_owned_split(
+        self,
+    ) -> (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ) {
+        let (r, w) = self.inner.into_split();
+        if self.prefix.is_empty() {
+            (Box::new(r), Box::new(w))
+        } else {
+            (
+                Box::new(PrefixedReadHalf {
+                    prefix: self.prefix,
+                    inner: r,
+                }),
+                Box::new(w),
+            )
+        }
     }
 }
 
@@ -158,7 +204,8 @@ async fn accept_proxy_protocol(
 }
 
 /// Build an [`UpgradedIoExtractor`] for [`PrefixedStream`] that enforces ZERO
-/// pipelined trailing bytes before `101 Switching Protocols`!
+/// pipelined trailing bytes before `101 Switching Protocols` and splits the
+/// underlying `TcpStream` into lock-free owned halves!
 fn prefixed_upgrade_extractor() -> UpgradedIoExtractor {
     Box::new(|upgraded| {
         let parts = upgraded.downcast::<TokioIo<PrefixedStream>>().ok()?;
@@ -166,8 +213,7 @@ fn prefixed_upgrade_extractor() -> UpgradedIoExtractor {
             return None;
         }
         let stream = parts.io.into_inner();
-        let (r, w) = tokio::io::split(stream);
-        Some((Box::new(r), Box::new(w)))
+        Some(stream.into_owned_split())
     })
 }
 
@@ -249,79 +295,108 @@ pub async fn build_origin_from_config(
     Ok(Arc::new(origin))
 }
 
-/// Bind a tuned Linux `TcpListener` with zero-syscall child socket inheritance
+/// Bind tuned Linux `TcpListener`(s) with zero-syscall child socket inheritance
 /// (`TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_USER_TIMEOUT`, `TCP_NOTSENT_LOWAT`,
-/// `TCP_FASTOPEN`, best-effort BBR).
-async fn bind_tuned_listener(bind_addr: &str) -> Result<TcpListener, WebRelayError> {
+/// `TCP_FASTOPEN`, best-effort BBR) and multi-acceptor `SO_REUSEPORT` scaling
+/// on fixed production ports.
+async fn bind_tuned_listeners(bind_addr: &str) -> Result<Vec<TcpListener>, WebRelayError> {
     let sa = resolve_socket_addr(bind_addr).await?;
+    let want_reuse_port = sa.port() != 0;
+    let count = if want_reuse_port {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .clamp(1, 4)
+    } else {
+        1
+    };
+
     let cfg = mtg_net::SocketConfig {
-        reuse_port: false,
+        reuse_port: want_reuse_port,
         ..mtg_net::SocketConfig::default()
     };
-    let sock = mtg_net::create_listener_socket(sa, &cfg)?;
-    let std_listener: std::net::TcpListener = sock.into();
-    Ok(TcpListener::from_std(std_listener)?)
+
+    let mut listeners = Vec::with_capacity(count);
+    for _ in 0..count {
+        let sock = mtg_net::create_listener_socket(sa, &cfg)?;
+        let std_listener: std::net::TcpListener = sock.into();
+        listeners.push(TcpListener::from_std(std_listener)?);
+    }
+    Ok(listeners)
 }
 
-/// Spawn the public HTTP/WebSocket origin listener on `bind_addr`.
+/// Spawn the public HTTP/WebSocket origin listener(s) on `bind_addr`.
 pub async fn spawn_origin_server(
     origin: Arc<Origin>,
     bind_addr: &str,
     require_proxy_proto: bool,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), WebRelayError> {
-    let listener = bind_tuned_listener(bind_addr).await?;
-    let local_addr = listener.local_addr()?;
+    let listeners = bind_tuned_listeners(bind_addr).await?;
+    let local_addr = listeners[0].local_addr()?;
 
     let handle = tokio::spawn(async move {
-        loop {
-            let accept = tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        break;
-                    }
-                    continue;
-                }
-                res = listener.accept() => res,
-            };
-
-            let (stream, raw_peer) = match accept {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!(%e, "web relay accept error");
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    continue;
-                }
-            };
+        let mut acceptors = Vec::with_capacity(listeners.len());
+        for listener in listeners {
             let origin = Arc::clone(&origin);
+            let mut sd = shutdown_rx.clone();
+            acceptors.push(tokio::spawn(async move {
+                loop {
+                    let accept = tokio::select! {
+                        _ = sd.changed() => {
+                            if *sd.borrow() {
+                                break;
+                            }
+                            continue;
+                        }
+                        res = listener.accept() => res,
+                    };
 
-            tokio::spawn(async move {
-                let (client_peer, io_stream) = if require_proxy_proto {
-                    match accept_proxy_protocol(stream, raw_peer).await {
-                        Ok(res) => res,
-                        Err(_) => return,
-                    }
-                } else {
-                    (raw_peer, PrefixedStream::new(stream, Bytes::new()))
-                };
-
-                let io = TokioIo::new(io_stream);
-                let svc = service_fn(move |req: Request<Incoming>| {
+                    let (stream, raw_peer) = match accept {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            warn!(%e, "web relay accept error");
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        }
+                    };
                     let origin = Arc::clone(&origin);
-                    async move {
-                        let resp = origin
-                            .handle_incoming(req, client_peer, prefixed_upgrade_extractor())
-                            .await;
-                        Ok::<_, std::convert::Infallible>(resp)
-                    }
-                });
 
-                let _ = http1::Builder::new()
-                    .keep_alive(true)
-                    .serve_connection(io, svc)
-                    .with_upgrades()
-                    .await;
-            });
+                    tokio::spawn(async move {
+                        let (client_peer, io_stream) = if require_proxy_proto {
+                            match accept_proxy_protocol(stream, raw_peer).await {
+                                Ok(res) => res,
+                                Err(_) => return,
+                            }
+                        } else {
+                            (raw_peer, PrefixedStream::new(stream, Bytes::new()))
+                        };
+
+                        let io = TokioIo::new(io_stream);
+                        let svc = service_fn(move |req: Request<Incoming>| {
+                            let origin = Arc::clone(&origin);
+                            async move {
+                                let resp = origin
+                                    .handle_incoming(req, client_peer, prefixed_upgrade_extractor())
+                                    .await;
+                                Ok::<_, std::convert::Infallible>(resp)
+                            }
+                        });
+
+                        let _ = http1::Builder::new()
+                            .timer(TokioTimer::new())
+                            .keep_alive(true)
+                            .pipeline_flush(true)
+                            .header_read_timeout(Duration::from_secs(10))
+                            .max_buf_size(64 * 1024)
+                            .serve_connection(io, svc)
+                            .with_upgrades()
+                            .await;
+                    });
+                }
+            }));
+        }
+        for acc in acceptors {
+            let _ = acc.await;
         }
     });
 
@@ -365,7 +440,13 @@ pub async fn spawn_stats_server(
                         Ok::<_, std::convert::Infallible>(resp)
                     }
                 });
-                let _ = http1::Builder::new().serve_connection(io, svc).await;
+                let _ = http1::Builder::new()
+                    .timer(TokioTimer::new())
+                    .keep_alive(true)
+                    .header_read_timeout(Duration::from_secs(10))
+                    .max_buf_size(32 * 1024)
+                    .serve_connection(io, svc)
+                    .await;
             });
         }
     });

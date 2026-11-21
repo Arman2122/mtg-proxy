@@ -182,13 +182,13 @@ async fn faketls_handshake_and_dial(
         (parsed, raw_buf, leftover)
     } else {
         // Non-TLS / truncated / malformed probe -> front verbatim bytes!
-        let host = engine.fronting_host_for(&[]);
+        let hosts = engine.fronting_hosts_for(&[]);
         do_front(
             stream,
             client_addr,
             dst_addr,
             &raw_buf,
-            host,
+            hosts,
             worker_id,
             &engine,
         )
@@ -199,14 +199,14 @@ async fn faketls_handshake_and_dial(
     // 4. Match secret: Hints -> SNI bucket -> Budgeted hardware SIMD/SHA-NI scan
     let matched = match_faketls_secret(&parsed, client_ip, &engine).await;
     let Some(m) = matched else {
-        let host = engine.fronting_host_for(&parsed.sni_hostnames);
+        let hosts = engine.fronting_hosts_for(&parsed.sni_hostnames);
         hello_wire.extend_from_slice(&post_hello_buf);
         do_front(
             stream,
             client_addr,
             dst_addr,
             &hello_wire,
-            host,
+            hosts,
             worker_id,
             &engine,
         )
@@ -220,14 +220,14 @@ async fn faketls_handshake_and_dial(
         .seen_before(parsed.hello.session_id.as_slice())
     {
         core_metrics.replay_attacks.fetch_add(1, Ordering::Relaxed);
-        let host = engine.fronting_host_for(&parsed.sni_hostnames);
+        let hosts = engine.fronting_hosts_for(&parsed.sni_hostnames);
         hello_wire.extend_from_slice(&post_hello_buf);
         do_front(
             stream,
             client_addr,
             dst_addr,
             &hello_wire,
-            host,
+            hosts,
             worker_id,
             &engine,
         )
@@ -244,14 +244,14 @@ async fn faketls_handshake_and_dial(
         Some(client_ip),
         &m.limits,
     ) else {
-        let host = engine.fronting_host_for(&parsed.sni_hostnames);
+        let hosts = engine.fronting_hosts_for(&parsed.sni_hostnames);
         hello_wire.extend_from_slice(&post_hello_buf);
         do_front(
             stream,
             client_addr,
             dst_addr,
             &hello_wire,
-            host,
+            hosts,
             worker_id,
             &engine,
         )
@@ -261,6 +261,9 @@ async fn faketls_handshake_and_dial(
 
     // Earned hint: record ONLY after full admission succeeded!
     engine.hints.remember(client_ip, Arc::clone(&m.secret_name));
+    // Trigger throttled (<=1 per 2s) Zero-RTT cover pre-warm so reactive DPI
+    // active probes arriving right after a user handshake see 0 ms connect RTT!
+    engine.prewarm_fronting_cover(&parsed.sni_hostnames);
 
     let release_guard = ReleaseConnGuard {
         engine: Arc::clone(&engine),
@@ -271,13 +274,14 @@ async fn faketls_handshake_and_dial(
     };
 
     // 7. Build & send FakeTLS ServerHello + ChangeCipherSpec + AppData noise!
-    // Uses thread-local `HS_SH_BUF` + non-blocking `try_write` fast path ->
-    // ZERO 16.6 KiB heap allocations per handshake!
+    // Uses per-SNI calibrated cover cert-flight size + thread-local `HS_SH_BUF`
+    // + non-blocking `try_write` fast path -> ZERO heap allocations per handshake!
+    let doppel_params = engine.doppel.params_for_sni(&parsed.sni_hostnames);
     let write_ok = send_server_hello_zero_alloc(
         &mut stream,
         &m.candidate,
         &parsed.hello,
-        engine.doppel.params.load().noise,
+        doppel_params.noise,
         &engine.x25519_keys,
         engine.settings.handshake_timeout,
     )
@@ -311,6 +315,7 @@ async fn faketls_handshake_and_dial(
         client_addr,
         true,
         tls_unframer,
+        doppel_params,
         m.secret_name,
         m.ad_tag,
         obfs_match,
@@ -447,6 +452,7 @@ async fn obfs2_handshake_and_dial(
         client_addr,
         false,
         TlsUnframer::new(),
+        engine.doppel.params_for_sni(&[]),
         secret_name,
         ad_tag,
         obfs_match,
@@ -674,6 +680,7 @@ async fn dial_and_prepare_relay(
     client_addr: SocketAddr,
     is_faketls: bool,
     tls_unframer: TlsUnframer,
+    doppel_params: DoppelParams,
     secret_name: Arc<str>,
     ad_tag: Option<[u8; 16]>,
     obfs_match: mtg_crypto::obfs2::Obfs2Match,
@@ -686,7 +693,7 @@ async fn dial_and_prepare_relay(
 ) -> Option<EstablishedDirectRelay> {
     let user = engine.metrics.user(&secret_name);
     let dc = obfs_match.dc;
-    let doppel = build_doppel_state(engine);
+    let doppel = build_doppel_state(engine, is_faketls, doppel_params);
 
     // 1. Try multiplexed MiddleProxy when `ad_tag` is set!
     if let Some(tag_bytes) = ad_tag {
@@ -801,13 +808,16 @@ async fn dial_and_prepare_relay(
     })
 }
 
-fn build_doppel_state(engine: &ProxyEngine) -> Option<Box<(DoppelConnState, DoppelParams)>> {
-    if !engine.doppel.enabled {
+fn build_doppel_state(
+    engine: &ProxyEngine,
+    is_faketls: bool,
+    params: DoppelParams,
+) -> Option<Box<(DoppelConnState, DoppelParams)>> {
+    if !engine.doppel.enabled || !is_faketls {
         return None;
     }
-    let params = **engine.doppel.params.load();
     Some(Box::new((
-        DoppelConnState::new(engine.doppel.drs, engine.doppel.shaping),
+        DoppelConnState::new(params.drs || engine.doppel.drs, engine.doppel.shaping),
         params,
     )))
 }
@@ -817,12 +827,12 @@ async fn do_front(
     client_addr: SocketAddr,
     local_addr: SocketAddr,
     initial_bytes: &[u8],
-    host: String,
+    hosts: Vec<String>,
     worker_id: u16,
     engine: &ProxyEngine,
 ) {
     let target = FrontingTarget {
-        host,
+        hosts,
         port: engine.settings.fronting_port,
         send_proxy_v2: engine.settings.fronting_proxy_protocol,
         connect_timeout: engine.settings.tcp_timeout,
@@ -834,6 +844,7 @@ async fn do_front(
         local_addr,
         initial_bytes,
         &target,
+        &engine.fronting_pool,
         &engine.dns,
         engine.proxy_pool.as_ref(),
         &engine.settings.sock_cfg,

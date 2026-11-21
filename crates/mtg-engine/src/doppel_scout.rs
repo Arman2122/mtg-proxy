@@ -15,18 +15,19 @@ use std::time::Duration;
 
 use mtg_crypto::NoiseParams;
 use mtg_net::{
-    DnsResolver, ProxyPool, ProxyTarget, SocketConfig, coarse_now_ns, tune_tokio_stream,
+    DnsResolver, ProxyPool, ProxyTarget, SocketConfig, coarse_now_ns, happy_eyeballs_connect,
 };
 use mtg_protocol::doppel::{DoppelParams, ScoutCollector, ShapingMode};
+use rustc_hash::FxHashMap;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info};
 
-/// Maximum cover hosts probed per scouting cycle (prevents DNS/network bursts
-/// when thousands of secrets are configured).
-pub const MAX_SCOUT_TARGETS: usize = 8;
+/// Maximum cover hosts probed concurrently per scouting cycle (prevents
+/// DNS/network bursts when thousands of secrets are configured).
+pub const MAX_SCOUT_TARGETS: usize = 16;
 /// Per-target network timeout during cover scouting.
 pub const SCOUT_TARGET_TIMEOUT: Duration = Duration::from_secs(6);
 /// Maximum post-handshake response bytes read per cover URL for gap sampling.
@@ -269,8 +270,48 @@ pub fn build_scout_tls_connector() -> TlsConnector {
     TlsConnector::from(Arc::new(cfg))
 }
 
-/// Execute one complete scouting round over `targets`, returning aggregated
-/// [`DoppelParams`] if at least one cover server responded cleanly.
+/// Per-SNI calibrated Doppelganger profile catalog published atomically via `ArcSwap`.
+///
+/// When a proxy serves multiple FakeTLS cover domains (e.g. `storage.googleapis.com`
+/// and `www.cloudflare.com`), each domain receives its own exact live-measured
+/// TLS certificate-flight size, jitter, Weibull inter-arrival model, and DRS flag
+/// instead of averaging unrelated websites together!
+#[derive(Debug, Clone, Default)]
+pub struct DoppelCatalog {
+    pub default: DoppelParams,
+    pub per_host: FxHashMap<String, DoppelParams>,
+}
+
+impl DoppelCatalog {
+    #[inline]
+    pub fn from_default(default: DoppelParams) -> Self {
+        Self {
+            default,
+            per_host: FxHashMap::default(),
+        }
+    }
+
+    /// Look up the calibrated [`DoppelParams`] for the first matching client SNI,
+    /// falling back to `self.default`.
+    #[inline]
+    pub fn params_for_sni(&self, sni_list: &[String]) -> DoppelParams {
+        if !self.per_host.is_empty() {
+            for sni in sni_list {
+                if let Some(&p) = self.per_host.get(sni) {
+                    return p;
+                }
+                let lower = sni.to_ascii_lowercase();
+                if let Some(&p) = self.per_host.get(&lower) {
+                    return p;
+                }
+            }
+        }
+        self.default
+    }
+}
+
+/// Execute one complete **concurrent** scouting round over `targets`, returning
+/// a [`DoppelCatalog`] with both per-SNI host profiles and an aggregated fallback!
 pub async fn run_scout_round(
     targets: &[ScoutTarget],
     configured_drs: bool,
@@ -278,14 +319,34 @@ pub async fn run_scout_round(
     dns: &DnsResolver,
     proxy_pool: Option<&ProxyPool>,
     sock_cfg: &SocketConfig,
-) -> Option<DoppelParams> {
+) -> Option<DoppelCatalog> {
     if targets.is_empty() {
         return None;
     }
     let connector = build_scout_tls_connector();
+    let dns_owned = dns.clone();
+    let pool_owned = proxy_pool.cloned();
+    let sc = *sock_cfg;
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for target in targets.iter().take(MAX_SCOUT_TARGETS).cloned() {
+        let conn = connector.clone();
+        let d = dns_owned.clone();
+        let p = pool_owned.clone();
+        join_set.spawn(async move {
+            let res = probe_cover_target(&target, &d, p.as_ref(), &sc, &conn).await;
+            (target, res)
+        });
+    }
+
     let mut samples = Vec::new();
-    for target in targets.iter().take(MAX_SCOUT_TARGETS) {
-        match probe_cover_target(target, dns, proxy_pool, sock_cfg, &connector).await {
+    let mut per_host_samples: FxHashMap<String, Vec<ScoutSample>> = FxHashMap::default();
+
+    while let Some(joined) = join_set.join_next().await {
+        let Ok((target, res)) = joined else {
+            continue;
+        };
+        match res {
             Ok(sample) => {
                 debug!(
                     host = %target.host,
@@ -295,6 +356,10 @@ pub async fn run_scout_round(
                     drs = sample.observed_drs,
                     "doppelganger cover scouted"
                 );
+                per_host_samples
+                    .entry(target.host.clone())
+                    .or_default()
+                    .push(sample.clone());
                 samples.push(sample);
             }
             Err(e) => {
@@ -308,19 +373,26 @@ pub async fn run_scout_round(
         }
     }
 
-    let updated = aggregate_samples(&samples, configured_drs, shaping);
-    if let Some(p) = updated {
-        info!(
-            k = p.k,
-            lambda_ms = p.lambda_ms,
-            drs = p.drs,
-            noise_mean = p.noise.mean,
-            noise_jitter = p.noise.jitter,
-            probed = samples.len(),
-            "doppelganger traffic profile calibrated from live covers"
-        );
+    let default = aggregate_samples(&samples, configured_drs, shaping)?;
+    let mut per_host = FxHashMap::default();
+    for (host, host_samples) in per_host_samples {
+        if let Some(p) = aggregate_samples(&host_samples, configured_drs, shaping) {
+            per_host.insert(host, p);
+        }
     }
-    updated
+
+    info!(
+        k = default.k,
+        lambda_ms = default.lambda_ms,
+        drs = default.drs,
+        noise_mean = default.noise.mean,
+        noise_jitter = default.noise.jitter,
+        probed = samples.len(),
+        per_host_profiles = per_host.len(),
+        "doppelganger traffic profile calibrated from live covers"
+    );
+
+    Some(DoppelCatalog { default, per_host })
 }
 
 async fn dial_target(
@@ -348,18 +420,8 @@ async fn dial_target(
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "scout DNS timeout"))??;
 
-    let mut last_err = io::Error::other("no cover addresses resolved");
-    for sa in addrs {
-        match tokio::time::timeout(SCOUT_TARGET_TIMEOUT, TcpStream::connect(sa)).await {
-            Ok(Ok(stream)) => {
-                let _ = tune_tokio_stream(&stream, sock_cfg);
-                return Ok(stream);
-            }
-            Ok(Err(e)) => last_err = e,
-            Err(_) => last_err = io::Error::new(io::ErrorKind::TimedOut, "scout connect timeout"),
-        }
-    }
-    Err(last_err)
+    let (stream, _) = happy_eyeballs_connect(&addrs, sock_cfg, SCOUT_TARGET_TIMEOUT).await?;
+    Ok(stream)
 }
 
 #[cfg(test)]

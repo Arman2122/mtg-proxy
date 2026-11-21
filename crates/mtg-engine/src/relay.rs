@@ -24,10 +24,12 @@ use tokio::net::TcpStream;
 use crate::cancel::CancelToken;
 use crate::metrics::{DcEndpointStats, SecretRuntime};
 
-/// Upload read batch capacity (64 KiB — up to 4 FakeTLS records per read(2) syscall).
-const UPLOAD_SCRATCH_CAP: usize = 64 * 1024;
-/// Download coalesced read capacity (64 KiB = 4 x 16 KiB FakeTLS records per read(2)/writev(2)!).
-const DOWNLOAD_BATCH_RECORDS: usize = 4;
+/// Upload read batch capacity (128 KiB — up to 8 FakeTLS records per read(2) syscall).
+const UPLOAD_SCRATCH_CAP: usize = 128 * 1024;
+/// Maximum zero-memmove FakeTLS upload payload spans tracked on stack per read(2).
+const UPLOAD_MAX_SPANS: usize = 16;
+/// Download coalesced read capacity (8 x 16 KiB FakeTLS records = ~128 KiB per read(2)/writev(2)!).
+const DOWNLOAD_BATCH_RECORDS: usize = 8;
 const DOWNLOAD_SCRATCH_CAP: usize = DOWNLOAD_BATCH_RECORDS * MAX_TLS_RECORD_PAYLOAD;
 /// Fairness burst cap per direction per poll turn (256 KiB keeps p99/p99.9 flat under 32+ streams).
 const POLL_BURST_CAP: usize = 256 * 1024;
@@ -38,7 +40,7 @@ thread_local! {
     /// Per-worker L1/L2-hot scratch buffer for readiness-gated zero-idle-RAM relay.
     /// Idle connections hold ZERO bytes of I/O buffer!
     static RELAY_SCRATCH: RefCell<Box<[u8; UPLOAD_SCRATCH_CAP]>> =
-        RefCell::new(vec![0u8; UPLOAD_SCRATCH_CAP].into_boxed_slice().try_into().expect("64 KiB"));
+        RefCell::new(vec![0u8; UPLOAD_SCRATCH_CAP].into_boxed_slice().try_into().expect("128 KiB"));
 }
 
 /// Context passed into the bidirectional hot relay for one admitted stream.
@@ -59,7 +61,10 @@ struct DoppelRelayState {
     conn: DoppelConnState,
     params: DoppelParams,
     next_cap: Option<usize>,
+    /// Reusable pinned Sleep timer (allocated at most once per shaped stream,
+    /// reset in-place via `.as_mut().reset(...)` — zero per-record heap allocs!).
     delay: Option<Pin<Box<tokio::time::Sleep>>>,
+    delay_active: bool,
 }
 
 enum DrainResult {
@@ -126,6 +131,7 @@ impl DirectRelay {
                 params,
                 next_cap: None,
                 delay: None,
+                delay_active: false,
             })
         });
         Self {
@@ -285,18 +291,148 @@ impl DirectRelay {
                             match self.client.try_read(&mut scratch[..UPLOAD_SCRATCH_CAP]) {
                                 Ok(0) => ReadStep::Eof,
                                 Ok(n) => {
-                                    let moved = if self.is_faketls {
-                                        match self.tls_unframer.unframe_in_place(&mut scratch[..n])
+                                    if self.is_faketls {
+                                        // Zero-memmove fast path: locate payload spans in-place,
+                                        // run fused CTR directly on each span, and writev(2)!
+                                        let mut spans = [(0usize, 0usize); UPLOAD_MAX_SPANS];
+                                        match self
+                                            .tls_unframer
+                                            .unframe_spans(&scratch[..n], &mut spans)
                                         {
-                                            Ok(w) => w,
+                                            Ok(Some(0)) => return ReadStep::ZeroApp,
+                                            Ok(Some(span_count)) => {
+                                                let mut moved = 0usize;
+                                                for &(s, e) in &spans[..span_count] {
+                                                    moved += e - s;
+                                                }
+                                                if up_paced {
+                                                    self.up_pending.clear();
+                                                    self.up_off = 0;
+                                                    self.up_pending.reserve(moved);
+                                                    for &(s, e) in &spans[..span_count] {
+                                                        self.up_pending
+                                                            .extend_from_slice(&scratch[s..e]);
+                                                    }
+                                                    return ReadStep::NeedPace(moved);
+                                                }
+                                                for &(s, e) in &spans[..span_count] {
+                                                    self.fused_up
+                                                        .apply_fused_in_place(&mut scratch[s..e]);
+                                                }
+                                                if span_count == 1 {
+                                                    let (s, e) = spans[0];
+                                                    return match self.dc.try_write(&scratch[s..e]) {
+                                                        Ok(w) if w == moved => {
+                                                            ReadStep::Sent(moved)
+                                                        }
+                                                        Ok(0) => ReadStep::Err,
+                                                        Ok(w) => {
+                                                            self.up_pending.clear();
+                                                            self.up_off = 0;
+                                                            self.up_pending.extend_from_slice(
+                                                                &scratch[s + w..e],
+                                                            );
+                                                            ReadStep::Partial(moved)
+                                                        }
+                                                        Err(ref err)
+                                                            if err.kind()
+                                                                == io::ErrorKind::WouldBlock =>
+                                                        {
+                                                            self.up_pending.clear();
+                                                            self.up_off = 0;
+                                                            self.up_pending
+                                                                .extend_from_slice(&scratch[s..e]);
+                                                            ReadStep::Partial(moved)
+                                                        }
+                                                        Err(_) => ReadStep::Err,
+                                                    };
+                                                }
+                                                let mut iov = [IoSlice::new(&[]); UPLOAD_MAX_SPANS];
+                                                for (idx, &(s, e)) in
+                                                    spans[..span_count].iter().enumerate()
+                                                {
+                                                    iov[idx] = IoSlice::new(&scratch[s..e]);
+                                                }
+                                                return match self
+                                                    .dc
+                                                    .try_write_vectored(&iov[..span_count])
+                                                {
+                                                    Ok(w) if w == moved => ReadStep::Sent(moved),
+                                                    Ok(0) => ReadStep::Err,
+                                                    Ok(w) => {
+                                                        self.up_pending.clear();
+                                                        self.up_off = 0;
+                                                        copy_vectored_tail(
+                                                            &iov[..span_count],
+                                                            w,
+                                                            &mut self.up_pending,
+                                                        );
+                                                        ReadStep::Partial(moved)
+                                                    }
+                                                    Err(ref err)
+                                                        if err.kind()
+                                                            == io::ErrorKind::WouldBlock =>
+                                                    {
+                                                        self.up_pending.clear();
+                                                        self.up_off = 0;
+                                                        copy_vectored_tail(
+                                                            &iov[..span_count],
+                                                            0,
+                                                            &mut self.up_pending,
+                                                        );
+                                                        ReadStep::Partial(moved)
+                                                    }
+                                                    Err(_) => ReadStep::Err,
+                                                };
+                                            }
+                                            Ok(None) => {
+                                                // Rare: >16 tiny TLS records in one read -> compact fallback.
+                                                let Ok(moved) = self
+                                                    .tls_unframer
+                                                    .unframe_in_place(&mut scratch[..n])
+                                                else {
+                                                    return ReadStep::Err;
+                                                };
+                                                if moved == 0 {
+                                                    return ReadStep::ZeroApp;
+                                                }
+                                                if up_paced {
+                                                    self.up_pending.clear();
+                                                    self.up_off = 0;
+                                                    self.up_pending
+                                                        .extend_from_slice(&scratch[..moved]);
+                                                    return ReadStep::NeedPace(moved);
+                                                }
+                                                self.fused_up
+                                                    .apply_fused_in_place(&mut scratch[..moved]);
+                                                return match self.dc.try_write(&scratch[..moved]) {
+                                                    Ok(w) if w == moved => ReadStep::Sent(moved),
+                                                    Ok(0) => ReadStep::Err,
+                                                    Ok(w) => {
+                                                        self.up_pending.clear();
+                                                        self.up_off = 0;
+                                                        self.up_pending
+                                                            .extend_from_slice(&scratch[w..moved]);
+                                                        ReadStep::Partial(moved)
+                                                    }
+                                                    Err(ref err)
+                                                        if err.kind()
+                                                            == io::ErrorKind::WouldBlock =>
+                                                    {
+                                                        self.up_pending.clear();
+                                                        self.up_off = 0;
+                                                        self.up_pending
+                                                            .extend_from_slice(&scratch[..moved]);
+                                                        ReadStep::Partial(moved)
+                                                    }
+                                                    Err(_) => ReadStep::Err,
+                                                };
+                                            }
                                             Err(_) => return ReadStep::Err,
                                         }
-                                    } else {
-                                        n
-                                    };
-                                    if moved == 0 {
-                                        return ReadStep::ZeroApp;
                                     }
+
+                                    let moved = n;
                                     if up_paced {
                                         self.up_pending.clear();
                                         self.up_off = 0;
@@ -450,31 +586,50 @@ impl DirectRelay {
             let mut doppel_waiting = false;
             let mut max_read = DOWNLOAD_SCRATCH_CAP;
             let mut single_record_mode = false;
+            let mut burst_full_speed = false;
 
             if self.is_faketls
                 && let Some(d) = self.doppel.as_mut()
             {
-                single_record_mode = true;
-                if let Some(delay) = d.delay.as_mut() {
+                if d.delay_active
+                    && let Some(delay) = d.delay.as_mut()
+                {
                     if delay.as_mut().poll(cx).is_pending() {
                         doppel_waiting = true;
                     } else {
-                        d.delay = None;
-                    }
-                }
-                if !doppel_waiting && d.next_cap.is_none() {
-                    let (delay_dur, cap) = d.conn.next_record(&d.params, coarse_now_ns());
-                    d.next_cap = Some(cap.clamp(1, MAX_TLS_RECORD_PAYLOAD));
-                    if !delay_dur.is_zero() {
-                        let mut sleep = Box::pin(tokio::time::sleep(delay_dur));
-                        if sleep.as_mut().poll(cx).is_pending() {
-                            d.delay = Some(sleep);
-                            doppel_waiting = true;
-                        }
+                        d.delay_active = false;
                     }
                 }
                 if !doppel_waiting {
-                    max_read = d.next_cap.unwrap_or(MAX_TLS_RECORD_PAYLOAD);
+                    let now_ns = coarse_now_ns();
+                    if d.next_cap.is_none() && d.conn.is_burst_full_speed(now_ns) {
+                        // Burst mode after initial TTFB pacing & DRS ramp: unlock
+                        // full 8-record 128 KiB writev(2) zero-copy batching!
+                        burst_full_speed = true;
+                    } else {
+                        single_record_mode = true;
+                        if d.next_cap.is_none() {
+                            let (delay_dur, cap) = d.conn.next_record(&d.params, now_ns);
+                            d.next_cap = Some(cap.clamp(1, MAX_TLS_RECORD_PAYLOAD));
+                            if !delay_dur.is_zero() {
+                                let target = tokio::time::Instant::now() + delay_dur;
+                                let sleep = if let Some(existing) = d.delay.as_mut() {
+                                    existing.as_mut().reset(target);
+                                    existing
+                                } else {
+                                    d.delay = Some(Box::pin(tokio::time::sleep_until(target)));
+                                    d.delay.as_mut().expect("just inserted")
+                                };
+                                if sleep.as_mut().poll(cx).is_pending() {
+                                    d.delay_active = true;
+                                    doppel_waiting = true;
+                                }
+                            }
+                        }
+                        if !doppel_waiting {
+                            max_read = d.next_cap.unwrap_or(MAX_TLS_RECORD_PAYLOAD);
+                        }
+                    }
                 }
             }
 
@@ -597,6 +752,10 @@ impl DirectRelay {
                                 ReadStep::Sent(n) => {
                                     spurious_wb = 0;
                                     down_moved += n;
+                                    if burst_full_speed && let Some(d) = self.doppel.as_mut() {
+                                        let recs = n.div_ceil(MAX_TLS_RECORD_PAYLOAD) as u32;
+                                        d.conn.touch_burst_write(coarse_now_ns(), recs);
+                                    }
                                     if single_record_mode {
                                         if let Some(d) = self.doppel.as_mut() {
                                             d.next_cap = None;
@@ -614,6 +773,10 @@ impl DirectRelay {
                                 }
                                 ReadStep::Partial(n) => {
                                     down_moved += n;
+                                    if burst_full_speed && let Some(d) = self.doppel.as_mut() {
+                                        let recs = n.div_ceil(MAX_TLS_RECORD_PAYLOAD) as u32;
+                                        d.conn.touch_burst_write(coarse_now_ns(), recs);
+                                    }
                                     if single_record_mode && let Some(d) = self.doppel.as_mut() {
                                         d.next_cap = None;
                                     }

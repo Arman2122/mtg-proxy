@@ -15,12 +15,13 @@
 //!   cancel-safe for single-task `tokio::select!` multiplexing.
 
 use std::io::{self, IoSlice};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use bytes::{Buf as _, Bytes, BytesMut};
 use http::{HeaderMap, Method, Version};
+use mtg_net::coarse_now_ns;
 use sha1::{Digest as _, Sha1};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -244,7 +245,7 @@ pub struct WsReader<R> {
     in_frag: bool,
     frag_count: usize,
     max_message: usize,
-    ping_window_start: Instant,
+    ping_window_start_ns: u64,
     ping_count: u32,
 }
 
@@ -263,7 +264,7 @@ impl<R: AsyncRead + Unpin> WsReader<R> {
             in_frag: false,
             frag_count: 0,
             max_message: max_msg,
-            ping_window_start: Instant::now(),
+            ping_window_start_ns: coarse_now_ns(),
             ping_count: 0,
         }
     }
@@ -276,13 +277,13 @@ impl<R: AsyncRead + Unpin> WsReader<R> {
         loop {
             if let Some(ev) = self.try_parse_next()? {
                 // Reclaim oversized read buffer capacity once drained to keep idle RSS minimal!
-                if self.read_buf.is_empty() && self.read_buf.capacity() > 16 * 1024 {
+                if self.read_buf.is_empty() && self.read_buf.capacity() > 32 * 1024 {
                     self.read_buf = BytesMut::new();
                 }
                 return Ok(ev);
             }
-            if self.read_buf.capacity() - self.read_buf.len() < 4096 {
-                self.read_buf.reserve(4096);
+            if self.read_buf.capacity() - self.read_buf.len() < 16 * 1024 {
+                self.read_buf.reserve(16 * 1024);
             }
             let n = self.io.read_buf(&mut self.read_buf).await?;
             if n == 0 {
@@ -409,9 +410,11 @@ impl<R: AsyncRead + Unpin> WsReader<R> {
             if is_control {
                 match opcode {
                     OP_PING => {
-                        let now = Instant::now();
-                        if now.duration_since(self.ping_window_start) >= PING_WINDOW {
-                            self.ping_window_start = now;
+                        let now_ns = coarse_now_ns();
+                        if now_ns.saturating_sub(self.ping_window_start_ns)
+                            >= PING_WINDOW.as_nanos() as u64
+                        {
+                            self.ping_window_start_ns = now_ns;
                             self.ping_count = 0;
                         }
                         self.ping_count = self.ping_count.saturating_add(1);
@@ -499,11 +502,26 @@ impl<W: AsyncWrite + Unpin> WsWriter<W> {
     }
 
     /// Write a single binary WebSocket message whose payload is scattered across
-    /// `slices` using vectored `writev(2)` syscalls (zero intermediate copy!).
+    /// `slices` using zero-alloc stack-vectored `writev(2)` syscalls (zero
+    /// intermediate payload copy and zero heap allocation for `<= 63` slices!).
     pub async fn write_binary_vectored(&mut self, slices: &[&[u8]]) -> Result<(), WsError> {
         let total: usize = slices.iter().map(|s| s.len()).sum();
         let mut hdr = [0u8; 10];
         let hdr_len = encode_server_header(&mut hdr, OP_BINARY, total);
+
+        // Zero-alloc stack fast path for up to 63 payload slices (covers 99.99% of batches!).
+        if slices.len() < 64 {
+            let mut stack_bufs: [&[u8]; 64] = [&[]; 64];
+            stack_bufs[0] = &hdr[..hdr_len];
+            let mut count = 1usize;
+            for s in slices {
+                if !s.is_empty() {
+                    stack_bufs[count] = s;
+                    count += 1;
+                }
+            }
+            return self.write_all_vectored_timeout(&stack_bufs[..count]).await;
+        }
 
         let mut bufs: Vec<&[u8]> = Vec::with_capacity(slices.len() + 1);
         bufs.push(&hdr[..hdr_len]);
@@ -560,23 +578,28 @@ impl<W: AsyncWrite + Unpin> WsWriter<W> {
         let fut = async {
             let mut idx = 0usize;
             let mut off = 0usize;
-            let mut io_slices: Vec<IoSlice<'_>> = Vec::with_capacity(slices.len().min(64));
+            let mut io_slices: [IoSlice<'_>; 64] = [IoSlice::new(&[]); 64];
 
             while idx < slices.len() {
-                io_slices.clear();
+                let mut n_io = 0usize;
                 let first = &slices[idx][off..];
                 if !first.is_empty() {
-                    io_slices.push(IoSlice::new(first));
+                    io_slices[n_io] = IoSlice::new(first);
+                    n_io += 1;
                 }
-                for s in slices.iter().skip(idx + 1).take(63) {
+                for s in slices.iter().skip(idx + 1) {
+                    if n_io >= 64 {
+                        break;
+                    }
                     if !s.is_empty() {
-                        io_slices.push(IoSlice::new(s));
+                        io_slices[n_io] = IoSlice::new(s);
+                        n_io += 1;
                     }
                 }
-                if io_slices.is_empty() {
+                if n_io == 0 {
                     break;
                 }
-                let mut written = self.io.write_vectored(&io_slices).await?;
+                let mut written = self.io.write_vectored(&io_slices[..n_io]).await?;
                 if written == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,

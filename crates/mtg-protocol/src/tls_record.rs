@@ -64,6 +64,101 @@ impl TlsUnframer {
         self.hdr_len > 0 || self.app_rem > 0 || self.skip_rem > 0
     }
 
+    /// Zero-memmove span-based TLS record unframer.
+    ///
+    /// Scans `buf` and writes `(start, end)` byte spans of ApplicationData
+    /// payload slices into `out_spans` **without moving any payload bytes**.
+    /// Returns `Ok(Some(span_count))` if all payload slices in `buf` fit in
+    /// `out_spans` (the 99.99% fast path for reads up to 128 KiB!), or
+    /// `Ok(None)` if `buf` contained more records than `out_spans.len()` (in
+    /// which case `self` is left **unmodified** so the caller can seamlessly
+    /// fall back to [`Self::unframe_in_place`]).
+    pub fn unframe_spans(
+        &mut self,
+        buf: &[u8],
+        out_spans: &mut [(usize, usize)],
+    ) -> Result<Option<usize>, TlsRecordError> {
+        let saved = *self;
+        let len = buf.len();
+        let mut r = 0usize;
+        let mut count = 0usize;
+
+        while r < len {
+            if self.app_rem > 0 {
+                let take = (len - r).min(usize::from(self.app_rem));
+                if count >= out_spans.len() {
+                    *self = saved;
+                    return Ok(None);
+                }
+                // Coalesce immediately adjacent spans if any.
+                if count > 0 && out_spans[count - 1].1 == r {
+                    out_spans[count - 1].1 = r + take;
+                } else {
+                    out_spans[count] = (r, r + take);
+                    count += 1;
+                }
+                r += take;
+                self.app_rem -= take as u16;
+                continue;
+            }
+
+            if self.skip_rem > 0 {
+                let drop_n = (len - r).min(usize::from(self.skip_rem));
+                r += drop_n;
+                self.skip_rem -= drop_n as u16;
+                continue;
+            }
+
+            let need = TLS_HEADER_LEN - usize::from(self.hdr_len);
+            let avail = len - r;
+            if avail < need {
+                let start = usize::from(self.hdr_len);
+                self.hdr[start..start + avail].copy_from_slice(&buf[r..len]);
+                self.hdr_len += avail as u8;
+                break;
+            }
+
+            let hdr = if self.hdr_len == 0 {
+                let h = [buf[r], buf[r + 1], buf[r + 2], buf[r + 3], buf[r + 4]];
+                r += TLS_HEADER_LEN;
+                h
+            } else {
+                let start = usize::from(self.hdr_len);
+                self.hdr[start..TLS_HEADER_LEN].copy_from_slice(&buf[r..r + need]);
+                r += need;
+                self.hdr_len = 0;
+                self.hdr
+            };
+
+            if hdr[1] != TLS_RECORD_VERSION[0] || hdr[2] != TLS_RECORD_VERSION[1] {
+                return Err(TlsRecordError::InvalidVersion(hdr[1], hdr[2]));
+            }
+
+            let rec_type = hdr[0];
+            let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]);
+
+            if rec_type == TLS_RECORD_APPLICATION_DATA {
+                if rec_len == 0 {
+                    self.control_streak = self.control_streak.saturating_add(1);
+                    if self.control_streak > MAX_EMPTY_OR_NON_APP_STREAK {
+                        return Err(TlsRecordError::ExcessiveControlRecords);
+                    }
+                } else {
+                    self.control_streak = 0;
+                    self.app_rem = rec_len;
+                }
+            } else {
+                self.control_streak = self.control_streak.saturating_add(1);
+                if self.control_streak > MAX_EMPTY_OR_NON_APP_STREAK {
+                    return Err(TlsRecordError::ExcessiveControlRecords);
+                }
+                self.skip_rem = rec_len;
+            }
+        }
+
+        Ok(Some(count))
+    }
+
     /// Unframe TLS records in `buf` **in place** with zero allocations,
     /// compacting extracted ApplicationData payload into `buf[..written]` and
     /// returning `written`.
@@ -241,19 +336,36 @@ mod tests {
             }
 
             let mut u = TlsUnframer::new();
+            let mut u_spans = TlsUnframer::new();
             let mut got = Vec::new();
+            let mut got_spans = Vec::new();
             let mut pos = 0;
             let mut step_idx = 0;
             while pos < wire.len() {
                 let step = read_sizes[step_idx % read_sizes.len()].min(wire.len() - pos);
-                let mut slice = wire[pos..pos + step].to_vec();
+                let orig = wire[pos..pos + step].to_vec();
+                let mut slice = orig.clone();
                 let n = u.unframe_in_place(&mut slice).unwrap();
                 got.extend_from_slice(&slice[..n]);
+
+                let mut spans = [(0usize, 0usize); 4];
+                if let Some(sc) = u_spans.unframe_spans(&orig, &mut spans).unwrap() {
+                    for &(s, e) in &spans[..sc] {
+                        got_spans.extend_from_slice(&orig[s..e]);
+                    }
+                } else {
+                    let mut fallback = orig;
+                    let m = u_spans.unframe_in_place(&mut fallback).unwrap();
+                    got_spans.extend_from_slice(&fallback[..m]);
+                }
+
                 pos += step;
                 step_idx += 1;
             }
             prop_assert!(!u.is_mid_record());
-            prop_assert_eq!(got, expected);
+            prop_assert!(!u_spans.is_mid_record());
+            prop_assert_eq!(got, expected.clone());
+            prop_assert_eq!(got_spans, expected);
         }
     }
 }

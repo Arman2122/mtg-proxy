@@ -17,6 +17,7 @@
 //!   budget (`32 MiB / 16,384 items` with `CONTROL_RESERVE = 1024`) so control
 //!   frames (`CLOSE`, `WINDOW`, `BYE`) are never starved by bulk `DATA`.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -27,7 +28,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+use mtg_net::coarse_now_ns;
 use mtg_protocol::proxyproto::encode_v2_tcp;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
@@ -35,6 +37,25 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::debug;
+
+thread_local! {
+    /// Per-worker reusable 64 KiB read staging buffer shared across ALL WebRelay
+    /// sessions on this thread -> **0 B** idle read scratch per session!
+    static WEBRELAY_READ_SCRATCH: RefCell<Vec<u8>> =
+        RefCell::new(vec![0u8; MAX_RELAY_DATA_CHUNK]);
+}
+
+/// Reusable per-session scratch vectors (0 B while idle; eliminates per-batch
+/// and per-poll `Vec`/`BytesMut` heap allocations during active traffic!).
+#[derive(Default)]
+struct SessionScratch {
+    batch_frames: Vec<Frame>,
+    header_scratch: Vec<u8>,
+    header_spans: Vec<(usize, usize)>,
+    stream_ids: Vec<u32>,
+    to_close: Vec<u32>,
+    rr_cursor: usize,
+}
 
 use crate::frame::{
     Direction, Frame, FrameLimits, FrameType, HEADER_SIZE, INITIAL_WINDOW, MAX_RELAY_DATA_CHUNK,
@@ -279,10 +300,11 @@ impl Outbox {
         true
     }
 
-    /// Pop a coalesced batch of frames fitting within `batch_budget` bytes,
-    /// draining control frames first so `CLOSE`/`WINDOW` are never starved.
-    fn take_batch(&mut self, batch_budget: usize) -> Vec<Frame> {
-        let mut out = Vec::new();
+    /// Pop a coalesced batch of frames fitting within `batch_budget` bytes into
+    /// reusable `out` (zero per-batch heap allocation!), draining control frames
+    /// first so `CLOSE`/`WINDOW` are never starved.
+    fn take_batch_into(&mut self, batch_budget: usize, out: &mut Vec<Frame>) {
+        out.clear();
         let mut used = 0usize;
 
         while let Some(front) = self.control.front() {
@@ -308,8 +330,6 @@ impl Outbox {
                 out.push(f);
             }
         }
-
-        out
     }
 
     #[inline]
@@ -443,16 +463,21 @@ where
         DEFAULT_SESSION_PENDING_ITEMS,
         Arc::clone(&cfg.global_budget),
     );
-    // ONE shared 64 KiB read scratch buffer for the ENTIRE session (0B per idle stream!).
-    let mut read_scratch = vec![0u8; max_payload.max(4096)];
+    let mut scratch = SessionScratch::default();
     let mut pending_pong: Option<Bytes> = None;
 
-    let mut idle_deadline = Instant::now() + idle_timeout;
+    // ONE pinned idle timer reused for the entire session lifetime (throttled
+    // resets at 1s granularity via vDSO `coarse_now_ns()` -> zero timer churn!).
+    let idle_timeout_ns = idle_timeout.as_nanos().min(u128::from(u64::MAX)) as u64;
+    let mut last_activity_ns = coarse_now_ns();
+    let mut last_reset_ns = last_activity_ns;
+    let idle_sleep = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle_sleep);
     let mut ping_sent = false;
     let close_code;
     let mut result = Ok(());
 
-    // Helper closure to close & clean up all remaining streams on exit.
+    // Helper counter to close & clean up all remaining streams on exit.
     let mut active_stream_count_tracked: usize = 0;
 
     loop {
@@ -465,28 +490,23 @@ where
             break;
         }
 
-        // 2. Drain any ready downlink batch via vectored writev(2)!
+        // 2. Drain any ready downlink batch via zero-alloc stack-vectored writev(2)!
         if !outbox.is_empty() {
-            let batch = outbox.take_batch(batch_budget);
-            if !batch.is_empty()
-                && let Err(e) = write_frame_batch(&mut ws_writer, &batch).await
+            outbox.take_batch_into(batch_budget, &mut scratch.batch_frames);
+            if !scratch.batch_frames.is_empty()
+                && let Err(e) = write_frame_batch(&mut ws_writer, &mut scratch).await
             {
                 close_code = e.close_code();
                 result = Err(e);
                 break;
             }
-            // Loop immediately to check if more downlink frames or control arrived
-            // without starving reads.
         }
 
         // 3. Single-task cooperative multiplex:
         //    - External DELETE / shutdown cancellation
         //    - Incoming WebSocket events (cancel-safe!)
         //    - All active streams' dial/write/readiness-gated read in ONE poll_fn!
-        //    - Idle liveness timer (Ping after 1x idle, close after 2x idle)
-        let sleep = tokio::time::sleep_until(idle_deadline);
-        tokio::pin!(sleep);
-
+        //    - Reused pinned idle liveness timer (Ping after 1x idle, close after 2x idle)
         tokio::select! {
             biased;
 
@@ -498,7 +518,12 @@ where
             }
 
             ev = ws_reader.read_event() => {
-                idle_deadline = Instant::now() + idle_timeout;
+                let now_ns = coarse_now_ns();
+                last_activity_ns = now_ns;
+                if ping_sent || now_ns.saturating_sub(last_reset_ns) >= 1_000_000_000 {
+                    last_reset_ns = now_ns;
+                    idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
+                }
                 ping_sent = false;
 
                 match ev {
@@ -556,8 +581,9 @@ where
                     &mut streams,
                     &mut tombstones,
                     &mut outbox,
-                    &mut read_scratch,
+                    &mut scratch,
                     max_payload,
+                    batch_budget,
                     &cfg,
                     &mut active_stream_count_tracked,
                 )
@@ -566,14 +592,26 @@ where
                 // emitted WINDOW/CLOSE, or transitioned Dialing -> Open).
             }
 
-            () = &mut sleep => {
+            () = &mut idle_sleep => {
+                let now_ns = coarse_now_ns();
+                let elapsed_ns = now_ns.saturating_sub(last_activity_ns);
+                if !ping_sent && elapsed_ns < idle_timeout_ns {
+                    let rem_ns = idle_timeout_ns - elapsed_ns;
+                    last_reset_ns = now_ns;
+                    idle_sleep
+                        .as_mut()
+                        .reset(Instant::now() + Duration::from_nanos(rem_ns));
+                    continue;
+                }
                 if ping_sent {
                     // Two consecutive idle periods with no response -> dead peer!
                     close_code = CLOSE_NORMAL;
                     break;
                 }
                 ping_sent = true;
-                idle_deadline = Instant::now() + idle_timeout;
+                last_activity_ns = now_ns;
+                last_reset_ns = now_ns;
+                idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
                 if let Err(e) = ws_writer.write_control(OP_PING, &[]).await {
                     close_code = e.close_code();
                     result = Err(e);
@@ -770,127 +808,163 @@ fn apply_actions(
     }
 }
 
-/// Poll all active streams in a single cooperative pass:
+/// Poll all active streams in a single fair round-robin cooperative pass:
 /// 1. Advance any `Dialing` futures.
 /// 2. Flush queued uplink bytes to `Open` sockets and coalesce `WINDOW` returns.
-/// 3. Readiness-gated downlink read ONLY when `downlink_send_window > 0` and
-///    `outbox.can_accept_data()`!
+/// 3. Readiness-gated downlink read via thread-local `WEBRELAY_READ_SCRATCH`
+///    (0 B per idle session!) with burst coalescing up to `batch_budget` ONLY
+///    when `downlink_send_window > 0` and `outbox.can_accept_data()`!
 #[allow(clippy::too_many_arguments)]
 fn poll_all_streams(
     cx: &mut Context<'_>,
     streams: &mut FxHashMap<u32, StreamEntry>,
     tombstones: &mut Tombstones,
     outbox: &mut Outbox,
-    read_scratch: &mut [u8],
+    scratch: &mut SessionScratch,
     max_payload: usize,
+    batch_budget: usize,
     cfg: &SessionConfig,
     active_count: &mut usize,
 ) -> Poll<()> {
     let mut made_progress = false;
-    let mut to_close: Vec<u32> = Vec::new();
+    scratch.to_close.clear();
+    scratch.stream_ids.clear();
+    scratch.stream_ids.extend(streams.keys().copied());
 
-    for (&id, st) in streams.iter_mut() {
-        // Phase A: Poll dialing future if still connecting.
-        if let StreamState::Dialing(fut) = &mut st.state {
-            match fut.as_mut().poll(cx) {
-                Poll::Pending => continue,
-                Poll::Ready(Ok(io)) => {
-                    st.state = StreamState::Open(io);
-                    made_progress = true;
-                }
-                Poll::Ready(Err(_)) => {
-                    to_close.push(id);
-                    made_progress = true;
-                    continue;
-                }
-            }
-        }
+    let n_streams = scratch.stream_ids.len();
+    if n_streams == 0 {
+        return Poll::Pending;
+    }
+    let start = scratch.rr_cursor % n_streams;
+    scratch.rr_cursor = scratch.rr_cursor.wrapping_add(1);
 
-        let StreamState::Open(io) = &mut st.state else {
-            continue;
-        };
+    let mut pass_read_bytes = 0usize;
 
-        // Phase B: Flush uplink queue to backend TCP socket.
-        let mut write_failed = false;
-        while let Some(front) = st.uplink_queue.front_mut() {
-            match Pin::new(&mut **io).poll_write(cx, front) {
-                Poll::Pending => break,
-                Poll::Ready(Ok(0) | Err(_)) => {
-                    write_failed = true;
-                    break;
-                }
-                Poll::Ready(Ok(n)) => {
-                    let _ = front.split_to(n);
-                    if front.is_empty() {
-                        st.uplink_queue.pop_front();
-                    }
-                    st.uplink_drained = st.uplink_drained.saturating_add(n as u32);
-                    made_progress = true;
-                }
-            }
-        }
-        if write_failed {
-            to_close.push(id);
-            made_progress = true;
-            continue;
-        }
+    WEBRELAY_READ_SCRATCH.with(|cell| {
+        let mut tls_scratch = cell.borrow_mut();
+        let scratch_len = tls_scratch.len();
 
-        // Coalesced WINDOW return once threshold reached or queue emptied.
-        let should_return_window = st.uplink_drained >= WINDOW_COALESCE_BYTES
-            || (st.uplink_queue.is_empty() && st.uplink_drained >= WINDOW_IDLE_FLUSH_BYTES);
-        if should_return_window {
-            let delta = st.uplink_drained;
-            st.uplink_drained = 0;
-            st.uplink_window_credit = st.uplink_window_credit.saturating_add(delta);
-            outbox.push_control(Frame::Window {
-                stream_id: id,
-                delta,
-            });
-            made_progress = true;
-        }
+        for offset in 0..n_streams {
+            let id = scratch.stream_ids[(start + offset) % n_streams];
+            let Some(st) = streams.get_mut(&id) else {
+                continue;
+            };
 
-        // Phase C: STRICTLY readiness-gated downlink read!
-        // Never touch `read_scratch` or call `poll_read` if client gave 0 window
-        // or outbox is full (TCP backpressure propagates naturally to backend!).
-        if st.downlink_send_window > 0 && outbox.can_accept_data() {
-            let max_room = outbox.remaining_data_bytes().saturating_sub(HEADER_SIZE);
-            let cap = max_payload
-                .min(st.downlink_send_window as usize)
-                .min(max_room)
-                .min(read_scratch.len());
-            if cap > 0 {
-                let mut rbuf = ReadBuf::new(&mut read_scratch[..cap]);
-                match Pin::new(&mut **io).poll_read(cx, &mut rbuf) {
-                    Poll::Pending => {}
-                    Poll::Ready(Ok(())) => {
-                        let n = rbuf.filled().len();
-                        if n == 0 {
-                            to_close.push(id);
-                            made_progress = true;
-                        } else {
-                            let payload = Bytes::copy_from_slice(rbuf.filled());
-                            if outbox.push_data(Frame::Data {
-                                stream_id: id,
-                                payload,
-                            }) {
-                                st.downlink_send_window -= n as u32;
-                                if let Some(c) = &cfg.counters {
-                                    c.add_bytes_down(n);
-                                }
-                                made_progress = true;
-                            }
-                        }
+            // Phase A: Poll dialing future if still connecting.
+            if let StreamState::Dialing(fut) = &mut st.state {
+                match fut.as_mut().poll(cx) {
+                    Poll::Pending => continue,
+                    Poll::Ready(Ok(io)) => {
+                        st.state = StreamState::Open(io);
+                        made_progress = true;
                     }
                     Poll::Ready(Err(_)) => {
-                        to_close.push(id);
+                        scratch.to_close.push(id);
+                        made_progress = true;
+                        continue;
+                    }
+                }
+            }
+
+            let StreamState::Open(io) = &mut st.state else {
+                continue;
+            };
+
+            // Phase B: Flush uplink queue to backend TCP socket.
+            let mut write_failed = false;
+            while let Some(front) = st.uplink_queue.front_mut() {
+                match Pin::new(&mut **io).poll_write(cx, front) {
+                    Poll::Pending => break,
+                    Poll::Ready(Ok(0) | Err(_)) => {
+                        write_failed = true;
+                        break;
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        let _ = front.split_to(n);
+                        if front.is_empty() {
+                            st.uplink_queue.pop_front();
+                        }
+                        st.uplink_drained = st.uplink_drained.saturating_add(n as u32);
                         made_progress = true;
                     }
                 }
             }
-        }
-    }
+            if write_failed {
+                scratch.to_close.push(id);
+                made_progress = true;
+                continue;
+            }
 
-    for id in to_close {
+            // Coalesced WINDOW return once threshold reached or queue emptied.
+            let should_return_window = st.uplink_drained >= WINDOW_COALESCE_BYTES
+                || (st.uplink_queue.is_empty() && st.uplink_drained >= WINDOW_IDLE_FLUSH_BYTES);
+            if should_return_window {
+                let delta = st.uplink_drained;
+                st.uplink_drained = 0;
+                st.uplink_window_credit = st.uplink_window_credit.saturating_add(delta);
+                outbox.push_control(Frame::Window {
+                    stream_id: id,
+                    delta,
+                });
+                made_progress = true;
+            }
+
+            // Phase C: STRICTLY readiness-gated downlink read with burst coalescing!
+            // Fills up to `batch_budget` across up to 4 non-blocking reads per stream
+            // so bulk downloads pack full 256 KiB WebSocket writev(2) frames!
+            for _ in 0..4 {
+                if pass_read_bytes >= batch_budget
+                    || st.downlink_send_window == 0
+                    || !outbox.can_accept_data()
+                {
+                    break;
+                }
+                let max_room = outbox.remaining_data_bytes().saturating_sub(HEADER_SIZE);
+                let budget_rem = batch_budget.saturating_sub(pass_read_bytes);
+                let cap = max_payload
+                    .min(st.downlink_send_window as usize)
+                    .min(max_room)
+                    .min(budget_rem)
+                    .min(scratch_len);
+                if cap == 0 {
+                    break;
+                }
+                let mut rbuf = ReadBuf::new(&mut tls_scratch[..cap]);
+                match Pin::new(&mut **io).poll_read(cx, &mut rbuf) {
+                    Poll::Pending => break,
+                    Poll::Ready(Ok(())) => {
+                        let n = rbuf.filled().len();
+                        if n == 0 {
+                            scratch.to_close.push(id);
+                            made_progress = true;
+                            break;
+                        }
+                        let payload = Bytes::copy_from_slice(rbuf.filled());
+                        if outbox.push_data(Frame::Data {
+                            stream_id: id,
+                            payload,
+                        }) {
+                            st.downlink_send_window -= n as u32;
+                            pass_read_bytes += n;
+                            if let Some(c) = &cfg.counters {
+                                c.add_bytes_down(n);
+                            }
+                            made_progress = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    Poll::Ready(Err(_)) => {
+                        scratch.to_close.push(id);
+                        made_progress = true;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    for id in scratch.to_close.drain(..) {
         if streams.remove(&id).is_some() {
             *active_count = active_count.saturating_sub(1);
             if let Some(c) = &cfg.counters {
@@ -908,29 +982,26 @@ fn poll_all_streams(
     }
 }
 
-/// Encode and transmit a downlink batch as ONE vectored `writev(2)` WebSocket
-/// binary message with ZERO payload copying!
+/// Encode and transmit a downlink batch as ONE zero-alloc stack-vectored
+/// `writev(2)` WebSocket binary message with ZERO payload copying!
 async fn write_frame_batch<W: AsyncWrite + Unpin>(
     ws_writer: &mut WsWriter<W>,
-    batch: &[Frame],
+    scratch: &mut SessionScratch,
 ) -> Result<(), WsError> {
-    // Pack headers + tiny 4B window payloads contiguously into one small buffer,
-    // while keeping every `DATA` payload zero-copy via slice references!
-    let mut header_scratch =
-        BytesMut::with_capacity(batch.len() * (HEADER_SIZE + WINDOW_PAYLOAD_SIZE));
-    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(batch.len());
+    scratch.header_scratch.clear();
+    scratch.header_spans.clear();
 
-    for f in batch {
-        let start = header_scratch.len();
+    for f in &scratch.batch_frames {
+        let start = scratch.header_scratch.len();
         let mut hdr = [0u8; HEADER_SIZE];
         match f {
             Frame::Data { stream_id, payload } => {
                 encode_header(&mut hdr, FrameType::Data, *stream_id, payload.len() as u32);
-                header_scratch.extend_from_slice(&hdr);
+                scratch.header_scratch.extend_from_slice(&hdr);
             }
             Frame::Close { stream_id } => {
                 encode_header(&mut hdr, FrameType::Close, *stream_id, 0);
-                header_scratch.extend_from_slice(&hdr);
+                scratch.header_scratch.extend_from_slice(&hdr);
             }
             Frame::Window { stream_id, delta } => {
                 encode_header(
@@ -939,43 +1010,72 @@ async fn write_frame_batch<W: AsyncWrite + Unpin>(
                     *stream_id,
                     WINDOW_PAYLOAD_SIZE as u32,
                 );
-                header_scratch.extend_from_slice(&hdr);
-                header_scratch.extend_from_slice(&delta.to_be_bytes());
+                scratch.header_scratch.extend_from_slice(&hdr);
+                scratch
+                    .header_scratch
+                    .extend_from_slice(&delta.to_be_bytes());
             }
             Frame::Welcome => {
                 encode_header(&mut hdr, FrameType::Welcome, 0, 0);
-                header_scratch.extend_from_slice(&hdr);
+                scratch.header_scratch.extend_from_slice(&hdr);
             }
             Frame::Ping { payload } => {
                 encode_header(&mut hdr, FrameType::Ping, 0, payload.len() as u32);
-                header_scratch.extend_from_slice(&hdr);
+                scratch.header_scratch.extend_from_slice(&hdr);
             }
             Frame::Bye { payload } => {
                 encode_header(&mut hdr, FrameType::Bye, 0, payload.len() as u32);
-                header_scratch.extend_from_slice(&hdr);
+                scratch.header_scratch.extend_from_slice(&hdr);
             }
             Frame::Open { .. } | Frame::Pong { .. } | Frame::Hello { .. } => {
+                scratch.batch_frames.clear();
                 return Err(WsError::Io(io::Error::other("invalid downlink frame type")));
             }
         }
-        spans.push((start, header_scratch.len()));
+        scratch
+            .header_spans
+            .push((start, scratch.header_scratch.len()));
     }
 
-    let hdr_bytes = header_scratch.freeze();
-    let mut slices: Vec<&[u8]> = Vec::with_capacity(batch.len() * 2);
-    for (f, (s, e)) in batch.iter().zip(spans.iter()) {
-        slices.push(&hdr_bytes[*s..*e]);
-        match f {
-            Frame::Data { payload, .. } | Frame::Ping { payload } | Frame::Bye { payload }
-                if !payload.is_empty() =>
-            {
-                slices.push(payload);
+    let hdr_buf = scratch.header_scratch.as_slice();
+    let max_slices = scratch.batch_frames.len() * 2;
+    let res = if max_slices <= 63 {
+        let mut stack_slices: [&[u8]; 63] = [&[]; 63];
+        let mut count = 0usize;
+        for (f, (s, e)) in scratch.batch_frames.iter().zip(scratch.header_spans.iter()) {
+            stack_slices[count] = &hdr_buf[*s..*e];
+            count += 1;
+            match f {
+                Frame::Data { payload, .. } | Frame::Ping { payload } | Frame::Bye { payload }
+                    if !payload.is_empty() =>
+                {
+                    stack_slices[count] = payload;
+                    count += 1;
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
+        ws_writer
+            .write_binary_vectored(&stack_slices[..count])
+            .await
+    } else {
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(max_slices);
+        for (f, (s, e)) in scratch.batch_frames.iter().zip(scratch.header_spans.iter()) {
+            slices.push(&hdr_buf[*s..*e]);
+            match f {
+                Frame::Data { payload, .. } | Frame::Ping { payload } | Frame::Bye { payload }
+                    if !payload.is_empty() =>
+                {
+                    slices.push(payload);
+                }
+                _ => {}
+            }
+        }
+        ws_writer.write_binary_vectored(&slices).await
+    };
 
-    let res = ws_writer.write_binary_vectored(&slices).await;
+    // Release frame payload Bytes references immediately after wire flush!
+    scratch.batch_frames.clear();
     if res.is_err() {
         let _ = ws_writer.write_close(CLOSE_INTERNAL_ERROR).await;
     }
@@ -984,6 +1084,8 @@ async fn write_frame_batch<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use bytes::BytesMut;
+
     use super::*;
 
     #[test]

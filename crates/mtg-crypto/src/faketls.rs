@@ -2,7 +2,6 @@
 //! zero-allocation ServerHello generator.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand_chacha::ChaCha8Rng;
@@ -730,46 +729,37 @@ impl NoiseParams {
     }
 }
 
-/// Pre-generated lock-free ring of ephemeral X25519 public keys for FakeTLS
-/// `ServerHello` key_share extensions.
+/// Ephemeral X25519 public key generator for FakeTLS `ServerHello` `key_share`
+/// extensions.
 ///
-/// Eliminates a ~40 µs Curve25519 scalar multiplication on every FakeTLS
-/// handshake (FakeTLS never completes a real Diffie-Hellman exchange — the key
-/// share only has to be a valid uniformly distributed Curve25519 point).
-#[derive(Debug)]
+/// # Anti-DPI Stealth Upgrade
+/// Instead of cycling through a static ring of public keys (which repeats the
+/// exact same 32-byte `key_share` every `N` handshakes — an easily fingerprinted
+/// synthetic TLS anomaly under DPI inspection), every handshake derives a
+/// cryptographically fresh, never-repeating Curve25519 public point directly
+/// from the worker's thread-local CSPRNG (`TLS_RNG`, zero syscalls, zero
+/// cross-core atomic contention!).
+#[derive(Debug, Default)]
 pub struct X25519KeyRing {
-    keys: Vec<[u8; 32]>,
-    cursor: AtomicUsize,
-}
-
-impl Default for X25519KeyRing {
-    fn default() -> Self {
-        Self::new(256)
-    }
+    _private: (),
 }
 
 impl X25519KeyRing {
-    /// Generate `count` fresh random X25519 public keys (minimum 1).
-    pub fn new(count: usize) -> Self {
-        let n = count.max(1);
-        let mut keys = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut scalar = [0u8; 32];
-            getrandom::fill(&mut scalar).expect("OS CSPRNG failed");
-            let secret = StaticSecret::from(scalar);
-            let public = PublicKey::from(&secret);
-            keys.push(*public.as_bytes());
-        }
-        Self {
-            keys,
-            cursor: AtomicUsize::new(0),
-        }
+    /// Construct a fresh ephemeral X25519 key generator.
+    pub const fn new(_count: usize) -> Self {
+        Self { _private: () }
     }
 
+    /// Generate a fresh, cryptographically unique Curve25519 public key for one
+    /// FakeTLS `ServerHello` `key_share` extension (zero syscalls, zero locks).
     #[inline]
-    pub fn next_public_key(&self) -> &[u8; 32] {
-        let idx = self.cursor.fetch_add(1, Ordering::Relaxed) % self.keys.len();
-        &self.keys[idx]
+    pub fn next_public_key(&self) -> [u8; 32] {
+        let mut scalar = [0u8; 32];
+        TLS_RNG.with(|cell| {
+            cell.borrow_mut().fill_bytes(&mut scalar);
+        });
+        let secret = StaticSecret::from(scalar);
+        *PublicKey::from(&secret).as_bytes()
     }
 }
 
@@ -815,7 +805,7 @@ pub fn build_server_hello(
     out.extend_from_slice(sid);
     out.extend_from_slice(&client_hello.cipher_suite.to_be_bytes());
     out.extend_from_slice(&SERVER_HELLO_SUFFIX);
-    out.extend_from_slice(key_ring.next_public_key());
+    out.extend_from_slice(&key_ring.next_public_key());
 
     // 2. ChangeCipherSpec Record (6 bytes)
     out.extend_from_slice(&[
@@ -1109,5 +1099,19 @@ mod tests {
         mac.update(&zeroed);
         let want: [u8; 32] = mac.finalize().into_bytes().into();
         assert_eq!(got_random, want);
+    }
+
+    #[test]
+    fn ephemeral_x25519_key_shares_never_repeat_across_handshakes() {
+        let ring = X25519KeyRing::default();
+        let mut seen = std::collections::HashSet::with_capacity(512);
+        for _ in 0..512 {
+            let pk = ring.next_public_key();
+            assert_ne!(pk, [0u8; 32]);
+            assert!(
+                seen.insert(pk),
+                "X25519 key_share repeated — DPI fingerprint leak!"
+            );
+        }
     }
 }
