@@ -79,9 +79,10 @@ impl EngineRuntime {
             "Linux I/O engine initialized"
         );
 
-        // Await initial IP filter load before accepting traffic (fixes Go startup race!).
+        // Await initial IP filter load (warm cache + inline CIDRs + live fetch)
+        // before accepting traffic so connections never slip through an empty list at boot!
         if let Some(bl) = &engine.blocklist {
-            match bl.refresh_once().await {
+            match bl.init_load().await {
                 Ok(n) => {
                     engine
                         .metrics
@@ -92,7 +93,7 @@ impl EngineRuntime {
             }
         }
         if let Some(al) = &engine.allowlist {
-            match al.refresh_once().await {
+            match al.init_load().await {
                 Ok(n) => {
                     engine
                         .metrics

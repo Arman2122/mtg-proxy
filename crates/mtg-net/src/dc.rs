@@ -812,7 +812,9 @@ pub async fn fetch_url_bytes(
 }
 
 /// HTTP/HTTPS GET client honoring an optional [`DnsResolver`] (DoH/DoT/custom
-/// DNS), [`PreferIp`], RFC 8305 Happy Eyeballs, and optional [`ProxyPool`].
+/// DNS), [`PreferIp`], RFC 8305 Happy Eyeballs, bounded HTTP redirect following
+/// (up to 5 hops for GitHub `/releases/latest/download/...` and CDN URLs), and
+/// optional [`ProxyPool`].
 pub async fn fetch_url_bytes_with_dns(
     url: &str,
     dns: Option<&DnsResolver>,
@@ -822,107 +824,166 @@ pub async fn fetch_url_bytes_with_dns(
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
     const MAX_BODY: usize = 16 * 1024 * 1024;
+    const MAX_REDIRECTS: usize = 5;
+
     tokio::time::timeout(timeout, async {
-        let uri: hyper::Uri = url
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad URL: {e}")))?;
-        let is_https = uri.scheme_str() == Some("https");
-        let host = uri
-            .host()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL missing host"))?
-            .to_owned();
-        let port = uri.port_u16().unwrap_or(if is_https { 443 } else { 80 });
-        let path = uri
-            .path_and_query()
-            .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+        let mut current_url = url.to_owned();
+        let tls_cfg = build_tls_client_config();
 
-        let tcp = if let Some(pool) = proxy_pool
-            && !pool.is_empty()
-        {
-            pool.dial(&ProxyTarget::Domain(host.clone(), port))
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))?
-        } else {
-            let addrs = if let Some(resolver) = dns {
-                resolver.resolve_socket_addrs(&host, port).await?
-            } else {
-                let raw: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-                    .await?
-                    .collect();
-                let (mut v4, mut v6) = (Vec::new(), Vec::new());
-                for sa in raw {
-                    match sa {
-                        SocketAddr::V4(_) => v4.push(sa),
-                        SocketAddr::V6(_) => v6.push(sa),
-                    }
+        for hop in 0..=MAX_REDIRECTS {
+            let uri: hyper::Uri = current_url.parse().map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("bad URL: {e}"))
+            })?;
+            let scheme = uri.scheme_str().unwrap_or("");
+            let is_https = match scheme {
+                "https" => true,
+                "http" => false,
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported URL scheme {other:?}"),
+                    ));
                 }
-                order_by_prefer_ip(v4, v6, prefer_ip)
             };
-            let per_addr_timeout = timeout.min(Duration::from_secs(10));
-            let (s, _) = happy_eyeballs_connect(&addrs, &sock_cfg, per_addr_timeout).await?;
-            s
-        };
+            let host = uri
+                .host()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL missing host"))?
+                .to_owned();
+            let default_port = if is_https { 443 } else { 80 };
+            let port = uri.port_u16().unwrap_or(default_port);
+            let host_header = if port == default_port {
+                host.clone()
+            } else {
+                format!("{host}:{port}")
+            };
+            let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+            let path = uri
+                .path_and_query()
+                .map_or("/", hyper::http::uri::PathAndQuery::as_str);
 
-        let req = Request::builder()
-            .method("GET")
-            .uri(path)
-            .header("Host", &host)
-            .header("User-Agent", "mtg-proxy/2.0")
-            .header("Connection", "close")
-            .body(http_body_util::Empty::<bytes::Bytes>::new())
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            let tcp = if let Some(pool) = proxy_pool
+                && !pool.is_empty()
+            {
+                pool.dial(&ProxyTarget::Domain(bare_host.to_owned(), port))
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))?
+            } else {
+                let addrs = if let Some(resolver) = dns {
+                    resolver.resolve_socket_addrs(bare_host, port).await?
+                } else {
+                    let raw: Vec<SocketAddr> =
+                        tokio::net::lookup_host((bare_host, port)).await?.collect();
+                    let (mut v4, mut v6) = (Vec::new(), Vec::new());
+                    for sa in raw {
+                        match sa {
+                            SocketAddr::V4(_) => v4.push(sa),
+                            SocketAddr::V6(_) => v6.push(sa),
+                        }
+                    }
+                    order_by_prefer_ip(v4, v6, prefer_ip)
+                };
+                let per_addr_timeout = timeout.min(Duration::from_secs(10));
+                let (s, _) = happy_eyeballs_connect(&addrs, &sock_cfg, per_addr_timeout).await?;
+                s
+            };
 
-        let resp = if is_https {
-            let connector = TlsConnector::from(build_tls_client_config());
-            let sni = ServerName::try_from(host.clone())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-            let tls = connector.connect(sni, tcp).await?;
-            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-                .await
+            let req = Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("Host", &host_header)
+                .header("User-Agent", "mtg-proxy/2.2")
+                .header("Accept", "*/*")
+                .header("Connection", "close")
+                .body(http_body_util::Empty::<bytes::Bytes>::new())
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            sender
-                .send_request(req)
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))?
-        } else {
-            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            sender
-                .send_request(req)
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))?
-        };
 
-        if !resp.status().is_success() {
-            return Err(io::Error::other(format!(
-                "HTTP {} from {url}",
-                resp.status().as_u16()
-            )));
+            let resp = if is_https {
+                let connector = TlsConnector::from(Arc::clone(&tls_cfg));
+                let sni = ServerName::try_from(bare_host.to_owned())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+                let tls = connector.connect(sni, tcp).await?;
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                sender
+                    .send_request(req)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))?
+            } else {
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                sender
+                    .send_request(req)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))?
+            };
+
+            let status = resp.status();
+            if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+                if hop == MAX_REDIRECTS {
+                    return Err(io::Error::other(format!(
+                        "too many HTTP redirects (> {MAX_REDIRECTS}) from {url}"
+                    )));
+                }
+                let loc = resp
+                    .headers()
+                    .get(hyper::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| {
+                        io::Error::other(format!(
+                            "HTTP {} redirect missing Location header from {current_url}",
+                            status.as_u16()
+                        ))
+                    })?
+                    .trim();
+                current_url = resolve_redirect_url(scheme, &host_header, loc)?;
+                continue;
+            }
+
+            if !status.is_success() {
+                return Err(io::Error::other(format!(
+                    "HTTP {} from {current_url}",
+                    status.as_u16()
+                )));
+            }
+
+            let collected = http_body_util::Limited::new(resp.into_body(), MAX_BODY)
+                .collect()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+                .to_bytes();
+            return Ok(collected.to_vec());
         }
 
-        let collected = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?
-            .to_bytes();
-        if collected.len() > MAX_BODY {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "HTTP response exceeded 16 MiB cap",
-            ));
-        }
-        Ok(collected.to_vec())
+        Err(io::Error::other(format!(
+            "exceeded HTTP redirect limit fetching {url}"
+        )))
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("GET {url} timed out")))?
+}
+
+fn resolve_redirect_url(scheme: &str, host_header: &str, location: &str) -> io::Result<String> {
+    if location.starts_with("https://") || location.starts_with("http://") {
+        return Ok(location.to_owned());
+    }
+    if let Some(rest) = location.strip_prefix("//") {
+        return Ok(format!("{scheme}://{rest}"));
+    }
+    if location.starts_with('/') {
+        return Ok(format!("{scheme}://{host_header}{location}"));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unsupported redirect Location {location:?}"),
+    ))
 }
 
 /// Convert an `IpAddr` to a fixed 16-byte representation (IPv4-mapped if v4).
@@ -1071,5 +1132,46 @@ mod tests {
         let (_stream, addr, effective_dc) = router.dial_direct(99).await.unwrap();
         assert_eq!(addr, ok_dc2);
         assert_eq!(effective_dc, DEFAULT_DC);
+    }
+
+    #[tokio::test]
+    async fn fetch_url_follows_github_style_multi_hop_redirects() {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut s, _) = ln.accept().await.unwrap();
+                let mut req = [0u8; 1024];
+                let n = s.read(&mut req).await.unwrap();
+                let txt = String::from_utf8_lossy(&req[..n]);
+                let first_line = txt.lines().next().unwrap_or("");
+                let resp = if first_line.starts_with("GET /latest/download/ir.txt ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /v2026/ir.txt\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                } else if first_line.starts_with("GET /v2026/ir.txt ") {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{addr}/cdn/ir.txt\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n2.144.0.0/14\n"
+                        .to_owned()
+                };
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let body = fetch_url_bytes_with_dns(
+            &format!("http://{addr}/latest/download/ir.txt"),
+            None,
+            PreferIp::OnlyIpv4,
+            None,
+            SocketConfig::default(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, b"2.144.0.0/14\n");
+        srv.abort();
     }
 }

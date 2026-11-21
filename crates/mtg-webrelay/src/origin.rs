@@ -17,11 +17,12 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
-use http::{Method, Request, Response, StatusCode, Version};
+use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Incoming;
-use mtg_config::ClientIpSource;
+use mtg_config::{ClientIpSource, IpFilterAction};
 use mtg_core::Secret;
+use mtg_governance::LiveIpFilter;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, warn};
@@ -56,6 +57,26 @@ pub enum OriginError {
     Limits(String),
 }
 
+/// Optional wait-free Geo-Stealth IP allowlist/blocklist attached to [`Origin`].
+#[derive(Debug, Clone)]
+pub struct OriginIpFilters {
+    pub allowlist: Option<Arc<LiveIpFilter>>,
+    pub allowlist_action: IpFilterAction,
+    pub blocklist: Option<Arc<LiveIpFilter>>,
+    pub blocklist_action: IpFilterAction,
+}
+
+impl Default for OriginIpFilters {
+    fn default() -> Self {
+        Self {
+            allowlist: None,
+            allowlist_action: IpFilterAction::Front,
+            blocklist: None,
+            blocklist_action: IpFilterAction::Close,
+        }
+    }
+}
+
 /// Configuration constructing one [`Origin`].
 #[derive(Debug)]
 pub struct OriginOptions {
@@ -70,6 +91,7 @@ pub struct OriginOptions {
     pub max_streams: usize,
     pub client_ip_source: ClientIpSource,
     pub counters: Option<Arc<RelayCounters>>,
+    pub ip_filters: OriginIpFilters,
 }
 
 /// Public HTTP/WebSocket origin serving Tier-1 (carrier), Tier-2 (local
@@ -88,6 +110,7 @@ pub struct Origin {
     max_streams: usize,
     client_ip_source: ClientIpSource,
     counters: Option<Arc<RelayCounters>>,
+    ip_filters: OriginIpFilters,
     global_budget: Arc<GlobalBudget>,
 }
 
@@ -133,8 +156,39 @@ impl Origin {
             max_streams,
             client_ip_source: opts.client_ip_source,
             counters: opts.counters,
+            ip_filters: opts.ip_filters,
             global_budget: Arc::new(GlobalBudget::default()),
         })
+    }
+
+    /// Spawn periodic background refresh loops for any attached IP allowlist/blocklist.
+    pub fn spawn_ip_filter_refresh_loops(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
+        if let Some(bl) = &self.ip_filters.blocklist {
+            bl.spawn_refresh_loop(shutdown.clone());
+        }
+        if let Some(al) = &self.ip_filters.allowlist {
+            al.spawn_refresh_loop(shutdown);
+        }
+    }
+
+    /// Trigger a non-blocking refresh of attached IP filters (e.g. on `SIGHUP`).
+    pub fn trigger_ip_filter_refresh(&self) {
+        if let Some(bl) = &self.ip_filters.blocklist {
+            let bl = Arc::clone(bl);
+            tokio::spawn(async move {
+                let _ = bl.refresh_once().await;
+            });
+        }
+        if let Some(al) = &self.ip_filters.allowlist {
+            let al = Arc::clone(al);
+            tokio::spawn(async move {
+                let _ = al.refresh_once().await;
+            });
+        }
+    }
+
+    pub fn ip_filters(&self) -> &OriginIpFilters {
+        &self.ip_filters
     }
 
     /// Atomically swap `(secrets, retired)` on live reload (preserving previous
@@ -169,6 +223,22 @@ impl Origin {
         peer_addr: SocketAddr,
         extractor: UpgradedIoExtractor,
     ) -> Response<Full<Bytes>> {
+        // Geo-Stealth IP allowlist / blocklist check BEFORE Tier-1 & Tier-2:
+        // - `Front` (default for allowlist): strip any bridge/token atoms so nothing
+        //   leaks to cover-upstream logs, then serve Tier-3 cover site directly!
+        // - `Close` (default for blocklist): return uncacheable 404.
+        match self.check_ip_filters(req.headers(), Some(peer_addr)) {
+            WebIpVerdict::Close => return self.not_found(),
+            WebIpVerdict::Front => {
+                sanitize_stealth_cover_request(&mut req);
+                if let Some(c) = &self.counters {
+                    c.on_cover_served();
+                }
+                return self.cover.serve_incoming(req).await;
+            }
+            WebIpVerdict::Allow => {}
+        }
+
         // ONE atomic snapshot for the ENTIRE request (Tier-1 + Tier-2)!
         let registry = self.registry.load();
 
@@ -207,6 +277,28 @@ impl Origin {
 
     /// Direct non-Hyper request handler for unit tests & synthetic requests.
     pub async fn handle_bytes(&self, req: Request<Bytes>) -> Response<Full<Bytes>> {
+        self.handle_bytes_from(req, None).await
+    }
+
+    /// Direct non-Hyper request handler with an explicit `peer_addr` (for testing
+    /// IP allowlist / blocklist enforcement).
+    pub async fn handle_bytes_from(
+        &self,
+        mut req: Request<Bytes>,
+        peer_addr: Option<SocketAddr>,
+    ) -> Response<Full<Bytes>> {
+        match self.check_ip_filters(req.headers(), peer_addr) {
+            WebIpVerdict::Close => return self.not_found(),
+            WebIpVerdict::Front => {
+                sanitize_stealth_cover_request(&mut req);
+                if let Some(c) = &self.counters {
+                    c.on_cover_served();
+                }
+                return self.cover.serve_bytes(req).await;
+            }
+            WebIpVerdict::Allow => {}
+        }
+
         let registry = self.registry.load();
 
         let tier1 = match (req.method(), req.uri().path()) {
@@ -232,6 +324,35 @@ impl Origin {
             c.on_cover_served();
         }
         self.cover.serve_bytes(req).await
+    }
+
+    fn check_ip_filters(&self, headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> WebIpVerdict {
+        if self.ip_filters.blocklist.is_none() && self.ip_filters.allowlist.is_none() {
+            return WebIpVerdict::Allow;
+        }
+        let resolved_ip = peer_addr
+            .and_then(|sa| self.resolve_client_addr(headers, sa))
+            .map(|sa| mtg_core::ip::unmap_ip(sa.ip()));
+
+        if let Some(block) = &self.ip_filters.blocklist
+            && let Some(ip) = resolved_ip
+            && block.contains(ip)
+        {
+            return match self.ip_filters.blocklist_action {
+                IpFilterAction::Front => WebIpVerdict::Front,
+                IpFilterAction::Close => WebIpVerdict::Close,
+            };
+        }
+        if let Some(allow) = &self.ip_filters.allowlist {
+            let allowed = resolved_ip.is_some_and(|ip| allow.contains(ip));
+            if !allowed {
+                return match self.ip_filters.allowlist_action {
+                    IpFilterAction::Front => WebIpVerdict::Front,
+                    IpFilterAction::Close => WebIpVerdict::Close,
+                };
+            }
+        }
+        WebIpVerdict::Allow
     }
 
     fn try_serve_bridge<B>(
@@ -565,6 +686,47 @@ impl Origin {
             .header(header::CONTENT_LENGTH, 19)
             .body(Full::new(Bytes::from_static(b"404 page not found\n")))
             .expect("valid 404")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebIpVerdict {
+    Allow,
+    Front,
+    Close,
+}
+
+/// Strip potential proxy bridge query parameters and carrier auth/subprotocol
+/// headers before passing a geo-fronted request to `cover`, so:
+/// 1. A foreign prober presenting a leaked `/?bridge=<cap>` gets the exact `200 OK`
+///    cover homepage (zero 404 oracle!).
+/// 2. No leaked capability or bearer token is ever forwarded into `cover-upstream` logs!
+fn sanitize_stealth_cover_request<B>(req: &mut Request<B>) {
+    if let Some(query) = req.uri().query() {
+        let has_bridge_or_token =
+            query.contains(BRIDGE_QUERY) || credential_atoms(query).next().is_some();
+        if has_bridge_or_token {
+            let clean_path = req.uri().path().to_owned();
+            if let Ok(clean_uri) = clean_path.parse::<Uri>() {
+                *req.uri_mut() = clean_uri;
+            }
+        }
+    }
+    if req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.starts_with("Bearer "))
+    {
+        req.headers_mut().remove(header::AUTHORIZATION);
+    }
+    if req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.contains(SUBPROTOCOL_PREFIX))
+    {
+        req.headers_mut().remove("sec-websocket-protocol");
     }
 }
 

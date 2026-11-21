@@ -809,61 +809,56 @@ max-size = "1mib"
 # to maintain a desired error ratio.
 error-rate = 0.001
 
-# You can protect proxies by using different blocklists. If client has
-# ip from the given range, we do not try to do a proper handshake. We
-# actually route it to fronting domain. So, this client will never ever
-# have a chance to use mtg to access Telegram.
-#
-# Please remember that blocklists are initialized in async way. So,
-# when you start a proxy, blocklists are empty, they are populated and
-# processed in backgrounds. An error in any URL is ignored.
+# Blocklist denies proxy access to matching IPs/CIDRs (FireHOL `.netset`/`.ipset`,
+# plain CIDR lists, or Linux `ipset restore` files). Checked BEFORE allowlist.
 [defense.blocklist]
-# You can enable/disable this feature.
-enabled = true
-# This is a limiter for concurrency. In order to protect website
-# from overloading, we download files in this number of threads.
-download-concurrency = 2
-# A list of URLs in FireHOL format (https://iplists.firehol.org/)
-# You can provider links here (starts with https:// or http://) or
-# path to a local file, but in this case it should be absolute.
-#
-# NOTE: the default list below (firehol_level1.netset) includes bogon
-# networks, and therefore RFC1918 ranges as well (10.0.0.0/8,
-# 172.16.0.0/12, 192.168.0.0/16). If you run mtg on a home/LAN network
-# and connect from a client on the same LAN, that client will be
-# rejected with "ip was blacklisted" and the connection dropped (TCP
-# close, no response). If you see this, you can either disable this section
-# (enabled = false), replace firehol_level1 with a narrower list that
-# does not include bogons (e.g. firehol_abusers_1d), or connect via
-# a public IP/domain with hairpin NAT on your router. See README for
-# details.
-urls = [
-    "https://iplists.firehol.org/files/firehol_level1.netset",
-    # "/local.file"
-]
-# How often do we need to update a blocklist set.
-update-each = "24h"
-
-# Allowlist is an opposite to a blocklist. Only those IPs that are coming from
-# subnets defined in these lists are allowed. All others will be rejected.
-#
-# If this feature is disabled, then there won't be any check performed by this
-# validator. It is possible to combine both blocklist and whitelist.
-[defense.allowlist]
-# You can enable/disable this feature.
 enabled = false
-# This is a limiter for concurrency. In order to protect website
-# from overloading, we download files in this number of threads.
-download-concurrency = 2
-# A list of URLs in FireHOL format (https://iplists.firehol.org/)
-# You can provider links here (starts with https:// or http://) or
-# path to a local file, but in this case it should be absolute.
+# Action on matched IPs:
+#   "close" (default for blocklist) - drop TCP immediately (404 in web-relay).
+#   "front"                         - silently domain-front straight to cover website
+#                                     with zero secret scanning / zero HMAC CPU.
+action = "close"
+# Concurrent remote download workers (1..=16, default 4).
+download-concurrency = 4
+# HTTP(S) URLs (follows multi-hop GitHub release redirects) or local file paths.
+# NOTE: firehol_level1.netset includes RFC1918 LAN ranges (10.0.0.0/8, 192.168.0.0/16).
 urls = [
     # "https://iplists.firehol.org/files/firehol_level1.netset",
-    # "/local.file"
-
+    # "/etc/mtg-proxy/custom-blocklist.txt",
 ]
+# Optional inline CIDRs/IPs always merged with `urls`.
+# cidrs = ["198.51.100.0/24"]
+# Optional atomic on-disk cache (instant cold-boot warm start; survives upstream outages).
+# cache-file = "/var/lib/mtg-proxy/blocklist.cache"
 update-each = "24h"
+
+# Geo-Stealth Allowlist: ONLY IPs matching these CIDRs may authenticate as Telegram
+# proxy clients (and browse the cover website normally). Every non-matching (foreign)
+# IP is transparently domain-fronted straight to the cover website with ZERO secret
+# scanning, ZERO HMAC CPU, and ZERO TCP-drop fingerprint — even if a foreign prober
+# presents a leaked real `ee` secret or WEB bridge capability!
+#
+# Supports plain CIDR files (`ir-ipv4.txt`, `ir-ipv6.txt`), FireHOL `.ipset`, and
+# Linux `ipset restore` (`ir.ipset` — both IPv4+IPv6 in a single file!).
+[defense.allowlist]
+enabled = false
+# Action on non-matching IPs:
+#   "front" (default for allowlist) - stealth cover-only fronting (recommended!)
+#   "close"                         - drop TCP immediately (404 in web-relay)
+action = "front"
+download-concurrency = 4
+# Example using daily-updated Iran Geo-IP database (https://github.com/Arman2122/IR-Geo-DB):
+urls = [
+    # "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv4.txt",
+    # "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv6.txt",
+    # Or single combined Linux ipset restore file (IPv4 + IPv6):
+    # "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir.ipset",
+]
+# Optional inline CIDRs/IPs always allowed alongside `urls` (e.g. operator admin IP / loopback):
+# cidrs = ["127.0.0.1/32", "::1/128"]
+# Atomic on-disk cache (`0600`) so restarts stay 100% protected even during GitHub outages:
+# cache-file = "/var/lib/mtg-proxy/ir-allowlist.cache"
+update-each = "12h"
 
 # statsd statistics integration.
 [stats.statsd]

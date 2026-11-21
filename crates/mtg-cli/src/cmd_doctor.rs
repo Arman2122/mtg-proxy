@@ -6,9 +6,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::Utc;
-use mtg_config::{Config, PreferIp};
+use mtg_config::{Config, IpFilterAction, PreferIp};
 use mtg_crypto::aes_ctr::detect_aes_backend;
 use mtg_crypto::obfs2::build_outbound_handshake;
+use mtg_governance::LiveIpFilter;
 use mtg_net::{
     DcRouter, DnsResolver, DriverKind, ProxyPool, SocketConfig, allowed_linux_cpus, probe_uring,
 };
@@ -104,7 +105,11 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
     }
 
     let prefer_ip = conf.prefer_ip.unwrap_or(PreferIp::PreferIpv6);
-    let dns = DnsResolver::build(conf.network.dns.as_deref(), conf.network.doh_ip, prefer_ip)?;
+    let dns = std::sync::Arc::new(DnsResolver::build(
+        conf.network.dns.as_deref(),
+        conf.network.doh_ip,
+        prefer_ip,
+    )?);
     let sock_cfg = SocketConfig::default();
     let proxy_pool = conf
         .network
@@ -142,6 +147,49 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
         }
     }
 
+    // 4b. IP allowlist / blocklist (Geo-Stealth) live feed check
+    if conf.defense.allowlist.enabled.unwrap_or(false)
+        || conf.defense.blocklist.enabled.unwrap_or(false)
+    {
+        println!("Checking IP filters (allowlist / blocklist)...");
+        for (label, list, default_action) in [
+            ("allowlist", &conf.defense.allowlist, IpFilterAction::Front),
+            ("blocklist", &conf.defense.blocklist, IpFilterAction::Close),
+        ] {
+            if !list.enabled.unwrap_or(false) {
+                continue;
+            }
+            let action = list.action.unwrap_or(default_action);
+            let live = LiveIpFilter::from_list_config(
+                list,
+                Some(std::sync::Arc::clone(&dns)),
+                prefer_ip,
+                proxy_pool.clone(),
+                sock_cfg,
+            );
+            let start = Instant::now();
+            match live.init_load().await {
+                Ok(n) if n > 0 => {
+                    println!(
+                        "  ✅ {label}: loaded {n} entries ({} IPv4, {} IPv6) in {}ms (action={action})",
+                        live.v4_len(),
+                        live.v6_len(),
+                        start.elapsed().as_millis()
+                    );
+                }
+                Ok(_) => {
+                    println!(
+                        "  ⚠️  {label}: enabled (action={action}) but loaded 0 entries — check urls/cidrs!"
+                    );
+                }
+                Err(e) => {
+                    println!("  ❌ {label}: load failed ({e})");
+                    all_ok = false;
+                }
+            }
+        }
+    }
+
     // 5. Real Telegram DC RPC connectivity (`dcprobe` over obfuscated2!)
     if !skip_native_check {
         println!("Checking Telegram DC connectivity (RPC req_pq_multi)...");
@@ -152,7 +200,7 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
             Duration::from_secs(10),
             proxy_pool,
         )
-        .with_dns(std::sync::Arc::new(dns));
+        .with_dns(dns);
         let _ = router.refresh_once().await;
 
         let mut any_dc_ok = false;

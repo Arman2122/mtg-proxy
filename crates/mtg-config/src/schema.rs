@@ -22,9 +22,9 @@ use crate::scrub::{
     UNKNOWN_KEY_LINE, reads_as_a_value, scrub_error_against_doc, shown_name, value_free_name,
 };
 use crate::types::{
-    AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, PreferIp, StatsdTagFormat,
-    UnknownSecretAction, canonical_web_host, format_bytes_go, format_duration_go, parse_ad_tag,
-    parse_bytes_str, parse_duration, redact_proxy_url,
+    AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction, PreferIp,
+    StatsdTagFormat, UnknownSecretAction, canonical_web_host, format_bytes_go, format_duration_go,
+    parse_ad_tag, parse_bytes_str, parse_duration, redact_proxy_url, validate_ip_or_cidr,
 };
 
 /// Reserved `[secrets]` username that is never served (prevents hand-edit
@@ -165,6 +165,12 @@ pub struct ListConfig {
     pub download_concurrency: Option<u32>,
     pub urls: Option<Vec<String>>,
     pub update_each: Option<Duration>,
+    /// Action on denied IP: `"front"` (default for allowlist: stealth cover-only) or `"close"` (default for blocklist).
+    pub action: Option<IpFilterAction>,
+    /// Optional inline IP/CIDR entries always merged with `urls`.
+    pub cidrs: Option<Vec<String>>,
+    /// Optional atomic on-disk cache path (instant warm boot & survives upstream outages).
+    pub cache_file: Option<String>,
 }
 
 /// `[defense.anti-replay]`.
@@ -659,6 +665,18 @@ impl Config {
                      and needs speed, speed-up or speed-down beside it",
                     value_free_name(name)
                 )));
+            }
+        }
+
+        for (section, list) in [
+            ("defense.allowlist", &self.defense.allowlist),
+            ("defense.blocklist", &self.defense.blocklist),
+        ] {
+            if let Some(cidrs) = &list.cidrs {
+                for entry in cidrs {
+                    validate_ip_or_cidr(entry)
+                        .map_err(|e| ConfigError::Validation(format!("{section}.cidrs: {e}")))?;
+                }
             }
         }
 
@@ -1383,6 +1401,15 @@ impl Config {
 
 fn list_to_json(l: &ListConfig) -> Value {
     let mut m = Map::new();
+    if let Some(action) = l.action {
+        m.insert("action".into(), Value::String(action.as_str().to_owned()));
+    }
+    if let Some(cache_file) = &l.cache_file {
+        m.insert("cacheFile".into(), Value::String(cache_file.clone()));
+    }
+    if let Some(cidrs) = &l.cidrs {
+        m.insert("cidrs".into(), opt_vec_str_to_json(Some(cidrs.as_slice())));
+    }
     m.insert(
         "downloadConcurrency".into(),
         json!(l.download_concurrency.unwrap_or(0)),
@@ -2082,6 +2109,22 @@ fn parse_list_config(
                 list.download_concurrency = Some(expect_u32(v, "download-concurrency")?);
             }
             "urls" => list.urls = Some(expect_string_array(v, "urls")?),
+            "cidrs" => list.cidrs = Some(expect_string_array(v, "cidrs")?),
+            "cache-file" => {
+                let s = expect_str(v, "cache-file")?;
+                if !s.is_empty() {
+                    list.cache_file = Some(s.to_owned());
+                }
+            }
+            "action" => {
+                let s = expect_str(v, "action")?;
+                if !s.is_empty() {
+                    list.action = Some(
+                        s.parse()
+                            .map_err(|e| ConfigError::FieldParse(format!("action: {e}")))?,
+                    );
+                }
+            }
             "update-each" => {
                 let s = expect_str(v, "update-each")?;
                 if !s.is_empty() {

@@ -20,8 +20,8 @@ pub use metrics::{
     UsageRecord, compute_fair_caps,
 };
 pub use state::{
-    DoppelState, EngineError, EngineSettings, ListenerReport, ProxyEngine, SUPPORTED_FEATURES,
-    is_secret_served, peer_ip_of,
+    DoppelState, EngineError, EngineSettings, IpFilterVerdict, ListenerReport, ProxyEngine,
+    SUPPORTED_FEATURES, is_secret_served, peer_ip_of,
 };
 pub use worker::{BoundListenerSpec, EngineRuntime};
 
@@ -198,6 +198,203 @@ alice = "{secret_hex}"
         assert_eq!(&fronted_reply[..6], b"COVER:");
         assert_eq!(&fronted_reply[6..], probe_bytes);
         drop(probe);
+
+        runtime.shutdown();
+    }
+
+    /// Geo-Stealth (`[defense.allowlist]` with default `action = "front"`) end-to-end proof:
+    /// 1. Foreign prober IP (`203.0.113.7`) presenting a **100% VALID** leaked FakeTLS `ee`
+    ///    ClientHello is DENIED proxy access (`faketls.scanned == 0` — ZERO HMAC CPU!) and
+    ///    transparently `splice(2)`-fronted directly to the cover website (`COVER:...`)!
+    /// 2. Allowed Iranian IP (`5.160.1.10`) presenting a valid FakeTLS `ee` ClientHello
+    ///    connects cleanly to the Telegram DC and echoes `HELLO-IRAN-OK!!`!
+    /// 3. Allowed Iranian IP (`5.160.1.10`) presenting a normal browser HTTP/TLS request
+    ///    ALSO seamlessly sees the cover website (`COVER:...`)!
+    #[tokio::test]
+    async fn geo_stealth_allowlist_fronts_foreign_ip_even_with_valid_secret_while_allowing_iran_ip()
+    {
+        use mtg_protocol::proxyproto::encode_v2_tcp;
+
+        // 1. Mock Telegram DC echo server
+        let mock_dc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dc_addr = mock_dc.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = mock_dc.accept().await.unwrap();
+            let mut hs = [0u8; 64];
+            s.read_exact(&mut hs).await.unwrap();
+            let mut recv_key = [0u8; 32];
+            let mut recv_iv = [0u8; 16];
+            recv_key.copy_from_slice(&hs[8..40]);
+            recv_iv.copy_from_slice(&hs[40..56]);
+            let mut rev = [0u8; 48];
+            rev.copy_from_slice(&hs[8..56]);
+            rev.reverse();
+            let mut send_key = [0u8; 32];
+            let mut send_iv = [0u8; 16];
+            send_key.copy_from_slice(&rev[..32]);
+            send_iv.copy_from_slice(&rev[32..48]);
+
+            let mut dec = Aes256Ctr::new(&recv_key, &recv_iv);
+            let mut enc = Aes256Ctr::new(&send_key, &send_iv);
+            let mut dummy = [0u8; 64];
+            dec.apply_keystream(&mut dummy);
+
+            let mut buf = [0u8; 256];
+            let n = s.read(&mut buf).await.unwrap();
+            dec.apply_keystream(&mut buf[..n]);
+            enc.apply_keystream(&mut buf[..n]);
+            s.write_all(&buf[..n]).await.unwrap();
+        });
+
+        // 2. Mock cover website echoing `COVER:` + first received bytes (accepts 2 clients!)
+        let mock_cover = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cover_addr = mock_cover.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = mock_cover.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = s.read(&mut buf).await.unwrap();
+                    s.write_all(b"COVER:").await.unwrap();
+                    s.write_all(&buf[..n]).await.unwrap();
+                });
+            }
+        });
+
+        // 3. Configure proxy with Geo-Stealth allowlist (`5.160.0.0/16`) & PROXY v2 listener
+        let proxy_port = {
+            let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tmp.local_addr().unwrap().port()
+        };
+        let secret_hex =
+            "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d";
+        let secret = Secret::parse(secret_hex).unwrap();
+        let cfg_toml = format!(
+            r#"
+bind-to = "127.0.0.1:{proxy_port}"
+proxy-protocol-listener = true
+prefer-ip = "only-ipv4"
+[domain-fronting]
+host = "127.0.0.1"
+port = {}
+[defense.allowlist]
+enabled = true
+action = "front"
+cidrs = ["5.160.0.0/16"]
+[secrets]
+alice = "{secret_hex}"
+"#,
+            cover_addr.port()
+        );
+        let cfg = Config::parse(cfg_toml.as_bytes()).unwrap();
+        let engine = ProxyEngine::from_config(&cfg, None, 1, false).unwrap();
+
+        let mut dir = DcDirectory::default();
+        let mut v4 = BTreeMap::new();
+        v4.insert(2, vec![dc_addr]);
+        dir.direct_v4 = v4;
+        engine.dc_router.set_directory(dir);
+
+        let runtime = EngineRuntime::start(Arc::clone(&engine)).await.unwrap();
+        let proxy_addr = runtime.bound_faketls_addrs[0];
+        let dst_sa: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+        // Case A: Foreign IP (`203.0.113.7`) sends a 100% VALID leaked FakeTLS `ee` ClientHello!
+        // MUST get `COVER:` + exact raw ClientHello bytes verbatim with ZERO secret scanning!
+        let mut foreign = TcpStream::connect(proxy_addr).await.unwrap();
+        let pp_foreign = encode_v2_tcp("203.0.113.7:51000".parse().unwrap(), dst_sa);
+        let now_secs = Utc::now().timestamp() as u32;
+        let valid_ch = build_client_hello(secret.key(), "storage.googleapis.com", now_secs);
+        foreign.write_all(pp_foreign.as_slice()).await.unwrap();
+        foreign.write_all(&valid_ch).await.unwrap();
+
+        let mut got_cover = vec![0u8; 6 + valid_ch.len()];
+        foreign.read_exact(&mut got_cover).await.unwrap();
+        assert_eq!(&got_cover[..6], b"COVER:");
+        assert_eq!(&got_cover[6..], valid_ch.as_slice());
+        drop(foreign);
+
+        // Verify ZERO HMAC scans happened on the foreign prober, while allowlist_rejected & fronted incremented!
+        assert_eq!(
+            engine.metrics.faketls.scanned.load(Ordering::Relaxed),
+            0,
+            "foreign IP must NEVER trigger secret HMAC scanning!"
+        );
+        assert_eq!(
+            engine
+                .metrics
+                .core(0)
+                .allowlist_rejected_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            engine.metrics.core(0).fronted_total.load(Ordering::Relaxed),
+            1
+        );
+
+        // Case B: Iranian IP (`5.160.1.10`) sends valid FakeTLS `ee` ClientHello -> connects to DC!
+        let mut iran_tg = TcpStream::connect(proxy_addr).await.unwrap();
+        let pp_iran = encode_v2_tcp("5.160.1.10:52000".parse().unwrap(), dst_sa);
+        let iran_ch = build_client_hello(secret.key(), "storage.googleapis.com", now_secs);
+        iran_tg.write_all(pp_iran.as_slice()).await.unwrap();
+        iran_tg.write_all(&iran_ch).await.unwrap();
+
+        let mut sh_read = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let mut records_seen = 0usize;
+        let mut pos = 0usize;
+        while records_seen < 3 {
+            let n = iran_tg.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            sh_read.extend_from_slice(&tmp[..n]);
+            while sh_read.len() >= pos + 5 {
+                let rlen = u16::from_be_bytes([sh_read[pos + 3], sh_read[pos + 4]]) as usize;
+                if sh_read.len() < pos + 5 + rlen {
+                    break;
+                }
+                pos += 5 + rlen;
+                records_seen += 1;
+            }
+        }
+        assert_eq!(sh_read[0], 0x16);
+
+        let (obfs_frame, mut client_ciphers) =
+            build_outbound_handshake(2, ConnectionTag::PADDED_INTERMEDIATE, Some(secret.key()));
+        let mut payload = *b"HELLO-IRAN-OK!!!";
+        client_ciphers.send.apply_keystream(&mut payload);
+
+        let mut tls_pkt = vec![0u8; 5 + 64 + payload.len()];
+        let hdr: &mut [u8; 5] = (&mut tls_pkt[..5]).try_into().unwrap();
+        stamp_app_data_header(hdr, (64 + payload.len()) as u16);
+        tls_pkt[5..69].copy_from_slice(&obfs_frame);
+        tls_pkt[69..].copy_from_slice(&payload);
+        iran_tg.write_all(&tls_pkt).await.unwrap();
+
+        let mut unframer = TlsUnframer::new();
+        let mut app_back = Vec::new();
+        while app_back.len() < 16 {
+            let n = iran_tg.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            let w = unframer.unframe_in_place(&mut tmp[..n]).unwrap();
+            app_back.extend_from_slice(&tmp[..w]);
+        }
+        client_ciphers.recv.apply_keystream(&mut app_back[..16]);
+        assert_eq!(&app_back[..16], b"HELLO-IRAN-OK!!!");
+        drop(iran_tg);
+
+        // Case C: Iranian IP (`5.160.1.10`) visiting with normal browser HTTP -> ALSO sees cover website!
+        let mut iran_web = TcpStream::connect(proxy_addr).await.unwrap();
+        let pp_iran_web = encode_v2_tcp("5.160.1.10:52001".parse().unwrap(), dst_sa);
+        let web_req = b"GET / HTTP/1.1\r\nHost: my-dummy-site.example\r\n\r\n";
+        iran_web.write_all(pp_iran_web.as_slice()).await.unwrap();
+        iran_web.write_all(web_req).await.unwrap();
+
+        let mut web_reply = vec![0u8; 6 + web_req.len()];
+        iran_web.read_exact(&mut web_reply).await.unwrap();
+        assert_eq!(&web_reply[..6], b"COVER:");
+        assert_eq!(&web_reply[6..], web_req);
+        drop(iran_web);
 
         runtime.shutdown();
     }

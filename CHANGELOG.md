@@ -6,6 +6,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [2.2.0] — 2026-11-22
+
+Geo-Stealth cover-only fronting and enterprise auto-updating country IP allowlist/blocklist engine — designed for daily-updated geo-IP feeds such as [IR-Geo-DB](https://github.com/Arman2122/IR-Geo-DB) so foreign active probers and DPI scanners only ever see a genuine cover website (even with a leaked valid `ee` secret or WEB bridge capability) with zero HMAC CPU and zero TCP-drop fingerprinting.
+
+### Added
+- **Geo-Stealth Cover-Only Fronting (`action = "front" | "close"` across `mtg-config`, `mtg-engine`, `mtg-webrelay`):**
+  - Added configurable `action` (`"front"` default for `[defense.allowlist]`, `"close"` default for `[defense.blocklist]`), inline `cidrs = [...]` (strictly validated by `run --check` and `doctor`), and atomic on-disk `cache-file` to `[defense.allowlist]` and `[defense.blocklist]` while preserving 100% byte-exact `panel-config-string.golden` backwards compatibility.
+  - **FakeTLS (`ee`) Zero-HMAC Byte-0 `splice(2)` Fast Path:** Non-allowed (foreign) IPs with `action = "front"` never suffer a fingerprintable TCP drop/RST and never authenticate — even when presenting a valid leaked `ee` secret (`faketls.scanned = 0`, zero HMAC CPU!). Single/fixed covers skip ClientHello parsing altogether and enter zero-copy Linux `splice(2)` from byte 0; multi-domain covers peek SNI only (zero HMAC) to serve the exact matching TLS certificate. Allowed country IPs seamlessly browse the cover website normally AND authenticate to Telegram at ~4–25 ns DIR-24-8 O(1) lookup cost.
+  - **WEB Relay (`mtg-webrelay`) Geo-Stealth & Zero-Leak Cover Sanitization:** Wired `[defense.allowlist]` and `[defense.blocklist]` into `Origin` and `mtg-proxy web-relay` (with startup `init_load`, periodic background refresh, and `SIGHUP` refresh). Foreign IPs hitting any URL — including a leaked `/?bridge=<cap>`, `POST /api/v1/session`, or `GET /api/v1/ws` — silently receive the Tier-3 cover website with bridge/bearer/subprotocol atoms stripped so nothing leaks to `cover-upstream` logs and zero 404 oracle exists.
+  - **Obfuscated2 (`[[listener]]`) Indistinguishable Denial:** Non-allowed IPs with `action = "front"` read the 64-byte frame and exit via `dispose_obfs_denied` (`close` or bounded `drain`), indistinguishable from an unknown secret.
+- **Universal Auto-Updating IP Filter Engine (`mtg-net`, `mtg-governance`):**
+  - Upgraded `fetch_url_bytes_with_dns` to follow up to 5 HTTP `301/302/303/307/308` redirects (required for GitHub `/releases/latest/download/...` URLs), honoring custom DoH/DoT `DnsResolver`, `prefer-ip`, upstream proxies, and a strict 16 MiB body cap.
+  - Extended `IpFilterBuilder` to parse plain CIDR/IP files (`ir-ipv4.txt`, `ir-ipv6.txt`), FireHOL `.ipset`/`.netset`, AND Linux `ipset restore` files (`ir.ipset` — `create`, `flush`, `destroy`, `swap`, `add <set> <cidr> [-exist]`, both IPv4 + IPv6 in one file) while keeping strict rejection of corrupt feeds.
+  - Upgraded `LiveIpFilter` with bounded concurrent downloads (`download-concurrency`), 1 automatic transient retry, parse-before-swap validation, **per-source Last-Known-Good (LKG) retention** (if 1 of 2 URLs fails transiently, never drops the healthy source's IPv4/IPv6 coverage!), **crash-safe atomic `0600` `cache-file` snapshots** (warm-loaded in ~1.4 ms at boot; survives upstream GitHub outages), 60-second automatic retry backoff on partial/failed rounds, `SIGHUP` on-demand refresh, and live Prometheus/StatsD `mtg_iplist_size` gauge updates.
+- **`mtg-proxy doctor` Live IP Filter Verification (`mtg-cli`):**
+  - Added live `[defense.allowlist]` / `[defense.blocklist]` diagnostics reporting loaded IPv4 + IPv6 entry counts, fetch latency, and configured action.
+
+### Verified Live (`Arman2122/IR-Geo-DB` on DigitalOcean `s-2vcpu-2gb-intel`)
+- **`ir-ipv4.txt` + `ir-ipv6.txt` (GitHub multi-hop 302):** `2,552` CIDRs (`1,911` IPv4, `641` IPv6) fetched in `177–390 ms`, persisted to atomic `0600` cache (`39.8 KiB`), cold-boot warm-loaded in **`1.37 ms`**.
+- **`ir.ipset` (single combined Linux `ipset restore` file):** identical `2,552` CIDRs (`1,911` IPv4, `641` IPv6) parsed in `333 ms`.
+- **DIR-24-8 O(1) Lookup Throughput (Xeon Cascade Lake, 10k `/16`s random sweep):** `25.3 ns/op` (`~40 million lookups/s` per core).
+- **Live 4-Probe Geo-Stealth Matrix:**
+  - Foreign IP (`1.1.1.1`) with **100% valid `ee` secret** -> fronted byte-0 to real `storage.googleapis.com:443`, `faketls.scanned = 0`, `mtg_ip_blocklisted{ip_list="allowlist"} = 1`.
+  - Foreign IP (`1.1.1.1`) real HTTPS browser -> verified Google TLSv1.3 cert + real cover HTTP response.
+  - Iranian IP (`5.160.1.10`) with valid `ee` secret -> real Telegram DC 2 `resPQ` (`0x05162463`, `100 B`) in `95.6 ms`.
+  - Iranian IP (`5.160.1.10`) normal HTTPS browser -> verified Google TLSv1.3 cert + real cover HTTP response.
+- **Quality Gates:** `102/102` Rust workspace tests passing, `0` clippy warnings (`-D warnings`), `panel-config-string.golden` byte-exact, Playwright WebBridge `36/36` passing.
+
+---
+
 ## [2.1.0] — 2026-11-21
 
 Major FakeTLS (`ee`) hot-path acceleration, Iranian/GFW DPI anti-fingerprinting & stealth-at-wire-speed upgrade, Zero-RTT multi-cover domain fronting engine, and high-throughput `mtg-webrelay` Web Transport overhaul — all verified head-to-head on real Linux Intel Xeon hardware.

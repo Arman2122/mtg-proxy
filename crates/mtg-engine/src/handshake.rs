@@ -52,7 +52,7 @@ use tracing::debug;
 use crate::cancel::CancelToken;
 use crate::fronting::{FrontingTarget, front_connection};
 use crate::relay::{DirectRelay, RelayContext, relay_middleproxy};
-use crate::state::{ProxyEngine, peer_ip_of};
+use crate::state::{IpFilterVerdict, ProxyEngine, peer_ip_of};
 
 thread_local! {
     /// Per-worker reusable FakeTLS ServerHello + CCS + AppData staging buffer.
@@ -168,8 +168,30 @@ async fn faketls_handshake_and_dial(
     };
 
     // 2. Wait-free IP blocklist / allowlist check (0 ns when disabled!)
-    if !engine.check_ip_filters(client_ip, usize::from(worker_id)) {
-        return None;
+    //    - `Close`: drop immediately (default for explicit blocklists)
+    //    - `Front`: Geo-Stealth cover-only mode (default for allowlists):
+    //      * Single/fixed cover -> ZERO ClientHello parse, ZERO HMAC CPU, instant
+    //        zero-copy kernel `splice(2)` from byte 0 straight to the cover website!
+    //      * Multi-domain public covers -> SNI-only ClientHello peek (ZERO HMAC CPU,
+    //        ZERO secret authentication!) so the prober gets the exact matching cert!
+    let filter_verdict = engine.check_ip_filters(client_ip, usize::from(worker_id));
+    match filter_verdict {
+        IpFilterVerdict::Close => return None,
+        IpFilterVerdict::Front if engine.has_fixed_fronting_host() => {
+            let hosts = engine.fronting_hosts_for(&[]);
+            do_front(
+                stream,
+                client_addr,
+                dst_addr,
+                &raw_buf,
+                hosts,
+                worker_id,
+                &engine,
+            )
+            .await;
+            return None;
+        }
+        IpFilterVerdict::Front | IpFilterVerdict::Allow => {}
     }
 
     // 3. Incrementally read & parse FakeTLS ClientHello within handshake timeout
@@ -195,6 +217,23 @@ async fn faketls_handshake_and_dial(
         .await;
         return None;
     };
+
+    // Multi-domain Geo-Stealth cover-only path: front using SNI without touching any secrets!
+    if filter_verdict == IpFilterVerdict::Front {
+        let hosts = engine.fronting_hosts_for(&parsed.sni_hostnames);
+        hello_wire.extend_from_slice(&post_hello_buf);
+        do_front(
+            stream,
+            client_addr,
+            dst_addr,
+            &hello_wire,
+            hosts,
+            worker_id,
+            &engine,
+        )
+        .await;
+        return None;
+    }
 
     // 4. Match secret: Hints -> SNI bucket -> Budgeted hardware SIMD/SHA-NI scan
     let matched = match_faketls_secret(&parsed, client_ip, &engine).await;
@@ -362,12 +401,13 @@ async fn obfs2_handshake_and_dial(
         is_v4,
     };
 
-    if !engine.check_ip_filters(client_ip, usize::from(worker_id)) {
+    let filter_verdict = engine.check_ip_filters(client_ip, usize::from(worker_id));
+    if filter_verdict == IpFilterVerdict::Close {
         return None;
     }
 
-    // Always read the 64-byte obfuscated2 frame BEFORE checking rate limit so a
-    // rate-limited peer cannot be distinguished from a normal no-match!
+    // Always read the 64-byte obfuscated2 frame BEFORE checking rate limit or
+    // stealth IP denial so a denied peer cannot be distinguished from a normal no-match!
     while raw_buf.len() < HANDSHAKE_FRAME_LEN {
         let mut tmp = [0u8; 64];
         let need = HANDSHAKE_FRAME_LEN - raw_buf.len();
@@ -385,6 +425,11 @@ async fn obfs2_handshake_and_dial(
     frame.copy_from_slice(&raw_buf[..HANDSHAKE_FRAME_LEN]);
     let leftover = raw_buf.split_off(HANDSHAKE_FRAME_LEN);
     drop(raw_buf);
+
+    if filter_verdict == IpFilterVerdict::Front {
+        dispose_obfs_denied(stream, policy, &engine).await;
+        return None;
+    }
 
     if !engine.obfs_limiter.allow(&policy, client_ip) {
         engine

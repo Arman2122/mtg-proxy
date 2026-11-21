@@ -43,6 +43,7 @@ Unlike single-secret proxies, `mtg-proxy` gives every user their own named secre
   - [Extra Listeners (`[[listener]]`)](#extra-listeners-listener)
   - [WEB Proxy Transport (`web-relay`)](#web-proxy-transport-web-relay)
   - [Doppelganger Cover Scouting & Traffic Mimicry](#doppelganger-cover-scouting--traffic-mimicry)
+  - [Geo-Stealth Country Allowlist (`IR-Geo-DB`) & Cover-Only Fronting](#geo-stealth-country-allowlist-ir-geo-db--cover-only-fronting)
   - [Public IP Override & Environment Variables](#public-ip-override--environment-variables)
 - [CLI Command Reference](#cli-command-reference)
 - [Upgrading from v1.x (Go) to v2.0 (Rust)](#upgrading-from-v1x-go-to-v20-rust)
@@ -63,6 +64,7 @@ Unlike single-secret proxies, `mtg-proxy` gives every user their own named secre
 | **Single-Poll Full-Duplex `DirectRelay`** | Owns `(client, dc)` directly (no `into_split()` `Arc`s), shares 1 amortized idle timer, uses zero-memmove `TlsUnframer::unframe_spans` + L1/L2-hot 128 KiB thread-local scratch (`0 B` idle I/O buffers), batches up to 8 × 16 KiB FakeTLS records per `writev(2)` (`8 sys/MB`), and locks live task frame size to **`1,776 B`** via CI unit-test guard. |
 | **Multi-Arch Hardware Crypto** | Single-pass in-place fused double-CTR (`x86_64` **VAES+AVX2** 8-block, **AES-NI** 4-block; `aarch64` **ARMv8 AES** 4-block), per-handshake ephemeral X25519 key shares (zero repeated TLS keys), and multi-secret FakeTLS HMAC-SHA256 (**4-way interleaved SHA-NI**, **8-way AVX2**, **ARMv8 SHA-256**) with zero-alloc hot paths. |
 | **Zero-RTT Domain Fronting (`FrontingPool`)** | Pre-warmed standby TCP pool (liveness-checked via `MSG_PEEK \| MSG_DONTWAIT`) with reactive cover pre-warming for 0 ms proxy→cover connect RTT against active DPI probes, SNI-matched multi-cover failover, anti-self-loop IP filtering, and zero-copy Linux `splice(2)` kernel pipe relay. |
+| **Geo-Stealth IP Filter (`DIR-24-8`)** | Wait-free O(1) IPv4 DIR-24-8 bitmap (`~4 ns`) + coalesced IPv6 ranges (`~10 ns`), multi-hop GitHub redirect auto-updater (`IR-Geo-DB` / FireHOL / Linux `ipset restore`), per-source LKG retention, atomic `cache-file`, and zero-HMAC byte-0 `splice(2)` cover-only fronting for foreign IPs across both FakeTLS `ee` and `web-relay`. |
 | **High-Throughput WEB Transport (`mtg-webrelay`)** | Lock-free `TcpStream::into_split()`, `0 B` idle per-session scratch, stack-vectored `writev(2)` Shared-Frame v1 batching, fair round-robin stream coalescing, multi-acceptor `SO_REUSEPORT`, Slowloris-hardened HTTP/1.1, 16 MiB cached `StaticCover`, and Happy-Eyeballs keep-alive pooled `UpstreamCover`. |
 | **Lock-Free & Sharded State** | Cache-line-aligned per-worker admission gate & live-connection shards, per-secret sharded `AddressRegistry`, compact 32-byte `CancelToken`, vDSO `CLOCK_REALTIME_COARSE`/`CLOCK_MONOTONIC_COARSE`, and `tikv-jemallocator` (`percpu_arena:percpu`, 1s dirty/muzzy decay). |
 
@@ -373,6 +375,33 @@ scout-covers = true  # Concurrent per-SNI live TLS scouting (up to 16 cover doma
 ```
 
 Live background TLS scouting (`tokio-rustls` + Happy Eyeballs) measures each hosted cover domain's actual certificate-flight size, jitter, Weibull arrival gaps, and DRS behavior independently (`DoppelCatalog`) and publishes calibrated per-SNI profiles atomically via `ArcSwap`.
+
+### Geo-Stealth Country Allowlist (`IR-Geo-DB`) & Cover-Only Fronting
+
+Restrict proxy authentication to a specific country's IP ranges (for example, Iran via daily-updated [IR-Geo-DB](https://github.com/Arman2122/IR-Geo-DB)) while presenting a genuine cover website to every foreign scanner, probe, or censor — **even if a foreign prober holds a valid leaked `ee` secret or WEB bridge link**:
+
+```toml
+[defense.allowlist]
+enabled = true
+action = "front"             # Default for allowlist: stealth cover-only (never TCP-RST/drop!)
+urls = [
+    "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv4.txt",
+    "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv6.txt",
+    # Or single combined Linux ipset restore file (IPv4 + IPv6):
+    # "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir.ipset",
+]
+# Optional inline CIDRs always permitted (e.g., loopback / operator IP)
+cidrs = ["127.0.0.1/32", "::1/128"]
+# Atomic on-disk cache (0600) for instant cold boot & GitHub outage resilience
+cache-file = "/var/lib/mtg-proxy/ir-allowlist.cache"
+update-each = "12h"
+download-concurrency = 4
+```
+
+- **Zero-Fingerprint Cover-Only Fronting (`action = "front"`):**
+  - **FakeTLS (`ee`):** Rejected foreign IPs skip secret scanning completely (**0 HMAC CPU**) and enter zero-copy Linux `splice(2)` directly to the cover website from byte 0 (for single/fixed covers) or SNI-matched cover (for multi-domain covers). Allowed country IPs both browse the cover website normally AND authenticate to Telegram via `ee` secrets at ~4 ns DIR-24-8 lookup cost.
+  - **WEB Relay (`web-relay`):** Rejected foreign IPs hitting any path — even a leaked `/?bridge=<cap>` or `/api/v1/ws` — silently receive the Tier-3 cover website with bridge/bearer atoms stripped so nothing leaks to upstream logs and zero 404 oracle exists.
+- **Enterprise Resilience:** Follows multi-hop HTTP `301/302/307/308` GitHub release redirects, validates feeds before swapping, keeps per-source Last-Known-Good (LKG) snapshots so a partial URL outage never drops IPv4 or IPv6 coverage, retries failed/partial rounds every `60s`, persists atomic `0600` on-disk snapshots, updates live Prometheus `mtg_iplist_size` gauges, and refreshes on demand via `SIGHUP` (`mtg-proxy doctor` verifies live feeds too).
 
 ### Public IP Override & Environment Variables
 

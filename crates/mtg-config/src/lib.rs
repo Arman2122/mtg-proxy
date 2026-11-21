@@ -24,9 +24,10 @@ pub use scrub::{
     shown_name, unknown_key_path, value_free_name, value_free_text,
 };
 pub use types::{
-    AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, PreferIp, StatsdTagFormat,
-    TypeParseError, UnknownSecretAction, canonical_web_host, format_bytes_go, format_duration_go,
-    parse_ad_tag, parse_bytes_str, parse_duration, redact_proxy_url,
+    AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction, PreferIp,
+    StatsdTagFormat, TypeParseError, UnknownSecretAction, canonical_web_host, format_bytes_go,
+    format_duration_go, parse_ad_tag, parse_bytes_str, parse_duration, redact_proxy_url,
+    validate_ip_or_cidr,
 };
 
 #[cfg(test)]
@@ -298,5 +299,49 @@ alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732
         assert!(cfg.secrets.is_empty());
         assert_eq!(cfg.bind_to.len(), 2);
         assert_eq!(cfg.get_secrets()["default"].host(), "example.com");
+    }
+
+    #[test]
+    fn allowlist_and_blocklist_geo_stealth_fields_parse_and_validate() {
+        let raw = br#"
+bind-to = "0.0.0.0:443"
+[secrets]
+alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+[defense.allowlist]
+enabled = true
+action = "front"
+urls = [
+  "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv4.txt",
+  "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv6.txt",
+]
+cidrs = ["127.0.0.1/32", "2001:db8::/32"]
+cache-file = "/var/lib/mtg-proxy/ir-allowlist.cache"
+update-each = "12h"
+download-concurrency = 4
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.unknown_keys.is_empty());
+        assert_eq!(cfg.defense.allowlist.enabled, Some(true));
+        assert_eq!(cfg.defense.allowlist.action, Some(IpFilterAction::Front));
+        assert_eq!(
+            cfg.defense.allowlist.cidrs.as_deref(),
+            Some(&["127.0.0.1/32".to_owned(), "2001:db8::/32".to_owned()][..])
+        );
+        assert_eq!(
+            cfg.defense.allowlist.cache_file.as_deref(),
+            Some("/var/lib/mtg-proxy/ir-allowlist.cache")
+        );
+
+        let bad_cidr = br#"
+bind-to = "0.0.0.0:443"
+[secrets]
+alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+[defense.allowlist]
+enabled = true
+cidrs = ["192.0.2.0/33"]
+"#;
+        let parsed = Config::parse(bad_cidr).unwrap();
+        assert!(parsed.validate().is_err());
     }
 }

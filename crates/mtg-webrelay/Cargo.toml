@@ -22,6 +22,7 @@ idna.workspace = true
 mtg-config.workspace = true
 mtg-core.workspace = true
 mtg-crypto.workspace = true
+mtg-governance.workspace = true
 mtg-net.workspace = true
 mtg-protocol.workspace = true
 parking_lot.workspace = true

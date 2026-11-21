@@ -41,7 +41,7 @@ pub use metrics::{
     RelayStreamStats, handle_stats_request,
 };
 pub use origin::{
-    BRIDGE_QUERY, CARRIER_PATH, Origin, OriginError, OriginOptions, SESSION_PATH,
+    BRIDGE_QUERY, CARRIER_PATH, Origin, OriginError, OriginIpFilters, OriginOptions, SESSION_PATH,
     SUBPROTOCOL_PREFIX,
 };
 pub use page::{BRIDGE_JS, BridgeDocument, BridgePage, CARRIER_MODE, PageError};
@@ -147,6 +147,7 @@ mod integration_tests {
             max_streams: 8,
             client_ip_source: ClientIpSource::XForwardedFor,
             counters: Some(Arc::clone(&counters)),
+            ip_filters: OriginIpFilters::default(),
         })
         .unwrap();
 
@@ -346,6 +347,7 @@ mod integration_tests {
                 max_streams: 16,
                 client_ip_source: ClientIpSource::XForwardedFor,
                 counters: Some(Arc::clone(&counters)),
+                ip_filters: OriginIpFilters::default(),
             })
             .unwrap(),
         );
@@ -497,5 +499,124 @@ mod integration_tests {
         let _ = shutdown_tx.send(true);
         let _ = origin_srv.await;
         let _ = stats_srv.await;
+    }
+
+    #[tokio::test]
+    async fn geo_stealth_webrelay_fronts_foreign_ip_without_leaking_credentials_to_cover() {
+        use mtg_config::IpFilterAction;
+        use mtg_governance::{LiveIpFilter, LiveIpFilterConfig};
+        use parking_lot::Mutex;
+
+        #[derive(Debug, Default)]
+        struct RecordingCover {
+            seen_uris: Mutex<Vec<String>>,
+            seen_auth: Mutex<Vec<bool>>,
+        }
+
+        impl CoverHandler for RecordingCover {
+            fn serve(
+                &self,
+                req: Request<Bytes>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = http::Response<http_body_util::Full<Bytes>>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                self.seen_uris.lock().push(req.uri().to_string());
+                self.seen_auth
+                    .lock()
+                    .push(req.headers().contains_key(http::header::AUTHORIZATION));
+                Box::pin(async {
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("x-cover", "yes")
+                        .body(http_body_util::Full::new(Bytes::from_static(b"COVER_SITE")))
+                        .unwrap()
+                })
+            }
+        }
+
+        let allow = Arc::new(LiveIpFilter::from_config(LiveIpFilterConfig {
+            inline_cidrs: vec!["5.160.0.0/16".to_owned()],
+            ..LiveIpFilterConfig::default()
+        }));
+        allow.init_load().await.unwrap();
+
+        let secret = Secret::generate_mode(SecretMode::Dd, "").unwrap();
+        let signer = Signer::new(&[0x33; TOKEN_KEY_LEN]).unwrap();
+        let cover = Arc::new(RecordingCover::default());
+
+        let origin = Origin::new(OriginOptions {
+            host: "stealth.example.test".to_owned(),
+            secrets: vec![secret.clone()],
+            retired: vec![],
+            signer,
+            cover: CoverSite::Custom(Arc::clone(&cover) as Arc<dyn CoverHandler>),
+            backend: Arc::new(TcpProxyBackend::new(
+                "127.0.0.1:1".parse().unwrap(),
+                Duration::from_secs(1),
+            )),
+            limits: FrameLimits::default(),
+            max_sessions: 8,
+            max_streams: 8,
+            client_ip_source: ClientIpSource::ProxyProtocol,
+            counters: None,
+            ip_filters: OriginIpFilters {
+                allowlist: Some(Arc::clone(&allow)),
+                allowlist_action: IpFilterAction::Front,
+                blocklist: None,
+                blocklist_action: IpFilterAction::Close,
+            },
+        })
+        .unwrap();
+
+        let cap = derive_capability(&web_secret(&secret), "stealth.example.test").unwrap();
+        let foreign_peer: SocketAddr = "203.0.113.9:51234".parse().unwrap();
+        let iran_peer: SocketAddr = "5.160.1.10:52345".parse().unwrap();
+
+        // 1. Foreign prober with a 100% VALID leaked bridge capability -> gets COVER_SITE (200 OK)
+        //    AND cover handler sees sanitized `/` with ZERO capability leaked in query!
+        let r_foreign = Request::builder()
+            .uri(format!("/?bridge={}", cap.encode_base64url()))
+            .header("authorization", "Bearer leaked-session-token")
+            .body(Bytes::new())
+            .unwrap();
+        let resp_foreign = origin
+            .handle_bytes_from(r_foreign, Some(foreign_peer))
+            .await;
+        assert_eq!(resp_foreign.status(), StatusCode::OK);
+        assert_eq!(resp_foreign.headers().get("x-cover").unwrap(), "yes");
+        assert_eq!(cover.seen_uris.lock().as_slice(), &["/"]);
+        assert_eq!(cover.seen_auth.lock().as_slice(), &[false]);
+
+        // 2. Iranian user with valid bridge capability -> gets Tier-1 bridge HTML (TPROXY_BOOT)!
+        let r_iran_bridge = Request::builder()
+            .uri(format!("/?bridge={}", cap.encode_base64url()))
+            .body(Bytes::new())
+            .unwrap();
+        let resp_iran_bridge = origin
+            .handle_bytes_from(r_iran_bridge, Some(iran_peer))
+            .await;
+        assert_eq!(resp_iran_bridge.status(), StatusCode::OK);
+        assert!(resp_iran_bridge.headers().get("x-cover").is_none());
+        let html = String::from_utf8(
+            resp_iran_bridge
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("var TPROXY_BOOT="));
+
+        // 3. Iranian user visiting normal `/` -> ALSO gets COVER_SITE!
+        let r_iran_web = Request::builder().uri("/").body(Bytes::new()).unwrap();
+        let resp_iran_web = origin.handle_bytes_from(r_iran_web, Some(iran_peer)).await;
+        assert_eq!(resp_iran_web.status(), StatusCode::OK);
+        assert_eq!(resp_iran_web.headers().get("x-cover").unwrap(), "yes");
     }
 }

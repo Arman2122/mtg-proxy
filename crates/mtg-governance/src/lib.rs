@@ -32,7 +32,8 @@ pub use hints::{
     ObfuscatedLimiter, hint_key,
 };
 pub use ipfilter::{
-    DEFAULT_IPFILTER_UPDATE_EACH, IpFilter, IpFilterBuilder, IpFilterError, LiveIpFilter,
+    DEFAULT_IPFILTER_CONCURRENCY, DEFAULT_IPFILTER_RETRY_EACH, DEFAULT_IPFILTER_UPDATE_EACH,
+    IpFilter, IpFilterBuilder, IpFilterError, LiveIpFilter, LiveIpFilterConfig,
 };
 pub use rate_limit::{
     ADDR_BURST_DIVISOR, BlockedTracker, DEMAND_INFINITE, FAIR_ACTIVE_WINDOW_NS, FAIR_HOLD_TICKS,

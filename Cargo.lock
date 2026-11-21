@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-api"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "axum",
  "chrono",
@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-bench"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-cli"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1377,6 +1377,7 @@ dependencies = [
  "mtg-core",
  "mtg-crypto",
  "mtg-engine",
+ "mtg-governance",
  "mtg-net",
  "mtg-protocol",
  "mtg-webrelay",
@@ -1391,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-config"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "base64",
  "chrono",
@@ -1411,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-core"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "base64",
  "bitflags",
@@ -1426,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-crypto"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "aes",
  "base64",
@@ -1452,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-engine"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1483,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-governance"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1495,6 +1496,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "smallvec",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -1503,7 +1505,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-net"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1537,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-protocol"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "crc32fast",
  "getrandom 0.3.4",
@@ -1557,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "mtg-webrelay"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1572,6 +1574,7 @@ dependencies = [
  "mtg-config",
  "mtg-core",
  "mtg-crypto",
+ "mtg-governance",
  "mtg-net",
  "mtg-protocol",
  "parking_lot",

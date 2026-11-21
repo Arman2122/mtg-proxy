@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use mtg_config::{Config, HandshakeBudgetMode, ListenerPolicy, PreferIp};
+use mtg_config::{Config, HandshakeBudgetMode, IpFilterAction, ListenerPolicy, PreferIp};
 use mtg_core::{
     IpUnit, ModeSet, RetiringSecret, RotationClock, Secret, SecretLimits, SecretMode,
     is_personal_ip,
@@ -132,6 +132,18 @@ pub enum EngineError {
     Reload(String),
 }
 
+/// Result of evaluating `[defense.blocklist]` and `[defense.allowlist]` for a client IP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpFilterVerdict {
+    /// IP is permitted to attempt proxy authentication.
+    Allow,
+    /// IP is denied proxy access; transparently front directly to the cover website
+    /// (zero secret matching, zero HMAC CPU, zero TCP-drop fingerprint!).
+    Front,
+    /// IP is denied and the connection should be closed immediately.
+    Close,
+}
+
 /// Listener descriptor exposed on `GET /stats` (`listeners`).
 #[derive(Debug, Clone, Serialize)]
 pub struct ListenerReport {
@@ -217,7 +229,9 @@ pub struct ProxyEngine {
     pub faketls_replay: FakeTlsAntiReplay,
     pub obfs2_replay: Obfs2AntiReplay,
     pub blocklist: Option<Arc<LiveIpFilter>>,
+    pub blocklist_action: IpFilterAction,
     pub allowlist: Option<Arc<LiveIpFilter>>,
+    pub allowlist_action: IpFilterAction,
     pub dns: Arc<DnsResolver>,
     pub proxy_pool: Option<ProxyPool>,
     pub dc_router: Arc<DcRouter>,
@@ -332,16 +346,16 @@ impl ProxyEngine {
             Obfs2AntiReplay::disabled()
         };
 
+        let blocklist_action = cfg
+            .defense
+            .blocklist
+            .action
+            .unwrap_or(IpFilterAction::Close);
         let blocklist = if cfg.defense.blocklist.enabled.unwrap_or(false) {
-            let urls = cfg.defense.blocklist.urls.clone().unwrap_or_default();
-            let each = cfg
-                .defense
-                .blocklist
-                .update_each
-                .unwrap_or(Duration::from_secs(24 * 3600));
-            Some(Arc::new(LiveIpFilter::new(
-                urls,
-                each,
+            Some(Arc::new(LiveIpFilter::from_list_config(
+                &cfg.defense.blocklist,
+                Some(Arc::clone(&dns)),
+                prefer_ip,
                 proxy_pool.clone(),
                 sock_cfg,
             )))
@@ -349,16 +363,16 @@ impl ProxyEngine {
             None
         };
 
+        let allowlist_action = cfg
+            .defense
+            .allowlist
+            .action
+            .unwrap_or(IpFilterAction::Front);
         let allowlist = if cfg.defense.allowlist.enabled.unwrap_or(false) {
-            let urls = cfg.defense.allowlist.urls.clone().unwrap_or_default();
-            let each = cfg
-                .defense
-                .allowlist
-                .update_each
-                .unwrap_or(Duration::from_secs(24 * 3600));
-            Some(Arc::new(LiveIpFilter::new(
-                urls,
-                each,
+            Some(Arc::new(LiveIpFilter::from_list_config(
+                &cfg.defense.allowlist,
+                Some(Arc::clone(&dns)),
+                prefer_ip,
                 proxy_pool.clone(),
                 sock_cfg,
             )))
@@ -523,7 +537,9 @@ impl ProxyEngine {
             faketls_replay,
             obfs2_replay,
             blocklist,
+            blocklist_action,
             allowlist,
+            allowlist_action,
             dns,
             proxy_pool,
             dc_router,
@@ -544,18 +560,15 @@ impl ProxyEngine {
         }))
     }
 
-    /// True if IP is permitted by configured blocklist / allowlist (`0 ns` when disabled!).
+    /// Evaluate configured blocklist and allowlist (`0 ns` when both are disabled!).
+    ///
+    /// Precedence:
+    /// 1. Explicit `blocklist` match -> increments `blocklisted_total` and applies
+    ///    `blocklist_action` (default: `Close`).
+    /// 2. `allowlist` miss -> increments `allowlist_rejected_total` and applies
+    ///    `allowlist_action` (default: `Front`, Geo-Stealth cover-only!).
     #[inline]
-    pub fn check_ip_filters(&self, ip: IpAddr, worker_id: usize) -> bool {
-        if let Some(allow) = &self.allowlist
-            && !allow.contains(ip)
-        {
-            self.metrics
-                .core(worker_id)
-                .allowlist_rejected_total
-                .fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
+    pub fn check_ip_filters(&self, ip: IpAddr, worker_id: usize) -> IpFilterVerdict {
         if let Some(block) = &self.blocklist
             && block.contains(ip)
         {
@@ -563,9 +576,64 @@ impl ProxyEngine {
                 .core(worker_id)
                 .blocklisted_total
                 .fetch_add(1, Ordering::Relaxed);
-            return false;
+            return match self.blocklist_action {
+                IpFilterAction::Front => IpFilterVerdict::Front,
+                IpFilterAction::Close => IpFilterVerdict::Close,
+            };
         }
-        true
+        if let Some(allow) = &self.allowlist
+            && !allow.contains(ip)
+        {
+            self.metrics
+                .core(worker_id)
+                .allowlist_rejected_total
+                .fetch_add(1, Ordering::Relaxed);
+            return match self.allowlist_action {
+                IpFilterAction::Front => IpFilterVerdict::Front,
+                IpFilterAction::Close => IpFilterVerdict::Close,
+            };
+        }
+        IpFilterVerdict::Allow
+    }
+
+    /// True when fronting target selection does not depend on ClientHello SNI
+    /// (dedicated local/reverse-proxy `[domain-fronting].host` or `<= 1` distinct
+    /// hosted cover hostname). Allows Geo-Stealth (`IpFilterVerdict::Front`) to
+    /// skip ClientHello parsing completely and enter kernel `splice(2)` at byte 0!
+    #[inline]
+    pub fn has_fixed_fronting_host(&self) -> bool {
+        let explicit = &self.settings.fronting_host;
+        if !explicit.is_empty()
+            && (self.settings.fronting_port != 443
+                || explicit.eq_ignore_ascii_case("localhost")
+                || explicit.parse::<IpAddr>().is_ok())
+        {
+            return true;
+        }
+        self.secrets.load().sni_buckets.len() <= 1
+    }
+
+    /// Trigger a non-blocking background refresh of active blocklist / allowlist
+    /// feeds (e.g. on `SIGHUP`) and update live Prometheus/StatsD size gauges.
+    pub fn trigger_ip_filter_refresh(&self) {
+        if let Some(bl) = &self.blocklist {
+            let bl = Arc::clone(bl);
+            let m = Arc::clone(&self.metrics);
+            tokio::spawn(async move {
+                if let Ok(n) = bl.refresh_once().await {
+                    m.blocklist_size.store(n as u64, Ordering::Release);
+                }
+            });
+        }
+        if let Some(al) = &self.allowlist {
+            let al = Arc::clone(al);
+            let m = Arc::clone(&self.metrics);
+            tokio::spawn(async move {
+                if let Ok(n) = al.refresh_once().await {
+                    m.allowlist_size.store(n as u64, Ordering::Release);
+                }
+            });
+        }
     }
 
     /// Resolve ordered fronting candidate hostnames (primary SNI-matched cover
@@ -1269,12 +1337,18 @@ impl ProxyEngine {
         // 1. Hourly Telegram DC & MiddleProxy config refresh (only fetch if ad_tag exists or DC updates needed)
         self.dc_router.spawn_refresh_loop(shutdown.clone());
 
-        // 2. IP blocklist / allowlist periodic refresh
+        // 2. IP blocklist / allowlist periodic refresh (keeps Prometheus/StatsD size gauges live!)
         if let Some(bl) = &self.blocklist {
-            bl.spawn_refresh_loop(shutdown.clone());
+            let m = Arc::clone(&self.metrics);
+            bl.spawn_refresh_loop_with_hook(shutdown.clone(), move |n| {
+                m.blocklist_size.store(n as u64, Ordering::Release);
+            });
         }
         if let Some(al) = &self.allowlist {
-            al.spawn_refresh_loop(shutdown.clone());
+            let m = Arc::clone(&self.metrics);
+            al.spawn_refresh_loop_with_hook(shutdown.clone(), move |n| {
+                m.allowlist_size.store(n as u64, Ordering::Release);
+            });
         }
 
         // 3. 1-second fair-share water-level ticker (only touches fair-enabled secrets!)

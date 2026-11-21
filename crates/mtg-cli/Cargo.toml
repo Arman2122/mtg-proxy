@@ -26,6 +26,7 @@ mtg-config.workspace = true
 mtg-core.workspace = true
 mtg-crypto.workspace = true
 mtg-engine.workspace = true
+mtg-governance.workspace = true
 mtg-net.workspace = true
 mtg-protocol.workspace = true
 mtg-webrelay.workspace = true

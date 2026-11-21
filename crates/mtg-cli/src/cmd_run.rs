@@ -309,6 +309,7 @@ async fn run_proxy(
                             for w in warnings {
                                 warn!("retiring-secret: {w}");
                             }
+                            engine.trigger_ip_filter_refresh();
                         }
                         Err(e) => {
                             warn!(error = %e, "SIGHUP reload failed; keeping active secret set");

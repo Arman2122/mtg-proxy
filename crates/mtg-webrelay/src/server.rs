@@ -20,8 +20,10 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use mtg_config::{ClientIpSource, Config, ConfigWeb};
+use mtg_config::{ClientIpSource, Config, ConfigWeb, IpFilterAction, PreferIp};
 use mtg_core::Secret;
+use mtg_governance::LiveIpFilter;
+use mtg_net::{DnsResolver, ProxyPool, SocketConfig};
 use mtg_protocol::proxyproto::{ProxyParseStatus, ProxyProtoMode, parse_proxy_header};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,7 +35,7 @@ use crate::WebRelayError;
 use crate::cover::{CoverSite, StaticCover, UpstreamCover};
 use crate::frame::FrameLimits;
 use crate::metrics::{RelayCounters, handle_stats_request};
-use crate::origin::{Origin, OriginOptions, UpgradedIoExtractor};
+use crate::origin::{Origin, OriginIpFilters, OriginOptions, UpgradedIoExtractor};
 use crate::session::{DEFAULT_DIAL_TIMEOUT, TcpProxyBackend};
 use crate::token::Signer;
 
@@ -277,6 +279,8 @@ pub async fn build_origin_from_config(
         batch_bytes: conf.web.carrier_batch_bytes.unwrap_or(0) as usize,
     };
 
+    let ip_filters = build_ip_filters_from_config(conf).await?;
+
     let origin = Origin::new(OriginOptions {
         host,
         secrets,
@@ -289,10 +293,81 @@ pub async fn build_origin_from_config(
         max_streams: conf.web.max_streams.unwrap_or(0) as usize,
         client_ip_source: conf.web.client_ip.unwrap_or_default(),
         counters: Some(counters),
+        ip_filters,
     })
     .map_err(|e| WebRelayError::Config(e.to_string()))?;
 
     Ok(Arc::new(origin))
+}
+
+async fn build_ip_filters_from_config(conf: &Config) -> Result<OriginIpFilters, WebRelayError> {
+    let want_bl = conf.defense.blocklist.enabled.unwrap_or(false);
+    let want_al = conf.defense.allowlist.enabled.unwrap_or(false);
+    if !want_bl && !want_al {
+        return Ok(OriginIpFilters::default());
+    }
+
+    let prefer_ip = conf.prefer_ip.unwrap_or(PreferIp::PreferIpv6);
+    let sock_cfg = SocketConfig::default();
+    let dns = Arc::new(
+        DnsResolver::build(conf.network.dns.as_deref(), conf.network.doh_ip, prefer_ip)
+            .map_err(|e| WebRelayError::Config(format!("dns init failed: {e}")))?,
+    );
+    let tcp_timeout = conf.network.timeout.tcp.unwrap_or(Duration::from_secs(10));
+    let proxy_pool = match &conf.network.proxies {
+        Some(urls) if !urls.is_empty() => Some(
+            ProxyPool::from_urls(urls, sock_cfg, tcp_timeout)
+                .map_err(|e| WebRelayError::Config(e.to_string()))?,
+        ),
+        _ => None,
+    };
+
+    let blocklist = if want_bl {
+        let bl = Arc::new(LiveIpFilter::from_list_config(
+            &conf.defense.blocklist,
+            Some(Arc::clone(&dns)),
+            prefer_ip,
+            proxy_pool.clone(),
+            sock_cfg,
+        ));
+        if let Err(e) = bl.init_load().await {
+            warn!(error = %e, "web-relay initial blocklist load failed");
+        }
+        Some(bl)
+    } else {
+        None
+    };
+
+    let allowlist = if want_al {
+        let al = Arc::new(LiveIpFilter::from_list_config(
+            &conf.defense.allowlist,
+            Some(dns),
+            prefer_ip,
+            proxy_pool,
+            sock_cfg,
+        ));
+        if let Err(e) = al.init_load().await {
+            warn!(error = %e, "web-relay initial allowlist load failed");
+        }
+        Some(al)
+    } else {
+        None
+    };
+
+    Ok(OriginIpFilters {
+        allowlist,
+        allowlist_action: conf
+            .defense
+            .allowlist
+            .action
+            .unwrap_or(IpFilterAction::Front),
+        blocklist,
+        blocklist_action: conf
+            .defense
+            .blocklist
+            .action
+            .unwrap_or(IpFilterAction::Close),
+    })
 }
 
 /// Bind tuned Linux `TcpListener`(s) with zero-syscall child socket inheritance
@@ -503,6 +578,24 @@ pub async fn run_web_relay(
             conf.web.client_ip.unwrap_or_default().as_str()
         );
         println!("  stats     {}", stats_bind.unwrap_or("(off)"));
+        if conf.defense.allowlist.enabled.unwrap_or(false) {
+            println!(
+                "  allowlist enabled (action={})",
+                conf.defense
+                    .allowlist
+                    .action
+                    .unwrap_or(IpFilterAction::Front)
+            );
+        }
+        if conf.defense.blocklist.enabled.unwrap_or(false) {
+            println!(
+                "  blocklist enabled (action={})",
+                conf.defense
+                    .blocklist
+                    .action
+                    .unwrap_or(IpFilterAction::Close)
+            );
+        }
         return Ok(());
     }
 
@@ -520,6 +613,7 @@ pub async fn run_web_relay(
     let initial_web = conf.web.clone();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    origin.spawn_ip_filter_refresh_loops(shutdown_rx.clone());
     let require_pp = conf.web.client_ip.unwrap_or_default() == ClientIpSource::ProxyProtocol;
 
     let (origin_addr, origin_handle) =
@@ -556,6 +650,7 @@ pub async fn run_web_relay(
             _ = sighup.recv() => {
                 info!("received SIGHUP; reloading WEB relay profiles");
                 reload_web_profiles(&cfg_path, &initial_web, &origin, &counters);
+                origin.trigger_ip_filter_refresh();
                 last_mtime = file_mtime(&cfg_path);
             }
             _ = poll_tick.tick() => {

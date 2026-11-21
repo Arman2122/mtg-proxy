@@ -32,6 +32,10 @@ pub enum TypeParseError {
     InvalidClientIpSource(String),
     #[error("unknown on-unknown-secret action {0:?} (expected \"close\" or \"drain\")")]
     InvalidUnknownSecretAction(String),
+    #[error("unknown ip-filter action {0:?} (expected \"front\" or \"close\")")]
+    InvalidIpFilterAction(String),
+    #[error("incorrect IP or CIDR entry {0:?}")]
+    InvalidCidr(String),
     #[error("unknown handshake-budget mode {0:?} (expected \"enforce\", \"observe\", or \"off\")")]
     InvalidHandshakeBudgetMode(String),
     #[error("incorrect handshake-budget cpu-percent {0}: must be in 1..=100")]
@@ -241,6 +245,76 @@ impl FromStr for UnknownSecretAction {
             _ => Err(TypeParseError::InvalidUnknownSecretAction(s.to_owned())),
         }
     }
+}
+
+/// Action taken when a client IP is rejected by `[defense.allowlist]` or matched
+/// by `[defense.blocklist]`.
+///
+/// - [`Self::Front`] (default for `allowlist`): transparently domain-front the
+///   connection directly to the cover website (0 secret matching, 0 HMAC CPU,
+///   0 TCP drop fingerprint; in WEB relay, serve the Tier-3 cover site directly).
+/// - [`Self::Close`] (default for `blocklist`): drop the TCP connection
+///   immediately (or return uncacheable `404` in WEB relay).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IpFilterAction {
+    #[default]
+    Front,
+    Close,
+}
+
+impl IpFilterAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Front => "front",
+            Self::Close => "close",
+        }
+    }
+}
+
+impl fmt::Display for IpFilterAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IpFilterAction {
+    type Err = TypeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "front" => Ok(Self::Front),
+            "close" => Ok(Self::Close),
+            _ => Err(TypeParseError::InvalidIpFilterAction(s.to_owned())),
+        }
+    }
+}
+
+/// Validate a single bare IP or CIDR string (e.g. `"5.160.0.0/16"`, `"2001:db8::/32"`, `"127.0.0.1"`).
+pub fn validate_ip_or_cidr(raw: &str) -> Result<(), TypeParseError> {
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(TypeParseError::InvalidCidr(raw.to_owned()));
+    }
+    if let Some((ip_str, bits_str)) = token.split_once('/') {
+        let ip: IpAddr = ip_str
+            .parse()
+            .map_err(|_| TypeParseError::InvalidCidr(raw.to_owned()))?;
+        let bits: u8 = bits_str
+            .parse()
+            .map_err(|_| TypeParseError::InvalidCidr(raw.to_owned()))?;
+        let max_bits = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if bits > max_bits {
+            return Err(TypeParseError::InvalidCidr(raw.to_owned()));
+        }
+    } else {
+        let _: IpAddr = token
+            .parse()
+            .map_err(|_| TypeParseError::InvalidCidr(raw.to_owned()))?;
+    }
+    Ok(())
 }
 
 /// Mode for `[defense.handshake-budget]`.
