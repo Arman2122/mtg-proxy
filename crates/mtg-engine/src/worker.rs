@@ -20,7 +20,7 @@ use mtg_net::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::handshake::{handle_faketls_connection, handle_obfs2_connection};
 use crate::state::ProxyEngine;
@@ -54,6 +54,16 @@ impl EngineRuntime {
     /// 5. Spawns `worker_count` CPU-pinned OS worker threads and background
     ///    maintenance tasks.
     pub async fn start(engine: Arc<ProxyEngine>) -> io::Result<Self> {
+        Self::start_with_extra_obfs_listeners(engine, &[]).await
+    }
+
+    /// Start the runtime with optional extra internal `Obfs2` listeners
+    /// (used by `[web] integrated = true` to bind an internal loopback `dd` backend
+    /// without requiring a manual `[[listener]]` stanza).
+    pub async fn start_with_extra_obfs_listeners(
+        engine: Arc<ProxyEngine>,
+        extra_obfs: &[(String, ListenerPolicy)],
+    ) -> io::Result<Self> {
         if let Ok((soft, hard)) = raise_nofile_limit(DEFAULT_NOFILE_TARGET) {
             info!(soft, hard, "RLIMIT_NOFILE configured");
         }
@@ -81,28 +91,7 @@ impl EngineRuntime {
 
         // Await initial IP filter load (warm cache + inline CIDRs + live fetch)
         // before accepting traffic so connections never slip through an empty list at boot!
-        if let Some(bl) = &engine.blocklist {
-            match bl.init_load().await {
-                Ok(n) => {
-                    engine
-                        .metrics
-                        .blocklist_size
-                        .store(n as u64, std::sync::atomic::Ordering::Release);
-                }
-                Err(e) => warn!(error = %e, "initial blocklist load failed"),
-            }
-        }
-        if let Some(al) = &engine.allowlist {
-            match al.init_load().await {
-                Ok(n) => {
-                    engine
-                        .metrics
-                        .allowlist_size
-                        .store(n as u64, std::sync::atomic::Ordering::Release);
-                }
-                Err(e) => warn!(error = %e, "initial allowlist load failed"),
-            }
-        }
+        engine.init_ip_filters().await;
 
         // Resolve and pre-bind worker 0's listeners first so port `:0` assignments
         // are known (and shared across all SO_REUSEPORT worker threads!) and bind
@@ -126,7 +115,7 @@ impl EngineRuntime {
             worker0_sockets.push((std::net::TcpListener::from(sock), spec));
         }
 
-        for (raw, policy) in &engine.settings.listeners {
+        for (raw, policy) in engine.settings.listeners.iter().chain(extra_obfs.iter()) {
             let sa = resolve_bind_addr(raw)?;
             let sock = create_listener_socket(sa, &sock_cfg)?;
             let actual = sock

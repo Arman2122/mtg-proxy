@@ -13,7 +13,7 @@ jobs:
     name: Linux x86_64 — Format, Clippy, Tests, Fuzz & Playwright
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -33,9 +33,9 @@ jobs:
       - name: Verify all 8 fuzz targets compile cleanly
         run: cargo check --manifest-path fuzz/Cargo.toml
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install Playwright Chromium for WEB bridge harness
         working-directory: test/webbridge
@@ -55,7 +55,7 @@ jobs:
     name: Linux aarch64 (ARMv8 AES/SHA-2) — Cross-Compile & Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install aarch64 Linux cross-compiler
         run: |

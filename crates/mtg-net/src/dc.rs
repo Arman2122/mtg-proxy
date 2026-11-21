@@ -811,6 +811,19 @@ pub async fn fetch_url_bytes(
     .await
 }
 
+/// Outcome of a conditional HTTP/HTTPS GET request (`ETag` / `Last-Modified`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalFetch {
+    /// Upstream returned `304 Not Modified`; cached body is still current.
+    NotModified,
+    /// Upstream returned `200 OK` with body bytes and optional cache validators.
+    Modified {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+}
+
 /// HTTP/HTTPS GET client honoring an optional [`DnsResolver`] (DoH/DoT/custom
 /// DNS), [`PreferIp`], RFC 8305 Happy Eyeballs, bounded HTTP redirect following
 /// (up to 5 hops for GitHub `/releases/latest/download/...` and CDN URLs), and
@@ -823,6 +836,32 @@ pub async fn fetch_url_bytes_with_dns(
     sock_cfg: SocketConfig,
     timeout: Duration,
 ) -> io::Result<Vec<u8>> {
+    match fetch_url_conditional_with_dns(
+        url, dns, prefer_ip, proxy_pool, sock_cfg, timeout, None, None,
+    )
+    .await?
+    {
+        ConditionalFetch::Modified { bytes, .. } => Ok(bytes),
+        ConditionalFetch::NotModified => Err(io::Error::other(format!(
+            "unexpected HTTP 304 without conditional headers from {url}"
+        ))),
+    }
+}
+
+/// Conditional HTTP/HTTPS GET supporting `If-None-Match` / `If-Modified-Since`
+/// (`304 Not Modified`), multi-hop redirects (up to 5 hops), 16 MiB body cap,
+/// custom [`DnsResolver`], [`PreferIp`], Happy Eyeballs, and [`ProxyPool`].
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_url_conditional_with_dns(
+    url: &str,
+    dns: Option<&DnsResolver>,
+    prefer_ip: PreferIp,
+    proxy_pool: Option<&ProxyPool>,
+    sock_cfg: SocketConfig,
+    timeout: Duration,
+    if_none_match: Option<&str>,
+    if_modified_since: Option<&str>,
+) -> io::Result<ConditionalFetch> {
     const MAX_BODY: usize = 16 * 1024 * 1024;
     const MAX_REDIRECTS: usize = 5;
 
@@ -887,13 +926,24 @@ pub async fn fetch_url_bytes_with_dns(
                 s
             };
 
-            let req = Request::builder()
+            let mut req_builder = Request::builder()
                 .method("GET")
                 .uri(path)
                 .header("Host", &host_header)
-                .header("User-Agent", "mtg-proxy/2.2")
+                .header("User-Agent", "mtg-proxy/2.3")
                 .header("Accept", "*/*")
-                .header("Connection", "close")
+                .header("Connection", "close");
+            if let Some(etag) = if_none_match
+                && !etag.is_empty()
+            {
+                req_builder = req_builder.header(hyper::header::IF_NONE_MATCH, etag);
+            }
+            if let Some(ims) = if_modified_since
+                && !ims.is_empty()
+            {
+                req_builder = req_builder.header(hyper::header::IF_MODIFIED_SINCE, ims);
+            }
+            let req = req_builder
                 .body(http_body_util::Empty::<bytes::Bytes>::new())
                 .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -926,6 +976,9 @@ pub async fn fetch_url_bytes_with_dns(
             };
 
             let status = resp.status();
+            if status == hyper::StatusCode::NOT_MODIFIED {
+                return Ok(ConditionalFetch::NotModified);
+            }
             if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
                 if hop == MAX_REDIRECTS {
                     return Err(io::Error::other(format!(
@@ -954,12 +1007,27 @@ pub async fn fetch_url_bytes_with_dns(
                 )));
             }
 
+            let etag = resp
+                .headers()
+                .get(hyper::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let last_modified = resp
+                .headers()
+                .get(hyper::header::LAST_MODIFIED)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+
             let collected = http_body_util::Limited::new(resp.into_body(), MAX_BODY)
                 .collect()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
                 .to_bytes();
-            return Ok(collected.to_vec());
+            return Ok(ConditionalFetch::Modified {
+                bytes: collected.to_vec(),
+                etag,
+                last_modified,
+            });
         }
 
         Err(io::Error::other(format!(

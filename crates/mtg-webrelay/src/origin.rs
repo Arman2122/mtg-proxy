@@ -57,13 +57,21 @@ pub enum OriginError {
     Limits(String),
 }
 
-/// Optional wait-free Geo-Stealth IP allowlist/blocklist attached to [`Origin`].
+/// Optional wait-free Geo-Stealth IP allowlist/blocklist and CDN trusted-proxy
+/// configuration attached to [`Origin`].
 #[derive(Debug, Clone)]
 pub struct OriginIpFilters {
     pub allowlist: Option<Arc<LiveIpFilter>>,
     pub allowlist_action: IpFilterAction,
     pub blocklist: Option<Arc<LiveIpFilter>>,
     pub blocklist_action: IpFilterAction,
+    /// Trusted CDN / reverse-proxy IP ranges (e.g. Cloudflare / ArvanCloud / Nginx).
+    /// Peeled right-to-left from `X-Forwarded-For` and required before trusting
+    /// `client_ip_header` (100% immune to direct client header spoofing!).
+    pub trusted_proxies: Option<Arc<LiveIpFilter>>,
+    /// Authoritative real-client-IP header stamped by a verified CDN hop
+    /// (e.g. `"cf-connecting-ip"`, `"ar-real-ip"`).
+    pub client_ip_header: Option<String>,
 }
 
 impl Default for OriginIpFilters {
@@ -73,6 +81,8 @@ impl Default for OriginIpFilters {
             allowlist_action: IpFilterAction::Front,
             blocklist: None,
             blocklist_action: IpFilterAction::Close,
+            trusted_proxies: None,
+            client_ip_header: None,
         }
     }
 }
@@ -110,7 +120,7 @@ pub struct Origin {
     max_streams: usize,
     client_ip_source: ClientIpSource,
     counters: Option<Arc<RelayCounters>>,
-    ip_filters: OriginIpFilters,
+    ip_filters: ArcSwap<OriginIpFilters>,
     global_budget: Arc<GlobalBudget>,
 }
 
@@ -156,39 +166,98 @@ impl Origin {
             max_streams,
             client_ip_source: opts.client_ip_source,
             counters: opts.counters,
-            ip_filters: opts.ip_filters,
+            ip_filters: ArcSwap::from_pointee(opts.ip_filters),
             global_budget: Arc::new(GlobalBudget::default()),
         })
     }
 
-    /// Spawn periodic background refresh loops for any attached IP allowlist/blocklist.
+    /// Atomically replace active Geo-Stealth allowlist/blocklist & CDN trusted-proxy
+    /// filters (used during `SIGHUP` / `POST /reload` hot-reloads!).
+    pub fn set_ip_filters(&self, next: OriginIpFilters) {
+        self.ip_filters.store(Arc::new(next));
+    }
+
+    /// Atomically update allowlist/blocklist while preserving configured CDN
+    /// `trusted_proxies` and `client_ip_header` (used by integrated `[web]` sync!).
+    pub fn update_geo_filters(
+        &self,
+        allowlist: Option<Arc<LiveIpFilter>>,
+        allowlist_action: IpFilterAction,
+        blocklist: Option<Arc<LiveIpFilter>>,
+        blocklist_action: IpFilterAction,
+    ) {
+        let prev = self.ip_filters.load();
+        self.ip_filters.store(Arc::new(OriginIpFilters {
+            allowlist,
+            allowlist_action,
+            blocklist,
+            blocklist_action,
+            trusted_proxies: prev.trusted_proxies.clone(),
+            client_ip_header: prev.client_ip_header.clone(),
+        }));
+    }
+
+    /// Spawn periodic background refresh loops for any attached IP allowlist/blocklist
+    /// and auto-updating CDN trusted-proxy ranges.
     pub fn spawn_ip_filter_refresh_loops(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
-        if let Some(bl) = &self.ip_filters.blocklist {
+        let filters = self.ip_filters.load();
+        if let Some(bl) = &filters.blocklist {
             bl.spawn_refresh_loop(shutdown.clone());
         }
-        if let Some(al) = &self.ip_filters.allowlist {
-            al.spawn_refresh_loop(shutdown);
+        if let Some(al) = &filters.allowlist {
+            al.spawn_refresh_loop(shutdown.clone());
+        }
+        if let Some(tp) = &filters.trusted_proxies {
+            tp.spawn_refresh_loop(shutdown);
         }
     }
 
-    /// Trigger a non-blocking refresh of attached IP filters (e.g. on `SIGHUP`).
+    /// Spawn periodic background refresh loop ONLY for CDN `trusted_proxies`
+    /// (used by `[web] integrated = true` where `ProxyEngine` already manages
+    /// `allowlist` and `blocklist` refresh loops).
+    pub fn spawn_trusted_proxies_refresh_loop(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
+        let filters = self.ip_filters.load();
+        if let Some(tp) = &filters.trusted_proxies {
+            tp.spawn_refresh_loop(shutdown);
+        }
+    }
+
+    /// Trigger a non-blocking refresh ONLY for CDN `trusted_proxies`.
+    pub fn trigger_trusted_proxies_refresh(&self) {
+        let filters = self.ip_filters.load();
+        if let Some(tp) = &filters.trusted_proxies {
+            let tp = Arc::clone(tp);
+            tokio::spawn(async move {
+                let _ = tp.refresh_once().await;
+            });
+        }
+    }
+
+    /// Trigger a non-blocking refresh of attached IP filters & CDN ranges (e.g. on `SIGHUP`).
     pub fn trigger_ip_filter_refresh(&self) {
-        if let Some(bl) = &self.ip_filters.blocklist {
+        let filters = self.ip_filters.load();
+        if let Some(bl) = &filters.blocklist {
             let bl = Arc::clone(bl);
             tokio::spawn(async move {
                 let _ = bl.refresh_once().await;
             });
         }
-        if let Some(al) = &self.ip_filters.allowlist {
+        if let Some(al) = &filters.allowlist {
             let al = Arc::clone(al);
             tokio::spawn(async move {
                 let _ = al.refresh_once().await;
             });
         }
+        if let Some(tp) = &filters.trusted_proxies {
+            let tp = Arc::clone(tp);
+            tokio::spawn(async move {
+                let _ = tp.refresh_once().await;
+            });
+        }
     }
 
-    pub fn ip_filters(&self) -> &OriginIpFilters {
-        &self.ip_filters
+    pub fn ip_filters(&self) -> arc_swap::Guard<Arc<OriginIpFilters>> {
+        self.ip_filters.load()
     }
 
     /// Atomically swap `(secrets, retired)` on live reload (preserving previous
@@ -327,26 +396,27 @@ impl Origin {
     }
 
     fn check_ip_filters(&self, headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> WebIpVerdict {
-        if self.ip_filters.blocklist.is_none() && self.ip_filters.allowlist.is_none() {
+        let filters = self.ip_filters.load();
+        if filters.blocklist.is_none() && filters.allowlist.is_none() {
             return WebIpVerdict::Allow;
         }
         let resolved_ip = peer_addr
             .and_then(|sa| self.resolve_client_addr(headers, sa))
             .map(|sa| mtg_core::ip::unmap_ip(sa.ip()));
 
-        if let Some(block) = &self.ip_filters.blocklist
+        if let Some(block) = &filters.blocklist
             && let Some(ip) = resolved_ip
             && block.contains(ip)
         {
-            return match self.ip_filters.blocklist_action {
+            return match filters.blocklist_action {
                 IpFilterAction::Front => WebIpVerdict::Front,
                 IpFilterAction::Close => WebIpVerdict::Close,
             };
         }
-        if let Some(allow) = &self.ip_filters.allowlist {
+        if let Some(allow) = &filters.allowlist {
             let allowed = resolved_ip.is_some_and(|ip| allow.contains(ip));
             if !allowed {
-                return match self.ip_filters.allowlist_action {
+                return match filters.allowlist_action {
                     IpFilterAction::Front => WebIpVerdict::Front,
                     IpFilterAction::Close => WebIpVerdict::Close,
                 };
@@ -581,11 +651,73 @@ impl Origin {
         )
     }
 
-    fn resolve_client_addr(
+    /// Resolve the real browser client IP using spoof-proof trusted-proxy right-to-left
+    /// hop peeling (supports direct PROXY protocol, local Nginx/Caddy XFF, AND multi-hop
+    /// CDN chains like Cloudflare `CF-Connecting-IP` / ArvanCloud `Ar-Real-IP`!).
+    pub fn resolve_client_addr(
         &self,
         headers: &HeaderMap,
         peer_addr: SocketAddr,
     ) -> Option<SocketAddr> {
+        let filters = self.ip_filters.load();
+        if let Some(tp) = &filters.trusted_proxies {
+            let raw_peer = mtg_core::ip::unmap_ip(peer_addr.ip());
+            let peer_is_cdn = tp.contains(raw_peer);
+            let peer_is_trusted = raw_peer.is_loopback() || peer_is_cdn;
+            if !peer_is_trusted {
+                // Direct connection from an untrusted public IP (bypassing CDN!):
+                // NEVER trust any HTTP IP header — prevents Geo-Stealth IP spoofing!
+                return Some(SocketAddr::new(raw_peer, peer_addr.port()));
+            }
+
+            // Collect X-Forwarded-For chain left-to-right, then peel trusted CDN/loopback
+            // hops right-to-left to find the first untrusted client IP!
+            let mut xff_ips: Vec<IpAddr> = Vec::new();
+            for val in headers.get_all("x-forwarded-for") {
+                let Ok(s) = val.to_str() else {
+                    continue;
+                };
+                for part in s.split(',') {
+                    if let Some(ip) = parse_ip_or_sock(part.trim()) {
+                        xff_ips.push(mtg_core::ip::unmap_ip(ip));
+                    }
+                }
+            }
+
+            let mut saw_cdn_hop = peer_is_cdn;
+            let mut peeled_client: Option<IpAddr> = None;
+            for &hop in xff_ips.iter().rev() {
+                if tp.contains(hop) {
+                    saw_cdn_hop = true;
+                    continue;
+                }
+                if hop.is_loopback() {
+                    continue;
+                }
+                peeled_client = Some(hop);
+                break;
+            }
+
+            // Only honor an authoritative CDN header (e.g. `CF-Connecting-IP`) when
+            // network routing proved a trusted CDN hop in `trusted_proxies` delivered
+            // this request (100% immune to direct-to-origin header forgery!).
+            if saw_cdn_hop
+                && let Some(hdr_name) = &filters.client_ip_header
+                && let Some(ip) = extract_single_header_ip(headers, hdr_name)
+            {
+                return Some(SocketAddr::new(mtg_core::ip::unmap_ip(ip), 0));
+            }
+
+            if let Some(ip) = peeled_client {
+                return Some(SocketAddr::new(ip, 0));
+            }
+
+            if self.client_ip_source == ClientIpSource::ProxyProtocol && !raw_peer.is_loopback() {
+                return Some(SocketAddr::new(raw_peer, peer_addr.port()));
+            }
+            return None;
+        }
+
         match self.client_ip_source {
             ClientIpSource::ProxyProtocol => Some(peer_addr),
             ClientIpSource::XForwardedFor => {
@@ -600,11 +732,8 @@ impl Origin {
                         continue;
                     };
                     for part in s.split(',') {
-                        let trimmed = part.trim();
-                        if let Ok(ip) = trimmed.parse::<IpAddr>() {
-                            rightmost = Some(ip);
-                        } else if let Ok(sa) = trimmed.parse::<SocketAddr>() {
-                            rightmost = Some(sa.ip());
+                        if let Some(ip) = parse_ip_or_sock(part.trim()) {
+                            rightmost = Some(mtg_core::ip::unmap_ip(ip));
                         }
                     }
                 }
@@ -749,6 +878,25 @@ fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
         return None;
     }
     first.strip_prefix("Bearer ").map(str::trim)
+}
+
+fn parse_ip_or_sock(trimmed: &str) -> Option<IpAddr> {
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(sa) = trimmed.parse::<SocketAddr>() {
+        return Some(sa.ip());
+    }
+    None
+}
+
+fn extract_single_header_ip(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
+    let mut vals = headers.get_all(name).iter();
+    let first = vals.next()?.to_str().ok()?.trim();
+    if vals.next().is_some() {
+        return None;
+    }
+    parse_ip_or_sock(first)
 }
 
 #[inline]

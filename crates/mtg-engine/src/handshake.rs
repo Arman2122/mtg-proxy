@@ -194,7 +194,75 @@ async fn faketls_handshake_and_dial(
         IpFilterVerdict::Front | IpFilterVerdict::Allow => {}
     }
 
-    // 3. Incrementally read & parse FakeTLS ClientHello within handshake timeout
+    // 3. Single-port multi-transport demux (`ee` + `dd`/`plain` + Cover/WEB on ONE port!).
+    //    When `bind-to-accept` includes `dd`/`plain` AND this IP is allowed, peek the first
+    //    bytes to distinguish TLS (`0x16 0x03 0x00..=0x04`) from plaintext HTTP and raw
+    //    64-byte Obfuscated2 handshakes — preserving verbatim bytes for fronting on any miss!
+    let obfs_modes = engine.settings.bind_to_obfs_modes;
+    if filter_verdict == IpFilterVerdict::Allow && !obfs_modes.is_empty() {
+        let peek_ok = read_at_least(
+            &mut stream,
+            &mut raw_buf,
+            5,
+            engine.settings.handshake_timeout,
+        )
+        .await;
+        if !peek_ok {
+            let hosts = engine.fronting_hosts_for(&[]);
+            do_front(
+                stream,
+                client_addr,
+                dst_addr,
+                &raw_buf,
+                hosts,
+                worker_id,
+                &engine,
+            )
+            .await;
+            return None;
+        }
+        let looks_like_tls =
+            raw_buf.len() >= 3 && raw_buf[0] == 0x16 && raw_buf[1] == 0x03 && raw_buf[2] <= 0x04;
+        if !looks_like_tls {
+            if !looks_like_plain_http(&raw_buf)
+                && read_at_least(
+                    &mut stream,
+                    &mut raw_buf,
+                    HANDSHAKE_FRAME_LEN,
+                    engine.settings.handshake_timeout,
+                )
+                .await
+            {
+                return try_single_port_obfs2_or_front(
+                    stream,
+                    client_addr,
+                    dst_addr,
+                    client_ip,
+                    raw_buf,
+                    obfs_modes,
+                    worker_id,
+                    active_guard,
+                    engine,
+                )
+                .await;
+            }
+            // Plain HTTP or short non-TLS probe -> transparently front verbatim to cover!
+            let hosts = engine.fronting_hosts_for(&[]);
+            do_front(
+                stream,
+                client_addr,
+                dst_addr,
+                &raw_buf,
+                hosts,
+                worker_id,
+                &engine,
+            )
+            .await;
+            return None;
+        }
+    }
+
+    // 4. Incrementally read & parse FakeTLS ClientHello within handshake timeout
     let (parsed, mut hello_wire, mut post_hello_buf) = if let Ok((parsed, consumed)) =
         read_faketls_client_hello(&mut stream, &mut raw_buf, engine.settings.handshake_timeout)
             .await
@@ -203,6 +271,31 @@ async fn faketls_handshake_and_dial(
         let leftover = raw_buf.split_off(consumed);
         (parsed, raw_buf, leftover)
     } else {
+        // Rare 1-in-16M edge case: an Obfuscated2 random 64-byte frame started with
+        // `0x16 0x03 0x00..=0x04` (not `16 03 01 02`), failing TLS ClientHello parsing!
+        if filter_verdict == IpFilterVerdict::Allow
+            && !obfs_modes.is_empty()
+            && read_at_least(
+                &mut stream,
+                &mut raw_buf,
+                HANDSHAKE_FRAME_LEN,
+                engine.settings.handshake_timeout,
+            )
+            .await
+        {
+            return try_single_port_obfs2_or_front(
+                stream,
+                client_addr,
+                dst_addr,
+                client_ip,
+                raw_buf,
+                obfs_modes,
+                worker_id,
+                active_guard,
+                engine,
+            )
+            .await;
+        }
         // Non-TLS / truncated / malformed probe -> front verbatim bytes!
         let hosts = engine.fronting_hosts_for(&[]);
         do_front(
@@ -572,7 +665,7 @@ async fn match_faketls_secret(
 
     let now_unix_ns = coarse_realtime_ns();
     let rot_now = engine.rotation_clock.now();
-    let skew_ns = engine.settings.tolerate_time_skewness.as_nanos() as i128;
+    let skew_ns = engine.tolerate_time_skewness().as_nanos() as i128;
     let blocks = parsed.scan_blocks();
 
     let accept_pos = |pos: usize| -> Option<MatchedFakeTls> {
@@ -876,10 +969,11 @@ async fn do_front(
     worker_id: u16,
     engine: &ProxyEngine,
 ) {
+    let fcfg = engine.fronting_config();
     let target = FrontingTarget {
         hosts,
-        port: engine.settings.fronting_port,
-        send_proxy_v2: engine.settings.fronting_proxy_protocol,
+        port: fcfg.port,
+        send_proxy_v2: fcfg.proxy_protocol,
         connect_timeout: engine.settings.tcp_timeout,
         idle_timeout: engine.settings.idle_timeout,
     };
@@ -917,6 +1011,195 @@ async fn dispose_obfs_denied(mut stream: TcpStream, policy: ListenerPolicy, engi
         }
         engine.metrics.obfs.draining.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Fast check for plaintext HTTP methods (so HTTP probes on `:443` skip Obfuscated2
+/// trials completely and front immediately to the cover server!).
+#[inline]
+fn looks_like_plain_http(buf: &[u8]) -> bool {
+    if buf.len() < 4 {
+        return false;
+    }
+    matches!(
+        &buf[..4],
+        b"GET " | b"POST" | b"HEAD" | b"PUT " | b"OPTI" | b"DELE" | b"PATC"
+    )
+}
+
+async fn read_at_least(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    need: usize,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while buf.len() < need {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() {
+            return false;
+        }
+        let mut tmp = [0u8; 128];
+        let to_read = (need - buf.len()).min(tmp.len());
+        match tokio::time::timeout(rem, stream.read(&mut tmp[..to_read])).await {
+            Ok(Ok(0) | Err(_)) | Err(_) => return false,
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    true
+}
+
+/// Unified single-port Obfuscated2 (`dd` / `plain`) authentication branch on `bind-to`.
+/// On ANY miss, rate-limit, replay, or governance denial, transparently fronts the
+/// verbatim raw bytes to the cover website via `splice(2)` (zero fingerprint!).
+#[allow(clippy::too_many_arguments)]
+async fn try_single_port_obfs2_or_front(
+    stream: TcpStream,
+    client_addr: SocketAddr,
+    dst_addr: SocketAddr,
+    client_ip: IpAddr,
+    mut raw_buf: Vec<u8>,
+    modes: mtg_core::ModeSet,
+    worker_id: u16,
+    active_guard: ActiveConnGuard,
+    engine: Arc<ProxyEngine>,
+) -> Option<EstablishedDirectRelay> {
+    let public_policy = ListenerPolicy {
+        modes,
+        public: true,
+        proxy_protocol: engine.settings.proxy_protocol_listener,
+        on_unknown_secret: UnknownSecretAction::Close,
+        handshakes_per_ip: mtg_config::DEFAULT_HANDSHAKES_PER_IP,
+    };
+
+    if !engine.obfs_limiter.allow(&public_policy, client_ip) {
+        engine
+            .metrics
+            .obfs
+            .rate_limited
+            .fetch_add(1, Ordering::Relaxed);
+        let hosts = engine.fronting_hosts_for(&[]);
+        do_front(
+            stream,
+            client_addr,
+            dst_addr,
+            &raw_buf,
+            hosts,
+            worker_id,
+            &engine,
+        )
+        .await;
+        return None;
+    }
+
+    let mut frame = [0u8; HANDSHAKE_FRAME_LEN];
+    frame.copy_from_slice(&raw_buf[..HANDSHAKE_FRAME_LEN]);
+
+    engine.metrics.obfs.trials.fetch_add(1, Ordering::Relaxed);
+
+    let set = engine.secrets.load();
+    let rot_now = engine.rotation_clock.now();
+    let candidates = set.active_obfs2_for_modes(modes, rot_now);
+
+    let Ok(obfs_match) = match_handshake(
+        &frame,
+        candidates.iter().map(|c| Some(&*c.key)),
+        modes.tags(),
+    ) else {
+        drop(set);
+        engine.metrics.obfs.misses.fetch_add(1, Ordering::Relaxed);
+        engine.obfs_limiter.fail(&public_policy, client_ip);
+        let hosts = engine.fronting_hosts_for(&[]);
+        do_front(
+            stream,
+            client_addr,
+            dst_addr,
+            &raw_buf,
+            hosts,
+            worker_id,
+            &engine,
+        )
+        .await;
+        return None;
+    };
+
+    let matched_cand = candidates[obfs_match.index];
+    let secret_name = Arc::clone(&matched_cand.name);
+    let key_bytes = *matched_cand.key;
+    let retiring = matched_cand.retiring_until.is_some();
+    let limits = set.limits_of(&secret_name).cloned().unwrap_or_default();
+    let ad_tag = set.effective_ad_tag(&secret_name);
+    drop(set);
+
+    if engine.obfs2_replay.seen_before(&obfs_match.replay_key) {
+        engine
+            .metrics
+            .core(usize::from(worker_id))
+            .replay_attacks
+            .fetch_add(1, Ordering::Relaxed);
+        let hosts = engine.fronting_hosts_for(&[]);
+        do_front(
+            stream,
+            client_addr,
+            dst_addr,
+            &raw_buf,
+            hosts,
+            worker_id,
+            &engine,
+        )
+        .await;
+        return None;
+    }
+
+    let Ok((conn_handle, client_entry, cancel)) = engine.admit_connection(
+        worker_id,
+        &secret_name,
+        key_bytes,
+        retiring,
+        Some(client_ip),
+        &limits,
+    ) else {
+        let hosts = engine.fronting_hosts_for(&[]);
+        do_front(
+            stream,
+            client_addr,
+            dst_addr,
+            &raw_buf,
+            hosts,
+            worker_id,
+            &engine,
+        )
+        .await;
+        return None;
+    };
+
+    let leftover = raw_buf.split_off(HANDSHAKE_FRAME_LEN);
+    drop(raw_buf);
+
+    let release_guard = ReleaseConnGuard {
+        engine: Arc::clone(&engine),
+        secret_name: Arc::clone(&secret_name),
+        handle: conn_handle,
+        entry: Arc::clone(&client_entry),
+        retiring,
+    };
+
+    dial_and_prepare_relay(
+        stream,
+        client_addr,
+        false,
+        TlsUnframer::new(),
+        DoppelParams::default(),
+        secret_name,
+        ad_tag,
+        obfs_match,
+        leftover,
+        client_entry,
+        cancel,
+        active_guard,
+        release_guard,
+        &engine,
+    )
+    .await
 }
 
 async fn read_proxy_header(

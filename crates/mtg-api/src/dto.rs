@@ -138,6 +138,8 @@ pub struct UserStatsJson {
 
     #[serde(skip_serializing_if = "is_zero_u32")]
     pub client_conns: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub max_connections: u32,
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub client_conns_refused: i64,
     #[serde(skip_serializing_if = "is_zero_i64")]
@@ -209,6 +211,8 @@ pub struct SecretInfoJson {
 
     #[serde(skip_serializing_if = "is_zero_u32")]
     pub client_conns: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub max_connections: u32,
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub client_speed_limit: i64,
     #[serde(skip_serializing_if = "is_false")]
@@ -384,6 +388,8 @@ pub struct LimitFieldsReq {
     #[serde(default)]
     pub client_conns: i64,
     #[serde(default)]
+    pub max_connections: i64,
+    #[serde(default)]
     pub client_speed: String,
     #[serde(default)]
     pub client_fair: bool,
@@ -398,6 +404,12 @@ impl LimitFieldsReq {
             return Err(format!(
                 "client_conns must not be negative ({})",
                 self.client_conns
+            ));
+        }
+        if self.max_connections < 0 || self.max_connections > i64::from(u32::MAX) {
+            return Err(format!(
+                "max_connections must not be negative ({})",
+                self.max_connections
             ));
         }
         let quota_bytes = parse_quota_bytes(&self.quota).map_err(|e| e.to_string())?;
@@ -419,6 +431,7 @@ impl LimitFieldsReq {
             speed_down_bytes_per_second: speed_down,
             ip_limit: self.ip_limit as u32,
             client_conns: self.client_conns as u32,
+            max_connections: self.max_connections as u32,
             client_speed_bytes_per_second: client_speed,
             client_fair: self.client_fair,
         };
@@ -461,6 +474,8 @@ pub struct SecretEntryReq {
     #[serde(default)]
     pub client_conns: i64,
     #[serde(default)]
+    pub max_connections: i64,
+    #[serde(default)]
     pub client_speed: String,
     #[serde(default)]
     pub client_fair: bool,
@@ -478,6 +493,7 @@ impl SecretEntryReq {
             speed_down: self.speed_down.clone(),
             ip_limit: self.ip_limit,
             client_conns: self.client_conns,
+            max_connections: self.max_connections,
             client_speed: self.client_speed.clone(),
             client_fair: self.client_fair,
         }
@@ -524,6 +540,8 @@ pub struct PostSecretReq {
     #[serde(default)]
     pub client_conns: i64,
     #[serde(default)]
+    pub max_connections: i64,
+    #[serde(default)]
     pub client_speed: String,
     #[serde(default)]
     pub client_fair: bool,
@@ -541,6 +559,7 @@ impl PostSecretReq {
             speed_down: self.speed_down.clone(),
             ip_limit: self.ip_limit,
             client_conns: self.client_conns,
+            max_connections: self.max_connections,
             client_speed: self.client_speed.clone(),
             client_fair: self.client_fair,
         }
@@ -586,11 +605,142 @@ pub struct PutAdTagReq {
     pub ad_tag: String,
 }
 
-/// Format quota reset string (`""` when `QuotaReset::None`, `"monthly"` when `Monthly`).
+/// Format quota reset string (`""` when `QuotaReset::None`, `"daily"` / `"weekly"` / `"monthly"` otherwise).
 #[inline]
 pub fn quota_reset_str(r: QuotaReset) -> String {
     match r {
         QuotaReset::None => String::new(),
-        QuotaReset::Monthly => r.as_str().to_owned(),
+        QuotaReset::Daily | QuotaReset::Weekly | QuotaReset::Monthly => r.as_str().to_owned(),
     }
+}
+
+// ============================================================================
+// Enterprise Accounting, Health, Batch & IP Filter DTOs (v2.3.0+)
+// ============================================================================
+
+/// `GET /healthz` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthzResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+    pub uptime_seconds: i64,
+    pub total_connections: i64,
+    pub secrets_count: usize,
+    pub allowlist_enabled: bool,
+    pub allowlist_ready: bool,
+    pub allowlist_entries: usize,
+    pub blocklist_enabled: bool,
+    pub blocklist_ready: bool,
+    pub blocklist_entries: usize,
+}
+
+/// `PATCH /secrets/{name}` partial account mutation payload.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchSecretReq {
+    pub secret: Option<String>,
+    pub ad_tag: Option<String>,
+    pub quota: Option<String>,
+    /// Add extra bytes to the user's current quota ceiling (billing top-up!).
+    pub add_quota: Option<String>,
+    /// Reset `quota_used` to `0` and restart the quota period atomically.
+    #[serde(default)]
+    pub reset_quota: bool,
+    pub quota_reset: Option<String>,
+    pub expires: Option<String>,
+    pub disabled: Option<bool>,
+    pub speed: Option<String>,
+    pub speed_up: Option<String>,
+    pub speed_down: Option<String>,
+    pub ip_limit: Option<i64>,
+    pub client_conns: Option<i64>,
+    pub max_connections: Option<i64>,
+    pub client_speed: Option<String>,
+    pub client_fair: Option<bool>,
+}
+
+/// `POST /secrets/{name}/disconnect` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct DisconnectResultJson {
+    pub closed: usize,
+}
+
+/// `POST /secrets/batch` atomic bulk mutation request.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSecretsReq {
+    #[serde(default)]
+    pub upsert: BTreeMap<String, SecretEntryReq>,
+    #[serde(default)]
+    pub delete: Vec<String>,
+}
+
+/// `POST /secrets/batch` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchSecretsResultJson {
+    pub status: &'static str,
+    pub upserted: usize,
+    pub deleted: usize,
+}
+
+/// Global aggregate totals inside `GET /accounting`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountingTotalsJson {
+    pub total_bytes_in: i64,
+    pub total_bytes_out: i64,
+    pub total_bytes: i64,
+    pub active_connections: i64,
+    pub lifetime_connections: u64,
+    pub secrets_count: usize,
+    pub fronted_total: u64,
+    pub allowlist_rejected_total: u64,
+    pub blocklisted_total: u64,
+    pub replay_attacks: u64,
+}
+
+/// Per-account billing & governance record inside `GET /accounting`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountLedgerRowJson {
+    pub name: String,
+    pub mode: String,
+    pub active_connections: i64,
+    pub total_connections: u64,
+    pub bytes_in: i64,
+    pub bytes_out: i64,
+    pub total_bytes: i64,
+    pub quota: i64,
+    pub quota_used: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_remaining: Option<i64>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub quota_reset: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period_start: Option<DateTime<Utc>>,
+    pub quota_cutoffs: i64,
+    pub active_ips: usize,
+    pub ip_limit: u32,
+    pub max_connections: u32,
+    pub speed_limit: i64,
+    pub disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+/// `GET /accounting` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountingResponse {
+    pub started_at: DateTime<Utc>,
+    pub uptime_seconds: i64,
+    pub usage_persisted: bool,
+    pub totals: AccountingTotalsJson,
+    pub accounts: Vec<AccountLedgerRowJson>,
+}
+
+/// `POST /accounting/flush` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct FlushResultJson {
+    pub status: &'static str,
+    pub flushed: bool,
 }

@@ -25,9 +25,9 @@ pub use scrub::{
 };
 pub use types::{
     AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction, PreferIp,
-    StatsdTagFormat, TypeParseError, UnknownSecretAction, canonical_web_host, format_bytes_go,
-    format_duration_go, parse_ad_tag, parse_bytes_str, parse_duration, redact_proxy_url,
-    validate_ip_or_cidr,
+    StatsdTagFormat, TypeParseError, UnknownSecretAction, WebCdnPreset, canonical_web_host,
+    format_bytes_go, format_duration_go, parse_ad_tag, parse_bytes_str, parse_duration,
+    redact_proxy_url, validate_ip_or_cidr,
 };
 
 #[cfg(test)]

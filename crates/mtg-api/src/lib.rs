@@ -30,17 +30,32 @@ pub const MAX_API_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub fn build_api_router(engine: Arc<ProxyEngine>, token: &str) -> Router {
     let state = ApiState::new(engine, token);
     Router::new()
+        .route("/healthz", get(handlers::handle_healthz))
         .route("/stats", get(handlers::handle_stats))
         .route("/reload", any(handlers::handle_reload))
+        .route("/accounting", get(handlers::handle_get_accounting))
+        .route("/accounting/flush", post(handlers::handle_flush_accounting))
+        .route("/ip-filters", get(handlers::handle_get_ip_filters))
+        .route(
+            "/ip-filters/refresh",
+            post(handlers::handle_refresh_ip_filters),
+        )
         .route(
             "/secrets",
             get(handlers::handle_get_secrets)
                 .put(handlers::handle_put_secrets)
                 .post(handlers::handle_post_secret),
         )
+        .route("/secrets/batch", post(handlers::handle_batch_secrets))
         .route(
             "/secrets/{name}",
-            get(handlers::handle_get_secret).delete(handlers::handle_delete_secret),
+            get(handlers::handle_get_secret)
+                .patch(handlers::handle_patch_secret)
+                .delete(handlers::handle_delete_secret),
+        )
+        .route(
+            "/secrets/{name}/disconnect",
+            post(handlers::handle_disconnect_secret),
         )
         .route(
             "/secrets/{name}/reset-quota",
@@ -449,5 +464,78 @@ alice = "{ALICE_SECRET}"
         )
         .unwrap();
         assert!(text.contains("mtg_client_connections"));
+    }
+
+    #[tokio::test]
+    async fn enterprise_accounting_patch_batch_disconnect_healthz_and_ip_filters() {
+        let engine = build_test_engine(true, false);
+        let app = build_api_router(Arc::clone(&engine), "ops-token");
+        let auth = Some("Bearer ops-token");
+
+        // 1. GET /healthz
+        let (st, hz) = send(&app, Method::GET, "/healthz", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(hz["status"], "ok");
+        assert_eq!(hz["secrets_count"], 1);
+
+        // 2. POST /secrets/batch atomically adds bob & charlie!
+        let (st, batch) = send(
+            &app,
+            Method::POST,
+            "/secrets/batch",
+            auth,
+            Some(json!({
+                "upsert": {
+                    "bob": { "secret": BOB_SECRET, "quota": "1GB", "quota_reset": "daily", "max_connections": 25 },
+                    "charlie": { "secret": RETIRING_SECRET, "quota": "5GB", "quota_reset": "weekly" }
+                }
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(batch["upserted"], 2);
+        assert_eq!(batch["deleted"], 0);
+
+        // 3. PATCH /secrets/bob tops up quota (+2GB -> 3GB), updates disabled, without resending secret!
+        let (st, _) = send(
+            &app,
+            Method::PATCH,
+            "/secrets/bob",
+            auth,
+            Some(json!({ "add_quota": "2GB", "disabled": true, "reset_quota": true })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        let (st, bob) = send(&app, Method::GET, "/secrets/bob", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(bob["quota"], 3i64 << 30);
+        assert_eq!(bob["quota_reset"], "daily");
+        assert_eq!(bob["max_connections"], 25);
+        assert_eq!(bob["disabled"], true);
+
+        // 4. POST /secrets/bob/disconnect
+        let (st, disc) = send(&app, Method::POST, "/secrets/bob/disconnect", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(disc["closed"], 0);
+
+        // 5. GET /accounting & POST /accounting/flush
+        let (st, acc) = send(&app, Method::GET, "/accounting", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(acc["totals"]["secrets_count"], 3);
+        assert_eq!(acc["accounts"].as_array().unwrap().len(), 3);
+
+        let (st, fl) = send(&app, Method::POST, "/accounting/flush", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(fl["flushed"], false);
+
+        // 6. GET /ip-filters & POST /ip-filters/refresh
+        let (st, ipf) = send(&app, Method::GET, "/ip-filters", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(ipf["allowlist"]["enabled"], false);
+        assert_eq!(ipf["blocklist"]["enabled"], false);
+
+        let (st, _) = send(&app, Method::POST, "/ip-filters/refresh", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
     }
 }

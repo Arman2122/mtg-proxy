@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
 use http::Request;
@@ -22,13 +23,16 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use mtg_config::{ClientIpSource, Config, ConfigWeb, IpFilterAction, PreferIp};
 use mtg_core::Secret;
-use mtg_governance::LiveIpFilter;
+use mtg_governance::{DEFAULT_IPFILTER_UPDATE_EACH, LiveIpFilter, LiveIpFilterConfig};
 use mtg_net::{DnsResolver, ProxyPool, SocketConfig};
 use mtg_protocol::proxyproto::{ProxyParseStatus, ProxyProtoMode, parse_proxy_header};
+use rustls::pki_types::pem::PemObject as _;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
 use crate::WebRelayError;
@@ -232,10 +236,33 @@ pub fn extract_secrets_and_retired(conf: &Config) -> (Vec<String>, Vec<Secret>, 
     (names, secrets, retired)
 }
 
-/// Build a live [`Origin`] from validated `[web]` config.
+/// Pre-loaded allowlist/blocklist handles shared from `ProxyEngine` in
+/// `[web] integrated = true` mode (avoids duplicate CIDR downloads/bitmaps).
+#[derive(Debug, Clone)]
+pub struct SharedGeoFilters {
+    pub allowlist: Option<Arc<LiveIpFilter>>,
+    pub allowlist_action: IpFilterAction,
+    pub blocklist: Option<Arc<LiveIpFilter>>,
+    pub blocklist_action: IpFilterAction,
+}
+
+/// Build a live [`Origin`] from validated `[web]` config (standalone `web-relay` mode).
 pub async fn build_origin_from_config(
     conf: &Config,
     counters: Arc<RelayCounters>,
+) -> Result<Arc<Origin>, WebRelayError> {
+    build_origin_with_overrides(conf, counters, None, None, None).await
+}
+
+/// Build a live [`Origin`] for embedded `[web] integrated = true` mode inside `mtg-proxy run`,
+/// sharing the proxy engine's already-loaded Geo-Stealth allowlist/blocklist and pointing
+/// directly at an internal loopback `dd` listener!
+pub async fn build_origin_with_overrides(
+    conf: &Config,
+    counters: Arc<RelayCounters>,
+    backend_override: Option<SocketAddr>,
+    client_ip_override: Option<ClientIpSource>,
+    shared_ip_filters: Option<SharedGeoFilters>,
 ) -> Result<Arc<Origin>, WebRelayError> {
     conf.validate_web()
         .map_err(|e| WebRelayError::Config(e.to_string()))?;
@@ -245,12 +272,16 @@ pub async fn build_origin_from_config(
         .host
         .clone()
         .ok_or_else(|| WebRelayError::Config("missing [web] host".to_owned()))?;
-    let backend_hp = conf
-        .web
-        .backend
-        .as_ref()
-        .ok_or_else(|| WebRelayError::Config("missing [web] backend".to_owned()))?;
-    let backend_addr = resolve_socket_addr(backend_hp.as_str()).await?;
+    let backend_addr = if let Some(sa) = backend_override {
+        sa
+    } else {
+        let backend_hp = conf
+            .web
+            .backend
+            .as_ref()
+            .ok_or_else(|| WebRelayError::Config("missing [web] backend".to_owned()))?;
+        resolve_socket_addr(backend_hp.as_str()).await?
+    };
 
     let signer = Signer::load_file(Path::new(&conf.web.token_key))
         .map_err(|e| WebRelayError::Config(e.to_string()))?;
@@ -279,7 +310,7 @@ pub async fn build_origin_from_config(
         batch_bytes: conf.web.carrier_batch_bytes.unwrap_or(0) as usize,
     };
 
-    let ip_filters = build_ip_filters_from_config(conf).await?;
+    let ip_filters = build_ip_filters_from_config(conf, shared_ip_filters).await?;
 
     let origin = Origin::new(OriginOptions {
         host,
@@ -291,7 +322,9 @@ pub async fn build_origin_from_config(
         limits,
         max_sessions: conf.web.max_sessions.unwrap_or(0) as usize,
         max_streams: conf.web.max_streams.unwrap_or(0) as usize,
-        client_ip_source: conf.web.client_ip.unwrap_or_default(),
+        client_ip_source: client_ip_override
+            .or(conf.web.client_ip)
+            .unwrap_or_default(),
         counters: Some(counters),
         ip_filters,
     })
@@ -300,74 +333,340 @@ pub async fn build_origin_from_config(
     Ok(Arc::new(origin))
 }
 
-async fn build_ip_filters_from_config(conf: &Config) -> Result<OriginIpFilters, WebRelayError> {
-    let want_bl = conf.defense.blocklist.enabled.unwrap_or(false);
-    let want_al = conf.defense.allowlist.enabled.unwrap_or(false);
-    if !want_bl && !want_al {
-        return Ok(OriginIpFilters::default());
-    }
+/// Build an [`OriginIpFilters`] from `[defense.allowlist]`, `[defense.blocklist]`,
+/// and CDN trusted-proxy settings (`[web] cdn`, `trusted-proxies`, `trusted-proxy-urls`,
+/// `client-ip-header`).
+pub async fn build_ip_filters_from_config(
+    conf: &Config,
+    shared_ip_filters: Option<SharedGeoFilters>,
+) -> Result<OriginIpFilters, WebRelayError> {
+    let want_bl = shared_ip_filters.is_none() && conf.defense.blocklist.enabled.unwrap_or(false);
+    let want_al = shared_ip_filters.is_none() && conf.defense.allowlist.enabled.unwrap_or(false);
+    let want_cdn = conf.web.cdn.is_some()
+        || conf
+            .web
+            .trusted_proxies
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+        || conf
+            .web
+            .trusted_proxy_urls
+            .as_ref()
+            .is_some_and(|v| !v.is_empty());
 
-    let prefer_ip = conf.prefer_ip.unwrap_or(PreferIp::PreferIpv6);
-    let sock_cfg = SocketConfig::default();
-    let dns = Arc::new(
-        DnsResolver::build(conf.network.dns.as_deref(), conf.network.doh_ip, prefer_ip)
-            .map_err(|e| WebRelayError::Config(format!("dns init failed: {e}")))?,
-    );
-    let tcp_timeout = conf.network.timeout.tcp.unwrap_or(Duration::from_secs(10));
-    let proxy_pool = match &conf.network.proxies {
-        Some(urls) if !urls.is_empty() => Some(
-            ProxyPool::from_urls(urls, sock_cfg, tcp_timeout)
-                .map_err(|e| WebRelayError::Config(e.to_string()))?,
-        ),
-        _ => None,
-    };
-
-    let blocklist = if want_bl {
-        let bl = Arc::new(LiveIpFilter::from_list_config(
-            &conf.defense.blocklist,
-            Some(Arc::clone(&dns)),
-            prefer_ip,
-            proxy_pool.clone(),
-            sock_cfg,
-        ));
-        if let Err(e) = bl.init_load().await {
-            warn!(error = %e, "web-relay initial blocklist load failed");
-        }
-        Some(bl)
+    let (dns, prefer_ip, proxy_pool, sock_cfg) = if want_bl || want_al || want_cdn {
+        let prefer_ip = conf.prefer_ip.unwrap_or(PreferIp::PreferIpv6);
+        let sock_cfg = SocketConfig::default();
+        let dns = Arc::new(
+            DnsResolver::build(conf.network.dns.as_deref(), conf.network.doh_ip, prefer_ip)
+                .map_err(|e| WebRelayError::Config(format!("dns init failed: {e}")))?,
+        );
+        let tcp_timeout = conf.network.timeout.tcp.unwrap_or(Duration::from_secs(10));
+        let proxy_pool = match &conf.network.proxies {
+            Some(urls) if !urls.is_empty() => Some(
+                ProxyPool::from_urls(urls, sock_cfg, tcp_timeout)
+                    .map_err(|e| WebRelayError::Config(e.to_string()))?,
+            ),
+            _ => None,
+        };
+        (Some(dns), prefer_ip, proxy_pool, sock_cfg)
     } else {
-        None
+        (None, PreferIp::PreferIpv6, None, SocketConfig::default())
     };
 
-    let allowlist = if want_al {
-        let al = Arc::new(LiveIpFilter::from_list_config(
-            &conf.defense.allowlist,
-            Some(dns),
+    let (allowlist, allowlist_action, blocklist, blocklist_action) =
+        if let Some(shared) = shared_ip_filters {
+            (
+                shared.allowlist,
+                shared.allowlist_action,
+                shared.blocklist,
+                shared.blocklist_action,
+            )
+        } else {
+            let blocklist = if want_bl {
+                let bl = Arc::new(LiveIpFilter::from_list_config(
+                    &conf.defense.blocklist,
+                    dns.clone(),
+                    prefer_ip,
+                    proxy_pool.clone(),
+                    sock_cfg,
+                ));
+                if let Err(e) = bl.init_load().await {
+                    warn!(error = %e, "web-relay initial blocklist load failed");
+                }
+                Some(bl)
+            } else {
+                None
+            };
+
+            let allowlist = if want_al {
+                let al = Arc::new(LiveIpFilter::from_list_config(
+                    &conf.defense.allowlist,
+                    dns.clone(),
+                    prefer_ip,
+                    proxy_pool.clone(),
+                    sock_cfg,
+                ));
+                if let Err(e) = al.init_load().await {
+                    warn!(error = %e, "web-relay initial allowlist load failed");
+                }
+                Some(al)
+            } else {
+                None
+            };
+
+            (
+                allowlist,
+                conf.defense
+                    .allowlist
+                    .action
+                    .unwrap_or(IpFilterAction::Front),
+                blocklist,
+                conf.defense
+                    .blocklist
+                    .action
+                    .unwrap_or(IpFilterAction::Close),
+            )
+        };
+
+    // Build wait-free O(1) trusted CDN / reverse-proxy IP range filter!
+    let trusted_proxies = if want_cdn {
+        let mut sources: Vec<String> = Vec::new();
+        let mut inline_cidrs: Vec<String> = Vec::new();
+        if let Some(preset) = conf.web.cdn {
+            sources.extend(preset.ip_feed_urls().iter().map(|s| (*s).to_owned()));
+            inline_cidrs.extend(preset.fallback_cidrs().iter().map(|s| (*s).to_owned()));
+        }
+        if let Some(extra_urls) = &conf.web.trusted_proxy_urls {
+            sources.extend(extra_urls.iter().cloned());
+        }
+        if let Some(extra_cidrs) = &conf.web.trusted_proxies {
+            inline_cidrs.extend(extra_cidrs.iter().cloned());
+        }
+        let tp = Arc::new(LiveIpFilter::from_config(LiveIpFilterConfig {
+            sources,
+            inline_cidrs,
+            cache_file: None,
+            update_each: DEFAULT_IPFILTER_UPDATE_EACH,
+            download_concurrency: 4,
+            dns,
             prefer_ip,
             proxy_pool,
             sock_cfg,
-        ));
-        if let Err(e) = al.init_load().await {
-            warn!(error = %e, "web-relay initial allowlist load failed");
+        }));
+        if let Err(e) = tp.init_load().await {
+            warn!(error = %e, "web-relay trusted-proxies CDN feed load failed; using built-in/inline CIDRs");
         }
-        Some(al)
+        Some(tp)
     } else {
         None
     };
 
+    let client_ip_header = conf
+        .web
+        .client_ip_header
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .or_else(|| {
+            conf.web
+                .cdn
+                .map(|c| c.default_client_ip_header().to_owned())
+        });
+
     Ok(OriginIpFilters {
         allowlist,
-        allowlist_action: conf
-            .defense
-            .allowlist
-            .action
-            .unwrap_or(IpFilterAction::Front),
+        allowlist_action,
         blocklist,
-        blocklist_action: conf
-            .defense
-            .blocklist
-            .action
-            .unwrap_or(IpFilterAction::Close),
+        blocklist_action,
+        trusted_proxies,
+        client_ip_header,
     })
+}
+
+/// Load a PEM certificate chain & private key into a `tokio_rustls::TlsAcceptor`
+/// (supports RSA, ECDSA, Ed25519 keys & Let's Encrypt `fullchain.pem` / `privkey.pem`,
+/// hot-reloadable on `SIGHUP`!).
+pub fn load_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor, WebRelayError> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| {
+            WebRelayError::Config(format!(
+                "cannot read [web] tls-cert {}: {e}",
+                cert_path.display()
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            WebRelayError::Config(format!(
+                "invalid PEM in [web] tls-cert {}: {e}",
+                cert_path.display()
+            ))
+        })?;
+    if certs.is_empty() {
+        return Err(WebRelayError::Config(format!(
+            "[web] tls-cert {} contains no certificates",
+            cert_path.display()
+        )));
+    }
+    let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| {
+        WebRelayError::Config(format!(
+            "cannot read [web] tls-key {}: {e}",
+            key_path.display()
+        ))
+    })?;
+
+    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| WebRelayError::Config(format!("TLS protocol config error: {e}")))?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|e| WebRelayError::Config(format!("invalid TLS cert/key pair: {e}")))?;
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(cfg)))
+}
+
+/// Hot-reloadable TLS acceptor backed by a wait-free `ArcSwap<TlsAcceptor>`
+/// (supports zero-downtime Let's Encrypt certificate renewal on `SIGHUP`).
+#[derive(Clone)]
+pub struct ReloadableTlsAcceptor {
+    inner: Arc<ArcSwap<TlsAcceptor>>,
+}
+
+impl std::fmt::Debug for ReloadableTlsAcceptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReloadableTlsAcceptor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReloadableTlsAcceptor {
+    /// Load a PEM certificate chain & private key from disk.
+    pub fn load(cert_path: &Path, key_path: &Path) -> Result<Self, WebRelayError> {
+        let acceptor = load_tls_acceptor(cert_path, key_path)?;
+        Ok(Self {
+            inner: Arc::new(ArcSwap::from_pointee(acceptor)),
+        })
+    }
+
+    /// Atomically hot-reload certificates from disk without dropping live sessions.
+    pub fn reload(&self, cert_path: &Path, key_path: &Path) -> Result<(), WebRelayError> {
+        let next = load_tls_acceptor(cert_path, key_path)?;
+        self.inner.store(Arc::new(next));
+        Ok(())
+    }
+
+    #[inline]
+    fn load_full(&self) -> Arc<TlsAcceptor> {
+        self.inner.load_full()
+    }
+}
+
+/// Build an [`UpgradedIoExtractor`] for a TLS-wrapped [`PrefixedStream`].
+fn tls_upgrade_extractor() -> UpgradedIoExtractor {
+    Box::new(|upgraded| {
+        let parts = upgraded
+            .downcast::<TokioIo<tokio_rustls::server::TlsStream<PrefixedStream>>>()
+            .ok()?;
+        if !parts.read_buf.is_empty() {
+            return None;
+        }
+        let (r, w) = tokio::io::split(parts.io.into_inner());
+        Some((Box::new(r), Box::new(w)))
+    })
+}
+
+/// Spawn an in-process HTTPS/WSS [`Origin`] listener backed by a hot-reloadable
+/// [`ReloadableTlsAcceptor`] (enabling zero-Nginx/Caddy single-port `:443`
+/// all-in-one deployment when paired with `[web] integrated = true`!).
+pub async fn spawn_tls_origin_server(
+    origin: Arc<Origin>,
+    bind_addr: &str,
+    require_proxy_proto: bool,
+    tls_acceptor: ReloadableTlsAcceptor,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), WebRelayError> {
+    let listeners = bind_tuned_listeners(bind_addr).await?;
+    let local_addr = listeners[0].local_addr()?;
+
+    let handle = tokio::spawn(async move {
+        let mut acceptors = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let origin = Arc::clone(&origin);
+            let tls_acceptor = tls_acceptor.clone();
+            let mut sd = shutdown_rx.clone();
+            acceptors.push(tokio::spawn(async move {
+                loop {
+                    let accept = tokio::select! {
+                        _ = sd.changed() => {
+                            if *sd.borrow() {
+                                break;
+                            }
+                            continue;
+                        }
+                        res = listener.accept() => res,
+                    };
+
+                    let (stream, raw_peer) = match accept {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            warn!(%e, "web relay TLS accept error");
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        }
+                    };
+                    let origin = Arc::clone(&origin);
+                    let acceptor = tls_acceptor.load_full();
+
+                    tokio::spawn(async move {
+                        let (client_peer, prefixed) = if require_proxy_proto {
+                            match accept_proxy_protocol(stream, raw_peer).await {
+                                Ok(res) => res,
+                                Err(_) => return,
+                            }
+                        } else {
+                            (raw_peer, PrefixedStream::new(stream, Bytes::new()))
+                        };
+
+                        let Ok(Ok(tls_stream)) = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            acceptor.accept(prefixed),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+
+                        let io = TokioIo::new(tls_stream);
+                        let svc = service_fn(move |req: Request<Incoming>| {
+                            let origin = Arc::clone(&origin);
+                            async move {
+                                let resp = origin
+                                    .handle_incoming(req, client_peer, tls_upgrade_extractor())
+                                    .await;
+                                Ok::<_, std::convert::Infallible>(resp)
+                            }
+                        });
+
+                        let _ = http1::Builder::new()
+                            .timer(TokioTimer::new())
+                            .keep_alive(true)
+                            .pipeline_flush(true)
+                            .header_read_timeout(Duration::from_secs(10))
+                            .max_buf_size(64 * 1024)
+                            .serve_connection(io, svc)
+                            .with_upgrades()
+                            .await;
+                    });
+                }
+            }));
+        }
+        for acc in acceptors {
+            let _ = acc.await;
+        }
+    });
+
+    Ok((local_addr, handle))
 }
 
 /// Bind tuned Linux `TcpListener`(s) with zero-syscall child socket inheritance
@@ -557,7 +856,7 @@ pub async fn run_web_relay(
         .map(mtg_config::HostPort::as_str);
 
     if check_only {
-        // Also verify token key file & cover path exist and are readable!
+        // Also verify token key file, cover path, and optional TLS cert/key exist and are readable!
         let _ = Signer::load_file(Path::new(&conf.web.token_key))
             .map_err(|e| WebRelayError::Config(e.to_string()))?;
         if !conf.web.cover_dir.is_empty() {
@@ -566,6 +865,9 @@ pub async fn run_web_relay(
         } else if !conf.web.cover_upstream.is_empty() {
             let _ = UpstreamCover::new(&conf.web.cover_upstream)
                 .map_err(|e| WebRelayError::Config(e.to_string()))?;
+        }
+        if let (Some(cert), Some(key)) = (&conf.web.tls_cert, &conf.web.tls_key) {
+            let _ = ReloadableTlsAcceptor::load(Path::new(cert), Path::new(key))?;
         }
 
         println!("mtg-proxy {version}: [web] configuration is usable");
@@ -577,6 +879,37 @@ pub async fn run_web_relay(
             "  client-ip {}",
             conf.web.client_ip.unwrap_or_default().as_str()
         );
+        if let Some(cdn) = conf.web.cdn {
+            println!(
+                "  cdn       {} (header={})",
+                cdn.as_str(),
+                conf.web
+                    .client_ip_header
+                    .as_deref()
+                    .unwrap_or(cdn.default_client_ip_header())
+            );
+        } else if conf
+            .web
+            .trusted_proxies
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+            || conf
+                .web
+                .trusted_proxy_urls
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+        {
+            println!(
+                "  trusted-proxies custom (header={})",
+                conf.web
+                    .client_ip_header
+                    .as_deref()
+                    .unwrap_or("x-forwarded-for")
+            );
+        }
+        if let Some(cert) = &conf.web.tls_cert {
+            println!("  tls       enabled ({cert})");
+        }
         println!("  stats     {}", stats_bind.unwrap_or("(off)"));
         if conf.defense.allowlist.enabled.unwrap_or(false) {
             println!(
@@ -616,9 +949,35 @@ pub async fn run_web_relay(
     origin.spawn_ip_filter_refresh_loops(shutdown_rx.clone());
     let require_pp = conf.web.client_ip.unwrap_or_default() == ClientIpSource::ProxyProtocol;
 
-    let (origin_addr, origin_handle) =
-        spawn_origin_server(Arc::clone(&origin), listen, require_pp, shutdown_rx.clone()).await?;
-    info!(%origin_addr, host, backend, profiles = origin.profiles_len(), "web-relay listening");
+    let tls_acceptor = if let (Some(cert), Some(key)) = (&conf.web.tls_cert, &conf.web.tls_key) {
+        Some(ReloadableTlsAcceptor::load(
+            Path::new(cert),
+            Path::new(key),
+        )?)
+    } else {
+        None
+    };
+
+    let (origin_addr, origin_handle) = if let Some(acc) = tls_acceptor.clone() {
+        spawn_tls_origin_server(
+            Arc::clone(&origin),
+            listen,
+            require_pp,
+            acc,
+            shutdown_rx.clone(),
+        )
+        .await?
+    } else {
+        spawn_origin_server(Arc::clone(&origin), listen, require_pp, shutdown_rx.clone()).await?
+    };
+    info!(
+        %origin_addr,
+        host,
+        backend,
+        tls = tls_acceptor.is_some(),
+        profiles = origin.profiles_len(),
+        "web-relay listening"
+    );
 
     let stats_handle = if let Some(sb) = stats_bind {
         let (sa, sh) = spawn_stats_server(
@@ -651,6 +1010,14 @@ pub async fn run_web_relay(
                 info!("received SIGHUP; reloading WEB relay profiles");
                 reload_web_profiles(&cfg_path, &initial_web, &origin, &counters);
                 origin.trigger_ip_filter_refresh();
+                if let (Some(acc), Some(cert), Some(key)) =
+                    (&tls_acceptor, &initial_web.tls_cert, &initial_web.tls_key)
+                {
+                    match acc.reload(Path::new(cert), Path::new(key)) {
+                        Ok(()) => info!(cert, "reloaded [web] TLS certificate via SIGHUP"),
+                        Err(e) => warn!(error = %e, "SIGHUP [web] TLS reload failed; keeping active cert"),
+                    }
+                }
                 last_mtime = file_mtime(&cfg_path);
             }
             _ = poll_tick.tick() => {

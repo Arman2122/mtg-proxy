@@ -20,8 +20,9 @@ pub use metrics::{
     UsageRecord, compute_fair_caps,
 };
 pub use state::{
-    DoppelState, EngineError, EngineSettings, IpFilterVerdict, ListenerReport, ProxyEngine,
-    SUPPORTED_FEATURES, is_secret_served, peer_ip_of,
+    BatchUpsertSecret, DoppelState, EngineError, EngineSettings, FrontingRuntimeConfig,
+    IpFilterReportEntry, IpFilterVerdict, IpFiltersReport, IpFiltersState, ListenerReport,
+    ProxyEngine, SUPPORTED_FEATURES, SecretPatch, is_secret_served, peer_ip_of,
 };
 pub use worker::{BoundListenerSpec, EngineRuntime};
 
@@ -395,6 +396,198 @@ alice = "{secret_hex}"
         assert_eq!(&web_reply[..6], b"COVER:");
         assert_eq!(&web_reply[6..], web_req);
         drop(iran_web);
+
+        runtime.shutdown();
+    }
+
+    /// Unified Single-Port Multi-Transport + Geo-Stealth End-to-End Proof:
+    /// ONE single TCP port serves ALL THREE simultaneously:
+    /// 1. Allowed Iranian IP (`5.160.1.10`) with FakeTLS `ee` -> Telegram DC echo!
+    /// 2. Allowed Iranian IP (`5.160.1.10`) with Obfuscated2 `dd` on the EXACT SAME PORT -> Telegram DC echo!
+    /// 3. Allowed Iranian IP (`5.160.1.10`) with plain HTTP browser -> Cover website!
+    /// 4. Foreign IP (`203.0.113.8`) with a VALID Obfuscated2 `dd` handshake -> DENIED proxy access
+    ///    and transparently fronted straight to the cover website (`COVER:...`)!
+    #[tokio::test]
+    async fn single_port_multiplex_serves_faketls_obfs2_and_cover_with_geo_stealth() {
+        use mtg_protocol::proxyproto::encode_v2_tcp;
+
+        let mock_dc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dc_addr = mock_dc.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = mock_dc.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut hs = [0u8; 64];
+                    s.read_exact(&mut hs).await.unwrap();
+                    let mut recv_key = [0u8; 32];
+                    let mut recv_iv = [0u8; 16];
+                    recv_key.copy_from_slice(&hs[8..40]);
+                    recv_iv.copy_from_slice(&hs[40..56]);
+                    let mut rev = [0u8; 48];
+                    rev.copy_from_slice(&hs[8..56]);
+                    rev.reverse();
+                    let mut send_key = [0u8; 32];
+                    let mut send_iv = [0u8; 16];
+                    send_key.copy_from_slice(&rev[..32]);
+                    send_iv.copy_from_slice(&rev[32..48]);
+
+                    let mut dec = Aes256Ctr::new(&recv_key, &recv_iv);
+                    let mut enc = Aes256Ctr::new(&send_key, &send_iv);
+                    let mut dummy = [0u8; 64];
+                    dec.apply_keystream(&mut dummy);
+
+                    let mut buf = [0u8; 256];
+                    let n = s.read(&mut buf).await.unwrap();
+                    dec.apply_keystream(&mut buf[..n]);
+                    enc.apply_keystream(&mut buf[..n]);
+                    s.write_all(&buf[..n]).await.unwrap();
+                });
+            }
+        });
+
+        let mock_cover = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cover_addr = mock_cover.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = mock_cover.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = s.read(&mut buf).await.unwrap();
+                    s.write_all(b"COVER:").await.unwrap();
+                    s.write_all(&buf[..n]).await.unwrap();
+                });
+            }
+        });
+
+        let proxy_port = {
+            let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tmp.local_addr().unwrap().port()
+        };
+        let secret_hex =
+            "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d";
+        let secret = Secret::parse(secret_hex).unwrap();
+        let cfg_toml = format!(
+            r#"
+bind-to = "127.0.0.1:{proxy_port}"
+bind-to-accept = ["ee", "dd"]
+proxy-protocol-listener = true
+prefer-ip = "only-ipv4"
+[domain-fronting]
+host = "127.0.0.1"
+port = {}
+[defense.allowlist]
+enabled = true
+action = "front"
+cidrs = ["5.160.0.0/16"]
+[secrets]
+alice = "{secret_hex}"
+"#,
+            cover_addr.port()
+        );
+        let cfg = Config::parse(cfg_toml.as_bytes()).unwrap();
+        let engine = ProxyEngine::from_config(&cfg, None, 1, false).unwrap();
+
+        let mut dir = DcDirectory::default();
+        let mut v4 = BTreeMap::new();
+        v4.insert(2, vec![dc_addr]);
+        dir.direct_v4 = v4;
+        engine.dc_router.set_directory(dir);
+
+        let runtime = EngineRuntime::start(Arc::clone(&engine)).await.unwrap();
+        let proxy_addr = runtime.bound_faketls_addrs[0];
+        let dst_sa: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+        // 1. Iranian IP + FakeTLS `ee` on shared port -> Telegram DC echo!
+        let mut c_ee = TcpStream::connect(proxy_addr).await.unwrap();
+        let pp_ir = encode_v2_tcp("5.160.1.10:53001".parse().unwrap(), dst_sa);
+        let ch = build_client_hello(
+            secret.key(),
+            "storage.googleapis.com",
+            Utc::now().timestamp() as u32,
+        );
+        c_ee.write_all(pp_ir.as_slice()).await.unwrap();
+        c_ee.write_all(&ch).await.unwrap();
+
+        let mut sh_read = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let mut recs = 0usize;
+        let mut pos = 0usize;
+        while recs < 3 {
+            let n = c_ee.read(&mut tmp).await.unwrap();
+            assert!(n > 0);
+            sh_read.extend_from_slice(&tmp[..n]);
+            while sh_read.len() >= pos + 5 {
+                let rlen = u16::from_be_bytes([sh_read[pos + 3], sh_read[pos + 4]]) as usize;
+                if sh_read.len() < pos + 5 + rlen {
+                    break;
+                }
+                pos += 5 + rlen;
+                recs += 1;
+            }
+        }
+        let (obfs_ee, mut ee_ciphers) =
+            build_outbound_handshake(2, ConnectionTag::PADDED_INTERMEDIATE, Some(secret.key()));
+        let mut p1 = *b"SINGLE-PORT-EE!!";
+        ee_ciphers.send.apply_keystream(&mut p1);
+        let mut tls_pkt = vec![0u8; 5 + 64 + p1.len()];
+        let hdr: &mut [u8; 5] = (&mut tls_pkt[..5]).try_into().unwrap();
+        stamp_app_data_header(hdr, (64 + p1.len()) as u16);
+        tls_pkt[5..69].copy_from_slice(&obfs_ee);
+        tls_pkt[69..].copy_from_slice(&p1);
+        c_ee.write_all(&tls_pkt).await.unwrap();
+
+        let mut unframer = TlsUnframer::new();
+        let mut app_back = Vec::new();
+        while app_back.len() < 16 {
+            let n = c_ee.read(&mut tmp).await.unwrap();
+            let w = unframer.unframe_in_place(&mut tmp[..n]).unwrap();
+            app_back.extend_from_slice(&tmp[..w]);
+        }
+        ee_ciphers.recv.apply_keystream(&mut app_back[..16]);
+        assert_eq!(&app_back[..16], b"SINGLE-PORT-EE!!");
+        drop(c_ee);
+
+        // 2. Iranian IP + Obfuscated2 `dd` on the EXACT SAME PORT -> Telegram DC echo!
+        let mut c_dd = TcpStream::connect(proxy_addr).await.unwrap();
+        let pp_ir2 = encode_v2_tcp("5.160.1.10:53002".parse().unwrap(), dst_sa);
+        let (obfs_dd, mut dd_ciphers) =
+            build_outbound_handshake(2, ConnectionTag::PADDED_INTERMEDIATE, Some(secret.key()));
+        let mut p2 = *b"SINGLE-PORT-DD!!";
+        dd_ciphers.send.apply_keystream(&mut p2);
+        c_dd.write_all(pp_ir2.as_slice()).await.unwrap();
+        c_dd.write_all(&obfs_dd).await.unwrap();
+        c_dd.write_all(&p2).await.unwrap();
+
+        let mut dd_back = [0u8; 16];
+        c_dd.read_exact(&mut dd_back).await.unwrap();
+        dd_ciphers.recv.apply_keystream(&mut dd_back);
+        assert_eq!(&dd_back, b"SINGLE-PORT-DD!!");
+        drop(c_dd);
+
+        // 3. Iranian IP + normal HTTP browser on the EXACT SAME PORT -> Cover website!
+        let mut c_http = TcpStream::connect(proxy_addr).await.unwrap();
+        let pp_ir3 = encode_v2_tcp("5.160.1.10:53003".parse().unwrap(), dst_sa);
+        let req = b"GET / HTTP/1.1\r\nHost: cover.example\r\n\r\n";
+        c_http.write_all(pp_ir3.as_slice()).await.unwrap();
+        c_http.write_all(req).await.unwrap();
+        let mut got_http = vec![0u8; 6 + req.len()];
+        c_http.read_exact(&mut got_http).await.unwrap();
+        assert_eq!(&got_http[..6], b"COVER:");
+        assert_eq!(&got_http[6..], req);
+        drop(c_http);
+
+        // 4. Foreign IP (`203.0.113.8`) + VALID Obfuscated2 `dd` handshake -> DENIED & FRONTED to cover!
+        let mut c_foreign_dd = TcpStream::connect(proxy_addr).await.unwrap();
+        let pp_for = encode_v2_tcp("203.0.113.8:53004".parse().unwrap(), dst_sa);
+        let (for_dd, _) =
+            build_outbound_handshake(2, ConnectionTag::PADDED_INTERMEDIATE, Some(secret.key()));
+        c_foreign_dd.write_all(pp_for.as_slice()).await.unwrap();
+        c_foreign_dd.write_all(&for_dd).await.unwrap();
+        let mut got_for = vec![0u8; 6 + for_dd.len()];
+        c_foreign_dd.read_exact(&mut got_for).await.unwrap();
+        assert_eq!(&got_for[..6], b"COVER:");
+        assert_eq!(&got_for[6..], &for_dd);
+        drop(c_foreign_dd);
 
         runtime.shutdown();
     }

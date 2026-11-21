@@ -13,16 +13,18 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use mtg_config::{Config, HandshakeBudgetMode, IpFilterAction, ListenerPolicy, PreferIp};
+use mtg_config::{
+    Config, HandshakeBudgetMode, IpFilterAction, ListConfig, ListenerPolicy, PreferIp,
+};
 use mtg_core::{
-    IpUnit, ModeSet, RetiringSecret, RotationClock, Secret, SecretLimits, SecretMode,
+    IpUnit, ModeSet, QuotaReset, RetiringSecret, RotationClock, Secret, SecretLimits, SecretMode,
     is_personal_ip,
 };
 use mtg_crypto::faketls::X25519KeyRing;
 use mtg_governance::{
     AddressRegistry, BanEntryJson, BanError, BanList, ClientEntry, ClientTable, ConnHandle,
-    EntryInit, FairShareScratch, FakeTlsAntiReplay, LedgerDeny, LiveIpFilter, MatchHints,
-    Obfs2AntiReplay, ObfuscatedLimiter, ScanBudget, ScanBudgetConfig, SecretSet,
+    EntryInit, FairShareScratch, FakeTlsAntiReplay, LedgerDeny, LiveIpFilter, LiveIpFilterStatus,
+    MatchHints, Obfs2AntiReplay, ObfuscatedLimiter, ScanBudget, ScanBudgetConfig, SecretSet,
 };
 use mtg_net::{
     DEFAULT_CARRIERS_PER_DC, DcRouter, DnsResolver, MiddleProxyPool, ProxyPool, SocketConfig,
@@ -144,6 +146,73 @@ pub enum IpFilterVerdict {
     Close,
 }
 
+/// Hot-reloadable domain-fronting destination parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontingRuntimeConfig {
+    pub host: String,
+    pub port: u16,
+    pub proxy_protocol: bool,
+}
+
+/// Wait-free snapshot of active IP allowlist / blocklist filters and their policies.
+#[derive(Debug)]
+pub struct IpFiltersState {
+    pub blocklist: Option<Arc<LiveIpFilter>>,
+    pub blocklist_action: IpFilterAction,
+    pub blocklist_cfg: ListConfig,
+    pub allowlist: Option<Arc<LiveIpFilter>>,
+    pub allowlist_action: IpFilterAction,
+    pub allowlist_cfg: ListConfig,
+}
+
+/// Observability report for one IP filter (blocklist or allowlist).
+#[derive(Debug, Clone, Serialize)]
+pub struct IpFilterReportEntry {
+    pub enabled: bool,
+    pub action: String,
+    pub rejected_total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<LiveIpFilterStatus>,
+}
+
+/// Combined status snapshot returned by `GET /ip-filters`.
+#[derive(Debug, Clone, Serialize)]
+pub struct IpFiltersReport {
+    pub allowlist: IpFilterReportEntry,
+    pub blocklist: IpFilterReportEntry,
+}
+
+/// Partial update payload for `PATCH /secrets/{name}` (updates only specified fields
+/// without requiring the caller to resend the secret key or untouched limits!).
+#[derive(Debug, Default, Clone)]
+pub struct SecretPatch {
+    pub secret: Option<Secret>,
+    pub ad_tag: Option<Option<[u8; 16]>>,
+    pub quota_bytes: Option<i64>,
+    pub add_quota_bytes: Option<i64>,
+    pub reset_quota: bool,
+    pub quota_reset: Option<QuotaReset>,
+    pub expires_at: Option<Option<DateTime<Utc>>>,
+    pub disabled: Option<bool>,
+    pub speed_bytes_per_second: Option<i64>,
+    pub speed_up_bytes_per_second: Option<i64>,
+    pub speed_down_bytes_per_second: Option<i64>,
+    pub ip_limit: Option<u32>,
+    pub client_conns: Option<u32>,
+    pub max_connections: Option<u32>,
+    pub client_speed_bytes_per_second: Option<i64>,
+    pub client_fair: Option<bool>,
+}
+
+/// One upsert entry for atomic `POST /secrets/batch`.
+#[derive(Debug, Clone)]
+pub struct BatchUpsertSecret {
+    pub name: String,
+    pub secret: Secret,
+    pub ad_tag: Option<[u8; 16]>,
+    pub limits: SecretLimits,
+}
+
 /// Listener descriptor exposed on `GET /stats` (`listeners`).
 #[derive(Debug, Clone, Serialize)]
 pub struct ListenerReport {
@@ -192,8 +261,12 @@ pub struct EngineSettings {
     pub api_bind_to: Option<String>,
     pub api_token: String,
     pub bind_to: Vec<String>,
+    /// Obfuscated2 modes (`dd` / `plain`) multiplexed onto the primary `bind-to` port
+    /// (empty by default = FakeTLS `ee` only).
+    pub bind_to_obfs_modes: ModeSet,
     pub listeners: Vec<(String, ListenerPolicy)>,
     pub proxy_protocol_listener: bool,
+    pub prefer_ip: PreferIp,
     pub track_client_ips: bool,
     pub concurrency: u32,
     pub tolerate_time_skewness: Duration,
@@ -228,10 +301,10 @@ pub struct ProxyEngine {
     pub obfs_limiter: ObfuscatedLimiter,
     pub faketls_replay: FakeTlsAntiReplay,
     pub obfs2_replay: Obfs2AntiReplay,
-    pub blocklist: Option<Arc<LiveIpFilter>>,
-    pub blocklist_action: IpFilterAction,
-    pub allowlist: Option<Arc<LiveIpFilter>>,
-    pub allowlist_action: IpFilterAction,
+    pub ip_filters: ArcSwap<IpFiltersState>,
+    pub fronting_cfg: ArcSwap<FrontingRuntimeConfig>,
+    pub track_client_ips_live: AtomicBool,
+    pub tolerate_time_skewness_ms: AtomicU64,
     pub dns: Arc<DnsResolver>,
     pub proxy_pool: Option<ProxyPool>,
     pub dc_router: Arc<DcRouter>,
@@ -241,6 +314,11 @@ pub struct ProxyEngine {
     pub doppel: DoppelState,
     pub metrics: Arc<ProxyMetrics>,
 
+    /// Broadcasts a monotonic revision counter whenever `secrets` swaps (so embedded
+    /// `[web] integrated = true` syncs instantaneously without 2s polling!).
+    secret_sync_tx: watch::Sender<u64>,
+    /// Cancels old IP filter background refresh loops cleanly on hot reload.
+    ip_filter_loop_cancel: Mutex<Option<watch::Sender<bool>>>,
     /// Serializes config reloads & API secret mutations.
     reload_mu: Mutex<()>,
     /// Per-worker cache-line-isolated admission gate (zero cross-core lock contention!).
@@ -346,43 +424,12 @@ impl ProxyEngine {
             Obfs2AntiReplay::disabled()
         };
 
-        let blocklist_action = cfg
-            .defense
-            .blocklist
-            .action
-            .unwrap_or(IpFilterAction::Close);
-        let blocklist = if cfg.defense.blocklist.enabled.unwrap_or(false) {
-            Some(Arc::new(LiveIpFilter::from_list_config(
-                &cfg.defense.blocklist,
-                Some(Arc::clone(&dns)),
-                prefer_ip,
-                proxy_pool.clone(),
-                sock_cfg,
-            )))
-        } else {
-            None
-        };
+        let ip_filters = build_ip_filters_state(cfg, &dns, prefer_ip, proxy_pool.clone(), sock_cfg);
 
-        let allowlist_action = cfg
-            .defense
-            .allowlist
-            .action
-            .unwrap_or(IpFilterAction::Front);
-        let allowlist = if cfg.defense.allowlist.enabled.unwrap_or(false) {
-            Some(Arc::new(LiveIpFilter::from_list_config(
-                &cfg.defense.allowlist,
-                Some(Arc::clone(&dns)),
-                prefer_ip,
-                proxy_pool.clone(),
-                sock_cfg,
-            )))
-        } else {
-            None
-        };
-
+        let bind_to_obfs_modes = cfg.get_bind_to_obfs_modes();
         let mut listeners = Vec::with_capacity(cfg.listeners.len());
         let mut listener_reports = Vec::with_capacity(cfg.listeners.len());
-        let mut listener_modes = ModeSet::empty();
+        let mut listener_modes = cfg.get_listener_modes();
         for l in &cfg.listeners {
             let pol = l
                 .policy()
@@ -465,23 +512,33 @@ impl ProxyEngine {
             ..ScanBudgetConfig::default()
         });
 
+        let track_client_ips = cfg.track_client_ips.unwrap_or(false);
+        let tolerate_time_skewness = cfg.tolerate_time_skewness.unwrap_or(Duration::from_secs(5));
+        let fronting_init = FrontingRuntimeConfig {
+            host: cfg.get_domain_fronting_host().to_owned(),
+            port: cfg.get_domain_fronting_port(443),
+            proxy_protocol: cfg.get_domain_fronting_proxy_protocol(false),
+        };
+
         let settings = EngineSettings {
             config_path,
             usage_state_file: usage_path,
             api_bind_to: cfg.api_bind_to.as_ref().map(|h| h.as_str().to_owned()),
             api_token: (*cfg.api_token).clone(),
             bind_to: cfg.bind_to.iter().map(|b| b.as_str().to_owned()).collect(),
+            bind_to_obfs_modes,
             listeners,
             proxy_protocol_listener: cfg.proxy_protocol_listener.unwrap_or(false),
-            track_client_ips: cfg.track_client_ips.unwrap_or(false),
+            prefer_ip,
+            track_client_ips,
             concurrency: cfg.concurrency.unwrap_or(8192),
-            tolerate_time_skewness: cfg.tolerate_time_skewness.unwrap_or(Duration::from_secs(5)),
+            tolerate_time_skewness,
             tcp_timeout,
             idle_timeout,
             handshake_timeout,
-            fronting_host: cfg.get_domain_fronting_host().to_owned(),
-            fronting_port: cfg.get_domain_fronting_port(443),
-            fronting_proxy_protocol: cfg.get_domain_fronting_proxy_protocol(false),
+            fronting_host: fronting_init.host.clone(),
+            fronting_port: fronting_init.port,
+            fronting_proxy_protocol: fronting_init.proxy_protocol,
             public_ipv4: cfg.public_ipv4,
             public_ipv6: cfg.public_ipv6,
             advertised_port,
@@ -522,6 +579,8 @@ impl ProxyEngine {
             )),
         };
 
+        let (secret_sync_tx, _) = watch::channel(0u64);
+
         Ok(Arc::new(Self {
             settings,
             listener_modes,
@@ -536,10 +595,12 @@ impl ProxyEngine {
             obfs_limiter: ObfuscatedLimiter::new(),
             faketls_replay,
             obfs2_replay,
-            blocklist,
-            blocklist_action,
-            allowlist,
-            allowlist_action,
+            ip_filters: ArcSwap::from_pointee(ip_filters),
+            fronting_cfg: ArcSwap::from_pointee(fronting_init),
+            track_client_ips_live: AtomicBool::new(track_client_ips),
+            tolerate_time_skewness_ms: AtomicU64::new(
+                tolerate_time_skewness.as_millis().min(u128::from(u64::MAX)) as u64,
+            ),
             dns,
             proxy_pool,
             dc_router,
@@ -548,6 +609,8 @@ impl ProxyEngine {
             x25519_keys: X25519KeyRing::default(),
             doppel,
             metrics,
+            secret_sync_tx,
+            ip_filter_loop_cancel: Mutex::new(None),
             reload_mu: Mutex::new(()),
             live_gate: StripedGate::new(workers),
             live_conns: (0..workers.max(1))
@@ -560,7 +623,37 @@ impl ProxyEngine {
         }))
     }
 
-    /// Evaluate configured blocklist and allowlist (`0 ns` when both are disabled!).
+    /// Current hot-reloadable `track-client-ips` state.
+    #[inline]
+    pub fn track_client_ips(&self) -> bool {
+        self.track_client_ips_live.load(Ordering::Acquire)
+    }
+
+    /// Current hot-reloadable `tolerate-time-skewness` duration.
+    #[inline]
+    pub fn tolerate_time_skewness(&self) -> Duration {
+        Duration::from_millis(self.tolerate_time_skewness_ms.load(Ordering::Acquire))
+    }
+
+    /// Snapshot of current hot-reloadable domain-fronting destination config.
+    #[inline]
+    pub fn fronting_config(&self) -> arc_swap::Guard<Arc<FrontingRuntimeConfig>> {
+        self.fronting_cfg.load()
+    }
+
+    /// Atomically update domain-fronting destination (used by hot-reload and
+    /// integrated single-port `[web]` TLS fallback!).
+    pub fn set_fronting_config(&self, cfg: FrontingRuntimeConfig) {
+        self.fronting_cfg.store(Arc::new(cfg));
+    }
+
+    /// Subscribe to real-time secret/retired mutation revisions (for zero-delay
+    /// synchronization with embedded `[web] integrated = true`).
+    pub fn subscribe_secret_changes(&self) -> watch::Receiver<u64> {
+        self.secret_sync_tx.subscribe()
+    }
+
+    /// Evaluate configured blocklist and allowlist (`~1 ns` when both are disabled!).
     ///
     /// Precedence:
     /// 1. Explicit `blocklist` match -> increments `blocklisted_total` and applies
@@ -569,26 +662,30 @@ impl ProxyEngine {
     ///    `allowlist_action` (default: `Front`, Geo-Stealth cover-only!).
     #[inline]
     pub fn check_ip_filters(&self, ip: IpAddr, worker_id: usize) -> IpFilterVerdict {
-        if let Some(block) = &self.blocklist
+        let filters = self.ip_filters.load();
+        if filters.blocklist.is_none() && filters.allowlist.is_none() {
+            return IpFilterVerdict::Allow;
+        }
+        if let Some(block) = &filters.blocklist
             && block.contains(ip)
         {
             self.metrics
                 .core(worker_id)
                 .blocklisted_total
                 .fetch_add(1, Ordering::Relaxed);
-            return match self.blocklist_action {
+            return match filters.blocklist_action {
                 IpFilterAction::Front => IpFilterVerdict::Front,
                 IpFilterAction::Close => IpFilterVerdict::Close,
             };
         }
-        if let Some(allow) = &self.allowlist
+        if let Some(allow) = &filters.allowlist
             && !allow.contains(ip)
         {
             self.metrics
                 .core(worker_id)
                 .allowlist_rejected_total
                 .fetch_add(1, Ordering::Relaxed);
-            return match self.allowlist_action {
+            return match filters.allowlist_action {
                 IpFilterAction::Front => IpFilterVerdict::Front,
                 IpFilterAction::Close => IpFilterVerdict::Close,
             };
@@ -602,22 +699,72 @@ impl ProxyEngine {
     /// skip ClientHello parsing completely and enter kernel `splice(2)` at byte 0!
     #[inline]
     pub fn has_fixed_fronting_host(&self) -> bool {
-        let explicit = &self.settings.fronting_host;
-        if !explicit.is_empty()
-            && (self.settings.fronting_port != 443
-                || explicit.eq_ignore_ascii_case("localhost")
-                || explicit.parse::<IpAddr>().is_ok())
+        let fcfg = self.fronting_cfg.load();
+        if !fcfg.host.is_empty()
+            && (fcfg.port != 443
+                || fcfg.host.eq_ignore_ascii_case("localhost")
+                || fcfg.host.parse::<IpAddr>().is_ok())
         {
             return true;
         }
         self.secrets.load().sni_buckets.len() <= 1
     }
 
+    /// Cold-boot initialization of active blocklist & allowlist filters.
+    pub async fn init_ip_filters(&self) {
+        let filters = self.ip_filters.load_full();
+        if let Some(bl) = &filters.blocklist {
+            match bl.init_load().await {
+                Ok(n) => {
+                    self.metrics
+                        .blocklist_size
+                        .store(n as u64, Ordering::Release);
+                }
+                Err(e) => warn!(error = %e, "initial blocklist load failed"),
+            }
+        }
+        if let Some(al) = &filters.allowlist {
+            match al.init_load().await {
+                Ok(n) => {
+                    self.metrics
+                        .allowlist_size
+                        .store(n as u64, Ordering::Release);
+                }
+                Err(e) => warn!(error = %e, "initial allowlist load failed"),
+            }
+        }
+    }
+
+    /// Spawn (or replace) background refresh loops for the currently active `ip_filters`.
+    pub fn restart_ip_filter_refresh_loops(&self) {
+        let (tx, rx) = watch::channel(false);
+        if let Some(prev) = self.ip_filter_loop_cancel.lock().replace(tx) {
+            let _ = prev.send(true);
+        }
+        let filters = self.ip_filters.load_full();
+        if let Some(bl) = &filters.blocklist {
+            let m = Arc::clone(&self.metrics);
+            bl.spawn_refresh_loop_with_hook(rx.clone(), move |n| {
+                m.blocklist_size.store(n as u64, Ordering::Release);
+            });
+        } else {
+            self.metrics.blocklist_size.store(0, Ordering::Release);
+        }
+        if let Some(al) = &filters.allowlist {
+            let m = Arc::clone(&self.metrics);
+            al.spawn_refresh_loop_with_hook(rx, move |n| {
+                m.allowlist_size.store(n as u64, Ordering::Release);
+            });
+        } else {
+            self.metrics.allowlist_size.store(0, Ordering::Release);
+        }
+    }
+
     /// Trigger a non-blocking background refresh of active blocklist / allowlist
     /// feeds (e.g. on `SIGHUP`) and update live Prometheus/StatsD size gauges.
     pub fn trigger_ip_filter_refresh(&self) {
-        if let Some(bl) = &self.blocklist {
-            let bl = Arc::clone(bl);
+        let filters = self.ip_filters.load_full();
+        if let Some(bl) = filters.blocklist.clone() {
             let m = Arc::clone(&self.metrics);
             tokio::spawn(async move {
                 if let Ok(n) = bl.refresh_once().await {
@@ -625,8 +772,7 @@ impl ProxyEngine {
                 }
             });
         }
-        if let Some(al) = &self.allowlist {
-            let al = Arc::clone(al);
+        if let Some(al) = filters.allowlist.clone() {
             let m = Arc::clone(&self.metrics);
             tokio::spawn(async move {
                 if let Ok(n) = al.refresh_once().await {
@@ -636,15 +782,62 @@ impl ProxyEngine {
         }
     }
 
+    /// Synchronously refresh active IP filters and return the fresh status report
+    /// (for `POST /ip-filters/refresh`).
+    pub async fn refresh_ip_filters_now(&self) -> IpFiltersReport {
+        let filters = self.ip_filters.load_full();
+        if let Some(bl) = &filters.blocklist
+            && let Ok(n) = bl.refresh_once().await
+        {
+            self.metrics
+                .blocklist_size
+                .store(n as u64, Ordering::Release);
+        }
+        if let Some(al) = &filters.allowlist
+            && let Ok(n) = al.refresh_once().await
+        {
+            self.metrics
+                .allowlist_size
+                .store(n as u64, Ordering::Release);
+        }
+        self.ip_filters_status()
+    }
+
+    /// Snapshot live status of both allowlist and blocklist (for `GET /ip-filters` & `/healthz`).
+    pub fn ip_filters_status(&self) -> IpFiltersReport {
+        let filters = self.ip_filters.load();
+        let mut bl_rej = 0u64;
+        let mut al_rej = 0u64;
+        for c in &self.metrics.cores {
+            bl_rej += c.blocklisted_total.load(Ordering::Relaxed);
+            al_rej += c.allowlist_rejected_total.load(Ordering::Relaxed);
+        }
+        IpFiltersReport {
+            allowlist: IpFilterReportEntry {
+                enabled: filters.allowlist.is_some(),
+                action: filters.allowlist_action.as_str().to_owned(),
+                rejected_total: al_rej,
+                status: filters.allowlist.as_ref().map(|f| f.status()),
+            },
+            blocklist: IpFilterReportEntry {
+                enabled: filters.blocklist.is_some(),
+                action: filters.blocklist_action.as_str().to_owned(),
+                rejected_total: bl_rej,
+                status: filters.blocklist.as_ref().map(|f| f.status()),
+            },
+        }
+    }
+
     /// Resolve ordered fronting candidate hostnames (primary SNI-matched cover
     /// first, followed by configured fallback & alternate hosted covers for
     /// automatic failover without ever accepting arbitrary SSRF targets).
     pub fn fronting_hosts_for(&self, sni_candidates: &[String]) -> Vec<String> {
-        let explicit = &self.settings.fronting_host;
+        let fcfg = self.fronting_cfg.load();
+        let explicit = &fcfg.host;
         // Dedicated local/reverse-proxy cover (e.g., nginx/caddy on non-443 or loopback/IP literal)
         // always takes strict precedence over public hosted SNI covers.
         if !explicit.is_empty()
-            && (self.settings.fronting_port != 443
+            && (fcfg.port != 443
                 || explicit.eq_ignore_ascii_case("localhost")
                 || explicit.parse::<IpAddr>().is_ok())
         {
@@ -698,13 +891,14 @@ impl ProxyEngine {
     /// handshakes so reactive active DPI probes (replay or fresh TLS probe
     /// arriving seconds later) experience **0 ms proxy->cover TCP RTT**!
     pub fn prewarm_fronting_cover(&self, sni_candidates: &[String]) {
-        if self.settings.fronting_port != 443 || !self.fronting_pool.try_claim_prewarm_tick() {
+        let fcfg = self.fronting_cfg.load();
+        if fcfg.port != 443 || !self.fronting_pool.try_claim_prewarm_tick() {
             return;
         }
         if let Some(primary) = self.fronting_hosts_for(sni_candidates).into_iter().next() {
             self.fronting_pool.schedule_warm_refill(
                 &primary,
-                self.settings.fronting_port,
+                fcfg.port,
                 self.settings.tcp_timeout,
                 Arc::clone(&self.dns),
                 self.proxy_pool.clone(),
@@ -740,6 +934,11 @@ impl ProxyEngine {
         let user = self.metrics.user(secret_name);
         user.rollover_if_needed(limits.quota_reset, now);
         if limits.quota_bytes > 0 && user.quota_used.load(Ordering::Acquire) >= limits.quota_bytes {
+            return Err(());
+        }
+        if limits.max_connections > 0
+            && user.connections.load(Ordering::Relaxed) >= i64::from(limits.max_connections)
+        {
             return Err(());
         }
 
@@ -814,6 +1013,7 @@ impl ProxyEngine {
         );
 
         user.connections.fetch_add(1, Ordering::Relaxed);
+        user.total_connections.fetch_add(1, Ordering::Relaxed);
         user.last_seen_unix
             .store(now.timestamp(), Ordering::Relaxed);
         if retiring {
@@ -821,7 +1021,7 @@ impl ProxyEngine {
             user.retiring_last_seen_ns
                 .store(now.timestamp_nanos_opt().unwrap_or(0), Ordering::Relaxed);
         }
-        if self.settings.track_client_ips
+        if self.track_client_ips()
             && let Some(ip) = client_ip
         {
             // Format IP on stack & check read lock first — zero alloc & zero write lock when unchanged!
@@ -887,8 +1087,66 @@ impl ProxyEngine {
         closed
     }
 
-    /// Reload secrets, limits, ad-tags, and retiring blocks from `config_path`.
+    /// Full async hot-reload from `config_path`: atomically reloads secrets,
+    /// per-secret limits, ad-tags, retiring-secrets, `[throttle] max-connections`,
+    /// `track-client-ips`, `tolerate-time-skewness`, `[domain-fronting]` destination,
+    /// AND `[defense.allowlist]` / `[defense.blocklist]` (pre-loading new IP feeds
+    /// BEFORE swapping so zero traffic slips through an empty list!).
+    ///
+    /// If parsing or validation fails, nothing is mutated and live connections stay untouched.
+    pub async fn reload_from_disk_async(&self) -> Result<Vec<String>, EngineError> {
+        let cfg = self.read_and_validate_reload_config()?;
+
+        // Check if allowlist / blocklist configuration structurally changed.
+        let prev_filters = self.ip_filters.load_full();
+        let filters_changed = prev_filters.allowlist_cfg != cfg.defense.allowlist
+            || prev_filters.blocklist_cfg != cfg.defense.blocklist;
+
+        if filters_changed {
+            let next_filters = build_ip_filters_state(
+                &cfg,
+                &self.dns,
+                self.settings.prefer_ip,
+                self.proxy_pool.clone(),
+                self.settings.sock_cfg,
+            );
+            // Warm-load new filters BEFORE swapping so zero requests see an unready filter!
+            if let Some(bl) = &next_filters.blocklist {
+                match bl.init_load().await {
+                    Ok(n) => self
+                        .metrics
+                        .blocklist_size
+                        .store(n as u64, Ordering::Release),
+                    Err(e) => warn!(error = %e, "hot-reload blocklist load failed"),
+                }
+            }
+            if let Some(al) = &next_filters.allowlist {
+                match al.init_load().await {
+                    Ok(n) => self
+                        .metrics
+                        .allowlist_size
+                        .store(n as u64, Ordering::Release),
+                    Err(e) => warn!(error = %e, "hot-reload allowlist load failed"),
+                }
+            }
+            self.ip_filters.store(Arc::new(next_filters));
+            self.restart_ip_filter_refresh_loops();
+            info!("hot-reloaded IP allowlist/blocklist configuration");
+        } else {
+            self.trigger_ip_filter_refresh();
+        }
+
+        self.apply_reloaded_config_sync(&cfg)
+    }
+
+    /// Synchronous reload of secrets, limits, ad-tags, retiring blocks, throttle,
+    /// tracking, skewness, and fronting config from `config_path`.
     pub fn reload_from_disk(&self) -> Result<Vec<String>, EngineError> {
+        let cfg = self.read_and_validate_reload_config()?;
+        self.apply_reloaded_config_sync(&cfg)
+    }
+
+    fn read_and_validate_reload_config(&self) -> Result<Config, EngineError> {
         let Some(path) = &self.settings.config_path else {
             return Err(EngineError::Reload(
                 "no configuration file path configured".to_owned(),
@@ -902,7 +1160,10 @@ impl ProxyEngine {
             .map_err(|e| EngineError::Reload(e.to_string()))?;
         cfg.validate()
             .map_err(|e| EngineError::Reload(e.to_string()))?;
+        Ok(cfg)
+    }
 
+    fn apply_reloaded_config_sync(&self, cfg: &Config) -> Result<Vec<String>, EngineError> {
         let now = self.rotation_clock.now();
         let retiring_report = cfg.get_retiring_secrets(now);
         let secrets = cfg.get_secrets();
@@ -918,7 +1179,255 @@ impl ProxyEngine {
             default_ad_tag,
             &retiring_report.usable,
         )?;
+
+        // Hot-reload live operational knobs atomically with zero connection drops!
+        self.metrics
+            .set_throttle_limit(i64::from(cfg.throttle.max_connections.unwrap_or(0)));
+        self.track_client_ips_live
+            .store(cfg.track_client_ips.unwrap_or(false), Ordering::Release);
+        let skew = cfg.tolerate_time_skewness.unwrap_or(Duration::from_secs(5));
+        self.tolerate_time_skewness_ms.store(
+            skew.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
+        let new_fronting = FrontingRuntimeConfig {
+            host: cfg.get_domain_fronting_host().to_owned(),
+            port: cfg.get_domain_fronting_port(443),
+            proxy_protocol: cfg.get_domain_fronting_proxy_protocol(false),
+        };
+        if !new_fronting.host.is_empty() || self.fronting_cfg.load().host != new_fronting.host {
+            // Preserve auto-bound integrated TLS cover when config has no explicit host override.
+            let prev = self.fronting_cfg.load();
+            let preserve_integrated = cfg.get_domain_fronting_host().is_empty()
+                && !prev.host.is_empty()
+                && prev.host == "127.0.0.1"
+                && prev.port != 443;
+            if !preserve_integrated {
+                self.fronting_cfg.store(Arc::new(new_fronting));
+            }
+        }
+
         Ok(retiring_report.lines)
+    }
+
+    /// `PATCH /secrets/{name}` — partial atomic update of an existing account
+    /// (supports top-up `add_quota_bytes`, `reset_quota`, `disabled`, `expires`,
+    /// speed/ip/conn limits, `ad_tag`, or key rotation without resending untouched fields!).
+    pub fn patch_secret(&self, name: &str, patch: SecretPatch) -> Result<(), EngineError> {
+        let _reload_guard = self.reload_mu.lock();
+        let prev = self.secrets.load();
+        if !prev.contains(name) {
+            return Err(EngineError::SecretNotFound(name.to_owned()));
+        }
+
+        let mut secrets = BTreeMap::new();
+        let mut all_limits = BTreeMap::new();
+        let mut all_tags = BTreeMap::new();
+        let mut retiring = Vec::new();
+        let default_tag = prev.default_ad_tag;
+
+        for (k, rec) in &prev.records {
+            secrets.insert(k.clone(), rec.secret.clone());
+            if !rec.limits.is_zero() {
+                all_limits.insert(k.clone(), rec.limits.clone());
+            }
+            if let Some(t) = rec.ad_tag {
+                all_tags.insert(k.clone(), t);
+            }
+            retiring.extend(rec.retiring.iter().cloned());
+        }
+        drop(prev);
+
+        if let Some(new_sec) = patch.secret {
+            if !new_sec.is_valid() {
+                return Err(EngineError::Invalid("invalid secret".to_owned()));
+            }
+            retiring.retain(|r| r.secret.key() != new_sec.key());
+            secrets.insert(name.to_owned(), new_sec);
+        }
+        if let Some(tag_opt) = patch.ad_tag {
+            if let Some(t) = tag_opt {
+                all_tags.insert(name.to_owned(), t);
+            } else {
+                all_tags.remove(name);
+            }
+        }
+
+        let mut lim = all_limits.remove(name).unwrap_or_default();
+        if let Some(q) = patch.quota_bytes {
+            lim.quota_bytes = q.max(0);
+        }
+        if let Some(add_q) = patch.add_quota_bytes {
+            if add_q < 0 {
+                return Err(EngineError::Invalid(
+                    "add_quota must not be negative".to_owned(),
+                ));
+            }
+            lim.quota_bytes = lim.quota_bytes.saturating_add(add_q);
+        }
+        if let Some(qr) = patch.quota_reset {
+            lim.quota_reset = qr;
+        }
+        if let Some(exp) = patch.expires_at {
+            lim.expires_at = exp;
+        }
+        if let Some(dis) = patch.disabled {
+            lim.disabled = dis;
+        }
+        if let Some(sp) = patch.speed_bytes_per_second {
+            lim.speed_bytes_per_second = sp;
+        }
+        if let Some(sp) = patch.speed_up_bytes_per_second {
+            lim.speed_up_bytes_per_second = sp;
+        }
+        if let Some(sp) = patch.speed_down_bytes_per_second {
+            lim.speed_down_bytes_per_second = sp;
+        }
+        if let Some(il) = patch.ip_limit {
+            lim.ip_limit = il;
+        }
+        if let Some(cc) = patch.client_conns {
+            lim.client_conns = cc;
+        }
+        if let Some(mc) = patch.max_connections {
+            lim.max_connections = mc;
+        }
+        if let Some(cs) = patch.client_speed_bytes_per_second {
+            lim.client_speed_bytes_per_second = cs;
+        }
+        if let Some(cf) = patch.client_fair {
+            lim.client_fair = cf;
+        }
+        if lim.client_fair && !lim.fair_totals().is_active() {
+            return Err(EngineError::Invalid(
+                "client_fair requires speed, speed_up, or speed_down".to_owned(),
+            ));
+        }
+        if !lim.is_zero() {
+            all_limits.insert(name.to_owned(), lim);
+        }
+
+        if patch.reset_quota {
+            self.metrics.reset_quota(name, Utc::now());
+        }
+
+        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, default_tag, &retiring)
+    }
+
+    /// `POST /secrets/{name}/disconnect` — immediately cancel ALL live streams of `secret_name`.
+    pub fn disconnect_secret_all(&self, secret_name: &str) -> Result<usize, EngineError> {
+        if !self.secrets.load().contains(secret_name) {
+            return Err(EngineError::SecretNotFound(secret_name.to_owned()));
+        }
+        let tokens: Vec<CancelToken> = {
+            let _live_guard = self.live_gate.write_all();
+            let mut out = Vec::new();
+            for shard in &self.live_conns {
+                let conns = shard.0.lock();
+                for slot in conns.values() {
+                    if slot.secret_name.as_ref() == secret_name {
+                        out.push(slot.cancel.clone());
+                    }
+                }
+            }
+            out
+        };
+        let count = tokens.len();
+        for tok in tokens {
+            tok.cancel();
+        }
+        Ok(count)
+    }
+
+    /// `POST /secrets/batch` — atomic bulk upsert + delete in a single `ArcSwap` publish!
+    pub fn batch_mutate_secrets(
+        &self,
+        upserts: Vec<BatchUpsertSecret>,
+        deletes: &[String],
+    ) -> Result<(usize, usize), EngineError> {
+        const MAX_BATCH: usize = 1_000;
+        if upserts.len() + deletes.len() > MAX_BATCH {
+            return Err(EngineError::Invalid(format!(
+                "batch exceeds maximum of {MAX_BATCH} operations"
+            )));
+        }
+        for u in &upserts {
+            if u.name.is_empty() {
+                return Err(EngineError::Invalid(
+                    "empty secret name in batch".to_owned(),
+                ));
+            }
+            if !u.secret.is_valid() {
+                return Err(EngineError::Invalid(format!(
+                    "invalid secret for {:?}",
+                    u.name
+                )));
+            }
+        }
+
+        let _reload_guard = self.reload_mu.lock();
+        let prev = self.secrets.load();
+        let mut secrets = BTreeMap::new();
+        let mut all_limits = BTreeMap::new();
+        let mut all_tags = BTreeMap::new();
+        let mut retiring = Vec::new();
+        let default_tag = prev.default_ad_tag;
+
+        for (k, rec) in &prev.records {
+            secrets.insert(k.clone(), rec.secret.clone());
+            if !rec.limits.is_zero() {
+                all_limits.insert(k.clone(), rec.limits.clone());
+            }
+            if let Some(t) = rec.ad_tag {
+                all_tags.insert(k.clone(), t);
+            }
+            retiring.extend(rec.retiring.iter().cloned());
+        }
+        drop(prev);
+
+        let mut deleted_count = 0usize;
+        for name in deletes {
+            if secrets.remove(name).is_some() {
+                all_limits.remove(name);
+                all_tags.remove(name);
+                retiring.retain(|r| r.name != *name);
+                deleted_count += 1;
+            }
+        }
+
+        let upserted_count = upserts.len();
+        for u in upserts {
+            retiring.retain(|r| r.secret.key() != u.secret.key());
+            secrets.insert(u.name.clone(), u.secret);
+            if let Some(t) = u.ad_tag {
+                all_tags.insert(u.name.clone(), t);
+            } else {
+                all_tags.remove(&u.name);
+            }
+            if u.limits.is_zero() {
+                all_limits.remove(&u.name);
+            } else {
+                all_limits.insert(u.name, u.limits);
+            }
+        }
+
+        if secrets.is_empty() {
+            return Err(EngineError::LastSecret);
+        }
+
+        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, default_tag, &retiring)?;
+        Ok((upserted_count, deleted_count))
+    }
+
+    /// Force an immediate atomic flush of `usage-state-file` (returns `Ok(false)` if unset).
+    pub fn flush_usage_now(&self) -> Result<bool, EngineError> {
+        let Some(path) = &self.settings.usage_state_file else {
+            return Ok(false);
+        };
+        self.metrics
+            .flush_usage_atomic(path)
+            .map_err(|e| EngineError::Reload(format!("usage flush failed: {e}")))?;
+        Ok(true)
     }
 
     /// `PUT /secrets` — replaces the entire secret set while preserving active
@@ -1131,6 +1640,10 @@ impl ProxyEngine {
             .cloned()
             .collect();
         self.secrets.store(Arc::clone(&new_set));
+        // Notify embedded `[web] integrated = true` subscribers immediately!
+        self.secret_sync_tx.send_modify(|rev| {
+            *rev = rev.wrapping_add(1);
+        });
 
         // Synchronize client table ceilings, fair-share totals, bans, and close stale streams!
         let now_ns = coarse_now_ns();
@@ -1225,7 +1738,7 @@ impl ProxyEngine {
             self.hints.forget_unit(u, secret_name);
         }
         let mut addresses = Vec::new();
-        if self.settings.track_client_ips {
+        if self.track_client_ips() {
             addresses = dedup.iter().map(ToString::to_string).collect();
             addresses.sort();
         }
@@ -1265,9 +1778,12 @@ impl ProxyEngine {
         Ok(())
     }
 
-    /// Trigger graceful shutdown, signalling all active connections.
+    /// Trigger graceful shutdown, signalling all active connections and IP filter refreshers.
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        if let Some(tx) = self.ip_filter_loop_cancel.lock().take() {
+            let _ = tx.send(true);
+        }
         for shard in &self.live_conns {
             let conns = shard.0.lock();
             for slot in conns.values() {
@@ -1290,7 +1806,7 @@ impl ProxyEngine {
             return Err(EngineError::SecretNotFound(secret_name.to_owned()));
         }
         let now = Utc::now();
-        if !self.settings.track_client_ips {
+        if !self.track_client_ips() {
             return Ok((self.bans.count(secret_name, now), false, Vec::new()));
         }
         let list = self.bans.list(secret_name, now);
@@ -1306,7 +1822,7 @@ impl ProxyEngine {
         if !self.secrets.load().contains(secret_name) {
             return Err(EngineError::SecretNotFound(secret_name.to_owned()));
         }
-        if !self.settings.track_client_ips {
+        if !self.track_client_ips() {
             let view = self.clients.view(secret_name, false);
             return Ok((view, Vec::new()));
         }
@@ -1337,19 +1853,8 @@ impl ProxyEngine {
         // 1. Hourly Telegram DC & MiddleProxy config refresh (only fetch if ad_tag exists or DC updates needed)
         self.dc_router.spawn_refresh_loop(shutdown.clone());
 
-        // 2. IP blocklist / allowlist periodic refresh (keeps Prometheus/StatsD size gauges live!)
-        if let Some(bl) = &self.blocklist {
-            let m = Arc::clone(&self.metrics);
-            bl.spawn_refresh_loop_with_hook(shutdown.clone(), move |n| {
-                m.blocklist_size.store(n as u64, Ordering::Release);
-            });
-        }
-        if let Some(al) = &self.allowlist {
-            let m = Arc::clone(&self.metrics);
-            al.spawn_refresh_loop_with_hook(shutdown.clone(), move |n| {
-                m.allowlist_size.store(n as u64, Ordering::Release);
-            });
-        }
+        // 2. IP blocklist / allowlist periodic refresh (hot-reloadable, live gauges!)
+        self.restart_ip_filter_refresh_loops();
 
         // 3. 1-second fair-share water-level ticker (only touches fair-enabled secrets!)
         {
@@ -1397,7 +1902,7 @@ impl ProxyEngine {
                         }
                         _ = usage_tick.tick() => {
                             if let Some(path) = &engine.settings.usage_state_file
-                                && let Err(e) = engine.metrics.flush_usage_atomic(path)
+                                && let Err(e) = engine.metrics.flush_usage_if_dirty(path)
                             {
                                 warn!(path = %path.display(), error = %e, "usage.json atomic flush failed");
                             }
@@ -1557,6 +2062,58 @@ impl ProxyEngine {
         for tok in stale {
             tok.cancel();
         }
+    }
+}
+
+/// Helper to build an [`IpFiltersState`] from validated [`Config`].
+fn build_ip_filters_state(
+    cfg: &Config,
+    dns: &Arc<DnsResolver>,
+    prefer_ip: PreferIp,
+    proxy_pool: Option<ProxyPool>,
+    sock_cfg: SocketConfig,
+) -> IpFiltersState {
+    let blocklist_action = cfg
+        .defense
+        .blocklist
+        .action
+        .unwrap_or(IpFilterAction::Close);
+    let blocklist = if cfg.defense.blocklist.enabled.unwrap_or(false) {
+        Some(Arc::new(LiveIpFilter::from_list_config(
+            &cfg.defense.blocklist,
+            Some(Arc::clone(dns)),
+            prefer_ip,
+            proxy_pool.clone(),
+            sock_cfg,
+        )))
+    } else {
+        None
+    };
+
+    let allowlist_action = cfg
+        .defense
+        .allowlist
+        .action
+        .unwrap_or(IpFilterAction::Front);
+    let allowlist = if cfg.defense.allowlist.enabled.unwrap_or(false) {
+        Some(Arc::new(LiveIpFilter::from_list_config(
+            &cfg.defense.allowlist,
+            Some(Arc::clone(dns)),
+            prefer_ip,
+            proxy_pool,
+            sock_cfg,
+        )))
+    } else {
+        None
+    };
+
+    IpFiltersState {
+        blocklist,
+        blocklist_action,
+        blocklist_cfg: cfg.defense.blocklist.clone(),
+        allowlist,
+        allowlist_action,
+        allowlist_cfg: cfg.defense.allowlist.clone(),
     }
 }
 

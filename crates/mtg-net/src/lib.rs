@@ -18,10 +18,11 @@ pub mod timer;
 pub mod uring;
 
 pub use dc::{
-    DEFAULT_DC, DcDirectory, DcRouter, FETCH_TIMEOUT, FIRST_FETCH_GRACE, HAPPY_EYEBALLS_DELAY,
-    REFRESH_PERIOD, RETRY_PERIOD, TELEGRAM_PROXY_CONFIG_V4_URL, TELEGRAM_PROXY_CONFIG_V6_URL,
-    TELEGRAM_PROXY_SECRET_URL, build_tls_client_config, default_core_addresses, fetch_url_bytes,
-    fetch_url_bytes_with_dns, happy_eyeballs_connect, happy_eyeballs_connect_with,
+    ConditionalFetch, DEFAULT_DC, DcDirectory, DcRouter, FETCH_TIMEOUT, FIRST_FETCH_GRACE,
+    HAPPY_EYEBALLS_DELAY, REFRESH_PERIOD, RETRY_PERIOD, TELEGRAM_PROXY_CONFIG_V4_URL,
+    TELEGRAM_PROXY_CONFIG_V6_URL, TELEGRAM_PROXY_SECRET_URL, build_tls_client_config,
+    default_core_addresses, fetch_url_bytes, fetch_url_bytes_with_dns,
+    fetch_url_conditional_with_dns, happy_eyeballs_connect, happy_eyeballs_connect_with,
     parse_proxy_config,
 };
 pub use dns::DnsResolver;

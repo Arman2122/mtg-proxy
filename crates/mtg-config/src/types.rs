@@ -34,6 +34,8 @@ pub enum TypeParseError {
     InvalidUnknownSecretAction(String),
     #[error("unknown ip-filter action {0:?} (expected \"front\" or \"close\")")]
     InvalidIpFilterAction(String),
+    #[error("unknown web CDN preset {0:?} (expected \"cloudflare\" or \"arvancloud\")")]
+    InvalidWebCdnPreset(String),
     #[error("incorrect IP or CIDR entry {0:?}")]
     InvalidCidr(String),
     #[error("unknown handshake-budget mode {0:?} (expected \"enforce\", \"observe\", or \"off\")")]
@@ -285,6 +287,93 @@ impl FromStr for IpFilterAction {
             "front" => Ok(Self::Front),
             "close" => Ok(Self::Close),
             _ => Err(TypeParseError::InvalidIpFilterAction(s.to_owned())),
+        }
+    }
+}
+
+/// Built-in CDN preset for `[web]` trusted proxy IP ranges and real client-IP header extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WebCdnPreset {
+    Cloudflare,
+    ArvanCloud,
+}
+
+impl WebCdnPreset {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::ArvanCloud => "arvancloud",
+        }
+    }
+
+    /// Default authoritative real-client-IP header stamped by this CDN.
+    pub const fn default_client_ip_header(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cf-connecting-ip",
+            Self::ArvanCloud => "ar-real-ip",
+        }
+    }
+
+    /// Official auto-updating IP range feed URLs for this CDN.
+    pub const fn ip_feed_urls(self) -> &'static [&'static str] {
+        match self {
+            Self::Cloudflare => &[
+                "https://www.cloudflare.com/ips-v4",
+                "https://www.cloudflare.com/ips-v6",
+            ],
+            Self::ArvanCloud => &["https://www.arvancloud.ir/en/ips.txt"],
+        }
+    }
+
+    /// Built-in offline fallback CIDRs so cold boots before the first CDN feed fetch
+    /// still recognize genuine CDN edge nodes immediately.
+    pub const fn fallback_cidrs(self) -> &'static [&'static str] {
+        match self {
+            Self::Cloudflare => &[
+                // Official Cloudflare IPv4 ranges (https://www.cloudflare.com/ips-v4)
+                "173.245.48.0/20",
+                "103.21.244.0/22",
+                "103.22.200.0/22",
+                "103.31.4.0/22",
+                "141.101.64.0/18",
+                "108.162.192.0/18",
+                "190.93.240.0/20",
+                "188.114.96.0/20",
+                "197.234.240.0/22",
+                "198.41.128.0/17",
+                "162.158.0.0/15",
+                "104.16.0.0/13",
+                "104.24.0.0/14",
+                "172.64.0.0/13",
+                "131.0.72.0/22",
+                // Official Cloudflare IPv6 ranges (https://www.cloudflare.com/ips-v6)
+                "2400:cb00::/32",
+                "2606:4700::/32",
+                "2803:f800::/32",
+                "2405:b500::/32",
+                "2405:8100::/32",
+                "2a06:98c0::/29",
+                "2c0f:f248::/32",
+            ],
+            Self::ArvanCloud => &[],
+        }
+    }
+}
+
+impl fmt::Display for WebCdnPreset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WebCdnPreset {
+    type Err = TypeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cloudflare" | "cf" => Ok(Self::Cloudflare),
+            "arvancloud" | "arvan" => Ok(Self::ArvanCloud),
+            _ => Err(TypeParseError::InvalidWebCdnPreset(s.to_owned())),
         }
     }
 }

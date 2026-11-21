@@ -47,6 +47,13 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
             "  ⚠️  Option \"domain-fronting-ip\" is deprecated. Please use \"host\" in [domain-fronting] section instead."
         );
     }
+    let obfs_mux = conf.get_bind_to_obfs_modes();
+    if !obfs_mux.is_empty() {
+        println!(
+            "  ✅ Single-port multi-transport enabled on bind-to: ee + {:?}",
+            obfs_mux.sorted_names()
+        );
+    }
 
     // 2. Linux kernel, CPU affinity & hardware crypto capability probe
     println!("Checking Linux kernel & CPU capabilities...");
@@ -121,9 +128,18 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
 
     // 4. Domain fronting origin reachability + SNI self-pointing loop guard
     println!("Checking domain fronting...");
+    let integrated_tls_cover = conf.web.enabled.unwrap_or(false)
+        && conf.web.integrated.unwrap_or(false)
+        && conf.web.tls_cert.is_some()
+        && conf.web.tls_key.is_some()
+        && conf.get_domain_fronting_host().is_empty();
     let fronting_host = resolve_fronting_host(&conf);
     let fronting_port = conf.get_domain_fronting_port(443);
-    if !fronting_host.is_empty() {
+    if integrated_tls_cover {
+        println!(
+            "  ✅ Domain fronting auto-wired to in-process integrated [web] TLS cover origin (PROXY v2)"
+        );
+    } else if !fronting_host.is_empty() {
         let addr_label = format!("{fronting_host}:{fronting_port}");
         match check_tcp_reachable(&dns, &fronting_host, fronting_port, Duration::from_secs(5)).await
         {
@@ -142,6 +158,97 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
             }
             Err(e) => {
                 println!("  ❌ {addr_label}: {e}");
+                all_ok = false;
+            }
+        }
+    }
+
+    // 4c. Optional [web] relay, in-process TLS & CDN trusted-proxy diagnostics
+    if conf.web.enabled.unwrap_or(false) {
+        println!("Checking [web] relay configuration...");
+        match conf.validate_web() {
+            Ok(()) => {
+                let mode = if conf.web.integrated.unwrap_or(false) {
+                    "integrated"
+                } else {
+                    "standalone"
+                };
+                println!(
+                    "  ✅ [web] schema valid (mode={mode}, host={})",
+                    conf.web.host.as_deref().unwrap_or("")
+                );
+                if let Err(e) = mtg_webrelay::Signer::load_file(Path::new(&conf.web.token_key)) {
+                    println!("  ❌ [web] token-key {}: {e}", conf.web.token_key);
+                    all_ok = false;
+                } else {
+                    println!("  ✅ [web] token-key readable");
+                }
+                if !conf.web.cover_dir.is_empty() {
+                    if let Err(e) = mtg_webrelay::StaticCover::new(&conf.web.cover_dir) {
+                        println!("  ❌ [web] cover-dir {}: {e}", conf.web.cover_dir);
+                        all_ok = false;
+                    } else {
+                        println!("  ✅ [web] cover-dir usable ({})", conf.web.cover_dir);
+                    }
+                }
+                if let (Some(cert), Some(key)) = (&conf.web.tls_cert, &conf.web.tls_key) {
+                    if let Err(e) =
+                        mtg_webrelay::ReloadableTlsAcceptor::load(Path::new(cert), Path::new(key))
+                    {
+                        println!("  ❌ [web] TLS cert/key load failed: {e}");
+                        all_ok = false;
+                    } else {
+                        println!("  ✅ [web] in-process TLS cert/key valid ({cert})");
+                    }
+                }
+                if conf.web.cdn.is_some()
+                    || conf
+                        .web
+                        .trusted_proxies
+                        .as_ref()
+                        .is_some_and(|v| !v.is_empty())
+                    || conf
+                        .web
+                        .trusted_proxy_urls
+                        .as_ref()
+                        .is_some_and(|v| !v.is_empty())
+                {
+                    let start = Instant::now();
+                    match mtg_webrelay::build_ip_filters_from_config(
+                        &conf,
+                        Some(mtg_webrelay::SharedGeoFilters {
+                            allowlist: None,
+                            allowlist_action: IpFilterAction::Front,
+                            blocklist: None,
+                            blocklist_action: IpFilterAction::Close,
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(filters) => {
+                            if let Some(tp) = filters.trusted_proxies {
+                                println!(
+                                    "  ✅ [web] CDN trusted-proxies loaded {} CIDRs ({} IPv4, {} IPv6) in {}ms (header={})",
+                                    tp.len(),
+                                    tp.v4_len(),
+                                    tp.v6_len(),
+                                    start.elapsed().as_millis(),
+                                    filters
+                                        .client_ip_header
+                                        .as_deref()
+                                        .unwrap_or("x-forwarded-for")
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("  ❌ [web] CDN trusted-proxies load failed: {e}");
+                            all_ok = false;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!("  ❌ [web] validation failed: {e}");
                 all_ok = false;
             }
         }

@@ -30,15 +30,22 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 # If not set, the API server is not started. Bind it to a loopback address
 # (127.0.0.1) unless you set api-token below, since the API can mutate secrets.
 # Endpoints:
+#   GET    /healthz          lightweight liveness/readiness JSON probe (uptime, connections, IP filter status)
 #   GET    /stats            per-user connection counts, traffic and quota usage
-#   POST   /reload           re-read [secrets], ad-tag, [secret-ad-tags], [secret-limits] and [[retiring-secret]] from this file
-#   GET    /secrets          list secrets (name, secret, host, ad_tag, effective_ad_tag, quota/expiry/disabled/speed_limit/ip_limit)
+#   GET    /accounting       enterprise billing & directional accounting ledger (bytes_in, bytes_out, total_connections, quota, cutoffs, speed/ip/conn limits)
+#   POST   /accounting/flush force an immediate crash-safe atomic flush of usage-state-file
+#   POST   /reload           full async hot-reload: [secrets], limits, ad-tags, retiring-secrets, [throttle], track-client-ips, tolerate-time-skewness, [domain-fronting], and [defense.allowlist]/[defense.blocklist]
+#   GET    /secrets          list secrets (name, secret, host, ad_tag, effective_ad_tag, quota/expiry/disabled/speed_limit/ip_limit/max_connections)
 #   GET    /secrets/{name}   one entry of that list, by name
-#   POST   /secrets          add/update one secret: {"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?}
-#   PUT    /secrets          replace the whole set: {"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?,ip_limit?}},"ad_tag"?}
-#                            (both also take speed_up, speed_down, client_conns, client_speed and client_fair)
+#   POST   /secrets          add/update one secret: {"name","secret","ad_tag"?,"quota"?,"quota_reset"?,"expires"?,"disabled"?,"speed"?,"ip_limit"?,"max_connections"?}
+#   PATCH  /secrets/{name}   partial atomic account update: top-up {"add_quota":"10GB"}, {"reset_quota":true}, {"disabled":true}, {"max_connections":32}, etc. without resending secret key
+#   PUT    /secrets          replace the whole set: {"secrets":{name:{secret,ad_tag?,quota?,quota_reset?,expires?,disabled?,speed?,ip_limit?,max_connections?}},"ad_tag"?}
+#                            (also accepts speed_up, speed_down, client_conns, client_speed and client_fair)
+#   POST   /secrets/batch    atomic bulk upsert + delete in a single lock-free swap: {"upsert":[...],"delete":[...]}
 #   DELETE /secrets/{name}   remove one secret
 #   POST   /secrets/{name}/reset-quota   zero the secret's used-bytes counter
+#   POST   /secrets/{name}/disconnect    disconnect ALL active connections for this secret immediately (without banning)
+#   POST   /secrets/{name}/kick          close active connections matching specified {"ips":[...]}
 #   GET    /secrets/{name}/external-ips  the user's address view: ip_limit, active_ips (+ addresses with track-client-ips)
 #   PUT    /secrets/{name}/external-ips  {"ips":[...],"ttl":"90s"}: addresses the user holds on other systems, counted here until ttl
 #   DELETE /secrets/{name}/external-ips  clear that report
@@ -46,6 +53,8 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 #   POST   /secrets/{name}/bans  {"ips":[...],"ttl":"1h","force":false}: refuse those addresses this secret, in memory, until ttl
 #   GET    /secrets/{name}/bans  the secret's bans (addresses only with track-client-ips)
 #   DELETE /secrets/{name}/bans/{address}  lift one ban; an IPv6 ban may be named by its /64
+#   GET    /ip-filters       inspect live [defense.allowlist] / [defense.blocklist] status (ETag/304 counts, SHA-256 hash, CIDR counts, last refresh)
+#   POST   /ip-filters/refresh  trigger synchronous conditional HTTP refresh of allowlist/blocklist feeds
 #   GET    /adtag            read the global ad-tag: {"ad_tag": "<hex>"|null}
 #   PUT    /adtag            set the global ad-tag: {"ad_tag":"<32 hex chars>"}
 #   DELETE /adtag            clear the global ad-tag
@@ -76,6 +85,13 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 bind-to = "0.0.0.0:3128"
 # Or an array to listen on multiple addresses at once:
 # bind-to = ["127.0.0.1:443", "[::1]:443"]
+
+# Optional single-port multi-transport multiplexing on `bind-to` (default: ["ee"] only).
+# Set to ["ee", "dd"] or ["ee", "dd", "plain"] to serve FakeTLS (ee), Obfuscated2
+# (dd/plain), AND the cover website / integrated [web] HTTPS relay ALL on ONE port (e.g. :443)!
+# Unmatched probes and foreign IPs (under [defense.allowlist] action = "front") are
+# transparently domain-fronted verbatim to the cover website.
+# bind-to-accept = ["ee", "dd"]
 
 # Additional listeners for the pre-FakeTLS secret forms. This section is purely
 # additive: bind-to above is never replaced and always serves FakeTLS only, so a
@@ -165,21 +181,39 @@ bind-to = "0.0.0.0:3128"
 # # Off unless this is true. The relay refuses to start without it.
 # enabled = true
 #
+# # Run the WEB relay INSIDE `mtg-proxy run` (single-binary, zero-delay secret &
+# # Geo-Stealth allowlist sync, auto-bound internal loopback `dd` backend!).
+# # Pair with `tls-cert` + `tls-key` (and omit `bind-to` & `backend`) for true
+# # zero-Nginx/Caddy single-port `:443` serving ee + dd + web-relay + dummy website!
+# # integrated = true
+#
 # # Required. The hostname a client types, and the name its capability is
 # # derived over -- changing it invalidates every WEB link ever issued, exactly
 # # like changing an ee secret's fronting domain. Must be a bare name with a
 # # public certificate: no scheme, no port, no IP literal, no localhost.
 # host = "web.example.com"
 #
-# # Required. Where the relay listens for the front proxy. Loopback on a host
-# # install; inside a container it must be reachable from the front proxy, so
-# # 0.0.0.0 with the port unpublished.
+# # Where the relay listens for the front proxy (optional when integrated = true
+# # with tls-cert + tls-key, which auto-wires into primary bind-to via PROXY v2).
 # bind-to = "127.0.0.1:8099"
 #
-# # Required. Must name a [[listener]] above that accepts "dd". That stanza also
-# # decides whether the relay sends a PROXY header, so the two processes cannot
-# # disagree about what the socket between them speaks.
+# # Optional when integrated = true (an internal loopback `dd` backend is auto-bound).
+# # Required in standalone `mtg-proxy web-relay` mode (must name a [[listener]] accepting "dd").
 # backend = "127.0.0.1:2398"
+#
+# # Optional in-process TLS termination (hot-reloaded on SIGHUP!). Supports Let's Encrypt
+# # fullchain.pem + privkey.pem (RSA, ECDSA, Ed25519).
+# # tls-cert = "/etc/letsencrypt/live/web.example.com/fullchain.pem"
+# # tls-key  = "/etc/letsencrypt/live/web.example.com/privkey.pem"
+#
+# # CDN-aware spoof-proof Geo-Stealth for deployments behind Cloudflare / ArvanCloud /
+# # custom reverse proxies! Peels trusted CDN edge IPs right-to-left and ONLY trusts
+# # `CF-Connecting-IP` / `Ar-Real-IP` when the network hop actually came from a verified
+# # CDN CIDR (100% immune to direct-to-origin header forgery!).
+# # cdn = "cloudflare"          # or "arvancloud" (auto-updates official CDN CIDR feeds!)
+# # trusted-proxies = ["10.0.0.0/8"]
+# # trusted-proxy-urls = ["https://www.cloudflare.com/ips-v4", "https://www.cloudflare.com/ips-v6"]
+# # client-ip-header = "cf-connecting-ip"
 #
 # # Required. 32 bytes, mode 0600, from `mtg-proxy generate-web-key <path>`.
 # # Never generated at startup: a key invented on a missing file works until the
@@ -429,7 +463,10 @@ allow-fallback-on-unknown-dc = false
 # Fields (all optional):
 #   quota        max relayed bytes; human sizes ("10GB", "500MiB") or a bare
 #                integer byte count; omit for unlimited
-#   quota-reset  "none" (default, lifetime cap) or "monthly" (reset each month)
+#   quota-reset  "none" (default, lifetime cap), "daily" (UTC 00:00),
+#                "weekly" (UTC Monday 00:00), or "monthly" (UTC 1st 00:00)
+#   max-connections  hard concurrent connection cap for this secret across ALL
+#                client IPs (omit or 0 for unlimited)
 #   expires      RFC3339 ("2026-12-31T00:00:00Z") or date ("2026-12-31"); omit
 #                for never
 #   disabled     true to reject the secret without removing it (default false)

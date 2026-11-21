@@ -23,8 +23,9 @@ use crate::scrub::{
 };
 use crate::types::{
     AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction, PreferIp,
-    StatsdTagFormat, UnknownSecretAction, canonical_web_host, format_bytes_go, format_duration_go,
-    parse_ad_tag, parse_bytes_str, parse_duration, redact_proxy_url, validate_ip_or_cidr,
+    StatsdTagFormat, UnknownSecretAction, WebCdnPreset, canonical_web_host, format_bytes_go,
+    format_duration_go, parse_ad_tag, parse_bytes_str, parse_duration, redact_proxy_url,
+    validate_ip_or_cidr,
 };
 
 /// Reserved `[secrets]` username that is never served (prevents hand-edit
@@ -125,6 +126,7 @@ pub struct ConfigSecretLimit {
     pub speed_down: Option<i64>,
     pub ip_limit: Option<u32>,
     pub client_conns: Option<u32>,
+    pub max_connections: Option<u32>,
     pub client_speed: Option<i64>,
     pub client_fair: Option<bool>,
 }
@@ -156,6 +158,19 @@ pub struct ConfigWeb {
     pub stats_bind_to: Option<HostPort>,
     /// Optional Rust-native zero-hop embedded mode (`[web] integrated = true`).
     pub integrated: Option<bool>,
+    /// Optional built-in CDN preset (`"cloudflare"` or `"arvancloud"`) enabling
+    /// auto-updating trusted CDN edge ranges and spoof-proof real client IP extraction.
+    pub cdn: Option<WebCdnPreset>,
+    /// Optional inline trusted reverse-proxy / CDN CIDRs peeled right-to-left from `X-Forwarded-For`.
+    pub trusted_proxies: Option<Vec<String>>,
+    /// Optional auto-updating URLs or files listing trusted CDN / reverse-proxy CIDRs.
+    pub trusted_proxy_urls: Option<Vec<String>>,
+    /// Optional authoritative client-IP header set by a trusted CDN (e.g. `"CF-Connecting-IP"`).
+    pub client_ip_header: Option<String>,
+    /// Optional PEM certificate chain path for direct in-process HTTPS termination in `integrated` mode.
+    pub tls_cert: Option<String>,
+    /// Optional PEM private key path paired with `tls-cert`.
+    pub tls_key: Option<String>,
 }
 
 /// `[defense.blocklist]` / `[defense.allowlist]`.
@@ -305,6 +320,9 @@ pub struct Config {
     pub usage_state_file: String,
     pub api_token: Zeroizing<String>,
     pub bind_to: Vec<HostPort>,
+    /// Optional single-port multi-transport modes accepted on `bind-to` (default: `["ee"]` only).
+    /// Set to `["ee", "dd"]` or `["ee", "dd", "plain"]` to multiplex FakeTLS + Obfuscated2 + Cover/WEB on one port!
+    pub bind_to_accept: Option<Vec<SecretMode>>,
     pub listeners: Vec<ConfigListener>,
     pub web: ConfigWeb,
     pub proxy_protocol_listener: Option<bool>,
@@ -490,6 +508,7 @@ impl Config {
                 speed_down_bytes_per_second: cfg.speed_down.unwrap_or(0),
                 ip_limit: cfg.ip_limit.unwrap_or(0),
                 client_conns: cfg.client_conns.unwrap_or(0),
+                max_connections: cfg.max_connections.unwrap_or(0),
                 client_speed_bytes_per_second: cfg.client_speed.unwrap_or(0),
                 client_fair: cfg.client_fair.unwrap_or(false),
             };
@@ -530,10 +549,28 @@ impl Config {
             .unwrap_or(default_val)
     }
 
-    pub fn get_listener_modes(&self) -> ModeSet {
+    /// Return Obfuscated2 modes (`dd` / `plain`) multiplexed onto the primary `bind-to` port.
+    /// Empty by default (FakeTLS `ee`-only).
+    pub fn get_bind_to_obfs_modes(&self) -> ModeSet {
+        let Some(modes) = &self.bind_to_accept else {
+            return ModeSet::empty();
+        };
         let mut set = ModeSet::empty();
+        for &m in modes {
+            if m != SecretMode::FakeTls {
+                set |= ModeSet::of(&[m]);
+            }
+        }
+        set
+    }
+
+    pub fn get_listener_modes(&self) -> ModeSet {
+        let mut set = self.get_bind_to_obfs_modes();
         for l in &self.listeners {
             set |= ModeSet::of(&l.accept);
+        }
+        if self.web.enabled.unwrap_or(false) && self.web.integrated.unwrap_or(false) {
+            set |= ModeSet::of(&[SecretMode::Dd]);
         }
         set
     }
@@ -621,14 +658,30 @@ impl Config {
             }
         }
 
-        // V4: bind-to is permanently FakeTLS-only; need at least one ee secret or domain-fronting.host.
+        if let Some(modes) = &self.bind_to_accept {
+            let set = ModeSet::of(modes);
+            if set.is_empty() || !set.has(SecretMode::FakeTls) {
+                return Err(ConfigError::Validation(
+                    "bind-to-accept must include \"ee\" (e.g. [\"ee\", \"dd\"] or [\"ee\", \"dd\", \"plain\"])"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        // V4: bind-to is FakeTLS-capable; need at least one ee secret, domain-fronting.host,
+        // or integrated [web] with local TLS termination to serve as the cover site.
+        let has_integrated_tls = self.web.enabled.unwrap_or(false)
+            && self.web.integrated.unwrap_or(false)
+            && self.web.tls_cert.is_some()
+            && self.web.tls_key.is_some();
         let has_fronting = !self.get_domain_fronting_host().is_empty()
-            || self.get_secrets().values().any(Secret::is_hosted);
+            || self.get_secrets().values().any(Secret::is_hosted)
+            || has_integrated_tls;
         if !has_fronting {
             return Err(ConfigError::Validation(
                 "no secret carries a fronting hostname and domain-fronting.host is unset; \
                  the FakeTLS listener would have no cover site. \
-                 Set domain-fronting.host, or keep at least one ee secret"
+                 Set domain-fronting.host, configure integrated [web] TLS, or keep at least one ee secret"
                     .to_owned(),
             ));
         }
@@ -695,17 +748,35 @@ impl Config {
         canonical_web_host(host)
             .map_err(|e| ConfigError::Validation(format!("[web] host: {e}")))?;
 
-        if self.web.bind_to.is_none() {
+        let integrated = self.web.integrated.unwrap_or(false);
+        let has_tls_pair = match (&self.web.tls_cert, &self.web.tls_key) {
+            (Some(_), Some(_)) => true,
+            (None, None) => false,
+            _ => {
+                return Err(ConfigError::Validation(
+                    "[web] tls-cert and tls-key must both be set together".to_owned(),
+                ));
+            }
+        };
+
+        if self.web.bind_to.is_none() && !(integrated && has_tls_pair) {
             return Err(ConfigError::Validation(
-                "[web] bind-to is required".to_owned(),
+                "[web] bind-to is required (unless integrated = true with tls-cert + tls-key)"
+                    .to_owned(),
             ));
         }
 
-        let integrated = self.web.integrated.unwrap_or(false);
         if !integrated && self.web.backend.is_none() {
             return Err(ConfigError::Validation(
                 "[web] backend is required".to_owned(),
             ));
+        }
+
+        if let Some(proxies) = &self.web.trusted_proxies {
+            for entry in proxies {
+                validate_ip_or_cidr(entry)
+                    .map_err(|e| ConfigError::Validation(format!("[web] trusted-proxies: {e}")))?;
+            }
         }
 
         if self.web.token_key.is_empty() {
@@ -1172,6 +1243,11 @@ impl Config {
                         })),
                     );
                     lm.insert("ipLimit".into(), json!(lim.ip_limit.unwrap_or(0)));
+                    if let Some(mc) = lim.max_connections
+                        && mc > 0
+                    {
+                        lm.insert("maxConnections".into(), json!(mc));
+                    }
                     lm.insert(
                         "quota".into(),
                         Value::String(lim.quota.map_or_else(String::new, format_bytes_go)),
@@ -1393,7 +1469,36 @@ impl Config {
         if let Some(integrated) = self.web.integrated {
             web.insert("integrated".into(), Value::Bool(integrated));
         }
+        if let Some(cdn) = self.web.cdn {
+            web.insert("cdn".into(), Value::String(cdn.as_str().to_owned()));
+        }
+        if let Some(tp) = &self.web.trusted_proxies {
+            web.insert("trustedProxies".into(), opt_vec_str_to_json(Some(tp)));
+        }
+        if let Some(tpu) = &self.web.trusted_proxy_urls {
+            web.insert("trustedProxyUrls".into(), opt_vec_str_to_json(Some(tpu)));
+        }
+        if let Some(hdr) = &self.web.client_ip_header {
+            web.insert("clientIpHeader".into(), Value::String(hdr.clone()));
+        }
+        if let Some(cert) = &self.web.tls_cert {
+            web.insert("tlsCert".into(), Value::String(cert.clone()));
+        }
+        if let Some(key) = &self.web.tls_key {
+            web.insert("tlsKey".into(), Value::String(key.clone()));
+        }
         root.insert("web".into(), Value::Object(web));
+        if let Some(accept) = &self.bind_to_accept {
+            root.insert(
+                "bindToAccept".into(),
+                Value::Array(
+                    accept
+                        .iter()
+                        .map(|m| Value::String(m.as_str().to_owned()))
+                        .collect(),
+                ),
+            );
+        }
 
         serde_json::to_string(&Value::Object(root)).expect("JSON serialization cannot fail")
     }
@@ -1613,6 +1718,17 @@ fn parse_root_table(
             "bind-to" => {
                 cfg.bind_to = parse_bind_to(item)?;
             }
+            "bind-to-accept" => {
+                let names = expect_string_array(item, "bind-to-accept")?;
+                let mut modes = Vec::with_capacity(names.len());
+                for name in names {
+                    modes
+                        .push(name.parse().map_err(|e| {
+                            ConfigError::FieldParse(format!("bind-to-accept: {e}"))
+                        })?);
+                }
+                cfg.bind_to_accept = Some(modes);
+            }
             "listener" => {
                 parse_listeners_item(doc, item, &mut cfg.listeners, unknown)?;
             }
@@ -1820,6 +1936,7 @@ fn parse_secret_limit(
             }
             "ip-limit" => lim.ip_limit = Some(expect_u32(v, "ip-limit")?),
             "client-conns" => lim.client_conns = Some(expect_u32(v, "client-conns")?),
+            "max-connections" => lim.max_connections = Some(expect_u32(v, "max-connections")?),
             "client-speed" => {
                 let s = expect_str(v, "client-speed")?;
                 if !s.is_empty() {
@@ -2057,6 +2174,39 @@ fn parse_web_table(
                 }
             }
             "integrated" => web.integrated = Some(expect_bool(v, "web.integrated")?),
+            "cdn" => {
+                let s = expect_str(v, "web.cdn")?;
+                if !s.is_empty() {
+                    web.cdn = Some(
+                        s.parse()
+                            .map_err(|e| ConfigError::FieldParse(format!("web.cdn: {e}")))?,
+                    );
+                }
+            }
+            "trusted-proxies" => {
+                web.trusted_proxies = Some(expect_string_array(v, "web.trusted-proxies")?);
+            }
+            "trusted-proxy-urls" => {
+                web.trusted_proxy_urls = Some(expect_string_array(v, "web.trusted-proxy-urls")?);
+            }
+            "client-ip-header" => {
+                let s = expect_str(v, "web.client-ip-header")?;
+                if !s.is_empty() {
+                    web.client_ip_header = Some(s.to_owned());
+                }
+            }
+            "tls-cert" => {
+                let s = expect_str(v, "web.tls-cert")?;
+                if !s.is_empty() {
+                    web.tls_cert = Some(s.to_owned());
+                }
+            }
+            "tls-key" => {
+                let s = expect_str(v, "web.tls-key")?;
+                if !s.is_empty() {
+                    web.tls_key = Some(s.to_owned());
+                }
+            }
             _ => record_unknown(doc, unknown, &["web"], k, v),
         }
     }

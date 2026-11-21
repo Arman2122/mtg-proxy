@@ -6,6 +6,51 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [2.3.0] — 2026-11-22
+
+Unified single-port multi-transport multiplexing (`ee` + `dd`/`plain` + integrated in-process TLS `web-relay` + cover site on ONE port `:443`), CDN-aware spoof-proof Geo-Stealth (`cdn = "cloudflare" | "arvancloud"`), enterprise multi-tenant accounting & full async hot-reload, conditional HTTP `ETag`/`304` + SHA-256 IP filter auto-updates, and Node.js 24 GitHub Actions workflow upgrades.
+
+### Added
+- **Unified Single-Port Multi-Transport Multiplexing (`mtg-config`, `mtg-engine`, `mtg-webrelay`, `mtg-cli`):**
+  - Added optional `bind-to-accept = ["ee", "dd"]` / `["ee", "dd", "plain"]` (default `["ee"]` only — zero overhead when unset) allowing one port (e.g. `:443`) to serve FakeTLS (`ee`), Obfuscated2 (`dd`/`plain`), and the cover website / WEB proxy simultaneously while enforcing Geo-Stealth byte-0 fronting for foreign IPs, public per-IP failed-handshake rate limiting, Obfuscated2 anti-replay, and verbatim fronting on unmatched probes.
+  - Added embedded **`[web] integrated = true`** inside `mtg-proxy run`: automatically binds an internal loopback `dd` listener (when `[web] backend` is omitted), shares `ProxyEngine`'s live secrets, governance, accounting, and Geo-Stealth allowlist/blocklist with zero-delay real-time synchronization (`subscribe_secret_changes`), and eliminates running a separate `web-relay` daemon.
+  - Added **in-process hot-reloadable TLS** (`[web] tls-cert` + `tls-key`, `ReloadableTlsAcceptor`, zero new crate dependencies via `rustls-pki-types`) supporting Let's Encrypt `fullchain.pem`/`privkey.pem` (RSA, ECDSA, Ed25519) with zero-downtime `SIGHUP` cert reload. When paired with `integrated = true` and no `[web] bind-to`, `mtg-proxy` auto-wires `:443` domain fronting via PROXY protocol v2 straight into the in-process HTTPS/WSS WEB origin — enabling **true zero-Nginx/Caddy single-port `:443` all-in-one deployments**.
+- **CDN-Aware Spoof-Proof Geo-Stealth for `web-relay` (`mtg-config`, `mtg-webrelay`):**
+  - Added `[web] cdn = "cloudflare" | "arvancloud"`, `trusted-proxies`, `trusted-proxy-urls`, and `client-ip-header` so deployments behind Cloudflare or ArvanCloud (whose edge IPs are non-Iranian) work seamlessly with `[defense.allowlist]` (`IR-Geo-DB`).
+  - Automatically fetches and refreshes official CDN edge CIDRs (with built-in offline Cloudflare IPv4 + IPv6 fallback CIDRs) and performs right-to-left trusted-hop peeling in `Origin::resolve_client_addr`: `CF-Connecting-IP` / `Ar-Real-IP` is **only** trusted when network routing proves the hop arrived from a verified CIDR in `trusted_proxies`, remaining **100% immune to direct-to-origin or direct-to-Nginx header spoofing**.
+- **Enterprise Multi-Tenant Accounting, Quotas & Full Async Hot-Reload (`mtg-core`, `mtg-engine`, `mtg-api`, `mtg-cli`):**
+  - Added `quota-reset = "daily" | "weekly" | "monthly" | "none"` and per-secret `max-connections` hard concurrent cap (`DenyReason::MaxConnections`).
+  - Upgraded `usage-state-file` (`usage.json` v2) with backward-compatible persistence of `bytes_in`, `bytes_out`, `total_connections`, `quota_cutoffs`, and `last_seen_unix`, plus zero-overhead idle dirty-digest skipping to avoid unnecessary SSD writes.
+  - Upgraded `SIGHUP` and `POST /reload` to full async atomic hot-reload covering `[secrets]`, limits, ad-tags, retiring-secrets, `[throttle] max-connections`, `track-client-ips`, `tolerate-time-skewness`, `[domain-fronting]`, AND `[defense.allowlist]`/`[defense.blocklist]` (warm-loaded before atomic swap so zero traffic slips through an empty list!) plus integrated `[web]` TLS certs & filters.
+  - Added 8 strictly additive Management API endpoints (preserving all 19 Penhoon routes and 20 `SUPPORTED_FEATURES` 100% intact):
+    - `GET /healthz` (unblocks `deploy/scripts/deploy-release.sh` automated health verification!)
+    - `GET /accounting` (full multi-tenant billing ledger & directional counters) & `POST /accounting/flush`
+    - `PATCH /secrets/{name}` (partial atomic updates including billing top-up `add_quota`, `reset_quota`, `max_connections`)
+    - `POST /secrets/{name}/disconnect` (instant disconnect without banning)
+    - `POST /secrets/batch` (atomic bulk `upsert` + `delete` in a single `ArcSwap` swap)
+    - `GET /ip-filters` & `POST /ip-filters/refresh` (live IP filter telemetry & on-demand conditional refresh)
+- **Conditional HTTP (`ETag`/`304`) & SHA-256 IP Filter Auto-Updates (`mtg-net`, `mtg-governance`):**
+  - Added `fetch_url_conditional_with_dns` supporting `If-None-Match` / `If-Modified-Since` → `304 Not Modified`, per-source ETag/Last-Modified tracking, SHA-256 content-hash deduplication (skips 2 MiB DIR-24-8 rebuilds and SSD cache rewrites when unchanged), and ±5% deterministic fleet schedule jitter.
+- **Diagnostics (`mtg-cli`):**
+  - Extended `mtg-proxy doctor` and `mtg-proxy web-relay --check` with single-port multi-transport reporting, integrated `[web]` TLS validation, and live CDN `trusted-proxies` CIDR verification.
+
+### Fixed
+- **GitHub Actions Node.js 20 Deprecation Warnings (`.github/workflows/ci.yml`, `.github/workflows/release.yml`):**
+  - Upgraded remaining GitHub Actions to Node.js 24-native major tags: `actions/checkout@v7`, `actions/setup-node@v7` (`node-version: "24"`), `actions/upload-artifact@v7`, `actions/download-artifact@v8`, and `actions/attest-build-provenance@v4`.
+
+### Verified Live (`mtg-dev` DigitalOcean `s-2vcpu-2gb-intel`)
+- **All-in-One Single-Port `:18443` 7-Probe Live Matrix (`bind-to-accept = ["ee", "dd"]`, `[web] integrated = true`, `tls-cert`/`tls-key`, `cdn = "cloudflare"`, live `IR-Geo-DB`):**
+  - Iranian `ee` FakeTLS → real Telegram DC 2 `resPQ` (`100 B`) in `17.4 ms`.
+  - Iranian `dd` Obfuscated2 **on the exact same port** → real Telegram DC 2 `resPQ` (`100 B`) in `17.5 ms`.
+  - Iranian HTTPS browser **on the exact same port** → in-process TLS 1.3 dummy website `200 OK`.
+  - Iranian integrated WSS WEB proxy **on the exact same port** → auto-bound internal `dd` → real Telegram DC 2 `resPQ` (`103 B`) in `25.4 ms`.
+  - Cloudflare CDN live feed (`44` CIDRs in `35 ms`): Cloudflare edge IP `172.70.114.25` + `CF-Connecting-IP: <Iran IP>` → `200 OK` WEB bridge.
+  - Foreign attacker (`1.1.1.1`) with forged `CF-Connecting-IP: <Iran IP>` + valid `/?bridge=<cap>` AND valid leaked `ee` secret → neutralized (`200 OK` dummy website only, `delta faketls.scanned = 0`).
+  - Live `POST /ip-filters/refresh` → `HTTP 304 Not Modified` (`2,552` CIDRs retained with zero rebuild); `GET /healthz`, `GET /accounting`, `PATCH /secrets/{name}` top-up, `POST /secrets/batch` + zero-delay integrated WEB sync, `POST /accounting/flush`, and `POST /reload` all `200 OK`.
+- **Quality Gates:** `106/106` Rust workspace tests passing, `0` clippy warnings (`-D warnings`), `panel-config-string.golden` byte-exact, `steady_state_connection_future_size_guard` passing, Playwright WebBridge `36/36` passing.
+
+---
+
 ## [2.2.0] — 2026-11-22
 
 Geo-Stealth cover-only fronting and enterprise auto-updating country IP allowlist/blocklist engine — designed for daily-updated geo-IP feeds such as [IR-Geo-DB](https://github.com/Arman2122/IR-Geo-DB) so foreign active probers and DPI scanners only ever see a genuine cover website (even with a leaked valid `ee` secret or WEB bridge capability) with zero HMAC CPU and zero TCP-drop fingerprinting.

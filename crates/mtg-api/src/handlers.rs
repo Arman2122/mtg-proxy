@@ -15,8 +15,12 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use mtg_config::parse_duration;
-use mtg_core::{IpUnit, Secret, SecretLimits};
-use mtg_engine::{EngineError, ProxyEngine, SUPPORTED_FEATURES, is_secret_served};
+use mtg_core::{
+    IpUnit, Secret, SecretLimits, parse_expiry, parse_quota_bytes, parse_quota_reset, parse_speed,
+};
+use mtg_engine::{
+    BatchUpsertSecret, EngineError, ProxyEngine, SUPPORTED_FEATURES, SecretPatch, is_secret_served,
+};
 use mtg_governance::{
     BanError, DEFAULT_EXTERNAL_ADDRESS_TTL, FairBucket, MAX_EXTERNAL_ADDRESS_TTL,
     MAX_EXTERNAL_ADDRESSES, SecretRecord, parse_ban_request, parse_ban_unit,
@@ -27,11 +31,13 @@ use subtle::ConstantTimeEq as _;
 use tracing::warn;
 
 use crate::dto::{
-    AdTagResponse, AddressReportJson, BanReq, BanResultJson, BansReportJson, ClientRowJson,
-    ClientUsageJson, ClientsReportJson, ErrorBody, ExternalIpsReq, FakeTlsJson, KickReq,
-    KickResultJson, ObfuscatedJson, PostSecretReq, PutAdTagReq, PutSecretsReq, STATUS_OK,
-    SecretInfoJson, SecretsListResponse, StatsResponse, ThrottleJson, UnbanResultJson,
-    UserStatsJson, quota_reset_str,
+    AccountLedgerRowJson, AccountingResponse, AccountingTotalsJson, AdTagResponse,
+    AddressReportJson, BanReq, BanResultJson, BansReportJson, BatchSecretsReq,
+    BatchSecretsResultJson, ClientRowJson, ClientUsageJson, ClientsReportJson,
+    DisconnectResultJson, ErrorBody, ExternalIpsReq, FakeTlsJson, FlushResultJson, HealthzResponse,
+    KickReq, KickResultJson, ObfuscatedJson, PatchSecretReq, PostSecretReq, PutAdTagReq,
+    PutSecretsReq, STATUS_OK, SecretInfoJson, SecretsListResponse, StatsResponse, ThrottleJson,
+    UnbanResultJson, UserStatsJson, quota_reset_str,
 };
 
 const DEFAULT_CLIENTS_LIMIT: usize = 100;
@@ -137,7 +143,7 @@ fn parse_ad_tag_hex(raw: &str) -> Result<Option<[u8; 16]>, String> {
 pub async fn handle_stats(State(state): State<ApiState>) -> Response {
     let eng = &state.engine;
     let now = Utc::now();
-    let track = eng.settings.track_client_ips;
+    let track = eng.track_client_ips();
 
     let set = eng.secrets.load();
     let has_retiring = set.records.values().any(|r| !r.retiring.is_empty());
@@ -188,6 +194,7 @@ pub async fn handle_stats(State(state): State<ApiState>) -> Response {
             active_ips: 0,
             ip_limit_refused: rt.ip_limit_refused.load(Ordering::Relaxed),
             client_conns: 0,
+            max_connections: 0,
             client_conns_refused: rt.client_conns_refused.load(Ordering::Relaxed),
             client_speed_limit: 0,
             client_fair: false,
@@ -302,6 +309,7 @@ fn apply_limits_to_user_stats(u: &mut UserStatsJson, lim: &SecretLimits) {
     u.speed_limit_down = lim.speed_down_bytes_per_second;
     u.ip_limit = lim.ip_limit;
     u.client_conns = lim.client_conns;
+    u.max_connections = lim.max_connections;
     u.client_speed_limit = lim.client_speed_bytes_per_second;
     u.client_fair = lim.client_fair;
 }
@@ -348,10 +356,10 @@ pub async fn handle_reload(method: Method, State(state): State<ApiState>) -> Res
         return (StatusCode::SERVICE_UNAVAILABLE, "reload is not supported\n").into_response();
     }
 
-    match state.engine.reload_from_disk() {
+    match state.engine.reload_from_disk_async().await {
         Ok(_warnings) => (StatusCode::OK, Json(STATUS_OK)).into_response(),
         Err(e) => {
-            warn!(error = %e, "secret reload failed");
+            warn!(error = %e, "config reload failed");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response()
         }
     }
@@ -370,7 +378,7 @@ fn build_secret_info(
     rot_now: Option<DateTime<Utc>>,
 ) -> SecretInfoJson {
     let rt = eng.metrics.get_user(name);
-    let track = eng.settings.track_client_ips;
+    let track = eng.track_client_ips();
 
     let quota_used = rt
         .as_ref()
@@ -441,6 +449,7 @@ fn build_secret_info(
         ip_limit: rec.limits.ip_limit,
         active_ips: addr_report.active_ips,
         client_conns: rec.limits.client_conns,
+        max_connections: rec.limits.max_connections,
         client_speed_limit: rec.limits.client_speed_bytes_per_second,
         client_fair: rec.limits.client_fair,
         mode: rec.secret.mode().as_str().to_owned(),
@@ -469,7 +478,7 @@ pub async fn handle_get_secrets(State(state): State<ApiState>) -> Response {
     let set = eng.secrets.load();
     let has_retiring = set.records.values().any(|r| !r.retiring.is_empty());
     let rot_now = has_retiring.then(|| eng.rotation_clock.now());
-    let addr_reports = eng.addresses.report_all(eng.settings.track_client_ips, now);
+    let addr_reports = eng.addresses.report_all(eng.track_client_ips(), now);
     let empty_report = mtg_governance::AddressReport::default();
 
     let mut secrets = Vec::with_capacity(set.records.len());
@@ -501,7 +510,7 @@ pub async fn handle_get_secret(
     let rot_now = (!rec.retiring.is_empty()).then(|| eng.rotation_clock.now());
     let rep = eng
         .addresses
-        .report_one(&name, eng.settings.track_client_ips, Utc::now());
+        .report_one(&name, eng.track_client_ips(), Utc::now());
     let info = build_secret_info(eng, &name, rec, set.default_ad_tag, &rep, rot_now);
     (StatusCode::OK, Json(info)).into_response()
 }
@@ -749,7 +758,7 @@ pub async fn handle_get_clients(
         Err(e) => return map_engine_error(&e),
     };
 
-    if !state.engine.settings.track_client_ips {
+    if !state.engine.track_client_ips() {
         return (
             StatusCode::OK,
             Json(ClientsReportJson {
@@ -892,7 +901,7 @@ fn build_address_report_json(eng: &ProxyEngine, name: &str) -> Option<AddressRep
     let rec = set.records.get(name)?;
     let rep = eng
         .addresses
-        .report_one(name, eng.settings.track_client_ips, Utc::now());
+        .report_one(name, eng.track_client_ips(), Utc::now());
     Some(AddressReportJson {
         name: name.to_owned(),
         ip_limit: rec.limits.ip_limit,
@@ -1025,4 +1034,343 @@ pub async fn handle_delete_adtag(State(state): State<ApiState>) -> Response {
         Ok(()) => (StatusCode::OK, Json(STATUS_OK)).into_response(),
         Err(e) => map_engine_error(&e),
     }
+}
+
+// ============================================================================
+// Enterprise Routes (v2.3.0+): /healthz, PATCH /secrets/{name},
+// POST /secrets/{name}/disconnect, POST /secrets/batch,
+// GET /accounting, POST /accounting/flush, GET /ip-filters, POST /ip-filters/refresh
+// ============================================================================
+
+pub async fn handle_healthz(State(state): State<ApiState>) -> Response {
+    let eng = &state.engine;
+    let ipf = eng.ip_filters_status();
+    let resp = HealthzResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds: eng.metrics.started_instant.elapsed().as_secs() as i64,
+        total_connections: eng.metrics.total_active_connections(),
+        secrets_count: eng.secrets.load().records.len(),
+        allowlist_enabled: ipf.allowlist.enabled,
+        allowlist_ready: ipf.allowlist.status.as_ref().is_none_or(|s| s.ready),
+        allowlist_entries: ipf.allowlist.status.as_ref().map_or(0, |s| s.entries),
+        blocklist_enabled: ipf.blocklist.enabled,
+        blocklist_ready: ipf.blocklist.status.as_ref().is_none_or(|s| s.ready),
+        blocklist_entries: ipf.blocklist.status.as_ref().map_or(0, |s| s.entries),
+    };
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+pub async fn handle_patch_secret(
+    Path(name): Path<String>,
+    State(state): State<ApiState>,
+    body: Bytes,
+) -> Response {
+    let req: PatchSecretReq = match decode_strict_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let mut patch = SecretPatch {
+        reset_quota: req.reset_quota,
+        disabled: req.disabled,
+        client_fair: req.client_fair,
+        ..SecretPatch::default()
+    };
+
+    if let Some(s) = req.secret {
+        match Secret::parse(&s) {
+            Ok(parsed) => patch.secret = Some(parsed),
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid secret: {e}")),
+        }
+    }
+    if let Some(tag_str) = req.ad_tag {
+        match parse_ad_tag_hex(&tag_str) {
+            Ok(tag) => patch.ad_tag = Some(tag),
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid ad_tag: {e}")),
+        }
+    }
+    if let Some(q) = req.quota {
+        match parse_quota_bytes(&q) {
+            Ok(bytes) => patch.quota_bytes = Some(bytes),
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid quota: {e}")),
+        }
+    }
+    if let Some(aq) = req.add_quota {
+        match parse_quota_bytes(&aq) {
+            Ok(bytes) => patch.add_quota_bytes = Some(bytes),
+            Err(e) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid add_quota: {e}"));
+            }
+        }
+    }
+    if let Some(qr) = req.quota_reset {
+        match parse_quota_reset(&qr) {
+            Ok(reset) => patch.quota_reset = Some(reset),
+            Err(e) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid quota_reset: {e}"));
+            }
+        }
+    }
+    if let Some(exp) = req.expires {
+        match parse_expiry(&exp) {
+            Ok(dt) => patch.expires_at = Some(dt),
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid expires: {e}")),
+        }
+    }
+    if let Some(sp) = req.speed {
+        match parse_speed(&sp) {
+            Ok(v) => patch.speed_bytes_per_second = Some(v),
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid speed: {e}")),
+        }
+    }
+    if let Some(sp) = req.speed_up {
+        match parse_speed(&sp) {
+            Ok(v) => patch.speed_up_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid speed_up: {e}"));
+            }
+        }
+    }
+    if let Some(sp) = req.speed_down {
+        match parse_speed(&sp) {
+            Ok(v) => patch.speed_down_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(StatusCode::BAD_REQUEST, format!("invalid speed_down: {e}"));
+            }
+        }
+    }
+    if let Some(sp) = req.client_speed {
+        match parse_speed(&sp) {
+            Ok(v) => patch.client_speed_bytes_per_second = Some(v),
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid client_speed: {e}"),
+                );
+            }
+        }
+    }
+    if let Some(v) = req.ip_limit {
+        if v < 0 || v > i64::from(u32::MAX) {
+            return json_error(StatusCode::BAD_REQUEST, "ip_limit out of range");
+        }
+        patch.ip_limit = Some(v as u32);
+    }
+    if let Some(v) = req.client_conns {
+        if v < 0 || v > i64::from(u32::MAX) {
+            return json_error(StatusCode::BAD_REQUEST, "client_conns out of range");
+        }
+        patch.client_conns = Some(v as u32);
+    }
+    if let Some(v) = req.max_connections {
+        if v < 0 || v > i64::from(u32::MAX) {
+            return json_error(StatusCode::BAD_REQUEST, "max_connections out of range");
+        }
+        patch.max_connections = Some(v as u32);
+    }
+
+    match state.engine.patch_secret(&name, patch) {
+        Ok(()) => (StatusCode::OK, Json(STATUS_OK)).into_response(),
+        Err(e) => map_engine_error(&e),
+    }
+}
+
+pub async fn handle_disconnect_secret(
+    Path(name): Path<String>,
+    State(state): State<ApiState>,
+) -> Response {
+    match state.engine.disconnect_secret_all(&name) {
+        Ok(closed) => (StatusCode::OK, Json(DisconnectResultJson { closed })).into_response(),
+        Err(e) => map_engine_error(&e),
+    }
+}
+
+pub async fn handle_batch_secrets(State(state): State<ApiState>, body: Bytes) -> Response {
+    let req: BatchSecretsReq = match decode_strict_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let mut upserts = Vec::with_capacity(req.upsert.len());
+    for (name, entry) in req.upsert {
+        let secret = match Secret::parse(&entry.secret) {
+            Ok(s) => s,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid secret {name:?}: {e}"),
+                );
+            }
+        };
+        let ad_tag = match parse_ad_tag_hex(&entry.ad_tag) {
+            Ok(t) => t,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid ad_tag for {name:?}: {e}"),
+                );
+            }
+        };
+        let limits = match entry.parse_limits() {
+            Ok(l) => l,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid limits for {name:?}: {e}"),
+                );
+            }
+        };
+        upserts.push(BatchUpsertSecret {
+            name,
+            secret,
+            ad_tag,
+            limits,
+        });
+    }
+
+    match state.engine.batch_mutate_secrets(upserts, &req.delete) {
+        Ok((upserted, deleted)) => (
+            StatusCode::OK,
+            Json(BatchSecretsResultJson {
+                status: "ok",
+                upserted,
+                deleted,
+            }),
+        )
+            .into_response(),
+        Err(e) => map_engine_error(&e),
+    }
+}
+
+pub async fn handle_get_accounting(State(state): State<ApiState>) -> Response {
+    let eng = &state.engine;
+    let now = Utc::now();
+    let set = eng.secrets.load();
+    let addr_reports = eng.addresses.report_all(false, now);
+
+    let mut total_in = 0i64;
+    let mut total_out = 0i64;
+    let mut active_conns = 0i64;
+    let mut lifetime_conns = 0u64;
+    let mut accounts = Vec::with_capacity(set.records.len());
+
+    for (name, rec) in &set.records {
+        let rt = eng.metrics.get_user(name);
+        let bi = rt
+            .as_ref()
+            .map_or(0, |r| r.bytes_in.load(Ordering::Relaxed));
+        let bo = rt
+            .as_ref()
+            .map_or(0, |r| r.bytes_out.load(Ordering::Relaxed));
+        let conns = rt
+            .as_ref()
+            .map_or(0, |r| r.connections.load(Ordering::Relaxed));
+        let life = rt
+            .as_ref()
+            .map_or(0, |r| r.total_connections.load(Ordering::Relaxed));
+        let quota_used = rt
+            .as_ref()
+            .map_or(0, |r| r.quota_used.load(Ordering::Relaxed));
+        let cutoffs = rt
+            .as_ref()
+            .map_or(0, |r| r.quota_cutoffs.load(Ordering::Relaxed));
+        let pstart_ns = rt
+            .as_ref()
+            .map_or(0, |r| r.period_start_ns.load(Ordering::Relaxed));
+        let period_start = (pstart_ns > 0).then(|| DateTime::from_timestamp_nanos(pstart_ns));
+        let last_seen_unix = rt
+            .as_ref()
+            .map_or(0, |r| r.last_seen_unix.load(Ordering::Relaxed));
+        let last_seen = (last_seen_unix > 0)
+            .then(|| DateTime::from_timestamp(last_seen_unix, 0))
+            .flatten();
+
+        let quota = rec.limits.quota_bytes;
+        let quota_remaining = (quota > 0).then(|| (quota - quota_used).max(0));
+        let active_ips = addr_reports.get(name).map_or(0, |r| r.active_ips);
+
+        total_in = total_in.saturating_add(bi);
+        total_out = total_out.saturating_add(bo);
+        active_conns = active_conns.saturating_add(conns);
+        lifetime_conns = lifetime_conns.saturating_add(life);
+
+        accounts.push(AccountLedgerRowJson {
+            name: name.clone(),
+            mode: rec.secret.mode().as_str().to_owned(),
+            active_connections: conns,
+            total_connections: life,
+            bytes_in: bi,
+            bytes_out: bo,
+            total_bytes: bi.saturating_add(bo),
+            quota,
+            quota_used,
+            quota_remaining,
+            quota_reset: quota_reset_str(rec.limits.quota_reset),
+            period_start,
+            quota_cutoffs: cutoffs,
+            active_ips,
+            ip_limit: rec.limits.ip_limit,
+            max_connections: rec.limits.max_connections,
+            speed_limit: rec.limits.speed_bytes_per_second,
+            disabled: rec.limits.disabled,
+            expires_at: rec.limits.expires_at,
+            last_seen,
+        });
+    }
+
+    let mut fronted_total = 0u64;
+    let mut allowlist_rejected_total = 0u64;
+    let mut blocklisted_total = 0u64;
+    let mut replay_attacks = 0u64;
+    for c in &eng.metrics.cores {
+        fronted_total += c.fronted_total.load(Ordering::Relaxed);
+        allowlist_rejected_total += c.allowlist_rejected_total.load(Ordering::Relaxed);
+        blocklisted_total += c.blocklisted_total.load(Ordering::Relaxed);
+        replay_attacks += c.replay_attacks.load(Ordering::Relaxed);
+    }
+
+    let resp = AccountingResponse {
+        started_at: eng.metrics.started_at,
+        uptime_seconds: eng.metrics.started_instant.elapsed().as_secs() as i64,
+        usage_persisted: eng.settings.usage_state_file.is_some(),
+        totals: AccountingTotalsJson {
+            total_bytes_in: total_in,
+            total_bytes_out: total_out,
+            total_bytes: total_in.saturating_add(total_out),
+            active_connections: active_conns,
+            lifetime_connections: lifetime_conns,
+            secrets_count: set.records.len(),
+            fronted_total,
+            allowlist_rejected_total,
+            blocklisted_total,
+            replay_attacks,
+        },
+        accounts,
+    };
+
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+pub async fn handle_flush_accounting(State(state): State<ApiState>) -> Response {
+    match state.engine.flush_usage_now() {
+        Ok(flushed) => (
+            StatusCode::OK,
+            Json(FlushResultJson {
+                status: "ok",
+                flushed,
+            }),
+        )
+            .into_response(),
+        Err(e) => map_engine_error(&e),
+    }
+}
+
+pub async fn handle_get_ip_filters(State(state): State<ApiState>) -> Response {
+    (StatusCode::OK, Json(state.engine.ip_filters_status())).into_response()
+}
+
+pub async fn handle_refresh_ip_filters(State(state): State<ApiState>) -> Response {
+    let report = state.engine.refresh_ip_filters_now().await;
+    (StatusCode::OK, Json(report)).into_response()
 }

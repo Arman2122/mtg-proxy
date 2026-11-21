@@ -80,6 +80,8 @@ pub struct ObfsCounters {
 #[derive(Debug)]
 pub struct SecretRuntime {
     pub connections: AtomicI64,
+    /// Cumulative lifetime accepted connections for this secret (persisted in `usage.json`).
+    pub total_connections: AtomicU64,
     pub bytes_in: AtomicI64,
     pub bytes_out: AtomicI64,
     /// Last seen Unix seconds (`0` = never seen).
@@ -117,6 +119,7 @@ impl Default for SecretRuntime {
     fn default() -> Self {
         Self {
             connections: AtomicI64::new(0),
+            total_connections: AtomicU64::new(0),
             bytes_in: AtomicI64::new(0),
             bytes_out: AtomicI64::new(0),
             last_seen_unix: AtomicI64::new(0),
@@ -141,9 +144,10 @@ impl Default for SecretRuntime {
 }
 
 impl SecretRuntime {
-    /// Roll over `quota_used` when `reset == Monthly` and the calendar month changed.
+    /// Roll over `quota_used` when `reset` is `Daily`, `Weekly` (ISO week), or
+    /// `Monthly` and the UTC calendar period boundary has been crossed.
     pub fn rollover_if_needed(&self, reset: QuotaReset, now: DateTime<Utc>) {
-        if reset != QuotaReset::Monthly {
+        if reset == QuotaReset::None {
             return;
         }
         let now_ns = now.timestamp_nanos_opt().unwrap_or(0);
@@ -158,7 +162,13 @@ impl SecretRuntime {
             return;
         }
         let start_dt = DateTime::from_timestamp_nanos(start_ns);
-        if (now.year() != start_dt.year() || now.month() != start_dt.month())
+        let crossed = match reset {
+            QuotaReset::None => false,
+            QuotaReset::Daily => now.date_naive() != start_dt.date_naive(),
+            QuotaReset::Weekly => now.iso_week() != start_dt.iso_week(),
+            QuotaReset::Monthly => now.year() != start_dt.year() || now.month() != start_dt.month(),
+        };
+        if crossed
             && self
                 .period_start_ns
                 .compare_exchange(start_ns, now_ns, Ordering::AcqRel, Ordering::Acquire)
@@ -199,11 +209,34 @@ impl SecretRuntime {
     }
 }
 
-/// Persisted JSON schema for `usage-state-file` (100% compatible with Go `usageRecord`).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+#[inline]
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+#[inline]
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// Persisted JSON schema for `usage-state-file` (100% backward-compatible with
+/// Go `usageRecord` while also preserving full directional accounting across restarts!).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub quota_used: i64,
     pub period_start: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub bytes_in: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub bytes_out: i64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub total_connections: u64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub quota_cutoffs: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub last_seen_unix: i64,
 }
 
 /// Per-Telegram-DC/IP telemetry bucket for Prometheus & StatsD.
@@ -226,9 +259,10 @@ pub struct ProxyMetrics {
     dc_endpoints: RwLock<FxHashMap<(IpAddr, i32), Arc<DcEndpointStats>>>,
     pub blocklist_size: AtomicU64,
     pub allowlist_size: AtomicU64,
+    last_usage_digest: AtomicU64,
 
-    // Global connection-count fair throttle (`[throttle]`)
-    pub throttle_limit: i64,
+    // Global connection-count fair throttle (`[throttle]`, hot-reloadable!)
+    pub throttle_limit: AtomicI64,
     pub throttle_interval: Duration,
     pub throttle_active: AtomicBool,
     throttle_caps: RwLock<BTreeMap<String, i64>>,
@@ -250,7 +284,8 @@ impl ProxyMetrics {
             dc_endpoints: RwLock::new(FxHashMap::default()),
             blocklist_size: AtomicU64::new(0),
             allowlist_size: AtomicU64::new(0),
-            throttle_limit: i64::from(throttle_limit),
+            last_usage_digest: AtomicU64::new(0),
+            throttle_limit: AtomicI64::new(i64::from(throttle_limit)),
             throttle_interval: if throttle_interval.is_zero() {
                 Duration::from_secs(5)
             } else {
@@ -258,6 +293,15 @@ impl ProxyMetrics {
             },
             throttle_active: AtomicBool::new(false),
             throttle_caps: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    /// Hot-reload global `[throttle] max-connections` cap without restarting.
+    pub fn set_throttle_limit(&self, limit: i64) {
+        self.throttle_limit.store(limit.max(0), Ordering::Release);
+        if limit <= 0 {
+            self.throttle_caps.write().clear();
+            self.throttle_active.store(false, Ordering::Release);
         }
     }
 
@@ -312,7 +356,7 @@ impl ProxyMetrics {
 
     /// Check global connection-count fair throttle (`[throttle]`).
     pub fn can_connect_throttle(&self, name: &str) -> bool {
-        if self.throttle_limit <= 0 {
+        if self.throttle_limit.load(Ordering::Acquire) <= 0 {
             return true;
         }
         let cap = {
@@ -327,7 +371,8 @@ impl ProxyMetrics {
 
     /// Recompute global connection-count fair caps (exact port of Go `computeFairCaps`).
     pub fn recompute_throttle_caps(&self) {
-        if self.throttle_limit <= 0 {
+        let limit = self.throttle_limit.load(Ordering::Acquire);
+        if limit <= 0 {
             return;
         }
         let user_conns: BTreeMap<String, i64> = self
@@ -336,19 +381,20 @@ impl ProxyMetrics {
             .iter()
             .map(|(k, v)| (k.clone(), v.connections.load(Ordering::Relaxed)))
             .collect();
-        let caps = compute_fair_caps(&user_conns, self.throttle_limit);
+        let caps = compute_fair_caps(&user_conns, limit);
         let active = !caps.is_empty();
         *self.throttle_caps.write() = caps;
         self.throttle_active.store(active, Ordering::Release);
     }
 
     pub fn throttle_snapshot(&self) -> Option<(bool, i64, BTreeMap<String, i64>)> {
-        if self.throttle_limit <= 0 {
+        let limit = self.throttle_limit.load(Ordering::Acquire);
+        if limit <= 0 {
             return None;
         }
         let active = self.throttle_active.load(Ordering::Acquire);
         let caps = self.throttle_caps.read().clone();
-        Some((active, self.throttle_limit, caps))
+        Some((active, limit, caps))
     }
 
     /// Total active client connections summed across all worker cores.
@@ -362,7 +408,7 @@ impl ProxyMetrics {
             .sum()
     }
 
-    /// Restore persisted quota usage from `path` (missing file is `Ok(())`).
+    /// Restore persisted accounting & quota usage from `path` (missing file is `Ok(())`).
     pub fn load_usage(&self, path: &Path) -> io::Result<()> {
         let data = match fs::read(path) {
             Ok(d) => d,
@@ -375,13 +421,55 @@ impl ProxyMetrics {
             let u = self.user(&name);
             u.quota_used.store(rec.quota_used, Ordering::Release);
             u.period_start_ns.store(rec.period_start, Ordering::Release);
+            u.bytes_in.store(rec.bytes_in, Ordering::Release);
+            u.bytes_out.store(rec.bytes_out, Ordering::Release);
+            u.total_connections
+                .store(rec.total_connections, Ordering::Release);
+            u.quota_cutoffs.store(rec.quota_cutoffs, Ordering::Release);
+            u.last_seen_unix
+                .store(rec.last_seen_unix, Ordering::Release);
         }
+        let digest = self.compute_usage_digest();
+        self.last_usage_digest.store(digest, Ordering::Release);
         Ok(())
+    }
+
+    fn compute_usage_digest(&self) -> u64 {
+        let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+        let mix = |a: &mut u64, v: u64| {
+            *a ^= v;
+            *a = a.wrapping_mul(0x1000_0000_01b3);
+        };
+        for (name, st) in self.users.read().iter() {
+            for &b in name.as_bytes() {
+                mix(&mut acc, u64::from(b));
+            }
+            mix(&mut acc, st.quota_used.load(Ordering::Relaxed) as u64);
+            mix(&mut acc, st.period_start_ns.load(Ordering::Relaxed) as u64);
+            mix(&mut acc, st.bytes_in.load(Ordering::Relaxed) as u64);
+            mix(&mut acc, st.bytes_out.load(Ordering::Relaxed) as u64);
+            mix(&mut acc, st.total_connections.load(Ordering::Relaxed));
+            mix(&mut acc, st.quota_cutoffs.load(Ordering::Relaxed) as u64);
+            mix(&mut acc, st.last_seen_unix.load(Ordering::Relaxed) as u64);
+        }
+        acc
+    }
+
+    /// Flush `usage.json` ONLY when accounting counters changed since the last flush
+    /// (eliminates unnecessary idle SSD writes while adding zero hot-path instructions!).
+    pub fn flush_usage_if_dirty(&self, path: &Path) -> io::Result<bool> {
+        let cur = self.compute_usage_digest();
+        if cur == self.last_usage_digest.load(Ordering::Acquire) && path.exists() {
+            return Ok(false);
+        }
+        self.flush_usage_atomic(path)?;
+        Ok(true)
     }
 
     /// Crash-safe atomic `usage.json` flush: unique temp file (`0600`) ->
     /// `write_all` -> `sync_data` -> atomic `rename` -> parent dir `fsync`!
     pub fn flush_usage_atomic(&self, path: &Path) -> io::Result<()> {
+        let digest = self.compute_usage_digest();
         let records: BTreeMap<String, UsageRecord> = self
             .users
             .read()
@@ -392,6 +480,11 @@ impl ProxyMetrics {
                     UsageRecord {
                         quota_used: st.quota_used.load(Ordering::Relaxed),
                         period_start: st.period_start_ns.load(Ordering::Relaxed),
+                        bytes_in: st.bytes_in.load(Ordering::Relaxed),
+                        bytes_out: st.bytes_out.load(Ordering::Relaxed),
+                        total_connections: st.total_connections.load(Ordering::Relaxed),
+                        quota_cutoffs: st.quota_cutoffs.load(Ordering::Relaxed),
+                        last_seen_unix: st.last_seen_unix.load(Ordering::Relaxed),
                     },
                 )
             })
@@ -401,6 +494,9 @@ impl ProxyMetrics {
             .map_err(|e| io::Error::other(format!("marshal usage state: {e}")))?;
 
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
         let file_name = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -430,6 +526,8 @@ impl ProxyMetrics {
 
         if res.is_err() {
             let _ = fs::remove_file(&tmp_path);
+        } else {
+            self.last_usage_digest.store(digest, Ordering::Release);
         }
         res
     }
@@ -611,6 +709,30 @@ impl ProxyMetrics {
         );
         let _ = writeln!(out, "# TYPE {p}_replay_attacks counter");
         let _ = writeln!(out, "{p}_replay_attacks {replays}");
+
+        let (active_secrets, sum_in, sum_out) = {
+            let users = self.users.read();
+            let mut bi = 0i64;
+            let mut bo = 0i64;
+            for u in users.values() {
+                bi = bi.saturating_add(u.bytes_in.load(Ordering::Relaxed));
+                bo = bo.saturating_add(u.bytes_out.load(Ordering::Relaxed));
+            }
+            (users.len(), bi, bo)
+        };
+        let _ = writeln!(
+            out,
+            "# HELP {p}_active_secrets Number of tracked secret accounting buckets."
+        );
+        let _ = writeln!(out, "# TYPE {p}_active_secrets gauge");
+        let _ = writeln!(out, "{p}_active_secrets {active_secrets}");
+        let _ = writeln!(
+            out,
+            "# HELP {p}_total_bytes Cumulative relayed bytes across all secrets."
+        );
+        let _ = writeln!(out, "# TYPE {p}_total_bytes counter");
+        let _ = writeln!(out, "{p}_total_bytes{{direction=\"in\"}} {sum_in}");
+        let _ = writeln!(out, "{p}_total_bytes{{direction=\"out\"}} {sum_out}");
 
         out
     }

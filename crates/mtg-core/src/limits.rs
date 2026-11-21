@@ -30,7 +30,7 @@ pub enum LimitParseError {
     SpeedTooLarge(String),
     #[error("speed {0:?} is below the minimum of 64kbit/s (8000 bytes/s)")]
     SpeedTooSmall(String),
-    #[error("unknown quota reset {0:?} (want \"none\" or \"monthly\")")]
+    #[error("unknown quota reset {0:?} (want \"none\", \"daily\", \"weekly\", or \"monthly\")")]
     UnknownQuotaReset(String),
     #[error("invalid expiry {0:?} (want RFC3339 or YYYY-MM-DD)")]
     InvalidExpiry(String),
@@ -41,6 +41,8 @@ pub enum LimitParseError {
 pub enum QuotaReset {
     #[default]
     None,
+    Daily,
+    Weekly,
     Monthly,
 }
 
@@ -48,6 +50,8 @@ impl QuotaReset {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
             Self::Monthly => "monthly",
         }
     }
@@ -116,6 +120,8 @@ pub struct SecretLimits {
     pub ip_limit: u32,
     /// Maximum live connections per single client address (`0` = unlimited).
     pub client_conns: u32,
+    /// Maximum total concurrent connections across all addresses for this secret (`0` = unlimited).
+    pub max_connections: u32,
     /// Per-address combined speed ceiling in bytes/s (`0` = unlimited).
     pub client_speed_bytes_per_second: i64,
     /// Work-conserving fair share of secret speed limits across active addresses.
@@ -134,6 +140,7 @@ impl SecretLimits {
             && self.speed_down_bytes_per_second == 0
             && self.ip_limit == 0
             && self.client_conns == 0
+            && self.max_connections == 0
             && self.client_speed_bytes_per_second == 0
             && !self.client_fair
     }
@@ -173,6 +180,7 @@ pub enum DenyReason {
     ClientConns = 5,
     Banned = 6,
     KeyRevoked = 7,
+    MaxConnections = 8,
 }
 
 impl DenyReason {
@@ -186,6 +194,7 @@ impl DenyReason {
             Self::ClientConns => "client_conns",
             Self::Banned => "banned",
             Self::KeyRevoked => "key_revoked",
+            Self::MaxConnections => "max_connections",
         }
     }
 
@@ -366,10 +375,12 @@ fn byte_unit_multiplier_prefix(prefix_lower: &str) -> Option<f64> {
     }
 }
 
-/// Parse the quota reset policy (`""` / `"none"` / `"monthly"`, case-insensitive).
+/// Parse the quota reset policy (`""` / `"none"` / `"daily"` / `"weekly"` / `"monthly"`, case-insensitive).
 pub fn parse_quota_reset(s: &str) -> Result<QuotaReset, LimitParseError> {
     match s.trim().to_ascii_lowercase().as_str() {
         "" | "none" => Ok(QuotaReset::None),
+        "daily" => Ok(QuotaReset::Daily),
+        "weekly" => Ok(QuotaReset::Weekly),
         "monthly" => Ok(QuotaReset::Monthly),
         _ => Err(LimitParseError::UnknownQuotaReset(s.to_owned())),
     }
@@ -447,8 +458,10 @@ mod tests {
     fn quota_reset_and_expiry_parity() {
         assert_eq!(parse_quota_reset("").unwrap(), QuotaReset::None);
         assert_eq!(parse_quota_reset("NONE").unwrap(), QuotaReset::None);
+        assert_eq!(parse_quota_reset("Daily").unwrap(), QuotaReset::Daily);
+        assert_eq!(parse_quota_reset("WEEKLY").unwrap(), QuotaReset::Weekly);
         assert_eq!(parse_quota_reset("Monthly").unwrap(), QuotaReset::Monthly);
-        assert!(parse_quota_reset("weekly").is_err());
+        assert!(parse_quota_reset("yearly").is_err());
 
         assert_eq!(parse_expiry("").unwrap(), None);
         let d = parse_expiry("2026-12-31").unwrap().unwrap();

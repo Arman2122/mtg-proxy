@@ -40,8 +40,7 @@ Unlike single-secret proxies, `mtg-proxy` gives every user their own named secre
   - [Secret Rotation with Overlap](#secret-rotation-with-overlap)
   - [Sponsored Channel (`ad-tag`)](#sponsored-channel-ad-tag)
   - [Connection Throttling](#connection-throttling)
-  - [Extra Listeners (`[[listener]]`)](#extra-listeners-listener)
-  - [WEB Proxy Transport (`web-relay`)](#web-proxy-transport-web-relay)
+  - [Unified Single-Port Multi-Transport & WEB Proxy (`web-relay`)](#unified-single-port-multi-transport--web-proxy-web-relay)
   - [Doppelganger Cover Scouting & Traffic Mimicry](#doppelganger-cover-scouting--traffic-mimicry)
   - [Geo-Stealth Country Allowlist (`IR-Geo-DB`) & Cover-Only Fronting](#geo-stealth-country-allowlist-ir-geo-db--cover-only-fronting)
   - [Public IP Override & Environment Variables](#public-ip-override--environment-variables)
@@ -241,14 +240,20 @@ Configure `api-bind-to` (bind to loopback unless `api-token` is set — verified
 
 | Method & Path | Description |
 |---|---|
+| `GET /healthz` | Lightweight liveness/readiness probe (uptime, connections, active secrets, IP filter state). |
 | `GET /stats` | Live global & per-user counters, `features` capability list, `listeners`, `obfuscated`, `faketls_handshake`, and `throttle` state. |
-| `POST /reload` | Atomically re-read the config file from disk (`503` under `simple-run`). |
+| `GET /accounting` | Enterprise multi-tenant billing ledger (`bytes_in`, `bytes_out`, `total_connections`, `quota_used`/`remaining`, `quota_cutoffs`, `last_seen`, all limits). |
+| `POST /accounting/flush` | Force an immediate crash-safe atomic flush of `usage-state-file` to disk. |
+| `POST /reload` | Full async hot-reload: `[secrets]`, limits, ad-tags, retiring-secrets, `[throttle]`, `track-client-ips`, `tolerate-time-skewness`, `[domain-fronting]`, and `[defense.allowlist]`/`[defense.blocklist]`. |
 | `GET /secrets` | List all secrets with mode, host, effective ad-tag, limits, retiring info, and live usage. |
 | `POST /secrets` | Add or update one secret (key, optional `ad_tag`, and any governance limits). |
+| `PATCH /secrets/{name}` | Partial atomic account mutation (top-up `add_quota`, `reset_quota`, `disabled`, `expires`, `max_connections`, speed/IP limits) without resending the secret key. |
 | `PUT /secrets` | Atomically replace the entire secret set while keeping active retiring keys of retained names. |
+| `POST /secrets/batch` | Atomic bulk `upsert` + `delete` in a single lock-free `ArcSwap` swap (ideal for billing panels). |
 | `GET /secrets/{name}` | Inspect one named secret and its live counters (`404` if missing). |
 | `DELETE /secrets/{name}` | Delete one secret (`409` if it is the last remaining secret). |
 | `POST /secrets/{name}/reset-quota` | Reset a secret's `quota_used` counter to zero and restart its quota period. |
+| `POST /secrets/{name}/disconnect` | Immediately disconnect ALL live streams for this secret without banning. |
 | `POST /secrets/{name}/kick` | Immediately close live streams matching specified `ips` (O(K) indexed lookup). |
 | `GET /secrets/{name}/external-ips` | View local & externally reported active addresses and `ip_limit`. |
 | `PUT /secrets/{name}/external-ips` | Report external addresses (`{"ips":[...],"ttl":"90s"}`) counted toward `ip-limit`. |
@@ -257,6 +262,8 @@ Configure `api-bind-to` (bind to loopback unless `api-token` is set — verified
 | `POST /secrets/{name}/bans` | Temporarily ban addresses from a secret (`{"ips":[...],"ttl":"1h","force"?}`) and kick live streams. |
 | `GET /secrets/{name}/bans` | List active bans for a secret (addresses shown only when `track-client-ips = true`). |
 | `DELETE /secrets/{name}/bans/{address}` | Unban one IPv4 address or IPv6 `/64` prefix. |
+| `GET /ip-filters` | Inspect live `[defense.allowlist]` / `[defense.blocklist]` status (CIDR counts, ETag/304 hits, SHA-256 content hash, last refresh). |
+| `POST /ip-filters/refresh` | Trigger synchronous conditional HTTP (`If-None-Match` / `304`) refresh of allowlist/blocklist feeds. |
 | `GET /adtag` / `PUT /adtag` / `DELETE /adtag` | Read, set (`32` hex chars), or clear the global sponsored-channel `ad_tag`. |
 
 > **Privacy default (`track-client-ips = false`):** Client IP addresses (`connected_ips`, `last_ip`, per-address IP listings) are omitted by default and never written to disk; `usage-state-file` persists byte quotas only.
@@ -270,7 +277,8 @@ usage-state-file = "/var/lib/mtg-proxy/usage.json"
 
 [secret-limits.alice]
 quota = "10GB"            # human size or bare bytes
-quota-reset = "monthly"   # "none" (default) or "monthly"
+quota-reset = "monthly"   # "none" (default), "daily", "weekly", or "monthly"
+max-connections = 32      # hard concurrent connection cap for this account across all IPs
 speed = "5mbit"           # combined up+down sustained cap (lock-free GCRA)
 speed-up = "2mbit"        # optional directional caps (speed-up / speed-down)
 speed-down = "5mbit"
@@ -327,41 +335,28 @@ check-interval = "5s"
 
 Recomputes per-user fair-share connection caps automatically: light users keep all their slots while heavy consumers share the remaining budget equally (existing streams are never killed).
 
-### Extra Listeners (`[[listener]]`)
+### Unified Single-Port Multi-Transport & WEB Proxy (`web-relay`)
 
-`bind-to` is FakeTLS-only (`ee`). To also serve `dd` or `plain` obfuscated2 (for example, on loopback behind `web-relay` or `tproxy-server`), add `[[listener]]` blocks:
-
-```toml
-[[listener]]
-bind-to = "127.0.0.1:2398"
-accept = ["dd", "plain"]
-proxy-protocol = true
-```
-
-Non-loopback listeners require explicit `public = true` and automatically arm a sharded per-IP failed-handshake rate limiter (`handshakes-per-ip`, default `30/s`, burst `2×`) plus `on-unknown-secret = "close" | "drain"`.
-
-### WEB Proxy Transport (`web-relay`)
-
-Serves Telegram Desktop 7.1.2+ WEB proxies over genuine HTTPS + WebSocket from the same binary and config file:
-
-```bash
-mtg-proxy generate-web-key /etc/mtg-proxy/web.key
-mtg-proxy web-relay --check /etc/mtg-proxy/config.toml
-mtg-proxy web-relay /etc/mtg-proxy/config.toml
-```
+`mtg-proxy` supports **both** dedicated listeners (`[[listener]]` + standalone `mtg-proxy web-relay`) **and** all-in-one single-port `:443` multiplexing (`ee` + `dd`/`plain` + HTTPS `web-relay` + cover website from ONE process on ONE port, with zero Nginx/Caddy required!):
 
 ```toml
+# All-in-One Single-Port :443 (FakeTLS ee + Obfuscated2 dd + HTTPS WEB Relay + Cover Site)
+bind-to = "0.0.0.0:443"
+bind-to-accept = ["ee", "dd"]       # Optional: also accept dd (or plain) on :443 alongside ee!
+
 [web]
 enabled = true
-host = "web.example.com"
-bind-to = "127.0.0.1:8099"
-backend = "127.0.0.1:2398"
+integrated = true                   # Runs inside `mtg-proxy run`, auto-binds internal loopback dd backend!
+host = "example.com"
 token-key = "/etc/mtg-proxy/web.key"
-cover-dir = "/srv/site"           # or cover-upstream = "http://127.0.0.1:8080"
-stats-bind-to = "127.0.0.1:8100"  # loopback-only stats endpoint
+cover-dir = "/srv/site"             # or cover-upstream = "http://127.0.0.1:8080"
+tls-cert = "/etc/letsencrypt/live/example.com/fullchain.pem"  # Hot-reloaded on SIGHUP!
+tls-key  = "/etc/letsencrypt/live/example.com/privkey.pem"
+stats-bind-to = "127.0.0.1:8100"
 ```
 
-Features a 3-tier anti-oracle origin (unknown/retired/padded credentials serve the cover site identically), per-page 128-bit CSP nonces, strict RFC 6455 WebSocket framing, and automatic 2-second config-file watch + `SIGHUP` secret reloads. See [contrib/web-relay/README.md](contrib/web-relay/README.md) for the Caddy vhost setup.
+- **CDN-Aware Spoof-Proof Geo-Stealth (`cdn = "cloudflare" | "arvancloud"`):** When running `[web]` behind Cloudflare, ArvanCloud, or a custom CDN alongside `[defense.allowlist]` (such as `IR-Geo-DB`), CDN edge IPs are foreign and would otherwise conflict with a country allowlist. Setting `cdn = "cloudflare"` (or `cdn = "arvancloud"`, or custom `trusted-proxies` / `trusted-proxy-urls` + `client-ip-header`) automatically fetches and refreshes official CDN edge CIDRs, peels trusted CDN hops right-to-left, and **only** trusts `CF-Connecting-IP` / `Ar-Real-IP` when network routing proves the request arrived from a real CDN CIDR — **100% immune to direct-to-origin header spoofing**!
+- **Standalone Mode:** You can still run `mtg-proxy web-relay /etc/mtg-proxy/config.toml` as a separate process behind Caddy/Nginx (`[[listener]]` + `[web] bind-to` + `[web] backend`). Features a 3-tier anti-oracle origin, per-page 128-bit CSP nonces, strict RFC 6455 WebSocket framing, and automatic 2-second config-file watch + `SIGHUP` secret/TLS reloads. See [contrib/web-relay/README.md](contrib/web-relay/README.md) for Caddy examples.
 
 ### Doppelganger Cover Scouting & Traffic Mimicry
 
@@ -401,7 +396,7 @@ download-concurrency = 4
 - **Zero-Fingerprint Cover-Only Fronting (`action = "front"`):**
   - **FakeTLS (`ee`):** Rejected foreign IPs skip secret scanning completely (**0 HMAC CPU**) and enter zero-copy Linux `splice(2)` directly to the cover website from byte 0 (for single/fixed covers) or SNI-matched cover (for multi-domain covers). Allowed country IPs both browse the cover website normally AND authenticate to Telegram via `ee` secrets at ~4 ns DIR-24-8 lookup cost.
   - **WEB Relay (`web-relay`):** Rejected foreign IPs hitting any path — even a leaked `/?bridge=<cap>` or `/api/v1/ws` — silently receive the Tier-3 cover website with bridge/bearer atoms stripped so nothing leaks to upstream logs and zero 404 oracle exists.
-- **Enterprise Resilience:** Follows multi-hop HTTP `301/302/307/308` GitHub release redirects, validates feeds before swapping, keeps per-source Last-Known-Good (LKG) snapshots so a partial URL outage never drops IPv4 or IPv6 coverage, retries failed/partial rounds every `60s`, persists atomic `0600` on-disk snapshots, updates live Prometheus `mtg_iplist_size` gauges, and refreshes on demand via `SIGHUP` (`mtg-proxy doctor` verifies live feeds too).
+- **Enterprise Auto-Update & Resilience:** Uses conditional HTTP (`ETag`/`If-None-Match` and `Last-Modified`/`If-Modified-Since` → `304 Not Modified`), SHA-256 content deduplication (skips 2 MiB DIR-24-8 rebuilds and SSD cache rewrites when unchanged), ±5% fleet schedule jitter, multi-hop HTTP `301/302/307/308` GitHub release redirects, parse-before-swap validation, per-source Last-Known-Good (LKG) retention, `60s` retry backoff on partial outages, atomic `0600` on-disk `cache-file`, live `SIGHUP`/`POST /reload` config hot-reload, and Management API observability (`GET /ip-filters`, `POST /ip-filters/refresh`).
 
 ### Public IP Override & Environment Variables
 

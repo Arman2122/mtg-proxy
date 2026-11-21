@@ -46,8 +46,9 @@ pub use origin::{
 };
 pub use page::{BRIDGE_JS, BridgeDocument, BridgePage, CARRIER_MODE, PageError};
 pub use server::{
-    PrefixedStream, build_origin_from_config, reload_web_profiles, run_web_relay,
-    spawn_origin_server, spawn_stats_server,
+    PrefixedStream, ReloadableTlsAcceptor, SharedGeoFilters, build_ip_filters_from_config,
+    build_origin_from_config, build_origin_with_overrides, load_tls_acceptor, reload_web_profiles,
+    run_web_relay, spawn_origin_server, spawn_stats_server, spawn_tls_origin_server,
 };
 pub use session::{
     AsyncStream, BackendDialer, BoxedStream, CONTROL_RESERVE_ITEMS, DEFAULT_DIAL_TIMEOUT,
@@ -568,6 +569,8 @@ mod integration_tests {
                 allowlist_action: IpFilterAction::Front,
                 blocklist: None,
                 blocklist_action: IpFilterAction::Close,
+                trusted_proxies: None,
+                client_ip_header: None,
             },
         })
         .unwrap();
@@ -618,5 +621,134 @@ mod integration_tests {
         let resp_iran_web = origin.handle_bytes_from(r_iran_web, Some(iran_peer)).await;
         assert_eq!(resp_iran_web.status(), StatusCode::OK);
         assert_eq!(resp_iran_web.headers().get("x-cover").unwrap(), "yes");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_cdn_geo_stealth_allows_iran_peels_edge_ip_and_blocks_spoofing() {
+        use mtg_config::{IpFilterAction, WebCdnPreset};
+        use mtg_governance::{LiveIpFilter, LiveIpFilterConfig};
+
+        let iran_allow = Arc::new(LiveIpFilter::from_config(LiveIpFilterConfig {
+            inline_cidrs: vec!["5.160.0.0/16".to_owned()],
+            ..LiveIpFilterConfig::default()
+        }));
+        iran_allow.init_load().await.unwrap();
+
+        let cf_trusted = Arc::new(LiveIpFilter::from_config(LiveIpFilterConfig {
+            inline_cidrs: WebCdnPreset::Cloudflare
+                .fallback_cidrs()
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            ..LiveIpFilterConfig::default()
+        }));
+        cf_trusted.init_load().await.unwrap();
+
+        let secret = Secret::generate_mode(SecretMode::Dd, "").unwrap();
+        let signer = Signer::new(&[0x44; TOKEN_KEY_LEN]).unwrap();
+
+        let origin = Origin::new(OriginOptions {
+            host: "cdn.example.test".to_owned(),
+            secrets: vec![secret.clone()],
+            retired: vec![],
+            signer,
+            cover: CoverSite::Custom(Arc::new(MarkerCover)),
+            backend: Arc::new(TcpProxyBackend::new(
+                "127.0.0.1:1".parse().unwrap(),
+                Duration::from_secs(1),
+            )),
+            limits: FrameLimits::default(),
+            max_sessions: 8,
+            max_streams: 8,
+            client_ip_source: ClientIpSource::XForwardedFor,
+            counters: None,
+            ip_filters: OriginIpFilters {
+                allowlist: Some(iran_allow),
+                allowlist_action: IpFilterAction::Front,
+                blocklist: None,
+                blocklist_action: IpFilterAction::Close,
+                trusted_proxies: Some(cf_trusted),
+                client_ip_header: Some("cf-connecting-ip".to_owned()),
+            },
+        })
+        .unwrap();
+
+        let cap = derive_capability(&web_secret(&secret), "cdn.example.test").unwrap();
+        let bridge_uri = format!("/?bridge={}", cap.encode_base64url());
+        let local_nginx: SocketAddr = "127.0.0.1:45000".parse().unwrap();
+        let cf_edge_peer: SocketAddr = "172.70.114.25:443".parse().unwrap();
+        let direct_attacker: SocketAddr = "198.51.100.77:51234".parse().unwrap();
+
+        // 1. Iranian user behind Cloudflare -> Nginx (XFF ends with Cloudflare IP 172.70.114.25!):
+        //    MUST peel Cloudflare edge IP, verify CF-Connecting-IP=5.160.1.10, and ALLOW bridge!
+        let r_cf_iran = Request::builder()
+            .uri(&bridge_uri)
+            .header("cf-connecting-ip", "5.160.1.10")
+            .header("x-forwarded-for", "5.160.1.10, 172.70.114.25")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = origin.handle_bytes_from(r_cf_iran, Some(local_nginx)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("x-cover").is_none(),
+            "Iranian user via Cloudflare must get bridge!"
+        );
+
+        // 2. Iranian user behind Cloudflare -> Caddy PROXY protocol (peer_addr IS Cloudflare IP 172.70.114.25!):
+        let r_cf_pp_iran = Request::builder()
+            .uri(&bridge_uri)
+            .header("cf-connecting-ip", "5.160.1.10")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = origin
+            .handle_bytes_from(r_cf_pp_iran, Some(cf_edge_peer))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-cover").is_none());
+
+        // 3. Foreign user (203.0.113.9) behind Cloudflare -> MUST get COVER_SITE (even with valid cap!)
+        let r_cf_foreign = Request::builder()
+            .uri(&bridge_uri)
+            .header("cf-connecting-ip", "203.0.113.9")
+            .header("x-forwarded-for", "5.160.99.99, 203.0.113.9, 172.70.114.25")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = origin
+            .handle_bytes_from(r_cf_foreign, Some(local_nginx))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-cover").unwrap(), "yes");
+
+        // 4. SPOOF ATTACK A: Foreign attacker bypasses Cloudflare & hits Nginx directly with forged
+        //    CF-Connecting-IP: 5.160.1.10! Nginx appends real IP 203.0.113.9 (NOT in Cloudflare CIDRs!)
+        //    -> saw_cdn_hop is FALSE -> forged CF-Connecting-IP is IGNORED -> COVER_SITE!
+        let r_spoof_nginx = Request::builder()
+            .uri(&bridge_uri)
+            .header("cf-connecting-ip", "5.160.1.10")
+            .header("x-forwarded-for", "5.160.1.10, 203.0.113.9")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = origin
+            .handle_bytes_from(r_spoof_nginx, Some(local_nginx))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-cover").unwrap(),
+            "yes",
+            "Forged CF-Connecting-IP MUST NOT bypass Geo-Stealth!"
+        );
+
+        // 5. SPOOF ATTACK B: Foreign attacker connects directly to origin with forged headers!
+        let r_spoof_direct = Request::builder()
+            .uri(&bridge_uri)
+            .header("cf-connecting-ip", "5.160.1.10")
+            .header("x-forwarded-for", "5.160.1.10")
+            .body(Bytes::new())
+            .unwrap();
+        let resp = origin
+            .handle_bytes_from(r_spoof_direct, Some(direct_attacker))
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-cover").unwrap(), "yes");
     }
 }

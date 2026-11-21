@@ -33,7 +33,7 @@ pub use hints::{
 };
 pub use ipfilter::{
     DEFAULT_IPFILTER_CONCURRENCY, DEFAULT_IPFILTER_RETRY_EACH, DEFAULT_IPFILTER_UPDATE_EACH,
-    IpFilter, IpFilterBuilder, IpFilterError, LiveIpFilter, LiveIpFilterConfig,
+    IpFilter, IpFilterBuilder, IpFilterError, LiveIpFilter, LiveIpFilterConfig, LiveIpFilterStatus,
 };
 pub use rate_limit::{
     ADDR_BURST_DIVISOR, BlockedTracker, DEMAND_INFINITE, FAIR_ACTIVE_WINDOW_NS, FAIR_HOLD_TICKS,

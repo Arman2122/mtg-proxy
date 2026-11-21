@@ -21,20 +21,24 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use mtg_config::{ListConfig, PreferIp};
 use mtg_core::ip::unmap_ip;
-use mtg_net::{DnsResolver, ProxyPool, SocketConfig, fetch_url_bytes_with_dns};
+use mtg_net::{
+    ConditionalFetch, DnsResolver, ProxyPool, SocketConfig, fetch_url_conditional_with_dns,
+};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default remote IP list refresh interval (24 hours).
 pub const DEFAULT_IPFILTER_UPDATE_EACH: Duration = Duration::from_secs(24 * 3600);
@@ -476,28 +480,72 @@ impl Default for LiveIpFilterConfig {
     }
 }
 
+/// Live status snapshot of a [`LiveIpFilter`] for management APIs & diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveIpFilterStatus {
+    pub ready: bool,
+    pub entries: usize,
+    pub v4_entries: usize,
+    pub v6_entries: usize,
+    pub sources_total: usize,
+    pub sources_loaded: usize,
+    pub inline_cidrs: usize,
+    pub last_updated_unix: i64,
+    pub last_checked_unix: i64,
+    pub update_count: u64,
+    pub not_modified_count: u64,
+    pub partial_failure: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceCacheEntry {
+    body: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+enum SourceFetchOutcome {
+    NotModified,
+    Modified {
+        text: String,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+}
+
 /// Live-updating wait-free wrapper around [`IpFilter`] (`None` = disabled, 0 ns).
 ///
 /// Guarantees:
 /// - Warm-loads optional atomic on-disk `cache-file` + inline `cidrs` immediately
 ///   at startup before waiting on remote fetches.
+/// - Sends `If-None-Match` / `If-Modified-Since` (`304 Not Modified`) and deduplicates
+///   combined content via SHA-256 so unchanged feeds cause ZERO bitmap reallocation
+///   and ZERO SSD cache rewrites.
 /// - Follows multi-hop HTTP redirects (e.g. GitHub `/releases/latest/download/...`)
 ///   and retries once on transient download errors.
 /// - Per-source Last-Known-Good (LKG) retention: if 1 of 2 URLs fails transiently,
 ///   rebuilds with fresh data + retained LKG for the failed source (zero partial lockout!).
 /// - Retries automatically every 60 seconds after any failed/partial refresh, then
-///   returns to `update_each` cadence once all sources are healthy.
+///   returns to jittered `update_each` cadence once all sources are healthy.
 #[derive(Debug)]
 pub struct LiveIpFilter {
     current: Arc<ArcSwap<IpFilter>>,
     cfg: LiveIpFilterConfig,
-    /// Per-source validated Last-Known-Good raw feed text.
-    last_source_bodies: Mutex<FxHashMap<String, String>>,
+    /// Per-source validated Last-Known-Good raw feed text + HTTP cache validators.
+    last_source_bodies: Mutex<FxHashMap<String, SourceCacheEntry>>,
     /// Warm on-disk cache body kept until every remote source has succeeded once.
     warm_cache_body: Mutex<Option<String>>,
+    /// SHA-256 digest of the active compiled canonical inputs (skips no-op rebuilds!).
+    active_content_hash: Mutex<Option<[u8; 32]>>,
+    last_error: Mutex<Option<String>>,
     loaded_once: AtomicBool,
     last_partial_failure: AtomicBool,
     last_updated_unix: AtomicI64,
+    last_checked_unix: AtomicI64,
+    update_count: AtomicU64,
+    not_modified_count: AtomicU64,
 }
 
 impl LiveIpFilter {
@@ -555,9 +603,35 @@ impl LiveIpFilter {
             cfg,
             last_source_bodies: Mutex::new(FxHashMap::default()),
             warm_cache_body: Mutex::new(None),
+            active_content_hash: Mutex::new(None),
+            last_error: Mutex::new(None),
             loaded_once: AtomicBool::new(false),
             last_partial_failure: AtomicBool::new(false),
             last_updated_unix: AtomicI64::new(0),
+            last_checked_unix: AtomicI64::new(0),
+            update_count: AtomicU64::new(0),
+            not_modified_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Return an observability snapshot for management APIs & diagnostics.
+    pub fn status(&self) -> LiveIpFilterStatus {
+        let cur = self.current.load();
+        let sources_loaded = self.last_source_bodies.lock().len();
+        LiveIpFilterStatus {
+            ready: self.is_ready(),
+            entries: cur.len(),
+            v4_entries: cur.v4_len(),
+            v6_entries: cur.v6_len(),
+            sources_total: self.cfg.sources.len(),
+            sources_loaded,
+            inline_cidrs: self.cfg.inline_cidrs.len(),
+            last_updated_unix: self.last_updated_unix.load(Ordering::Acquire),
+            last_checked_unix: self.last_checked_unix.load(Ordering::Acquire),
+            update_count: self.update_count.load(Ordering::Relaxed),
+            not_modified_count: self.not_modified_count.load(Ordering::Relaxed),
+            partial_failure: self.last_partial_failure.load(Ordering::Acquire),
+            last_error: self.last_error.lock().clone(),
         }
     }
 
@@ -686,13 +760,24 @@ impl LiveIpFilter {
 
     /// Perform one concurrent refresh across all local files & HTTP(S) URLs.
     ///
-    /// - Validates every source independently BEFORE updating per-source LKG so
-    ///   corrupt responses can never poison an active filter.
+    /// - Sends `If-None-Match` / `If-Modified-Since` (`304 Not Modified`) when cached.
+    /// - Validates every modified source independently BEFORE updating per-source LKG
+    ///   so corrupt responses can never poison an active filter.
+    /// - Deduplicates combined inputs via SHA-256: if nothing changed, skips
+    ///   rebuilding the 2 MiB DIR-24-8 bitmap and skips rewriting `cache_file`!
     /// - If some sources fail transiently, retains their per-source LKG (or warm
     ///   cache body until every source has succeeded once) -> ZERO partial lockout!
-    /// - Atomically persists `cache_file` (`0600`) whenever all sources succeed.
+    /// - Atomically persists `cache_file` (`0600`) whenever all sources succeed & content changed.
     pub async fn refresh_once(&self) -> Result<usize, IpFilterError> {
+        let now_unix = Utc::now().timestamp();
+        self.last_checked_unix.store(now_unix, Ordering::Release);
+
         if self.cfg.sources.is_empty() {
+            let hash = compute_content_hash(&self.cfg.inline_cidrs, None, &[]);
+            if self.is_ready() && *self.active_content_hash.lock() == Some(hash) {
+                self.not_modified_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(self.len());
+            }
             let mut builder = IpFilterBuilder::new();
             for cidr in &self.cfg.inline_cidrs {
                 builder.push_line(cidr.trim())?;
@@ -700,12 +785,22 @@ impl LiveIpFilter {
             let compiled = builder.build();
             let count = compiled.len();
             self.current.store(Arc::new(compiled));
+            *self.active_content_hash.lock() = Some(hash);
+            *self.last_error.lock() = None;
             self.loaded_once.store(true, Ordering::Release);
             self.last_partial_failure.store(false, Ordering::Release);
-            self.last_updated_unix
-                .store(Utc::now().timestamp(), Ordering::Release);
+            self.last_updated_unix.store(now_unix, Ordering::Release);
+            self.update_count.fetch_add(1, Ordering::Relaxed);
             return Ok(count);
         }
+
+        // Snapshot existing ETag / Last-Modified validators for conditional HTTP GETs.
+        let validators: FxHashMap<String, (Option<String>, Option<String>)> = {
+            let lkg = self.last_source_bodies.lock();
+            lkg.iter()
+                .map(|(k, v)| (k.clone(), (v.etag.clone(), v.last_modified.clone())))
+                .collect()
+        };
 
         let sem = Arc::new(Semaphore::new(self.cfg.download_concurrency));
         let mut set = JoinSet::new();
@@ -716,67 +811,113 @@ impl LiveIpFilter {
             let prefer_ip = self.cfg.prefer_ip;
             let proxy_pool = self.cfg.proxy_pool.clone();
             let sock_cfg = self.cfg.sock_cfg;
+            let (etag, last_mod) = validators.get(&src).cloned().unwrap_or((None, None));
 
             set.spawn(async move {
                 let _permit = permit_sem.acquire_owned().await;
-                let fetched = fetch_single_source(
+                let fetched = fetch_single_source_conditional(
                     &src,
                     dns.as_deref(),
                     prefer_ip,
                     proxy_pool.as_ref(),
                     sock_cfg,
+                    etag.as_deref(),
+                    last_mod.as_deref(),
                 )
                 .await;
                 (src, fetched)
             });
         }
 
-        let mut fresh_bodies: Vec<(String, String)> = Vec::with_capacity(self.cfg.sources.len());
+        let mut fresh_entries: Vec<(String, SourceCacheEntry)> =
+            Vec::with_capacity(self.cfg.sources.len());
+        let mut not_modified_sources = 0usize;
         let mut failed_sources = 0usize;
+        let mut first_error: Option<String> = None;
 
         while let Some(joined) = set.join_next().await {
             let Ok((src, res)) = joined else {
                 failed_sources += 1;
+                if first_error.is_none() {
+                    first_error = Some("source fetch task panicked".to_owned());
+                }
                 continue;
             };
             match res {
-                Ok(text) => {
+                Ok(SourceFetchOutcome::NotModified) => {
+                    not_modified_sources += 1;
+                }
+                Ok(SourceFetchOutcome::Modified {
+                    text,
+                    etag,
+                    last_modified,
+                }) => {
                     // Validate parse BEFORE admitting into per-source LKG!
                     let mut validator = IpFilterBuilder::new();
                     match validator.push_ipset_str(&text) {
-                        Ok(()) => fresh_bodies.push((src, text)),
+                        Ok(()) => fresh_entries.push((
+                            src,
+                            SourceCacheEntry {
+                                body: text,
+                                etag,
+                                last_modified,
+                            },
+                        )),
                         Err(e) => {
                             warn!(source = %src, error = %e, "IP filter parse failed; keeping last-known-good");
+                            if first_error.is_none() {
+                                first_error = Some(format!("{src}: {e}"));
+                            }
                             failed_sources += 1;
                         }
                     }
                 }
                 Err(e) => {
                     warn!(source = %src, error = %e, "IP filter source download failed; keeping last-known-good");
+                    if first_error.is_none() {
+                        first_error = Some(format!("{src}: {e}"));
+                    }
                     failed_sources += 1;
                 }
             }
         }
 
-        let fresh_ok = fresh_bodies.len();
-        if fresh_ok == 0 {
+        let fresh_ok = fresh_entries.len();
+        let total_ok = fresh_ok + not_modified_sources;
+        if total_ok == 0 {
             self.last_partial_failure.store(true, Ordering::Release);
+            *self.last_error.lock() = first_error.or_else(|| {
+                Some("all IP filter sources failed; retaining previous filter".to_owned())
+            });
             return Err(IpFilterError::Io(io::Error::other(
                 "all IP filter sources failed; retaining previous filter",
             )));
         }
 
-        // Update per-source LKG map and snapshot all available source bodies.
+        // Fast-path: every source returned HTTP 304 Not Modified and we already have an active filter!
+        if fresh_ok == 0 && failed_sources == 0 && self.is_ready() {
+            self.last_partial_failure.store(false, Ordering::Release);
+            *self.last_error.lock() = None;
+            self.not_modified_count.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                entries = self.len(),
+                sources = not_modified_sources,
+                "IP filter unchanged (HTTP 304 Not Modified)"
+            );
+            return Ok(self.len());
+        }
+
+        // Update per-source LKG map and snapshot all available source bodies in deterministic order.
         let (lkg_snapshot, missing_lkg_sources) = {
             let mut lkg = self.last_source_bodies.lock();
-            for (src, body) in fresh_bodies {
-                lkg.insert(src, body);
+            for (src, entry) in fresh_entries {
+                lkg.insert(src, entry);
             }
             let mut ordered = Vec::with_capacity(self.cfg.sources.len());
             let mut missing = 0usize;
             for src in &self.cfg.sources {
-                if let Some(body) = lkg.get(src) {
-                    ordered.push(body.clone());
+                if let Some(entry) = lkg.get(src) {
+                    ordered.push(entry.body.clone());
                 } else {
                     missing += 1;
                 }
@@ -791,6 +932,27 @@ impl LiveIpFilter {
         } else {
             self.warm_cache_body.lock().clone()
         };
+
+        // SHA-256 content deduplication: skip 2 MiB DIR-24-8 rebuild & SSD cache rewrite when identical!
+        let content_hash = compute_content_hash(
+            &self.cfg.inline_cidrs,
+            fallback_cache.as_deref(),
+            &lkg_snapshot,
+        );
+        if self.is_ready() && *self.active_content_hash.lock() == Some(content_hash) {
+            self.last_partial_failure
+                .store(failed_sources > 0, Ordering::Release);
+            *self.last_error.lock() = first_error;
+            self.not_modified_count.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                entries = self.len(),
+                fresh_sources = fresh_ok,
+                not_modified_sources,
+                failed_sources,
+                "IP filter content unchanged (SHA-256 match); skipped bitmap rebuild"
+            );
+            return Ok(self.len());
+        }
 
         let mut builder = IpFilterBuilder::new();
         let want_cache_write = self.cfg.cache_file.is_some() && failed_sources == 0;
@@ -826,11 +988,13 @@ impl LiveIpFilter {
         let v6 = compiled.v6_len();
 
         self.current.store(Arc::new(compiled));
+        *self.active_content_hash.lock() = Some(content_hash);
+        *self.last_error.lock() = first_error;
         self.loaded_once.store(true, Ordering::Release);
         self.last_partial_failure
             .store(failed_sources > 0, Ordering::Release);
-        self.last_updated_unix
-            .store(Utc::now().timestamp(), Ordering::Release);
+        self.last_updated_unix.store(now_unix, Ordering::Release);
+        self.update_count.fetch_add(1, Ordering::Relaxed);
 
         if want_cache_write && let Some(cache_path) = self.cfg.cache_file.clone() {
             let lines = canonical_lines;
@@ -846,6 +1010,7 @@ impl LiveIpFilter {
             v4,
             v6,
             fresh_sources = fresh_ok,
+            not_modified_sources,
             failed_sources,
             "IP filter updated"
         );
@@ -861,7 +1026,7 @@ impl LiveIpFilter {
     /// (for updating Prometheus / StatsD gauges on every daily auto-refresh).
     ///
     /// Automatically uses 60s retry backoff whenever a previous round had partial
-    /// or full failures, returning to `update_each` once healthy.
+    /// or full failures, returning to jittered (+/-5%) `update_each` once healthy.
     pub fn spawn_refresh_loop_with_hook<F>(
         self: &Arc<Self>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -871,12 +1036,16 @@ impl LiveIpFilter {
     {
         let me = Arc::clone(self);
         tokio::spawn(async move {
+            let mut round: u64 = 0;
             loop {
-                let wait = if me.last_partial_failure.load(Ordering::Acquire) || !me.is_ready() {
+                round = round.wrapping_add(1);
+                let base_wait = if me.last_partial_failure.load(Ordering::Acquire) || !me.is_ready()
+                {
                     DEFAULT_IPFILTER_RETRY_EACH.min(me.cfg.update_each)
                 } else {
                     me.cfg.update_each
                 };
+                let wait = jitter_duration(base_wait, round);
 
                 tokio::select! {
                     () = tokio::time::sleep(wait) => {}
@@ -894,27 +1063,78 @@ impl LiveIpFilter {
     }
 }
 
-async fn fetch_single_source(
+fn compute_content_hash(
+    inline_cidrs: &[String],
+    fallback_cache: Option<&str>,
+    ordered_bodies: &[String],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for c in inline_cidrs {
+        hasher.update(c.trim().as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(b"\x00");
+    if let Some(warm) = fallback_cache {
+        hasher.update(warm.as_bytes());
+    }
+    hasher.update(b"\x00");
+    for body in ordered_bodies {
+        hasher.update(body.as_bytes());
+        hasher.update(b"\x00");
+    }
+    hasher.finalize().into()
+}
+
+/// Apply deterministic +/-5% schedule jitter so clusters don't stampede GitHub simultaneously.
+fn jitter_duration(base: Duration, round: u64) -> Duration {
+    let secs = base.as_secs();
+    if secs < 20 {
+        return base;
+    }
+    let max_jitter = (secs / 20).max(1);
+    let mix = (u64::from(std::process::id()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ round.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        % (max_jitter.saturating_mul(2).saturating_add(1));
+    let adjusted = secs.saturating_sub(max_jitter).saturating_add(mix).max(1);
+    Duration::from_secs(adjusted)
+}
+
+async fn fetch_single_source_conditional(
     src: &str,
     dns: Option<&DnsResolver>,
     prefer_ip: PreferIp,
     proxy_pool: Option<&ProxyPool>,
     sock_cfg: SocketConfig,
-) -> io::Result<String> {
+    if_none_match: Option<&str>,
+    if_modified_since: Option<&str>,
+) -> io::Result<SourceFetchOutcome> {
     if src.starts_with("http://") || src.starts_with("https://") {
         let mut last_err = None;
         for attempt in 0..2 {
-            match fetch_url_bytes_with_dns(
+            match fetch_url_conditional_with_dns(
                 src,
                 dns,
                 prefer_ip,
                 proxy_pool,
                 sock_cfg,
                 IPFILTER_FETCH_TIMEOUT,
+                if_none_match,
+                if_modified_since,
             )
             .await
             {
-                Ok(bytes) => return Ok(String::from_utf8_lossy(&bytes).into_owned()),
+                Ok(ConditionalFetch::NotModified) => return Ok(SourceFetchOutcome::NotModified),
+                Ok(ConditionalFetch::Modified {
+                    bytes,
+                    etag,
+                    last_modified,
+                }) => {
+                    return Ok(SourceFetchOutcome::Modified {
+                        text: String::from_utf8_lossy(&bytes).into_owned(),
+                        etag,
+                        last_modified,
+                    });
+                }
                 Err(e) => {
                     last_err = Some(e);
                     if attempt == 0 {
@@ -926,9 +1146,14 @@ async fn fetch_single_source(
         Err(last_err.unwrap_or_else(|| io::Error::other("download failed")))
     } else {
         let path = Path::new(src).to_path_buf();
-        tokio::task::spawn_blocking(move || fs::read_to_string(&path))
+        let text = tokio::task::spawn_blocking(move || fs::read_to_string(&path))
             .await
-            .map_err(|e| io::Error::other(format!("local file read join error: {e}")))?
+            .map_err(|e| io::Error::other(format!("local file read join error: {e}")))??;
+        Ok(SourceFetchOutcome::Modified {
+            text,
+            etag: None,
+            last_modified: None,
+        })
     }
 }
 
@@ -1110,6 +1335,62 @@ add ir-v6 2a01:5ec0::/32 -exist\r\n";
         assert!(cold.contains("2a01:5ec0::42".parse().unwrap()));
         assert!(cold.contains("127.0.0.1".parse().unwrap()));
         assert!(!cold.contains("203.0.113.9".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn conditional_etag_304_and_sha256_skip_redundant_rebuilds() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let req_count = Arc::new(AtomicU64::new(0));
+        let srv_count = Arc::clone(&req_count);
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = srv_count.fetch_add(1, Ordering::Relaxed);
+                let mut buf = [0u8; 2048];
+                let read = sock.read(&mut buf).await.unwrap();
+                let req_str = String::from_utf8_lossy(&buf[..read]);
+                if n == 1 && req_str.contains("if-none-match: \"v2026-11-22\"") {
+                    sock.write_all(
+                        b"HTTP/1.1 304 Not Modified\r\nETag: \"v2026-11-22\"\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    let body = "5.160.0.0/16\n2a01:5ec0::/32\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"v2026-11-22\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                }
+            }
+        });
+
+        let live = LiveIpFilter::from_config(LiveIpFilterConfig {
+            sources: vec![format!("http://{addr}/ir.txt")],
+            ..LiveIpFilterConfig::default()
+        });
+
+        assert_eq!(live.init_load().await.unwrap(), 2);
+        let st1 = live.status();
+        assert!(st1.ready);
+        assert_eq!(st1.update_count, 1);
+        assert_eq!(st1.not_modified_count, 0);
+
+        // Second refresh sends `If-None-Match: "v2026-11-22"` -> receives `304 Not Modified`!
+        assert_eq!(live.refresh_once().await.unwrap(), 2);
+        let st2 = live.status();
+        assert_eq!(
+            st2.update_count, 1,
+            "304 must NOT rebuild the 2 MiB bitmap!"
+        );
+        assert_eq!(st2.not_modified_count, 1);
+        assert!(live.contains("5.160.42.1".parse().unwrap()));
     }
 
     #[test]
