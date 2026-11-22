@@ -191,8 +191,16 @@ alice = "{secret_hex}"
         assert_eq!(&app_back[..16], b"HELLO-MTG-RUST!!");
         drop(client);
 
-        // Verify stats recorded alice's traffic!
+        // Verify stats recorded alice's traffic (brief bounded wait for worker core to finish
+        // `account_and_refresh_idle` after kernel socket write on loaded 2-core runners).
         let alice_rt = engine.metrics.user("alice");
+        let stats_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while (alice_rt.bytes_in.load(Ordering::Relaxed) < 16
+            || alice_rt.bytes_out.load(Ordering::Relaxed) < 16)
+            && std::time::Instant::now() < stats_deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         assert!(alice_rt.bytes_in.load(Ordering::Relaxed) >= 16);
         assert!(alice_rt.bytes_out.load(Ordering::Relaxed) >= 16);
 
