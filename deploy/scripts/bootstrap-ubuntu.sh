@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Idempotent Ubuntu 24.04 LTS host bootstrap for mtg-proxy (dev & prod).
 # Usage:
-#   bootstrap-ubuntu.sh [--dev] [--version v2.0.1]
+#   bootstrap-ubuntu.sh [--dev] [--version latest|v2.6.0]
 set -euo pipefail
 
 IS_DEV=0
-VERSION="${MTG_VERSION:-v2.0.1}"
+VERSION="${MTG_VERSION:-latest}"
 REPO="Arman2122/mtg-proxy"
 
 while [[ $# -gt 0 ]]; do
@@ -70,6 +70,13 @@ EOF
 sysctl --system >/dev/null
 
 echo "==> [5/6] Downloading & SHA-256 verifying mtg-proxy ${VERSION} release binary..."
+if [[ "$VERSION" == "latest" ]]; then
+  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
+  if [[ -z "$VERSION" ]]; then
+    echo "ERROR: could not resolve latest release tag from GitHub" >&2
+    exit 1
+  fi
+fi
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64)  ASSET_ARCH="linux-amd64" ;;
@@ -94,6 +101,10 @@ install -m 0755 "${PKG_DIR}/mtg-proxy" /usr/local/bin/mtg-proxy
 install -m 0644 "${PKG_DIR}/deploy/systemd/mtg-proxy.service" /etc/systemd/system/mtg-proxy.service
 install -m 0644 "${PKG_DIR}/deploy/sysctl.d/99-mtg-proxy.conf" /etc/sysctl.d/99-mtg-proxy.conf
 sysctl --system >/dev/null
+DEF_IFACE="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+if [[ -n "$DEF_IFACE" ]]; then
+  tc qdisc replace dev "$DEF_IFACE" root fq 2>/dev/null || true
+fi
 systemctl daemon-reload
 
 echo "==> [6/6] Installed $(/usr/local/bin/mtg-proxy --version)"

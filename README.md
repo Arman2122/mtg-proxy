@@ -12,67 +12,594 @@
 
 *One `9.6 MiB` binary. Multi-tenant governance. Hardware VAES / SHA-NI / ARMv8 crypto. `10+ GiB/s` throughput. `4.58 KiB/conn` marginal RAM.*
 
+[Quick Install](#quick-install) ·
+[5-Minute Setup](#5-minute-first-proxy-walkthrough) ·
+[Anti-DPI & Stealth](#guide-2-anti-dpi-cover-website--geo-stealth-ir-geo-db) ·
+[WEB Proxy](#guide-3-telegram-web-proxy-on-port-443--cdn) ·
+[Outbound Engine](#guide-4-bridge--relay--universal-plug-in-outbound-routing) ·
+[Management API](#guide-6-enterprise-management-api-panels--monitoring) ·
+[Benchmarks](#performance-benchmarks)
+
 </div>
 
 ---
 
-`mtg-proxy` is a censorship-resistant [Telegram MTProto proxy](https://core.telegram.org/mtproto) engineered to serve thousands of users and 100k+ concurrent connections from a single Linux process.
+`mtg-proxy` is a censorship-resistant [Telegram MTProto proxy](https://core.telegram.org/mtproto) written from the ground up in **pure Rust** for Linux (`x86_64` & `aarch64`). It serves everything from a personal single-VPS proxy to multi-thousand-user, 100k+-connection fleets from a single low-RAM process — with **100% drop-in compatibility** with `v1.x` TOML configs, Penhoon panels, FakeTLS (`ee`), Obfuscated2 (`dd`/`plain`), MiddleProxy (`ad-tag`), and Telegram's WEB proxy transport.
 
-Unlike single-secret proxies, `mtg-proxy` gives every user their own named secret, fronting hostname, traffic counters, quota/speed/address governance, and live rotation — all mutable at runtime via a REST Management API or `SIGHUP` without dropping existing connections.
+### Why `mtg-proxy`?
 
-**Version 2.0** is a complete ground-up rewrite in pure Rust targeting Linux (`x86_64` and `aarch64`) on bare metal, VMs, and containers, maintaining **100% drop-in compatibility** with `v1.x` TOML configs, Penhoon panel APIs, FakeTLS (`ee`), obfuscated2 (`dd`/`plain`), MiddleProxy (`ad-tag`), and the Telegram Desktop 7.1+ WEB proxy transport.
-
----
-
-## Table of Contents
-
-- [Architecture & Performance Benchmarks](#architecture--performance-benchmarks)
-- [How Clients Reach It](#how-clients-reach-it)
-- [Quick Start](#quick-start)
-- [Verifying Releases](#verifying-releases)
-- [Running with Docker](#running-with-docker)
-- [Production Linux Tuning (`systemd` & `sysctl`)](#production-linux-tuning-systemd--sysctl)
-- [Features](#features)
-  - [Multiple Secrets & Hot Reload](#multiple-secrets--hot-reload)
-  - [Management HTTP API, Enterprise Persistence & Multi-Core Panel Integration](#management-http-api--stats)
-  - [Universal Plug-In Outbound Traffic Engine (`[[outbound]]` & `[routing]`)](#universal-plug-in-outbound-traffic-engine)
-  - [4-Tier Connection & Speed Governance](#4-tier-connection--speed-governance-global-per-secret-per-ip--cgnat-safe-per-connection)
-  - [Per-Address Controls, Fair-Share & Bans](#per-address-controls-fair-share--bans)
-  - [Secret Rotation with Overlap](#secret-rotation-with-overlap)
-  - [Sponsored Channel (`ad-tag`)](#sponsored-channel-ad-tag)
-  - [Connection Throttling](#connection-throttling)
-  - [Unified Single-Port Multi-Transport & WEB Proxy (`web-relay`)](#unified-single-port-multi-transport--web-proxy-web-relay)
-  - [Doppelganger Cover Scouting, Post-Quantum `X25519MLKEM768` & Two-Speed Anti-DPI](#doppelganger-cover-scouting-post-quantum-x25519mlkem768--two-speed-anti-dpi)
-  - [Geo-Stealth Country Allowlist (`IR-Geo-DB`) & Cover-Only Fronting](#geo-stealth-country-allowlist-ir-geo-db--cover-only-fronting)
-  - [Public IP Override & Environment Variables](#public-ip-override--environment-variables)
-- [CLI Command Reference](#cli-command-reference)
-- [Upgrading from v1.x (Go) to v2.0 (Rust)](#upgrading-from-v1x-go-to-v20-rust)
-- [Workspace Architecture](#workspace-architecture)
-- [Documentation, Security & Contributing](#documentation-security--contributing)
-- [Credits & License](#credits--license)
-
----
-
-## Architecture & Performance Benchmarks
-
-### Key Systems Engineering
-
-| Layer | Pure-Rust v2.0 Implementation |
+| Capability | What You Get Out of the Box |
 |---|---|
-| **Thread-per-Core Runtime** | Pinned single-threaded `LocalSet` workers respecting Linux `sched_getaffinity(0)` (Docker/Kubernetes/systemd `AllowedCPUs=` cpusets) with independent per-core `SO_REUSEPORT` listen queues. |
-| **Zero-Syscall Socket Inheritance** | Tunes `TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_KEEP*`, `TCP_USER_TIMEOUT`, `TCP_NOTSENT_LOWAT`, `TCP_FASTOPEN`, and best-effort `TCP_CONGESTION=bbr` once on each listener before `listen(2)` — **0 `setsockopt` syscalls per accepted connection**. |
-| **Single-Poll Full-Duplex `DirectRelay`** | Owns `(client, dc)` directly (no `into_split()` `Arc`s), shares 1 amortized idle timer, uses zero-memmove `TlsUnframer::unframe_spans` + L1/L2-hot 128 KiB thread-local scratch (`0 B` idle I/O buffers), batches up to 8 × 16 KiB FakeTLS records per `writev(2)` (`8 sys/MB`), and locks live task frame size to **`1,776 B`** via CI unit-test guard. |
-| **Multi-Arch Hardware Crypto** | Single-pass in-place fused double-CTR (`x86_64` **VAES+AVX2** 8-block, **AES-NI** 4-block; `aarch64` **ARMv8 AES** 4-block), **Post-Quantum `X25519MLKEM768` (`0x11EC`)** & ephemeral X25519 FakeTLS handshakes (`0` heap allocs), hardware **SSE4.2 / ARMv8 CRC32C** for MiddleProxy, and multi-secret FakeTLS HMAC-SHA256 (**4-way interleaved SHA-NI**, **8-way AVX2**, **ARMv8 SHA-256**). |
-| **Zero-RTT Domain Fronting (`FrontingPool`)** | Pre-warmed standby TCP pool (liveness-checked via `MSG_PEEK \| MSG_DONTWAIT`) with reactive cover pre-warming for 0 ms proxy→cover connect RTT against active DPI probes, SNI-matched multi-cover failover, Linux `getifaddrs(3)` local-NIC anti-self-loop filtering, authentic nginx `unrecognized_name(112)` rejection option, and zero-copy Linux `splice(2)` kernel pipe relay. |
-| **Geo-Stealth IP Filter (`DIR-24-8`)** | Wait-free O(1) IPv4 DIR-24-8 bitmap (`~4 ns`) + coalesced IPv6 ranges (`~10 ns`), multi-hop GitHub redirect auto-updater (`IR-Geo-DB` / FireHOL / Linux `ipset restore`), per-source LKG retention, atomic `cache-file`, and zero-HMAC byte-0 `splice(2)` cover-only fronting for foreign IPs across both FakeTLS `ee` and `web-relay`. |
-| **High-Throughput WEB Transport (`mtg-webrelay`)** | Lock-free `TcpStream::into_split()`, `0 B` idle per-session scratch, stack-vectored `writev(2)` Shared-Frame v1 batching, fair round-robin stream coalescing, multi-acceptor `SO_REUSEPORT`, Slowloris-hardened HTTP/1.1, 16 MiB cached `StaticCover`, and Happy-Eyeballs keep-alive pooled `UpstreamCover`. |
-| **Lock-Free & Sharded State** | Cache-line-aligned per-worker admission gate & live-connection shards, per-secret sharded `AddressRegistry`, compact 32-byte `CancelToken`, vDSO `CLOCK_REALTIME_COARSE`/`CLOCK_MONOTONIC_COARSE`, and `tikv-jemallocator` (`percpu_arena:percpu`, 1s dirty/muzzy decay). |
+| **Extreme Speed & Tiny RAM** | Pinned thread-per-core Linux runtime (`SO_REUSEPORT`), single-pass fused VAES / AES-NI / ARMv8-AES crypto, `10+ GiB/s` throughput, **`4.58 KiB/conn`** marginal RAM, `0 B` idle I/O buffers. |
+| **All Transports on One Port** | Serve FakeTLS (`ee`), Obfuscated2 (`dd`/`plain`), Multi-Carrier Telegram WEB Proxy (`websocket`, `ws-lanes`, `https`, `https-lanes`, `auto`), and your cover website simultaneously on **`:443`** — zero Nginx/Caddy required. |
+| **Modern Anti-DPI Suite** | Live cover TLS 1.3 profiling (`scout-covers`), Post-Quantum `X25519MLKEM768` (`0x11EC`), Zero-RTT `splice(2)` domain fronting (`FrontingPool`), `unknown-sni-action`, Doppelganger DRS shaping, and `~4 ns` Geo-Stealth country allowlists (`IR-Geo-DB`). |
+| **Universal Outbound Engine** | Route Telegram DC & MiddleProxy traffic out over `direct://` (`SO_BINDTODEVICE` / WireGuard `wg0` / Linux `fwmark`), **Shadowsocks AEAD-2022**, SOCKS4/5, HTTP(S) CONNECT, or zero-overhead **Unix sidecars** (Xray / sing-box / VLESS+Reality / Hysteria2 / Trojan / TUIC / Tor). |
+| **4-Tier User Governance** | Lock-free GCRA speed caps, data quotas with auto-reset (`daily`/`weekly`/`monthly`), per-IP limits, CGNAT-safe per-connection speed caps, water-level fair-share, bans, kicks, and lossless `rotate-secret` with overlap. |
+| **Enterprise Panel Control Plane** | 35+ Bearer-authenticated REST endpoints, `ETag`/`If-Match` optimistic locking, real-time SSE `/events`, exact-once `/accounting/checkpoint`, 3-mode persistence (`memory` / `overlay` / `toml`), Prometheus `/metrics`, and StatsD. |
 
-### Interleaved Linux A/B Benchmarks (`Go v1.10.0` vs `Rust v2.0.0`)
+---
 
-Measured with `mtg-bench ab` (interleaved rounds, wire-interop verified on both binaries, identical configs):
+## Architecture Overview
 
-| Workload | Legacy Go (`v1.10.0`, 15 MiB) | **Rust (`v2.0.0`, 9.6 MiB)** | Improvement |
+```mermaid
+flowchart LR
+    C1["Telegram Client (ee / dd / WEB)"] --> L["Linux :443 Listener (SO_REUSEPORT + BBR/FQ)"]
+    P["Active Prober / Foreign Scanner"] --> L
+
+    L --> G["Geo-Stealth DIR-24-8 + Anti-Replay"]
+    G -->|"Unmatched / Foreign IP / Quota Hit"| F["Zero-RTT FrontingPool + splice(2)"]
+    F --> SITE["Cover Website (Local nginx/caddy or Upstream HTTPS)"]
+
+    G -->|"Authenticated (ee / dd / WEB)"| GOV["4-Tier Governance (Quota / GCRA Speed / IP / Bans)"]
+    GOV --> RELAY["DirectRelay (Fused VAES/AES-NI CTR + 8x16 KiB writev)"]
+
+    RELAY --> OUT["Universal Outbound Router (EWMA-RTT / Failover / Per-DC / Per-Secret)"]
+    OUT --> D1["Direct / WireGuard wg0 / fwmark"]
+    OUT --> D2["Shadowsocks AEAD-2022 / SOCKS5 / HTTPS"]
+    OUT --> D3["Unix Sidecar (Xray / sing-box / VLESS+Reality)"]
+    OUT --> D4["MiddleProxy Carriers (ad-tag)"]
+
+    D1 --> TG["Telegram DCs"]
+    D2 --> TG
+    D3 --> TG
+    D4 --> TG
+```
+
+---
+
+## Quick Install
+
+`mtg-proxy` runs natively on **Linux (`x86_64` and `aarch64`)** — bare metal, KVM/cloud VMs, and Docker/Kubernetes containers.
+
+### Option A — One-Command Linux Install (Recommended)
+
+Installs the latest verified GitHub release binary (`/usr/local/bin/mtg-proxy`), creates a dedicated non-root `mtg` system user, installs hardened `systemd` units, and applies Linux BBR + `fq` kernel tuning:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Arman2122/mtg-proxy/main/deploy/scripts/install.sh | sudo bash
+```
+
+<details>
+<summary>Installer options (pin version, skip systemd/sysctl, or uninstall)</summary>
+
+```bash
+# Pin a specific release tag
+curl -fsSL https://raw.githubusercontent.com/Arman2122/mtg-proxy/main/deploy/scripts/install.sh \
+  | sudo bash -s -- --version v2.6.0
+
+# Binary + user only (skip systemd & sysctl, e.g. inside containers)
+curl -fsSL https://raw.githubusercontent.com/Arman2122/mtg-proxy/main/deploy/scripts/install.sh \
+  | sudo bash -s -- --no-systemd --no-sysctl
+
+# Uninstall binary & systemd units (preserves /etc/mtg-proxy and /var/lib/mtg-proxy)
+curl -fsSL https://raw.githubusercontent.com/Arman2122/mtg-proxy/main/deploy/scripts/install.sh \
+  | sudo bash -s -- --uninstall
+```
+
+</details>
+
+### Option B — Manual Binary Download (SHA-256 Verified, No Pipe-to-Shell)
+
+```bash
+ARCH=$(uname -m | sed 's/x86_64/linux-amd64/;s/aarch64/linux-arm64/')
+TAG=$(curl -fsSL https://api.github.com/repos/Arman2122/mtg-proxy/releases/latest \
+  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
+VER="${TAG#v}"
+BASE="https://github.com/Arman2122/mtg-proxy/releases/download/${TAG}"
+
+curl -fsSLO "${BASE}/mtg-proxy-${VER}-${ARCH}.tar.gz"
+curl -fsSLO "${BASE}/mtg-proxy-${VER}-checksums.txt"
+grep -F "  mtg-proxy-${VER}-${ARCH}.tar.gz" "mtg-proxy-${VER}-checksums.txt" | sha256sum -c -
+
+tar -xzf "mtg-proxy-${VER}-${ARCH}.tar.gz"
+sudo install -m 0755 "mtg-proxy-${VER}-${ARCH}/mtg-proxy" /usr/local/bin/mtg-proxy
+mtg-proxy --version
+```
+
+### Option C — Docker & Docker Compose
+
+Multi-arch distroless images (`linux/amd64`, `linux/arm64`, `~20 MiB`) are published to GHCR (`ghcr.io/arman2122/mtg-proxy`).
+
+**10-second single-user container:**
+
+```bash
+SECRET=$(openssl rand -hex 16)
+docker run -d --name mtg-proxy --restart unless-stopped \
+  -p 443:443 \
+  -e SECRET="${SECRET}" \
+  -e SECRET_HOST="example.com" \
+  -e MTG_BIND_TO="0.0.0.0:443" \
+  ghcr.io/arman2122/mtg-proxy:latest
+
+# Print your ready-to-use tg:// proxy link
+docker exec mtg-proxy /usr/local/bin/mtg-proxy access /config/config.toml
+```
+
+**Production `docker-compose.yml` (non-root hardened + persistent config & usage state):**
+
+```yaml
+services:
+  mtg-proxy:
+    image: ghcr.io/arman2122/mtg-proxy:latest
+    container_name: mtg-proxy
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "443:443/tcp"
+      # Optional: bind Management API to host loopback only
+      - "127.0.0.1:9090:9090/tcp"
+    volumes:
+      - /etc/mtg-proxy/config.toml:/config/config.toml:ro
+      - mtg-state:/var/lib/mtg-proxy
+    # Pass --epoll if your container runtime blocks io_uring_setup via seccomp:
+    # command: ["run", "--epoll", "/config/config.toml"]
+
+volumes:
+  mtg-state:
+```
+
+> **Tip:** Make sure mounted `/etc/mtg-proxy/config.toml` is readable by uid `65534` (`chmod 0644` or `chown 65534:65534`), and ensure `/var/lib/mtg-proxy` is writable by uid `65534` when using `usage-state-file` or `cache-file`.
+
+### Option D — Build from Source (Linux, Rust 1.89+)
+
+```bash
+git clone https://github.com/Arman2122/mtg-proxy.git
+cd mtg-proxy
+cargo build --release --locked --bin mtg-proxy
+sudo install -m 0755 target/release/mtg-proxy /usr/local/bin/mtg-proxy
+```
+
+---
+
+## 5-Minute First Proxy Walkthrough
+
+After installing `/usr/local/bin/mtg-proxy` (Option A or B above), go from zero to a live production proxy in five commands:
+
+### 1. Generate a FakeTLS (`ee`) secret
+
+Use **your own domain** (best stealth) or any real, reachable TLS 1.3 hostname:
+
+```bash
+mtg-proxy generate-secret --hex example.com
+# Example output:
+# ee367a189aee18fa31c190054efd4a8e956578616d706c652e636f6d
+```
+
+### 2. Create `/etc/mtg-proxy/config.toml`
+
+```bash
+sudo tee /etc/mtg-proxy/config.toml >/dev/null <<'EOF'
+bind-to = "0.0.0.0:443"
+prefer-ip = "only-ipv4"            # Or "prefer-ipv4" / "prefer-ipv6"
+tolerate-time-skewness = "120s"
+usage-state-file = "/var/lib/mtg-proxy/usage.json"
+
+# Loopback-only Management API (protected by Bearer token)
+api-bind-to = "127.0.0.1:9090"
+api-token = "replace-with-openssl-rand-hex-32"
+
+[limits]
+max-connections-per-ip = 128
+max-new-connections-per-ip = 60
+
+[throttle]
+max-connections = 10000
+
+[defense.anti-replay]
+enabled = true
+max-size = "8mib"
+
+[defense.doppelganger]
+scout-covers = true
+pq-key-share = true
+
+# IMPORTANT: [secrets] must come AFTER all top-level keys (TOML table scoping)
+[secrets]
+alice = "ee367a189aee18fa31c190054efd4a8e956578616d706c652e636f6d"
+EOF
+
+sudo chown root:mtg /etc/mtg-proxy/config.toml
+sudo chmod 0640 /etc/mtg-proxy/config.toml
+```
+
+### 3. Validate & run diagnostics
+
+```bash
+sudo mtg-proxy run --check /etc/mtg-proxy/config.toml
+sudo mtg-proxy doctor /etc/mtg-proxy/config.toml
+```
+
+`doctor` verifies config syntax, CPU hardware crypto (`VAES`/`AES-NI`/`SHA-NI`/`ARMv8`), `io_uring`, `BBR`, NTP clock drift, fronting reachability, self-loop protection, and live Telegram DC RPC handshakes.
+
+### 4. Start on boot (and open port 443 in your firewall)
+
+```bash
+sudo systemctl enable --now mtg-proxy
+sudo systemctl status mtg-proxy --no-pager
+```
+
+### 5. Print your ready-to-share Telegram links & QR URLs
+
+```bash
+sudo mtg-proxy access /etc/mtg-proxy/config.toml
+```
+
+Whenever you edit `/etc/mtg-proxy/config.toml` later, reload live with **zero disconnects**:
+
+```bash
+sudo mtg-proxy run --check /etc/mtg-proxy/config.toml && sudo systemctl reload mtg-proxy
+```
+
+---
+
+## Step-by-Step Setup Guides
+
+### Guide 1: Multi-User Governance, Quotas, Speed Limits & Secret Rotation
+
+`mtg-proxy` enforces lock-free GCRA speed shaping and byte quotas across **four tiers** (server-wide, default-secret template, per-secret, and CGNAT-safe per-connection) — all hot-reloadable via `SIGHUP` or the Management API without dropping active connections:
+
+```toml
+usage-state-file = "/var/lib/mtg-proxy/usage.json"
+concurrency = 32768                     # Global hard TCP connection ceiling
+
+# Optional: Telegram sponsored channel tag (register bare 32-hex key with @MTProxybot)
+# ad-tag = "0123456789abcdef0123456789abcdef"
+# public-ipv4 = "203.0.113.10"
+
+[limits]
+speed = "800mbit"                       # Server-wide combined bandwidth cap
+speed-up = "400mbit"                    # Server-wide upload cap
+speed-down = "800mbit"                  # Server-wide download cap
+quota = "950GB"                         # Monthly VPS bandwidth ceiling (0 = unlimited)
+quota-reset = "monthly"                 # "none" | "daily" | "weekly" | "monthly"
+max-connections-per-ip = 64             # Global concurrent connections per IPv4 or IPv6 /64
+max-new-connections-per-ip = 25         # Connect-rate flood shield (conns/sec, burst 2x)
+conn-speed-up = "2mbit"                 # CGNAT-safe per-connection upload cap
+conn-speed-down = "8mbit"               # CGNAT-safe per-connection download cap
+
+# Defaults inherited by EVERY secret unless overridden below
+[limits.default-secret]
+client-conns = 16
+client-speed-up = "2mbit"
+client-speed-down = "10mbit"
+
+[throttle]
+max-connections = 5000                  # Fair-share connection throttling across heavy users
+check-interval = "5s"
+
+[secrets]
+alice  = "ee367a189aee18fa31c190054efd4a8e956578616d706c652e636f6d"
+shared = "ee0123456789abcdef0123456789abcd956578616d706c652e636f6d"
+
+[secret-limits.alice]
+quota = "50GB"                          # Cuts off live streams at ceiling & fronts new attempts
+quota-reset = "monthly"
+max-connections = 32                    # Hard cap across all IPs for this user
+speed = "10mbit"                        # Combined sustained cap
+speed-up = "4mbit"                      # Optional directional overrides
+speed-down = "10mbit"
+ip-limit = 2                            # Max simultaneous devices/locations (IPv4 or IPv6 /64)
+expires = "2027-01-01"                  # YYYY-MM-DD or RFC3339
+disabled = false
+
+[secret-limits.shared]
+speed = "50mbit"
+ip-limit = 30
+client-conns = 16                       # Max simultaneous connections per IP inside shared secret
+client-speed = "10mbit"                 # Static per-IP ceiling
+client-fair = true                      # 1-second water-level fair-share across active IPs
+```
+
+**Rotate a leaked secret with zero downtime (keeps old key valid during overlap):**
+
+```bash
+# Generate a new key for alice, accept the old key for 24h, and live-reload via API
+sudo mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --overlap 24h --reload
+
+# End overlap early or prune expired [[retiring-secret]] blocks
+sudo mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --end-overlap --reload
+sudo mtg-proxy rotate-secret /etc/mtg-proxy/config.toml --prune --reload
+```
+
+---
+
+### Guide 2: Anti-DPI, Cover Website & Geo-Stealth (`IR-Geo-DB`)
+
+For regions with aggressive stateful DPI (such as Iranian mobile ISPs), **pointing your own domain to your server and fronting to a real local HTTPS cover website** eliminates SNI-vs-IP mismatches and passes active probing cleanly:
+
+1. Point your domain (`your-site.com`) `A` record to your server IP.
+2. Run a real static HTTPS website (Caddy or Nginx with a valid Let's Encrypt TLS 1.3 cert) listening on **`127.0.0.1:8443`** (see [contrib/cover-site/README.md](contrib/cover-site/README.md) for ready-made Caddy templates).
+3. Generate your secret using `your-site.com` (`mtg-proxy generate-secret --hex your-site.com`) and configure `mtg-proxy`:
+
+```toml
+bind-to = "0.0.0.0:443"
+bind-to-accept = ["ee"]
+prefer-ip = "only-ipv4"
+tolerate-time-skewness = "300s"
+
+# Forward all unmatched probes & foreign IPs via zero-copy splice(2) to your local HTTPS site
+[domain-fronting]
+host = "your-site.com"
+ip = "127.0.0.1"
+port = 8443
+unknown-sni-action = "reject-handshake"  # Sends authentic nginx TLS alert 112 for wrong SNIs
+
+[defense.doppelganger]
+scout-covers = true                      # Calibrates ServerHello & cert-flight sizes from live cover
+pq-key-share = true                      # Set false if your local nginx/caddy does not negotiate ML-KEM768
+server-hello-fragment-mss = "off"        # "off" matches real 3-segment TLS 1.3; use "balanced"/"tspu" only for stateless DPI
+# Optional post-handshake record-size & burst shaping (0 latency after initial ramp):
+# enabled = true
+# drs = true
+# shaping = "burst"
+# server-hello-delay-min-ms = 5
+# server-hello-delay-max-ms = 25
+
+[defense.anti-replay]
+enabled = true
+max-size = "8mib"
+error-rate = 0.0001
+
+# Geo-Stealth Country Allowlist:
+# ONLY IPs from the allowlist can authenticate to Telegram (~4 ns DIR-24-8 lookup).
+# Every foreign IP / scanner / prober is transparently spliced to your cover website with 0 HMAC CPU —
+# even if they possess a valid leaked secret!
+[defense.allowlist]
+enabled = true
+action = "front"
+urls = [
+  "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv4.txt",
+  # Uncomment for dual-stack:
+  # "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv6.txt",
+]
+cidrs = ["127.0.0.1/32"]
+cache-file = "/var/lib/mtg-proxy/ir-allowlist.cache"
+update-each = "6h"
+download-concurrency = 4
+
+# Faster dead-flow recovery on mobile CGNAT/DPI blackholes (TCP_USER_TIMEOUT = 35s)
+[network.keep-alive]
+idle = "20s"
+interval = "5s"
+count = 3
+
+[secrets]
+main = "ee<32-hex-key><hex-encoded-your-site.com>"
+```
+
+> **Practical Anti-DPI Tip:** Avoid spoofing high-profile domains like `www.google.com` on well-known cloud VPS IPs (e.g., DigitalOcean/Hetzner/Vultr) — stateful mobile ISP DPI often flags SNI-vs-ASN mismatches and silently drops flows after the handshake. Always prefer **your own domain + local HTTPS cover site**, or pair with **Guide 3 (WEB Proxy + CDN)** or **Guide 4 (Domestic Bridge → Foreign Exit)**.
+
+---
+
+### Guide 3: Telegram WEB Proxy on Port 443 (+ CDN)
+
+`mtg-proxy` supports Telegram's **WEB proxy transport** across Desktop, Android, and iOS via five carriers (`websocket`, `ws-lanes`, `https` sequenced Conveyor with cellular-drop replay ring, HTTP/2 `https-lanes`, and self-healing `auto`) — **all directly inside `mtg-proxy run` on port `:443`** alongside `ee` and `dd` with zero Nginx/Caddy needed:
+
+```bash
+# 1. Generate the 32-byte WEB relay token signing key (chmod 0600)
+sudo -u mtg mtg-proxy generate-web-key /etc/mtg-proxy/web.key
+```
+
+```toml
+# 2. All-in-One Single-Port :443 (FakeTLS ee + Obfuscated2 dd + HTTPS WEB Relay + Cover Site)
+bind-to = "0.0.0.0:443"
+bind-to-accept = ["ee", "dd"]
+
+[web]
+enabled = true
+integrated = true                    # Runs inside `mtg-proxy run`, auto-binds internal loopback dd backend
+host = "your-site.com"
+hosts = ["alt.your-site.com"]        # Optional additional vhosts
+carrier = "auto"                     # "websocket" | "ws-lanes" | "https" | "https-lanes" | "auto"
+lanes = 2                            # Parallel lanes for ws-lanes / https-lanes
+base-path = "/api/v1"                # Stealth API path prefix
+token-key = "/etc/mtg-proxy/web.key"
+cover-dir = "/srv/site"              # Or: cover-upstream = "http://127.0.0.1:8080"
+tls-cert = "/etc/letsencrypt/live/your-site.com/fullchain.pem"  # Native h2 + HTTP/1.1 ALPN, SIGHUP-reloaded
+tls-key  = "/etc/letsencrypt/live/your-site.com/privkey.pem"
+stats-bind-to = "127.0.0.1:8100"
+
+# Optional: Spoof-proof Geo-Stealth behind Cloudflare or ArvanCloud CDN
+# Automatically fetches official CDN CIDRs and ONLY trusts CF-Connecting-IP / Ar-Real-IP
+# when the TCP peer is proven to be a genuine CDN edge IP!
+# cdn = "cloudflare"                 # "cloudflare" | "arvancloud"
+
+[secrets]
+alice = "ee367a189aee18fa31c190054efd4a8e95796f75722d736974652e636f6d"
+```
+
+Run `sudo mtg-proxy access /etc/mtg-proxy/config.toml` to print both `tg://proxy` (`ee`) and `tg://webproxy` links for every user. For standalone `mtg-proxy web-relay` deployments behind Caddy or Nginx, see [contrib/web-relay/README.md](contrib/web-relay/README.md).
+
+---
+
+### Guide 4: Bridge / Relay & Universal Plug-In Outbound Routing
+
+Route outbound Telegram DC and MiddleProxy (`ad-tag`) traffic over **any protocol** — ideal for **domestic bridge → foreign exit** setups (where users connect via native `ee` `tg://proxy` to a low-latency domestic VPS, and `mtg-proxy` tunnels traffic cleanly abroad):
+
+```toml
+# 1. Kernel line-rate WireGuard / Tailscale / sing-box TUN / secondary NIC
+[[outbound]]
+name = "wg-eu"
+url = "direct://"
+interface = "wg0"                # Linux SO_BINDTODEVICE
+fwmark = 0x100                   # Linux SO_MARK policy routing mark
+
+# 2. Hardware-accelerated Shadowsocks AEAD-2022 (SIP022) or Classic AEAD
+[[outbound]]
+name = "ss-frankfurt"
+url = "ss://2022-blake3-aes-256-gcm:<base64-32-byte-psk>@198.51.100.10:8388"
+
+# 3. Zero-TCP-overhead Unix Domain Socket sidecar (Xray / sing-box / VLESS+Reality / Hysteria2 / Trojan / TUIC / Tor)
+[[outbound]]
+name = "xray-reality"
+url = "unix+socks5:///run/xray/socks.sock"
+
+# Also supported: socks5://, socks5h://, socks4://, socks4a://, http://, https:// (TLS 1.3 CONNECT), unix://, unix+http://
+
+# Load-balancing & automatic circuit-breaker failover group
+[[outbound-group]]
+name = "eu-egress"
+strategy = "failover"            # "ewma-rtt" | "failover" | "weighted" | "round-robin" | "hash-dc"
+members = ["wg-eu", "ss-frankfurt", "xray-reality", "direct"]
+
+[routing]
+default-outbound = "eu-egress"
+
+# Optional per-Telegram-DC outbound overrides
+[routing.dc]
+2 = "wg-eu"
+4 = "ss-frankfurt"
+
+# Optional per-user outbound override
+[secret-limits.vip]
+outbound = "xray-reality"
+```
+
+Hot-swap outbounds and routing rules at runtime with zero dropped connections via `PUT /outbounds`, and probe live DC RTT through any outbound via `POST /outbounds/{name}/probe`.
+
+---
+
+### Guide 5: Production Linux Kernel Tuning (`BBR` + `fq` + `systemd`)
+
+Ready-to-deploy production templates live in `deploy/`:
+
+- [deploy/sysctl.d/99-mtg-proxy.conf](deploy/sysctl.d/99-mtg-proxy.conf) — `fq` + `bbr`, `tcp_ecn = 0`, 65,535 listen/SYN backlogs, 16 MiB TCP buffer auto-tuning, `tcp_mtu_probing = 1`, `tcp_fastopen = 3`, `tcp_notsent_lowat = 16384`, `fs.file-max = 2097152`.
+- [deploy/systemd/mtg-proxy.service](deploy/systemd/mtg-proxy.service) — least-privilege hardened unit (`User=mtg`, `CAP_NET_BIND_SERVICE` only, `ProtectSystem=strict`, `MemoryDenyWriteExecute=yes`, `LimitNOFILE=1048576`, `ExecReload=/bin/kill -HUP $MAINPID`).
+- [deploy/systemd/mtg-web-relay.service](deploy/systemd/mtg-web-relay.service) — dedicated hardened unit for standalone `web-relay`.
+- [deploy/scripts/bootstrap-ubuntu.sh](deploy/scripts/bootstrap-ubuntu.sh) — full Ubuntu 24.04 LTS host bootstrapper (NTP `chrony`, SSH key-only hardening, sysctl, verified binary, systemd).
+- [deploy/scripts/deploy-release.sh](deploy/scripts/deploy-release.sh) — zero-downtime atomic SSH release deployer with automatic health-check rollback.
+
+> **Important Linux BBR Gotcha:** `net.core.default_qdisc = fq` in `sysctl` only applies to *newly created* interfaces. On an already-running server, activate `fq` immediately on your primary NIC so BBR gets kernel packet pacing instead of falling back to `fq_codel`:
+>
+> ```bash
+> IFACE=$(ip route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+> sudo tc qdisc replace dev "$IFACE" root fq
+> tc qdisc show dev "$IFACE"   # should show: qdisc fq ...
+> ```
+> *(Our `install.sh` and `bootstrap-ubuntu.sh` scripts do this automatically.)*
+
+---
+
+### Guide 6: Enterprise Management API, Panels & Monitoring
+
+Enable the HTTP Management API with Bearer auth and choose your runtime persistence mode:
+
+```toml
+api-bind-to = "127.0.0.1:9090"
+api-token = "replace-with-strong-random-token"
+track-client-ips = false             # Privacy default: client IPs omitted & never written to disk
+
+[api]
+# "memory"  (default) - zero disk writes; ideal when an external VPN panel DB owns state (PUT /state)
+# "overlay"           - crash-safe atomic 0600 SHA-256 JSON overlay (flock + fsync + rename); keeps config.toml GitOps-clean
+# "toml"              - lossless toml_edit writeback directly into config.toml (preserving comments)
+persistence = "overlay"
+state-file = "/var/lib/mtg-proxy/runtime-state.json"
+
+[stats.prometheus]
+enabled = true
+bind-to = "127.0.0.1:3129"
+http-path = "/metrics"
+metric-prefix = "mtg"
+```
+
+**Quick API examples:**
+
+```bash
+AUTH="Authorization: Bearer replace-with-strong-random-token"
+
+# Liveness, live stats & panel capabilities
+curl -s -H "$AUTH" http://127.0.0.1:9090/healthz
+curl -s -H "$AUTH" http://127.0.0.1:9090/stats
+curl -s -H "$AUTH" http://127.0.0.1:9090/capabilities
+
+# Add a user live with 50 GB monthly quota and 10 Mbit/s speed cap
+curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+  http://127.0.0.1:9090/secrets \
+  -d '{"name":"bob","secret":"ee0123456789abcdef0123456789abcd6578616d706c652e636f6d","quota":"50GB","quota_reset":"monthly","speed":"10mbit","ip_limit":2}'
+
+# Top up a user's quota atomically (+20 GB) without resending their key
+curl -s -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+  http://127.0.0.1:9090/secrets/bob \
+  -d '{"add_quota":"20GB"}'
+
+# Stream real-time mutation events (SSE, zero polling)
+curl -N -H "$AUTH" http://127.0.0.1:9090/events
+```
+
+Every response includes strong `ETag: "rev-N"` and `X-State-Revision: N`. Pass `If-Match: "rev-N"` on mutations for optimistic concurrency control (`412 Precondition Failed` on stale revisions).
+
+<details>
+<summary><strong>Full Management HTTP API Reference (35+ Endpoints)</strong></summary>
+
+| Category | Method & Path | Description |
+|---|---|---|
+| **Core & Panel Discovery** | `GET /healthz` | Lightweight liveness/readiness probe (uptime, connections, active secrets, IP filters). |
+| | `GET /capabilities` | Multi-core panel discovery (`protocol`, `transports`, `outbound_protocols`, `persistence`, `boot_id`, `state_revision`, `features`). |
+| | `GET /state` / `PUT /state` | Export or atomically converge full mutable state (secrets, limits, ad-tags, outbounds, routing) in one call. |
+| | `GET /events` | Real-time Server-Sent Events (`text/event-stream`) stream of live control-plane changes. |
+| | `POST /reload` | Full async hot-reload of `config.toml` (secrets, limits, ad-tags, throttle, fronting, allowlist/blocklist). |
+| **Accounting & Stats** | `GET /stats` | Global & per-user counters, `listeners`, `obfuscated`, `faketls_handshake`, and `throttle` status. |
+| | `GET /accounting` | Multi-tenant billing ledger (`bytes_in`, `bytes_out`, `total_connections`, `quota_used`/`remaining`, `quota_cutoffs`, `last_seen`). |
+| | `POST /accounting/flush` | Immediate crash-safe atomic flush of `usage-state-file` to disk. |
+| | `POST /accounting/checkpoint` | Exact-once per-consumer distributed billing deltas (`boot_id`, `sequence`, `peek`, `counter_reset`). |
+| **Secrets CRUD** | `GET /secrets` | List all secrets with mode, host, effective ad-tag, limits, retiring info, and live usage. |
+| | `GET /secrets/{name}` | Inspect one named secret (`404` if missing). |
+| | `POST /secrets` | Add or update one secret (key, optional `ad_tag`, and governance limits). |
+| | `PATCH /secrets/{name}` | Partial atomic account update (`add_quota`, `reset_quota`, `disabled`, `expires`, `max_connections`, speed/IP limits). |
+| | `PUT /secrets` | Atomically replace the entire secret set while preserving active retiring keys of retained names. |
+| | `POST /secrets/batch` | Atomic bulk `upsert` + `delete` in a single lock-free `ArcSwap` swap. |
+| | `DELETE /secrets/{name}` | Delete one secret (`409` if it is the last remaining secret). |
+| **Session & Abuse Control** | `POST /secrets/{name}/reset-quota` | Zero a secret's `quota_used` counter and restart its quota period. |
+| | `POST /secrets/{name}/disconnect` | Immediately disconnect all active streams for a secret without banning. |
+| | `POST /secrets/{name}/kick` | Immediately close active streams matching specified `{"ips":[...]}` (`O(K)` indexed). |
+| | `GET /secrets/{name}/clients?limit=N` | Per-address usage sorted by bytes moved (default 100, max 1,000; IPs shown only if `track-client-ips = true`). |
+| | `GET/PUT/DELETE /secrets/{name}/external-ips` | View, report (`{"ips":[...],"ttl":"90s"}`), or clear external cluster IPs counted toward `ip-limit`. |
+| | `POST/GET /secrets/{name}/bans` | Temporarily ban addresses (`{"ips":[...],"ttl":"1h","force"?}`) and kick live streams. |
+| | `DELETE /secrets/{name}/bans/{address}` | Unban an IPv4 address or IPv6 `/64` prefix. |
+| **Global Governance** | `GET /limits` | Inspect live server-wide `[limits]` (concurrency, global speed/quota, per-IP caps, `conn-speed`, rejections). |
+| | `PUT /limits` / `PATCH /limits` | Live atomic update of server-wide `[limits]` without restarting. |
+| | `POST /limits/reset-quota` | Reset the server-wide `[limits]` quota counter to zero. |
+| **Outbounds & Routing** | `GET /outbounds` / `PUT /outbounds` | Inspect live RTT/dials/circuit breakers or hot-swap `[[outbound]]`, `[[outbound-group]]`, and `[routing]`. |
+| | `POST /outbounds/{name}/probe` | Actively dial Telegram DC through outbound `{name}` (bypassing open circuit) and return live RTT. |
+| **IP Filters & Ad-Tags** | `GET /ip-filters` | Inspect allowlist/blocklist CIDR counts, ETag/304 hits, SHA-256 hash, and refresh state. |
+| | `POST /ip-filters/refresh` | Trigger synchronous conditional HTTP (`If-None-Match` / `304`) refresh of allowlist/blocklist feeds. |
+| | `GET/PUT/DELETE /adtag` | Read, set (`32` hex chars), or clear the global sponsored-channel `ad_tag`. |
+
+</details>
+
+---
+
+## Performance Benchmarks
+
+Measured on Linux using `mtg-bench ab` (interleaved rounds, wire-interop verified on both binaries, identical configs):
+
+| Workload | Legacy Go (`v1.10.0`, 15 MiB) | **Pure Rust (`v2.x`, 9.6 MiB)** | Improvement |
 |---|---:|---:|---:|
 | **5,000 Idle FakeTLS Conns — Total RSS** | `307.6 MiB` | **`39.8 MiB`** | **7.7× less total RAM** |
 | **5,000 Idle FakeTLS Conns — Per Conn** | `58.92 KiB/conn` | **`5.38 KiB/conn`** | **10.95× less RAM/conn** |
@@ -80,495 +607,129 @@ Measured with `mtg-bench ab` (interleaved rounds, wire-interop verified on both 
 | **32-Stream Raw `dd` Throughput** | `4.92–5.67 GiB/s` | **`10.80–12.34 GiB/s`** | **2.0–2.2× faster** |
 | **32-Stream Raw `dd` CPU / `p99.9` Tail** | `1.01 CPU-s/GB` / `39.7 ms` | **`0.50–0.54 CPU-s/GB` / `1.31–1.58 ms`** | **1.9× less CPU, up to 30× tighter tail** |
 | **32-Stream FakeTLS `ee` Throughput** | `0.08–0.09 GiB/s` | **`9.68–10.70 GiB/s`** (`16 sys/MB`) | **~115× faster, 11.7× fewer syscalls** |
-| **5,000-Secret FakeTLS Scan (1-core bench)** | `~6.5 ms` | **`357.8 µs`** (4-way SHA-NI) | **~18× faster** |
+| **5,000-Secret FakeTLS Scan (1-core)** | `~6.5 ms` | **`357.8 µs`** (4-way SHA-NI) | **~18× faster** |
 | **5,000-Secret Live Handshake Flood (`p50`)** | `3.9–6.0 ms` (`3.9k–5.5k hs/s`) | **`1.24–1.51 ms`** (peak **`9,710 hs/s`**) | **3–4× lower median latency** |
 
----
-
-## How Clients Reach It
-
-Three entry paths share one set of users. A secret is 16 key bytes; the prefix tells the *client* which door to use, so one user keeps a single name, quota bucket, and counter set across every transport:
-
-| Transport | Listener | Secret Form | Network Appearance |
-|---|---|---|---|
-| **FakeTLS** | `bind-to` (default `:443`) | `ee…` | Realistic TLS 1.3 handshake to your fronting domain; unmatched or denied traffic is transparently `splice(2)`-fronted. |
-| **Obfuscated2** | `[[listener]]` | `dd…` or bare 32-hex | Raw obfuscated2 TCP stream (keep on loopback behind a carrier unless `public = true`). |
-| **WEB Proxy** | HTTPS origin via `web-relay` | `dd…` | Genuine TLS + browser WebView loading an HTTPS page and opening a WebSocket (Telegram Desktop 7.1.2+). |
-
----
-
-## Quick Start
-
-### Option 1 — Download a Prebuilt Linux Binary
-
-Grab the latest `linux-amd64` or `linux-arm64` archive from [Releases](https://github.com/Arman2122/mtg-proxy/releases) and verify it (see [Verifying Releases](#verifying-releases)).
-
-### Option 2 — Build from Source (Linux `x86_64` or `aarch64`, Rust 1.89+)
-
-```bash
-git clone https://github.com/Arman2122/mtg-proxy.git
-cd mtg-proxy
-cargo build --release --bin mtg-proxy
-# Produces target/release/mtg-proxy (~9.6 MiB, fat-LTO stripped)
-```
-
-### Generate Secrets, Write a Config & Run
-
-```bash
-# Generate FakeTLS secrets (choose a real, reachable HTTPS CDN/domain)
-mtg-proxy generate-secret --hex storage.googleapis.com
-```
-
-```toml
-# /etc/mtg-proxy/config.toml
-bind-to = "0.0.0.0:443"
-api-bind-to = "127.0.0.1:9090"
-api-token = "replace-with-strong-random-token"
-usage-state-file = "/var/lib/mtg-proxy/usage.json"
-
-[throttle]
-max-connections = 5000
-
-# [secrets] must appear after all top-level keys (TOML table scoping rule).
-[secrets]
-alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
-bob   = "ee0123456789abcdef0123456789abcd9573746f726167652e676f6f676c65617069732e636f6d"
-```
-
-Validate, diagnose, run, and print client links:
-
-```bash
-mtg-proxy run --check /etc/mtg-proxy/config.toml
-mtg-proxy doctor /etc/mtg-proxy/config.toml
-mtg-proxy run /etc/mtg-proxy/config.toml
-mtg-proxy access /etc/mtg-proxy/config.toml
-```
-
----
-
-## Verifying Releases
-
-Every tagged release publishes:
-
-- `mtg-proxy-<version>-linux-amd64.tar.gz` and `mtg-proxy-<version>-linux-arm64.tar.gz`
-- `mtg-proxy-<version>-checksums.txt` (SHA-256)
-- `mtg-proxy-<version>-sbom.spdx.json` (SPDX 2.3 Rust Cargo SBOM)
-- Signed Sigstore / in-toto [build provenance attestations](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds)
-
-```bash
-VERSION=2.0.0
-PKG=mtg-proxy-${VERSION}-linux-amd64
-BASE="https://github.com/Arman2122/mtg-proxy/releases/download/v${VERSION}"
-
-# 1. Verify SHA-256 checksum
-curl -sfLO "${BASE}/${PKG}.tar.gz"
-curl -sfLO "${BASE}/mtg-proxy-${VERSION}-checksums.txt"
-sha256sum -c --ignore-missing "mtg-proxy-${VERSION}-checksums.txt"
-
-# 2. Verify signed Sigstore provenance attestation
-gh attestation verify "${PKG}.tar.gz" \
-    --repo Arman2122/mtg-proxy \
-    --signer-workflow Arman2122/mtg-proxy/.github/workflows/release.yml
-
-# 3. Verify container image provenance
-gh attestation verify "oci://ghcr.io/arman2122/mtg-proxy:${VERSION}" \
-    --repo Arman2122/mtg-proxy \
-    --signer-workflow Arman2122/mtg-proxy/.github/workflows/docker-publish.yml
-```
-
-See [SECURITY.md](SECURITY.md) for the full verification & threat model specification.
-
----
-
-## Running with Docker
-
-Multi-arch images (`linux/amd64`, `linux/arm64`, `gcr.io/distroless/cc-debian12`) are published to GHCR and ship with a working default config at `/config/config.toml`, supporting zero-config env-var launches:
-
-```bash
-docker run -d --name mtg -p 443:443 \
-    -e SECRET=00112233445566778899aabbccddeeff \
-    -e SECRET_HOST=storage.googleapis.com \
-    -e TAG=3f40462915a3e6026a4d790127b95ded \
-    -e MTG_BIND_TO=0.0.0.0:443 \
-    ghcr.io/arman2122/mtg-proxy:latest
-```
-
-Or mount your own config file (recommended with `--user 65534:65534` for non-root hardening):
-
-```bash
-docker run -d --name mtg -p 443:443 --user 65534:65534 \
-    -v /etc/mtg-proxy/config.toml:/config/config.toml:ro \
-    ghcr.io/arman2122/mtg-proxy:latest
-```
-
-> **Note for non-root containers & strict seccomp:** Make sure the mounted config is readable by uid `65534` (`0640`/`0644`), and if running under a strict seccomp profile that audits `io_uring_setup`, pass `run --epoll /config/config.toml`. `:latest` only moves on tagged releases; `main` builds publish under `sha-<commit>`.
-
----
-
-## Production Linux Tuning (`systemd` & `sysctl`)
-
-Ready-to-deploy production templates are shipped in `deploy/`:
-
-- [deploy/sysctl.d/99-mtg-proxy.conf](deploy/sysctl.d/99-mtg-proxy.conf) — enables `fq` + `bbr`, 65,535 listen/SYN backlogs, 16 MiB TCP buffer auto-tuning, `tcp_fastopen = 3`, `tcp_notsent_lowat = 16384`, and `fs.file-max = 2097152`.
-- [deploy/systemd/mtg-proxy.service](deploy/systemd/mtg-proxy.service) — least-privilege systemd unit (`CAP_NET_BIND_SERVICE` only, `ProtectSystem=strict`, `MemoryDenyWriteExecute=yes`, `LimitNOFILE=1048576`, `ExecReload=/bin/kill -HUP $MAINPID`).
-- [deploy/systemd/mtg-web-relay.service](deploy/systemd/mtg-web-relay.service) — dedicated hardened systemd unit for `mtg-proxy web-relay`.
-
-```bash
-sudo install -m 0755 target/release/mtg-proxy /usr/local/bin/mtg-proxy
-sudo install -m 0644 deploy/sysctl.d/99-mtg-proxy.conf /etc/sysctl.d/99-mtg-proxy.conf
-sudo sysctl --system
-sudo install -m 0644 deploy/systemd/mtg-proxy.service /etc/systemd/system/mtg-proxy.service
-sudo systemctl daemon-reload && sudo systemctl enable --now mtg-proxy
-```
-
----
-
-## Features
-
-### Multiple Secrets & Hot Reload
-
-Define one named secret per user under `[secrets]` (single-secret `secret = "..."` still works and maps to `default`). Reload changes without restarting or dropping active users via `SIGHUP` (`systemctl reload mtg-proxy`) or `POST /reload`:
-
-```bash
-curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:9090/reload
-```
-
-Hot reload atomically swaps `[secrets]`, `ad-tag`, `[secret-ad-tags]`, `[secret-limits]`, and `[[retiring-secret]]`. Removed or re-keyed secrets close immediately (unless covered by a `[[retiring-secret]]` overlap); untouched users remain connected with all counters preserved.
-
-### Management HTTP API & Stats
-
-Configure `api-bind-to` (bind to loopback unless `api-token` is set — verified in constant time via `Authorization: Bearer <token>`):
-
-| Method & Path | Description |
-|---|---|
-| `GET /healthz` | Lightweight liveness/readiness probe (uptime, connections, active secrets, IP filter state). |
-| `GET /stats` | Live global & per-user counters, `features` capability list, `listeners`, `obfuscated`, `faketls_handshake`, and `throttle` state. |
-| `GET /accounting` | Enterprise multi-tenant billing ledger (`bytes_in`, `bytes_out`, `total_connections`, `quota_used`/`remaining`, `quota_cutoffs`, `last_seen`, all limits). |
-| `POST /accounting/flush` | Force an immediate crash-safe atomic flush of `usage-state-file` to disk. |
-| `GET /limits` | Inspect live server-wide `[limits]` (concurrency, global speed/quota, per-IP conn/rate caps, CGNAT-safe `conn-speed`, rejection counts). |
-| `PUT /limits` / `PATCH /limits` | Live atomic update of global `concurrency`, `throttle_max_connections`, `speed*`, `quota`, `max_connections_per_ip`, `max_new_connections_per_ip`, and `conn_speed*`. |
-| `POST /limits/reset-quota` | Reset the server-wide `[limits]` quota counter to zero immediately. |
-| `POST /reload` | Full async hot-reload: `[secrets]`, limits, ad-tags, retiring-secrets, `[throttle]`, `track-client-ips`, `tolerate-time-skewness`, `[domain-fronting]`, and `[defense.allowlist]`/`[defense.blocklist]`. |
-| `GET /secrets` | List all secrets with mode, host, effective ad-tag, limits, retiring info, and live usage. |
-| `POST /secrets` | Add or update one secret (key, optional `ad_tag`, and any governance limits). |
-| `PATCH /secrets/{name}` | Partial atomic account mutation (top-up `add_quota`, `reset_quota`, `disabled`, `expires`, `max_connections`, speed/IP limits) without resending the secret key. |
-| `PUT /secrets` | Atomically replace the entire secret set while keeping active retiring keys of retained names. |
-| `POST /secrets/batch` | Atomic bulk `upsert` + `delete` in a single lock-free `ArcSwap` swap (ideal for billing panels). |
-| `GET /secrets/{name}` | Inspect one named secret and its live counters (`404` if missing). |
-| `DELETE /secrets/{name}` | Delete one secret (`409` if it is the last remaining secret). |
-| `POST /secrets/{name}/reset-quota` | Reset a secret's `quota_used` counter to zero and restart its quota period. |
-| `POST /secrets/{name}/disconnect` | Immediately disconnect ALL live streams for this secret without banning. |
-| `POST /secrets/{name}/kick` | Immediately close live streams matching specified `ips` (O(K) indexed lookup). |
-| `GET /secrets/{name}/external-ips` | View local & externally reported active addresses and `ip_limit`. |
-| `PUT /secrets/{name}/external-ips` | Report external addresses (`{"ips":[...],"ttl":"90s"}`) counted toward `ip-limit`. |
-| `DELETE /secrets/{name}/external-ips` | Clear external address report. |
-| `GET /secrets/{name}/clients` | Per-address usage sorted by bytes moved (`?limit=N`, default 100, max 1,000). |
-| `POST /secrets/{name}/bans` | Temporarily ban addresses from a secret (`{"ips":[...],"ttl":"1h","force"?}`) and kick live streams. |
-| `GET /secrets/{name}/bans` | List active bans for a secret (addresses shown only when `track-client-ips = true`). |
-| `DELETE /secrets/{name}/bans/{address}` | Unban one IPv4 address or IPv6 `/64` prefix. |
-| `GET /ip-filters` | Inspect live `[defense.allowlist]` / `[defense.blocklist]` status (CIDR counts, ETag/304 hits, SHA-256 content hash, last refresh). |
-| `POST /ip-filters/refresh` | Trigger synchronous conditional HTTP (`If-None-Match` / `304`) refresh of allowlist/blocklist feeds. |
-| `GET /adtag` / `PUT /adtag` / `DELETE /adtag` | Read, set (`32` hex chars), or clear the global sponsored-channel `ad_tag`. |
-| `GET /capabilities` | Multi-core VPN panel core discovery (`protocol`, `transports`, `outbound_protocols`, `persistence`, `boot_id`, `state_revision`, `api_capabilities`, `features`). |
-| `GET /state` / `PUT /state` | Export or atomically converge the entire mutable runtime state (secrets, limits, ad-tags, outbounds, groups, routing) in ONE call. |
-| `GET /events` | Zero-polling real-time Server-Sent Events (`text/event-stream`) stream of live control-plane mutations. |
-| `POST /accounting/checkpoint` | Exact-once per-consumer distributed multi-node billing deltas (`boot_id`, `sequence`, `peek`, `counter_reset` detection). |
-| `GET /outbounds` / `PUT /outbounds` | Inspect live outbound RTT/dials/circuit breakers or hot-swap `[[outbound]]`, `[[outbound-group]]` & `[routing]` with zero dropped connections. |
-| `POST /outbounds/{name}/probe` | Actively dial Telegram DC through outbound `{name}` (bypassing open circuit) and return live RTT. |
-
-- **Optimistic Concurrency (`ETag` & `If-Match`):** Every API response includes strong `ETag: "rev-N"` and `X-State-Revision: N`. Passing `If-Match: "rev-N"` on any mutation guarantees safe concurrent panel writes (`412 Precondition Failed` on stale revisions; omit `If-Match` for full Penhoon/legacy compatibility).
-- **3-Mode Runtime Persistence (`[api] persistence`):** Choose `"memory"` (default — zero disk writes for external panel DBs), `"overlay"` (crash-safe atomic `0600` SHA-256 checksummed JSON `state-file` with `flock(2)` + `fsync` + `rename`, keeping `config.toml` clean & GitOps-immutable while surviving reboots), or `"toml"` (lossless `toml_edit` + `flock(2)` writeback directly into `config.toml` preserving operator comments).
-
-> **Privacy default (`track-client-ips = false`):** Client IP addresses (`connected_ips`, `last_ip`, per-address IP listings) are omitted by default and never written to disk; `usage-state-file` persists byte quotas only.
-
-Prometheus (`/metrics`, including `mtg_outbound_dials_total`, `mtg_outbound_rtt_ms`, and `mtg_outbound_circuit_open`) and StatsD UDP exporters are also built in under `[stats.prometheus]` and `[stats.statsd]`.
-
-### Universal Plug-In Outbound Traffic Engine
-
-Route outbound Telegram DC and MiddleProxy (`ad-tag`) traffic through **any protocol** — at zero overhead on direct TCP, with per-node lock-free circuit breakers, EWMA-RTT P2C / Failover / Weighted / Round-Robin / Hash-DC load balancing, per-DC routing, per-secret overrides, and live `PUT /outbounds` hot-swaps:
-
-```toml
-# 1. Kernel line-rate WireGuard / Tailscale / sing-box TUN / multi-NIC routing
-[[outbound]]
-name = "wg-de"
-url = "direct://"
-interface = "wg0"        # Linux SO_BINDTODEVICE
-fwmark = 0x100           # Linux SO_MARK policy routing mark
-
-# 2. Hardware-accelerated Shadowsocks AEAD-2022 (SIP022) & Classic AEAD
-[[outbound]]
-name = "ss-frankfurt"
-url = "ss://2022-blake3-aes-256-gcm:<base64-32-byte-psk>@198.51.100.10:8388"
-
-# 3. Zero-TCP-overhead Linux Unix domain socket sidecar (Xray / sing-box / VLESS+Reality / Hysteria2 / Trojan / TUIC / Tor)
-[[outbound]]
-name = "xray-reality"
-url = "unix+socks5:///run/xray/socks.sock"
-
-# 4. Also supports socks5://, socks5h://, socks4://, socks4a://, http://, https:// (TLS 1.3 CONNECT), unix://, unix+http://
-
-[[outbound-group]]
-name = "eu-egress"
-strategy = "failover"    # "ewma-rtt" | "failover" | "weighted" | "round-robin" | "hash-dc"
-members = ["wg-de", "ss-frankfurt", "xray-reality", "direct"]
-
-[routing]
-default-outbound = "eu-egress"
-[routing.dc]
-2 = "wg-de"
-
-[secret-limits.vip]
-outbound = "xray-reality"
-```
-
-### 4-Tier Connection & Speed Governance (Global, Per-Secret, Per-IP & CGNAT-Safe Per-Connection)
-
-Enforce lock-free GCRA bandwidth shaping, connection limits, and data quotas across **all four tiers** — hot-reloadable via `SIGHUP`, `POST /reload`, or live `PUT/PATCH /limits` with zero dropped connections:
-
-```toml
-usage-state-file = "/var/lib/mtg-proxy/usage.json"
-concurrency = 32768               # Hot-reloadable global hard TCP cap
-
-[limits]
-speed = "800mbit"                 # Server-wide combined bandwidth cap (up + down)
-speed-up = "400mbit"              # Server-wide upload cap
-speed-down = "800mbit"            # Server-wide download cap
-quota = "950GB"                   # Server-wide monthly data ceiling (prevents VPS overage!)
-quota-reset = "monthly"           # "none" | "daily" | "weekly" | "monthly"
-max-connections-per-ip = 64       # Global concurrent connections per IPv4 / IPv6 /64
-max-new-connections-per-ip = 25   # Global connect-rate flood shield (conns/sec, burst 2x)
-conn-speed-up = "2mbit"           # CGNAT-safe per-connection upload cap
-conn-speed-down = "8mbit"         # CGNAT-safe per-connection download cap
-
-# Optional defaults inherited by EVERY secret unless overridden in [secret-limits.<name>]:
-[limits.default-secret]
-client-conns = 16
-client-speed-up = "2mbit"
-client-speed-down = "10mbit"
-
-[secret-limits.alice]
-quota = "10GB"            # human size or bare bytes
-quota-reset = "monthly"   # "none" (default), "daily", "weekly", or "monthly"
-max-connections = 32      # hard concurrent connection cap for this account across all IPs
-speed = "5mbit"           # combined up+down sustained cap (lock-free GCRA)
-speed-up = "2mbit"        # optional directional caps (speed-up / speed-down)
-speed-down = "5mbit"
-ip-limit = 2              # max simultaneous places (IPv4 or IPv6 /64)
-conn-speed-down = "4mbit" # per-connection override for this secret
-expires = "2026-12-31"    # RFC3339 or YYYY-MM-DD
-disabled = false
-```
-
-- Exceeded quotas cut off live streams at the ceiling (`quota_cutoffs`) and transparently front new attempts to the cover site so probers cannot distinguish limited users from invalid secrets.
-- Speed limits pace without buffering (backpressure stays in the kernel TCP window) and update live on reload without dropping connections.
-
-### Per-Address Controls, Fair-Share & Bans
-
-Inside a shared secret, prevent a single heavy address from starving others:
-
-```toml
-[secret-limits.shared]
-speed = "50mbit"
-ip-limit = 30
-client-conns = 16         # max simultaneous connections per IPv4 / IPv6 /64
-client-speed = "10mbit"   # per-address static speed ceiling
-client-fair = true        # 1-second water-level fair-share across active addresses
-```
-
-### Secret Rotation with Overlap
-
-Rotate a leaked link without disconnecting legitimate users simultaneously:
-
-```bash
-mtg-proxy rotate-secret /etc/mtg-proxy/config.toml alice --overlap 24h --reload
-```
-
-Writes the new primary key into `[secrets]` (preserving comments and formatting via lossless TOML editing) and records the previous key in `[[retiring-secret]]` with an absolute `until` timestamp guarded by a monotonic `RotationClock`. Supports `--end-overlap`, `--prune`, `--host`, `--dry-run`, `--reload`, and `--force`.
-
-### Sponsored Channel (`ad-tag`)
-
-```toml
-ad-tag = "0123456789abcdef0123456789abcdef"
-public-ipv4 = "1.2.3.4"
-
-[secret-ad-tags]
-bob = "fedcba9876543210fedcba9876543210"
-```
-
-Register the **bare 32-hex key** (without `ee` or hostname) with [@MTProxybot](https://t.me/MTProxybot). `mtg-proxy` multiplexes eligible streams over persistent AES-256-CBC MiddleProxy carriers and falls back transparently to direct Telegram DCs if a carrier is unreachable.
-
-### Connection Throttling
-
-```toml
-[throttle]
-max-connections = 5000
-check-interval = "5s"
-```
-
-Recomputes per-user fair-share connection caps automatically: light users keep all their slots while heavy consumers share the remaining budget equally (existing streams are never killed).
-
-### Unified Single-Port Multi-Transport & WEB Proxy (`web-relay`)
-
-`mtg-proxy` supports **both** dedicated listeners (`[[listener]]` + standalone `mtg-proxy web-relay`) **and** all-in-one single-port `:443` multiplexing (`ee` + `dd`/`plain` + HTTPS `web-relay` + cover website from ONE process on ONE port, with zero Nginx/Caddy required!):
-
-```toml
-# All-in-One Single-Port :443 (FakeTLS ee + Obfuscated2 dd + HTTPS WEB Relay + Cover Site)
-bind-to = "0.0.0.0:443"
-bind-to-accept = ["ee", "dd"]       # Optional: also accept dd (or plain) on :443 alongside ee!
-
-[web]
-enabled = true
-integrated = true                   # Runs inside `mtg-proxy run`, auto-binds internal loopback dd backend!
-host = "example.com"
-hosts = ["alt.example.com"]         # Optional multi-vhost secondary domains
-carrier = "auto"                    # "websocket" | "ws-lanes" | "https" | "https-lanes" | "auto" (Desktop + Android + iOS!)
-lanes = 2                           # Parallel lanes for ws-lanes / https-lanes
-base-path = "/api/v1"               # Optional stealth API mount prefix (e.g. "/cdn/v2")
-token-key = "/etc/mtg-proxy/web.key"
-cover-dir = "/srv/site"             # or cover-upstream = "http://127.0.0.1:8080"
-tls-cert = "/etc/letsencrypt/live/example.com/fullchain.pem"  # Native HTTP/2 (h2) + HTTP/1.1 ALPN, hot-reloaded on SIGHUP!
-tls-key  = "/etc/letsencrypt/live/example.com/privkey.pem"
-stats-bind-to = "127.0.0.1:8100"
-```
-
-- **Multi-Carrier Support (Desktop, Android & iOS):** Supports classic RFC 6455 `websocket`, parallel `ws-lanes`, iOS WKWebView / strict-CDN-friendly sequenced **`https` Conveyor** (`POST /up` with `X-Up-Seq` out-of-order reassembly + `GET /down` with 64-batch/4 MiB cellular-drop replay ring), native HTTP/2 **`https-lanes`** & full-duplex **`POST /stream`**, and self-healing **`auto`** failover — served over native HTTP/2 (`h2` ALPN / `h2c`) AND lock-free HTTP/1.1 WebSockets!
-
-- **CDN-Aware Spoof-Proof Geo-Stealth (`cdn = "cloudflare" | "arvancloud"`):** When running `[web]` behind Cloudflare, ArvanCloud, or a custom CDN alongside `[defense.allowlist]` (such as `IR-Geo-DB`), CDN edge IPs are foreign and would otherwise conflict with a country allowlist. Setting `cdn = "cloudflare"` (or `cdn = "arvancloud"`, or custom `trusted-proxies` / `trusted-proxy-urls` + `client-ip-header`) automatically fetches and refreshes official CDN edge CIDRs, peels trusted CDN hops right-to-left, and **only** trusts `CF-Connecting-IP` / `Ar-Real-IP` when network routing proves the request arrived from a real CDN CIDR — **100% immune to direct-to-origin header spoofing**!
-- **Standalone Mode:** You can still run `mtg-proxy web-relay /etc/mtg-proxy/config.toml` as a separate process behind Caddy/Nginx (`[[listener]]` + `[web] bind-to` + `[web] backend`). Features a 3-tier anti-oracle origin, per-page 128-bit CSP nonces, strict RFC 6455 WebSocket framing, and automatic 2-second config-file watch + `SIGHUP` secret/TLS reloads. See [contrib/web-relay/README.md](contrib/web-relay/README.md) for Caddy examples.
-
-### Doppelganger Cover Scouting, Post-Quantum `X25519MLKEM768` & Two-Speed Anti-DPI
-
-`mtg-proxy` mirrors real 2026 TLS 1.3 web handshakes down to the exact cipher suite, extension order, Post-Quantum `X25519MLKEM768` (`0x11EC`, `1,210 B`) `ServerHello`, and certificate-flight size — while keeping the bulk data plane at full MTU wire speed (`128 KiB` 8-record `writev(2)`):
-
-```toml
-tolerate-time-skewness = "120s" # Mobile-friendly default (boot-time <120s also auto-accepted)
-# ignore-time-skew = false      # Optional: accept arbitrary client clock drift (HMAC + anti-replay still enforced)
-
-[domain-fronting]
-unknown-sni-action = "front"    # "front" (default) | "reject-handshake" (nginx alert 112) | "drop"
-
-[defense.doppelganger]
-scout-covers = true                  # Live per-SNI raw PQ ServerHello + cert-flight profiling (0 data-plane latency!)
-pq-key-share = true                  # Mirror 1,210 B Post-Quantum X25519MLKEM768 when offered by iOS/Chrome clients
-server-hello-fragment-mss = "balanced" # Two-speed Linux MSG_EOR splitting on ServerHello ONLY ("off"|"extreme"|"tspu"|"balanced"|88..=1400)
-# shaping = "burst"                  # Optional: TTFB pacing (<=35ms cap) + DRS ramp after >1s idle, then 128 KiB wire speed
-# drs = true                         # Optional: Dynamic Record Sizing (1450 -> 4096 -> 16384 B)
-```
-
-Live background TLS scouting probes each hosted cover domain with a real PQ `X25519MLKEM768` `ClientHello` to capture its exact `ServerHelloProfile` (TLS 1.3 cipher suite, PQ vs X25519 selection, extension ordering, and certificate-flight noise size) and publishes calibrated per-SNI profiles atomically via `ArcSwap` — even when `shaping` and `drs` are disabled for zero data-plane latency.
-
-- **Two-Speed `MSG_EOR` ServerHello Fragmentation:** Splits only the `ServerHello` flight across kernel-MSS-aware TCP segments (`TCP_INFO tcpi_snd_mss` minus TCP timestamps) via Linux `send(MSG_EOR | MSG_DONTWAIT | MSG_NOSIGNAL)` to defeat stateless DPI inspection while leaving all bulk chat/media transfers at full MTU.
-- **RFC 793 True Half-Close & TLS Alert Hygiene:** Properly handles client `TLS Alert (0x15)` `close_notify` and TCP `FIN` half-closes (`SHUT_WR`) so in-flight Telegram messages and media chunks finish cleanly without truncation or mobile reconnect loops.
-- **Hardware CRC32C & Abridged MiddleProxy (`ad-tag`):** Automatically negotiates `RPC_FLAG_USE_CRC32C` (`x86_64` SSE4.2 / `aarch64` ARMv8 CRC instructions), supports `Abridged` / `Intermediate` / `PaddedIntermediate` framing, binds SOCKS5 `BND.ADDR` into the KDF, monitors carrier EWMA RTT via `RPC_PING`/`RPC_PONG`, and drains carriers cleanly on Telegram proxy-secret rotations.
-
-### Geo-Stealth Country Allowlist (`IR-Geo-DB`) & Cover-Only Fronting
-
-Restrict proxy authentication to a specific country's IP ranges (for example, Iran via daily-updated [IR-Geo-DB](https://github.com/Arman2122/IR-Geo-DB)) while presenting a genuine cover website to every foreign scanner, probe, or censor — **even if a foreign prober holds a valid leaked `ee` secret or WEB bridge link**:
-
-```toml
-[defense.allowlist]
-enabled = true
-action = "front"             # Default for allowlist: stealth cover-only (never TCP-RST/drop!)
-urls = [
-    "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv4.txt",
-    "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir-ipv6.txt",
-    # Or single combined Linux ipset restore file (IPv4 + IPv6):
-    # "https://github.com/Arman2122/IR-Geo-DB/releases/latest/download/ir.ipset",
-]
-# Optional inline CIDRs always permitted (e.g., loopback / operator IP)
-cidrs = ["127.0.0.1/32", "::1/128"]
-# Atomic on-disk cache (0600) for instant cold boot & GitHub outage resilience
-cache-file = "/var/lib/mtg-proxy/ir-allowlist.cache"
-update-each = "12h"
-download-concurrency = 4
-```
-
-- **Zero-Fingerprint Cover-Only Fronting (`action = "front"`):**
-  - **FakeTLS (`ee`):** Rejected foreign IPs skip secret scanning completely (**0 HMAC CPU**) and enter zero-copy Linux `splice(2)` directly to the cover website from byte 0 (for single/fixed covers) or SNI-matched cover (for multi-domain covers). Allowed country IPs both browse the cover website normally AND authenticate to Telegram via `ee` secrets at ~4 ns DIR-24-8 lookup cost.
-  - **WEB Relay (`web-relay`):** Rejected foreign IPs hitting any path — even a leaked `/?bridge=<cap>` or `/api/v1/ws` — silently receive the Tier-3 cover website with bridge/bearer atoms stripped so nothing leaks to upstream logs and zero 404 oracle exists.
-- **Enterprise Auto-Update & Resilience:** Uses conditional HTTP (`ETag`/`If-None-Match` and `Last-Modified`/`If-Modified-Since` → `304 Not Modified`), SHA-256 content deduplication (skips 2 MiB DIR-24-8 rebuilds and SSD cache rewrites when unchanged), ±5% fleet schedule jitter, multi-hop HTTP `301/302/307/308` GitHub release redirects, parse-before-swap validation, per-source Last-Known-Good (LKG) retention, `60s` retry backoff on partial outages, atomic `0600` on-disk `cache-file`, live `SIGHUP`/`POST /reload` config hot-reload, and Management API observability (`GET /ip-filters`, `POST /ip-filters/refresh`).
-
-### Public IP Override & Environment Variables
-
-```toml
-public-ipv4 = "1.2.3.4"
-public-ipv6 = "2001:db8::1"
-```
-
-Environment variables always override the config file (re-applied on every reload):
-
-| Variable | Precedence Alias | Purpose |
-|---|---|---|
-| `SECRET` | `MTG_SECRET` | Full secret (`ee…`/base64) or bare 16-byte hex key (paired with `SECRET_HOST`). |
-| `SECRET_HOST` | `MTG_SECRET_HOST` | Fronting hostname when `SECRET` is a bare 16-byte hex key. |
-| `TAG` | `MTG_TAG` | Global sponsored-channel `ad-tag` (empty clears it). |
-| `MTG_BIND_TO` | — | Comma-separated `host:port` list overriding `bind-to`. |
-
----
-
-## CLI Command Reference
-
-| Command | Description |
-|---|---|
-| `mtg-proxy run [--check] [--workers N] [--epoll] <config>` | Run the full proxy with `SIGHUP` reload and API. `--check` strictly validates config & exits. `--workers N` overrides pinned core count. `--epoll` skips startup `io_uring` probing for strict seccomp sandboxes. |
-| `mtg-proxy simple-run <bind-to> <secret> [flags]` | Run a single-secret proxy directly from CLI flags without a config file. |
-| `mtg-proxy generate-secret [--hex] [--mode ee\|dd\|plain] [hostname]` | Generate a cryptographically random secret (`--hex`/`-x` for hex, default base64). |
-| `mtg-proxy access [--ipv4 IP] [--ipv6 IP] [--port N] [--hex] <config>` | Print `tg://` / `t.me` / `tg://webproxy` links and QR URLs as JSON. |
-| `mtg-proxy doctor [--skip-native-check] <config>` | Diagnose config, CPU hardware crypto (`VAES`/`AES-NI`/`SHA-NI`/`ARMv8`), cgroup CPU affinity, kernel capabilities, SNTP clock skew, fronting reachability, SNI self-loop check, and live Telegram DC RPC probes. |
-| `mtg-proxy rotate-secret <config> <name> [flags]` | Losslessly rotate a secret with optional `--overlap`, `--end-overlap`, `--prune`, `--dry-run`, `--reload`. |
-| `mtg-proxy web-relay [--check] <config>` | Run the standalone WEB proxy relay with `SIGHUP` + 2-second config watcher. |
-| `mtg-proxy generate-web-key <path>` | Generate a 32-byte WEB relay token signing key (`0600`). |
-| `mtg-proxy version` / `--version` / `-v` | Print version, target triple, and git revision. |
-
-See [example.config.toml](example.config.toml) for every supported option and default value.
-
----
-
-## Upgrading from v1.x (Go) to v2.0 (Rust)
-
-- **Config files & env vars:** Drop-in compatible. Run `mtg-proxy run --check /etc/mtg-proxy/config.toml` before swapping binaries.
-- **`usage-state-file`:** Identical JSON schema; existing quota counters carry over seamlessly.
-- **Management API & Penhoon panels:** All 19 endpoints, Bearer auth, status codes, and JSON payloads are unchanged.
-- **Platform note:** `v2.0.0` targets Linux (`x86_64` and `aarch64`) exclusively; macOS/Windows/BSD server builds are not provided.
-
----
-
-## Workspace Architecture
+<details>
+<summary><strong>Deep Systems Engineering & Workspace Layout</strong></summary>
+
+- **Thread-per-Core Runtime:** Pinned single-threaded `LocalSet` workers respecting Linux `sched_getaffinity(0)` (Docker/Kubernetes/systemd `AllowedCPUs=`) with independent per-core `SO_REUSEPORT` listen queues.
+- **Zero-Syscall Socket Inheritance:** Tunes `TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_KEEP*`, `TCP_USER_TIMEOUT`, `TCP_NOTSENT_LOWAT`, `TCP_FASTOPEN`, and `TCP_CONGESTION=bbr` once on each listener before `listen(2)` — **0 `setsockopt` syscalls per accepted connection**.
+- **Single-Poll `DirectRelay`:** Owns `(client, dc)` directly without `into_split()` `Arc`s, shares 1 amortized idle timer, uses zero-memmove `TlsUnframer::unframe_spans` + 128 KiB thread-local scratch (`0 B` idle buffers), batches up to `8 × 16 KiB` FakeTLS records per `writev(2)`, and locks live task frame size to **`1,776 B`** via CI guard.
+- **Multi-Arch Hardware Crypto:** Fused in-place double-CTR (`x86_64` VAES+AVX2 8-block, AES-NI 4-block; `aarch64` ARMv8 AES 4-block), multi-secret FakeTLS HMAC-SHA256 (4-way SHA-NI, 8-way AVX2, ARMv8 SHA-256), and hardware SSE4.2 / ARMv8 CRC32C for MiddleProxy.
+- **Allocator:** `tikv-jemallocator` configured with `percpu_arena:percpu`, 1s dirty/muzzy decay, and background threads.
 
 ```text
 mtg-proxy/
 ├── Cargo.toml                  # 11-crate Rust 2024 workspace (fat LTO, abort, strip)
 ├── crates/
 │   ├── mtg-core/               # Secrets, IpUnit, limits, monotonic RotationClock
-│   ├── mtg-crypto/             # VAES/AES-NI/ARMv8-AES fused-CTR, 4-way SHA-NI / 8-way AVX2 / ARMv8-SHA2
+│   ├── mtg-crypto/             # VAES/AES-NI/ARMv8-AES fused-CTR, SHA-NI/AVX2/ARMv8-SHA2, PQ FakeTLS
 │   ├── mtg-protocol/           # TLS unframer, PROXY v1/v2, MiddleProxy RPC, Doppelganger MLE/DRS, dcprobe
-│   ├── mtg-net/                # Linux sockopts, cgroup affinity, epoll/io_uring, splice(2), DoH/DoT, DC router
-│   ├── mtg-governance/         # Sharded AddressRegistry, ClientTable, GCRA + fair-share, bans, anti-replay, FireHOL
-│   ├── mtg-webrelay/           # WEB proxy origin, strict RFC 6455 WS, bridge page/CSP, 2s live watcher
+│   ├── mtg-net/                # Linux sockopts, epoll/io_uring, splice(2), DoH/DoT, DC router, Universal Outbounds
+│   ├── mtg-governance/         # Sharded AddressRegistry, 4-tier GCRA + fair-share, bans, anti-replay, DIR-24-8
+│   ├── mtg-webrelay/           # Multi-carrier WEB proxy (WS, HTTPS Conveyor, h2), CSP bridge, CDN IP trust
 │   ├── mtg-config/             # Strict TOML parser, env overlays, redaction, lossless toml_edit rotation
-│   ├── mtg-engine/             # Pinned workers, DirectRelay, splice fronting, live Doppelganger scout, metrics
-│   ├── mtg-api/                # 19-route Penhoon Management API, Prometheus & StatsD exporters
-│   ├── mtg-cli/                # mtg-proxy binary, tikv-jemallocator, SIGHUP reload, doctor
+│   ├── mtg-engine/             # Pinned workers, DirectRelay, FrontingPool, live Doppelganger scout, metrics
+│   ├── mtg-api/                # 35+ route Enterprise Management API, SSE, checkpoints, persistence, Prometheus/StatsD
+│   ├── mtg-cli/                # mtg-proxy binary, tikv-jemallocator, SIGHUP reload, doctor, access, rotate-secret
 │   └── mtg-bench/              # Interleaved Linux A/B benchmark & wire-interop verifier
-├── deploy/                     # Production systemd units & sysctl.d Linux kernel tuning
+├── deploy/                     # Installer, Ubuntu bootstrapper, atomic deployer, systemd units & sysctl.d tuning
+├── contrib/                    # Ready-made Caddy/Nginx/HAProxy configs for cover sites, SNI routing & web-relay
 ├── fuzz/                       # 8 libFuzzer harnesses covering every untrusted parser
 ├── test/webbridge/             # Live Chromium Playwright harness (36 checks)
 └── tests/golden/               # Byte-exact FakeTLS, obfs2, MiddleProxy, config & rotation golden fixtures
 ```
 
+</details>
+
+---
+
+## CLI Command Reference & Environment Variables
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `mtg-proxy run [--check] [--workers N] [--epoll] <config>` | Run the proxy with `SIGHUP` hot-reload and API. `--check` strictly validates config & exits; `--epoll` skips `io_uring` probing under strict seccomp. |
+| `mtg-proxy simple-run <bind-to> <secret> [flags]` | Run a single-secret proxy directly from CLI flags without a config file. |
+| `mtg-proxy generate-secret [--hex\|-x] [--mode ee\|dd\|plain] [hostname]` | Generate a cryptographically random secret (default base64; `-x` for hex). |
+| `mtg-proxy access [--ipv4 IP] [--ipv6 IP] [--port N] [--hex] <config>` | Print `tg://` / `t.me` / `tg://webproxy` links and QR URLs as JSON. |
+| `mtg-proxy doctor [--skip-native-check] <config>` | Full diagnostic check: config, CPU crypto, `io_uring`, `BBR`, SNTP clock drift, fronting, IP filters, and live Telegram DC RPC probes. |
+| `mtg-proxy rotate-secret <config> [name] [flags]` | Losslessly rotate a secret with `--overlap`, `--host`, `--end-overlap`, `--prune`, `--dry-run`, `--reload`, `--force`. |
+| `mtg-proxy web-relay [--check] <config>` | Run standalone WEB proxy relay with `SIGHUP` + 2-second live config watcher. |
+| `mtg-proxy generate-web-key <path>` | Generate a 32-byte WEB relay token signing key (`0600`). |
+| `mtg-proxy version` / `-v` / `--version` | Print version, target triple, and git revision. |
+
+### Environment Variables
+
+Environment variables always override the config file (and are re-applied on every reload):
+
+| Variable | Precedence Alias | Purpose |
+|---|---|---|
+| `SECRET` | `MTG_SECRET` | Full secret (`ee…`/base64) or bare 16-byte hex key (paired with `SECRET_HOST`). |
+| `SECRET_HOST` | `MTG_SECRET_HOST` | Fronting hostname when `SECRET` is a bare 16-byte hex key. |
+| `TAG` | `MTG_TAG` | Global sponsored-channel `ad-tag` (empty string clears it). |
+| `MTG_BIND_TO` | — | Comma-separated `host:port` list overriding `bind-to`. |
+
+See [example.config.toml](example.config.toml) for every supported TOML key and default value.
+
+---
+
+## Verifying Releases (Supply-Chain Security)
+
+Every tagged release publishes Linux `amd64`/`arm64` archives, SHA-256 checksums, an **SPDX 2.3 Rust Cargo SBOM**, and signed **Sigstore / in-toto build provenance attestations**:
+
+```bash
+VERSION=2.6.0
+PKG="mtg-proxy-${VERSION}-linux-amd64"
+BASE="https://github.com/Arman2122/mtg-proxy/releases/download/v${VERSION}"
+
+# 1. Verify SHA-256 checksum
+curl -fsSLO "${BASE}/${PKG}.tar.gz"
+curl -fsSLO "${BASE}/mtg-proxy-${VERSION}-checksums.txt"
+sha256sum -c --ignore-missing "mtg-proxy-${VERSION}-checksums.txt"
+
+# 2. Verify signed Sigstore provenance attestation (release tarball)
+gh attestation verify "${PKG}.tar.gz" \
+  --repo Arman2122/mtg-proxy \
+  --signer-workflow Arman2122/mtg-proxy/.github/workflows/release.yml
+
+# 3. Verify signed Sigstore provenance attestation (GHCR container image)
+gh attestation verify "oci://ghcr.io/arman2122/mtg-proxy:${VERSION}" \
+  --repo Arman2122/mtg-proxy \
+  --signer-workflow Arman2122/mtg-proxy/.github/workflows/docker-publish.yml
+```
+
+See [SECURITY.md](SECURITY.md) for the complete verification guide and threat model.
+
+---
+
+## Troubleshooting & Upgrading
+
+| Symptom | Quick Check / Fix |
+|---|---|
+| **First-step diagnostic for any issue** | Run `sudo mtg-proxy doctor /etc/mtg-proxy/config.toml` — checks config, NTP clock skew, fronting reachability, IP filters, and live DC RPCs in ~1 second. |
+| **Messages slow / stuck "Connecting" on mobile ISPs** | 1. Verify BBR + `fq` qdisc is active on your NIC (`tc qdisc show` should show `fq`, not `fq_codel`). 2. Check NTP clock drift (`chronyc tracking`). 3. Avoid `www.google.com` cover on well-known VPS ranges; use your own domain + local cover site (Guide 2), WEB Proxy + CDN (Guide 3), or a domestic bridge (Guide 4). |
+| **Permission denied binding port `443`** | Run via `deploy/systemd/mtg-proxy.service` (grants `CAP_NET_BIND_SERVICE` to non-root `mtg`), or run `sudo setcap cap_net_bind_service=+ep /usr/local/bin/mtg-proxy`. |
+| **Container seccomp blocks `io_uring_setup`** | Pass `--epoll` (`mtg-proxy run --epoll /config/config.toml`) to skip the startup `io_uring` probe cleanly. |
+| **Upgrading from `v1.x` (Go) to `v2.x` (Rust)** | **Drop-in compatible** with `v1.x` TOML configs, `usage-state-file`, and Penhoon panels. Run `mtg-proxy run --check /etc/mtg-proxy/config.toml` before swapping binaries. Note: `v2.x` targets Linux (`x86_64` / `aarch64`) exclusively. |
+
 ---
 
 ## Documentation, Security & Contributing
 
-- **[Changelog](CHANGELOG.md)** — full release history and `v2.0.0` migration notes.
-- **[Wiki Documentation](https://github.com/Arman2122/mtg-proxy/wiki)** — deep guides on installation, configuration, WEB relay setup, monitoring, and security.
-- **[Security Policy](SECURITY.md)** — private vulnerability reporting, release attestation verification, and known side-channel notes.
-- **[Contributing Guide](CONTRIBUTING.md)** — Rust build/lint/test commands, ARM64 cross-checks, Playwright bridge harness, and performance guardrails.
+- **[Full Example Config](example.config.toml)** — every configuration option documented with defaults.
+- **[Changelog](CHANGELOG.md)** — full release history and upgrade notes.
+- **[Wiki Documentation](https://github.com/Arman2122/mtg-proxy/wiki)** — deep guides on installation, configuration, WEB relay, monitoring, and security.
+- **[Contrib Templates](contrib/)** — production Caddy, Nginx, and HAProxy recipes for cover sites, SNI routing, and standalone WEB relays.
+- **[Security Policy](SECURITY.md)** — private vulnerability disclosure, attestation verification, and side-channel notes.
+- **[Contributing Guide](CONTRIBUTING.md)** — build/lint/test commands, ARM64 cross-checks, Playwright bridge harness, and performance guardrails.
 
 ---
 
 ## Credits & License
 
-`mtg-proxy` originated as a fork of [9seconds/mtg](https://github.com/9seconds/mtg) by Sergey Arkhipov and contributors, expanded with multi-user governance, the Penhoon Management API, MiddleProxy ad-tags, secret rotation, the WEB proxy transport, and completely re-architected in pure Rust for v2.0.
+`mtg-proxy` originated as a fork of [9seconds/mtg](https://github.com/9seconds/mtg) by Sergey Arkhipov and contributors, expanded with multi-tenant governance, the enterprise Management API, universal pluggable outbounds, MiddleProxy ad-tags, secret rotation, the multi-carrier WEB proxy transport, and completely re-engineered in pure Rust for v2.x.
 
 Licensed under the [MIT License](LICENSE).
