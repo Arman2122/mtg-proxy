@@ -14,8 +14,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use mtg_config::{
-    Config, HandshakeBudgetMode, IpFilterAction, ListConfig, ListenerPolicy, PreferIp,
-    UnknownSniAction,
+    ApiPersistenceMode, Config, HandshakeBudgetMode, IpFilterAction, ListConfig, ListenerPolicy,
+    PreferIp, UnknownSniAction,
 };
 use mtg_core::{
     GlobalLimits, IpUnit, ModeSet, QuotaReset, RetiringSecret, RotationClock, Secret, SecretLimits,
@@ -29,19 +29,25 @@ use mtg_governance::{
     ScanBudgetConfig, SecretSet,
 };
 use mtg_net::{
-    DEFAULT_CARRIERS_PER_DC, DcRouter, DnsResolver, MiddleProxyPool, ProxyPool, SocketConfig,
-    coarse_now_ns, coarse_realtime_ns,
+    DEFAULT_CARRIERS_PER_DC, DcRouter, DnsResolver, MiddleProxyPool, OutboundGroupSpec,
+    OutboundRouter, OutboundSnapshot, OutboundSpec, OutboundStrategy, OutboundTarget, ProxyPool,
+    RoutingSpec, SocketConfig, coarse_now_ns, coarse_realtime_ns,
 };
 use mtg_protocol::doppel::{DoppelParams, ShapingMode};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tracing::{info, warn};
 
 use crate::cancel::CancelToken;
 use crate::metrics::ProxyMetrics;
+use crate::persistence::{
+    BillingCheckpointReport, BillingTracker, EngineEvent, GlobalLimitsSnapshot,
+    RUNTIME_STATE_SCHEMA_VERSION, RuntimeStateSnapshot, SecretLimitsSnapshot, default_overlay_path,
+    if_match_satisfied, load_overlay_verified, save_overlay_atomic, save_toml_atomic,
+};
 
 /// vDSO `CLOCK_REALTIME_COARSE` timestamp converted to `DateTime<Utc>` (~2 ns, zero syscalls).
 #[inline]
@@ -134,6 +140,8 @@ pub enum EngineError {
     Ban(#[from] BanError),
     #[error("reload failed: {0}")]
     Reload(String),
+    #[error("state persistence failed: {0}")]
+    Persistence(String),
 }
 
 /// Result of evaluating `[defense.blocklist]` and `[defense.allowlist]` for a client IP.
@@ -210,6 +218,8 @@ pub struct SecretPatch {
     pub conn_speed_bytes_per_second: Option<i64>,
     pub conn_speed_up_bytes_per_second: Option<i64>,
     pub conn_speed_down_bytes_per_second: Option<i64>,
+    /// `Some(Some(name))` sets a named outbound override; `Some(None)` clears it.
+    pub outbound: Option<Option<String>>,
 }
 
 /// Partial live update payload for `PATCH /limits` (updates only specified global knobs).
@@ -332,6 +342,9 @@ impl DoppelState {
 pub struct EngineSettings {
     pub config_path: Option<PathBuf>,
     pub usage_state_file: Option<PathBuf>,
+    pub api_persistence: ApiPersistenceMode,
+    pub state_file: Option<PathBuf>,
+    pub legacy_proxies: Vec<String>,
     pub api_bind_to: Option<String>,
     pub api_token: String,
     pub bind_to: Vec<String>,
@@ -390,7 +403,17 @@ pub struct ProxyEngine {
     pub x25519_keys: X25519KeyRing,
     pub doppel: DoppelState,
     pub metrics: Arc<ProxyMetrics>,
+    pub persistence_mode: ApiPersistenceMode,
+    pub state_file: Option<PathBuf>,
 
+    /// Monotonic control-plane state revision (powers strong HTTP `ETag` & `If-Match`).
+    state_revision: AtomicU64,
+    /// Monotonic SSE event ID sequence.
+    event_seq: AtomicU64,
+    /// Zero-polling real-time control-plane event broadcast bus (`GET /events`).
+    event_tx: broadcast::Sender<EngineEvent>,
+    /// Per-consumer distributed multi-node billing delta tracker (`POST /accounting/checkpoint`).
+    billing: Mutex<BillingTracker>,
     /// Broadcasts a monotonic revision counter whenever `secrets` swaps (so embedded
     /// `[web] integrated = true` syncs instantaneously without 2s polling!).
     secret_sync_tx: watch::Sender<u64>,
@@ -460,13 +483,76 @@ impl ProxyEngine {
                 .map_err(|e| EngineError::Invalid(format!("dns init failed: {e}")))?,
         );
 
-        let proxy_pool = match &cfg.network.proxies {
-            Some(urls) if !urls.is_empty() => Some(
-                ProxyPool::from_urls(urls, sock_cfg, tcp_timeout)
+        let legacy_proxies: Vec<String> = cfg.network.proxies.clone().unwrap_or_default();
+        let proxy_pool = if legacy_proxies.is_empty() {
+            None
+        } else {
+            Some(
+                ProxyPool::from_urls(&legacy_proxies, sock_cfg, tcp_timeout)
                     .map_err(|e| EngineError::Invalid(e.to_string()))?,
-            ),
-            _ => None,
+            )
         };
+
+        let api_persistence = cfg.api.persistence.unwrap_or(ApiPersistenceMode::Memory);
+        let state_file = match api_persistence {
+            ApiPersistenceMode::Overlay => Some(
+                cfg.api
+                    .state_file
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(
+                        || default_overlay_path(config_path.as_deref()),
+                        PathBuf::from,
+                    ),
+            ),
+            ApiPersistenceMode::Memory | ApiPersistenceMode::Toml => cfg
+                .api
+                .state_file
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+        };
+
+        // Load persisted overlay snapshot BEFORE building SecretSet & OutboundRouter when
+        // `[api] persistence = "overlay"` so restarts seamlessly restore live API state!
+        let overlay_snap = if api_persistence == ApiPersistenceMode::Overlay
+            && let Some(ref sf) = state_file
+        {
+            match load_overlay_verified(sf) {
+                Ok(snap) => snap,
+                Err(e) => {
+                    return Err(EngineError::Persistence(format!(
+                        "failed to load overlay state {}: {e}",
+                        sf.display()
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        let (initial_ob_specs, initial_ob_groups, initial_routing) =
+            if let Some(ref ov) = overlay_snap {
+                (
+                    ov.outbounds.clone(),
+                    ov.outbound_groups.clone(),
+                    ov.routing.clone(),
+                )
+            } else {
+                config_to_outbound_specs(cfg)?
+            };
+        let outbound_router = Arc::new(
+            OutboundRouter::build(
+                &initial_ob_specs,
+                &initial_ob_groups,
+                initial_routing,
+                &legacy_proxies,
+                &dns,
+                sock_cfg,
+                Vec::new(),
+            )
+            .map_err(|e| EngineError::Invalid(format!("outbound router init failed: {e}")))?,
+        );
 
         let dc_router = Arc::new(
             DcRouter::new(
@@ -476,7 +562,8 @@ impl ProxyEngine {
                 tcp_timeout,
                 proxy_pool.clone(),
             )
-            .with_dns(Arc::clone(&dns)),
+            .with_dns(Arc::clone(&dns))
+            .with_outbound_router(outbound_router),
         );
 
         let middleproxy = Arc::new(MiddleProxyPool::new(
@@ -546,14 +633,51 @@ impl ProxyEngine {
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
         };
 
+        // If an overlay snapshot was loaded at boot, overlay secrets/limits/ad-tags/concurrency!
+        let (secret_set, initial_concurrency, initial_throttle, initial_global_limits, initial_rev) =
+            if let Some(ref ov) = overlay_snap {
+                let (ov_secrets, ov_limits, ov_tags, ov_global_tag) =
+                    parse_runtime_snapshot_secrets(ov)?;
+                let retiring = cfg.get_retiring_secrets(now).usable;
+                let merged_set = SecretSet::build(
+                    &ov_secrets,
+                    &ov_limits,
+                    &ov_tags,
+                    ov_global_tag,
+                    &retiring,
+                    None,
+                );
+                info!(
+                    revision = ov.revision,
+                    secrets = merged_set.records.len(),
+                    outbounds = ov.outbounds.len(),
+                    "restored persisted runtime state overlay"
+                );
+                (
+                    merged_set,
+                    ov.concurrency,
+                    ov.throttle_max_connections,
+                    GlobalLimits::from(&ov.global_limits),
+                    ov.revision.max(1),
+                )
+            } else {
+                (
+                    secret_set,
+                    cfg.concurrency.unwrap_or(8192),
+                    cfg.throttle.max_connections.unwrap_or(0),
+                    cfg.get_global_limits(),
+                    1,
+                )
+            };
+
         let metrics = Arc::new(ProxyMetrics::new(
             workers,
-            cfg.throttle.max_connections.unwrap_or(0),
+            initial_throttle,
             cfg.throttle
                 .check_interval
                 .unwrap_or(Duration::from_secs(5)),
         ));
-        metrics.global_limits.apply(&cfg.get_global_limits());
+        metrics.global_limits.apply(&initial_global_limits);
 
         // Pre-register every configured secret & sync ceilings/speed limits.
         for (name, rec) in &secret_set.records {
@@ -610,6 +734,9 @@ impl ProxyEngine {
         let settings = EngineSettings {
             config_path,
             usage_state_file: usage_path,
+            api_persistence,
+            state_file: state_file.clone(),
+            legacy_proxies,
             api_bind_to: cfg.api_bind_to.as_ref().map(|h| h.as_str().to_owned()),
             api_token: (*cfg.api_token).clone(),
             bind_to: cfg.bind_to.iter().map(|b| b.as_str().to_owned()).collect(),
@@ -618,7 +745,7 @@ impl ProxyEngine {
             proxy_protocol_listener: cfg.proxy_protocol_listener.unwrap_or(false),
             prefer_ip,
             track_client_ips,
-            concurrency: cfg.concurrency.unwrap_or(8192),
+            concurrency: initial_concurrency,
             tolerate_time_skewness,
             tcp_timeout,
             idle_timeout,
@@ -689,6 +816,7 @@ impl ProxyEngine {
         };
 
         let (secret_sync_tx, _) = watch::channel(0u64);
+        let (event_tx, _) = broadcast::channel(512);
 
         Ok(Arc::new(Self {
             settings,
@@ -707,7 +835,7 @@ impl ProxyEngine {
             obfs2_replay,
             ip_filters: ArcSwap::from_pointee(ip_filters),
             fronting_cfg: ArcSwap::from_pointee(fronting_init),
-            concurrency_live: AtomicU32::new(cfg.concurrency.unwrap_or(8192)),
+            concurrency_live: AtomicU32::new(initial_concurrency),
             track_client_ips_live: AtomicBool::new(track_client_ips),
             tolerate_time_skewness_ms: AtomicU64::new(
                 tolerate_time_skewness.as_millis().min(u128::from(u64::MAX)) as u64,
@@ -721,6 +849,12 @@ impl ProxyEngine {
             x25519_keys: X25519KeyRing::default(),
             doppel,
             metrics,
+            persistence_mode: api_persistence,
+            state_file,
+            state_revision: AtomicU64::new(initial_rev),
+            event_seq: AtomicU64::new(0),
+            event_tx,
+            billing: Mutex::new(BillingTracker::new()),
             secret_sync_tx,
             ip_filter_loop_cancel: Mutex::new(None),
             reload_mu: Mutex::new(()),
@@ -839,6 +973,11 @@ impl ProxyEngine {
         if patch.reset_quota {
             self.metrics.global_limits.reset_quota(Utc::now());
         }
+        let _ = self.commit_mutation(
+            "limits.updated",
+            serde_json::json!({ "scope": "global" }),
+            true,
+        );
         self.global_limits_report()
     }
 
@@ -856,13 +995,365 @@ impl ProxyEngine {
             self.metrics.set_throttle_limit(i64::from(t));
         }
         self.metrics.global_limits.apply(limits);
+        let _ = self.commit_mutation(
+            "limits.updated",
+            serde_json::json!({ "scope": "global" }),
+            true,
+        );
         self.global_limits_report()
     }
 
     /// Reset server-wide quota usage counter to 0 (`POST /limits/reset-quota`).
     pub fn reset_global_quota(&self) -> GlobalLimitsReport {
         self.metrics.global_limits.reset_quota(Utc::now());
+        let _ = self.commit_mutation(
+            "limits.quota_reset",
+            serde_json::json!({ "scope": "global" }),
+            false,
+        );
         self.global_limits_report()
+    }
+
+    // -------------------------------------------------------------------------
+    // Enterprise Control Plane: Revisions, ETag/If-Match, Persistence, Outbounds,
+    // SSE Events, Atomic Desired-State Convergence & Distributed Billing Deltas
+    // -------------------------------------------------------------------------
+
+    /// Current monotonic control-plane state revision (`>= 1`).
+    #[inline]
+    pub fn state_revision(&self) -> u64 {
+        self.state_revision.load(Ordering::Acquire)
+    }
+
+    /// Strong HTTP `ETag` matching the current control-plane state revision (`"rev-N"`).
+    pub fn state_etag(&self) -> String {
+        format!("\"rev-{}\"", self.state_revision())
+    }
+
+    /// Validate an optional HTTP `If-Match` precondition header against current `state_revision`.
+    /// Returns `Err(current_etag)` when the precondition fails (`412 Precondition Failed`).
+    pub fn check_if_match(&self, header: Option<&str>) -> Result<(), String> {
+        let rev = self.state_revision();
+        if if_match_satisfied(header, rev) {
+            Ok(())
+        } else {
+            Err(format!("\"rev-{rev}\""))
+        }
+    }
+
+    /// Process-unique 128-bit random boot identifier (used by multi-node billing panels).
+    pub fn boot_id(&self) -> String {
+        self.billing.lock().boot_id().to_owned()
+    }
+
+    /// Subscribe to real-time control-plane SSE events (`GET /events`).
+    pub fn subscribe_events(&self) -> broadcast::Receiver<EngineEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Publish an informational event on the SSE broadcast bus without mutating revision.
+    pub fn emit_event(&self, event: &'static str, detail: serde_json::Value) {
+        let id = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let rev = self.state_revision();
+        let _ = self.event_tx.send(EngineEvent {
+            id,
+            event,
+            revision: rev,
+            timestamp: Utc::now(),
+            detail,
+        });
+    }
+
+    /// Bump `state_revision`, emit an SSE event, and (when `persist && mode != Memory`)
+    /// crash-safely write the updated runtime snapshot to disk!
+    fn commit_mutation(
+        &self,
+        event: &'static str,
+        detail: serde_json::Value,
+        persist: bool,
+    ) -> Result<u64, EngineError> {
+        let rev = self.state_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        if persist && self.persistence_mode != ApiPersistenceMode::Memory {
+            let snap = self.export_state_snapshot();
+            self.persist_snapshot(&snap)?;
+        }
+        let id = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.event_tx.send(EngineEvent {
+            id,
+            event,
+            revision: rev,
+            timestamp: Utc::now(),
+            detail,
+        });
+        Ok(rev)
+    }
+
+    fn persist_snapshot(&self, snap: &RuntimeStateSnapshot) -> Result<(), EngineError> {
+        match self.persistence_mode {
+            ApiPersistenceMode::Memory => Ok(()),
+            ApiPersistenceMode::Overlay => {
+                let path = self
+                    .state_file
+                    .clone()
+                    .unwrap_or_else(|| default_overlay_path(self.settings.config_path.as_deref()));
+                save_overlay_atomic(&path, snap).map_err(|e| {
+                    warn!(path = %path.display(), error = %e, "overlay persistence failed");
+                    EngineError::Persistence(format!("overlay write {}: {e}", path.display()))
+                })
+            }
+            ApiPersistenceMode::Toml => {
+                let Some(cfg_path) = &self.settings.config_path else {
+                    return Err(EngineError::Persistence(
+                        "persistence = \"toml\" requires a config file path".to_owned(),
+                    ));
+                };
+                save_toml_atomic(cfg_path, snap).map_err(|e| {
+                    warn!(path = %cfg_path.display(), error = %e, "TOML writeback failed");
+                    EngineError::Persistence(format!("TOML writeback {}: {e}", cfg_path.display()))
+                })
+            }
+        }
+    }
+
+    /// Export complete current mutable control-plane state (`GET /state` & persistence).
+    pub fn export_state_snapshot(&self) -> RuntimeStateSnapshot {
+        let set = self.secrets.load();
+        let mut secrets = BTreeMap::new();
+        let mut secret_ad_tags = BTreeMap::new();
+        let mut secret_limits = BTreeMap::new();
+        for (name, rec) in &set.records {
+            secrets.insert(name.clone(), rec.secret.encode_hex());
+            if let Some(tag) = rec.ad_tag {
+                secret_ad_tags.insert(name.clone(), hex::encode(tag));
+            }
+            if !rec.limits.is_zero() {
+                secret_limits.insert(name.clone(), SecretLimitsSnapshot::from(&rec.limits));
+            }
+        }
+        let global_ad_tag = set.default_ad_tag.map(hex::encode);
+        drop(set);
+
+        let (outbounds, outbound_groups, routing) = self.outbound_config_export();
+        let gl = self.metrics.global_limits.snapshot();
+
+        RuntimeStateSnapshot {
+            schema_version: RUNTIME_STATE_SCHEMA_VERSION,
+            revision: self.state_revision(),
+            updated_at: Utc::now(),
+            secrets,
+            secret_ad_tags,
+            secret_limits,
+            global_ad_tag,
+            concurrency: self.concurrency_limit(),
+            throttle_max_connections: self
+                .metrics
+                .throttle_limit
+                .load(Ordering::Acquire)
+                .clamp(0, i64::from(u32::MAX)) as u32,
+            global_limits: GlobalLimitsSnapshot::from(&gl),
+            outbounds,
+            outbound_groups,
+            routing,
+        }
+    }
+
+    /// Single-call atomic desired-state convergence (`PUT /state`): validates and
+    /// builds the new `OutboundRouter` and secret set BEFORE publishing anything,
+    /// then swaps outbounds, secrets, limits, and ad-tags atomically!
+    pub fn apply_state_snapshot(
+        &self,
+        desired: &RuntimeStateSnapshot,
+    ) -> Result<RuntimeStateSnapshot, EngineError> {
+        let (secrets, limits, ad_tags, global_ad_tag) = parse_runtime_snapshot_secrets(desired)?;
+        let new_router = Arc::new(
+            OutboundRouter::build(
+                &desired.outbounds,
+                &desired.outbound_groups,
+                desired.routing.clone(),
+                &self.settings.legacy_proxies,
+                &self.dns,
+                self.settings.sock_cfg,
+                Vec::new(),
+            )
+            .map_err(|e| EngineError::Invalid(format!("invalid outbounds: {e}")))?,
+        );
+        // Validate every secret's named outbound target against the new router.
+        for (name, lim) in &limits {
+            if let Some(ref target) = lim.outbound
+                && !new_router.has_target(target)
+            {
+                return Err(EngineError::Invalid(format!(
+                    "secret {name:?} references unknown outbound {target:?}"
+                )));
+            }
+        }
+
+        let _reload_guard = self.reload_mu.lock();
+        let prev = self.secrets.load();
+        let now = self.rotation_clock.now();
+        let mut kept_retiring = Vec::new();
+        for (name, rec) in &prev.records {
+            if secrets.contains_key(name) {
+                for r in &rec.retiring {
+                    if now < r.until && secrets.get(name).is_none_or(|p| p.key() != r.secret.key())
+                    {
+                        kept_retiring.push(r.clone());
+                    }
+                }
+            }
+        }
+        drop(prev);
+
+        // Publish outbounds + secrets + global limits atomically!
+        self.dc_router.set_outbound_router(new_router);
+        self.swap_secrets_locked(&secrets, &limits, &ad_tags, global_ad_tag, &kept_retiring)?;
+        self.set_concurrency_limit(desired.concurrency);
+        self.metrics
+            .set_throttle_limit(i64::from(desired.throttle_max_connections));
+        self.metrics
+            .global_limits
+            .apply(&GlobalLimits::from(&desired.global_limits));
+        self.commit_mutation(
+            "state.converged",
+            serde_json::json!({
+                "secrets": secrets.len(),
+                "outbounds": desired.outbounds.len(),
+            }),
+            true,
+        )?;
+        Ok(self.export_state_snapshot())
+    }
+
+    /// Snapshot live outbound telemetry (`GET /outbounds` & Prometheus).
+    pub fn outbound_snapshots(&self) -> Vec<OutboundSnapshot> {
+        self.dc_router
+            .outbound_router()
+            .map(|r| r.snapshots())
+            .unwrap_or_default()
+    }
+
+    /// Export current declarative outbound specs, groups, and routing policy.
+    pub fn outbound_config_export(
+        &self,
+    ) -> (Vec<OutboundSpec>, Vec<OutboundGroupSpec>, RoutingSpec) {
+        self.dc_router
+            .outbound_router()
+            .map(|r| r.config_export())
+            .unwrap_or_default()
+    }
+
+    /// True if `name` is a registered outbound node or outbound group.
+    pub fn outbound_target_exists(&self, name: &str) -> bool {
+        self.dc_router
+            .outbound_router()
+            .is_some_and(|r| r.has_target(name))
+    }
+
+    /// Hot-swap the entire universal outbound engine (`PUT /outbounds`) with zero dropped connections!
+    pub fn replace_outbounds(
+        &self,
+        specs: &[OutboundSpec],
+        groups: &[OutboundGroupSpec],
+        routing: RoutingSpec,
+    ) -> Result<Vec<OutboundSnapshot>, EngineError> {
+        let new_router = Arc::new(
+            OutboundRouter::build(
+                specs,
+                groups,
+                routing,
+                &self.settings.legacy_proxies,
+                &self.dns,
+                self.settings.sock_cfg,
+                Vec::new(),
+            )
+            .map_err(|e| EngineError::Invalid(format!("invalid outbounds: {e}")))?,
+        );
+        // Ensure no existing secret is left pointing at a removed outbound!
+        let set = self.secrets.load();
+        for (name, rec) in &set.records {
+            if let Some(ref target) = rec.limits.outbound
+                && !new_router.has_target(target)
+            {
+                return Err(EngineError::Invalid(format!(
+                    "secret {name:?} still references outbound {target:?}"
+                )));
+            }
+        }
+        drop(set);
+
+        let _reload_guard = self.reload_mu.lock();
+        let snaps = new_router.snapshots();
+        self.dc_router.set_outbound_router(new_router);
+        self.commit_mutation(
+            "outbound.updated",
+            serde_json::json!({ "count": snaps.len() }),
+            true,
+        )?;
+        Ok(snaps)
+    }
+
+    /// Actively probe a named outbound node against Telegram DC2 (or first known DC endpoint).
+    pub async fn probe_outbound(&self, name: &str) -> Result<Duration, EngineError> {
+        let Some(router) = self.dc_router.outbound_router() else {
+            return Err(EngineError::Invalid(
+                "outbound router not initialized".into(),
+            ));
+        };
+        let target_addr = self
+            .dc_router
+            .ranked_direct_addresses(2)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "149.154.167.50:443".parse().expect("valid dc2 addr"));
+        router
+            .probe_named(
+                name,
+                &OutboundTarget::Addr(target_addr),
+                self.settings.tcp_timeout,
+            )
+            .await
+            .map(|res| Duration::from_micros(res.rtt_us))
+            .map_err(|e| EngineError::Invalid(e.to_string()))
+    }
+
+    /// Compute exact per-consumer billing deltas since the consumer's last checkpoint
+    /// (`POST /accounting/checkpoint`).
+    pub fn take_billing_checkpoint(
+        &self,
+        consumer_id: &str,
+        peek: bool,
+    ) -> Result<BillingCheckpointReport, EngineError> {
+        let users = self.metrics.all_users();
+        let rows: Vec<(String, u64, u64, u64, u64, u64, i64)> = users
+            .into_iter()
+            .map(|(name, u)| {
+                (
+                    name,
+                    u.bytes_in.load(Ordering::Relaxed).max(0) as u64,
+                    u.bytes_out.load(Ordering::Relaxed).max(0) as u64,
+                    u.total_connections.load(Ordering::Relaxed),
+                    u.quota_used.load(Ordering::Relaxed).max(0) as u64,
+                    u.quota_cutoffs.load(Ordering::Relaxed).max(0) as u64,
+                    u.connections.load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+        let report = self
+            .billing
+            .lock()
+            .checkpoint(consumer_id, peek, &rows)
+            .map_err(EngineError::Invalid)?;
+        if !peek {
+            self.emit_event(
+                "accounting.checkpoint",
+                serde_json::json!({
+                    "consumer_id": report.consumer_id,
+                    "sequence": report.sequence,
+                    "total_delta_bytes": report.total_delta_bytes,
+                }),
+            );
+        }
+        Ok(report)
     }
 
     /// Current hot-reloadable `track-client-ips` state.
@@ -1424,7 +1915,23 @@ impl ProxyEngine {
         let ad_tags = cfg.get_secret_ad_tags();
         let default_ad_tag = cfg.ad_tag.as_deref().copied();
 
+        let (ob_specs, ob_groups, ob_routing) = config_to_outbound_specs(cfg)?;
+        let legacy_proxies: Vec<String> = cfg.network.proxies.clone().unwrap_or_default();
+        let next_router = Arc::new(
+            OutboundRouter::build(
+                &ob_specs,
+                &ob_groups,
+                ob_routing,
+                &legacy_proxies,
+                &self.dns,
+                self.settings.sock_cfg,
+                Vec::new(),
+            )
+            .map_err(|e| EngineError::Reload(format!("invalid outbounds in reload: {e}")))?,
+        );
+
         let _reload_guard = self.reload_mu.lock();
+        self.dc_router.set_outbound_router(next_router);
         self.swap_secrets_locked(
             &secrets,
             &limits,
@@ -1507,6 +2014,11 @@ impl ProxyEngine {
             }
         }
 
+        let _ = self.commit_mutation(
+            "config.reloaded",
+            serde_json::json!({ "secrets": secrets.len() }),
+            false,
+        );
         Ok(retiring_report.lines)
     }
 
@@ -1613,6 +2125,23 @@ impl ProxyEngine {
         if let Some(csd) = patch.conn_speed_down_bytes_per_second {
             lim.conn_speed_down_bytes_per_second = csd;
         }
+        if let Some(ob_opt) = patch.outbound {
+            if let Some(ref target) = ob_opt {
+                let trimmed = target.trim();
+                if trimmed.is_empty() {
+                    lim.outbound = None;
+                } else {
+                    if !self.outbound_target_exists(trimmed) {
+                        return Err(EngineError::Invalid(format!(
+                            "unknown outbound {trimmed:?}"
+                        )));
+                    }
+                    lim.outbound = Some(trimmed.to_owned());
+                }
+            } else {
+                lim.outbound = None;
+            }
+        }
         if lim.client_fair && !lim.fair_totals().is_active() {
             return Err(EngineError::Invalid(
                 "client_fair requires speed, speed_up, or speed_down".to_owned(),
@@ -1626,7 +2155,9 @@ impl ProxyEngine {
             self.metrics.reset_quota(name, Utc::now());
         }
 
-        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, default_tag, &retiring)
+        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, default_tag, &retiring)?;
+        self.commit_mutation("secret.patched", serde_json::json!({ "name": name }), true)?;
+        Ok(())
     }
 
     /// `POST /secrets/{name}/disconnect` — immediately cancel ALL live streams of `secret_name`.
@@ -1675,6 +2206,14 @@ impl ProxyEngine {
             if !u.secret.is_valid() {
                 return Err(EngineError::Invalid(format!(
                     "invalid secret for {:?}",
+                    u.name
+                )));
+            }
+            if let Some(ref target) = u.limits.outbound
+                && !self.outbound_target_exists(target)
+            {
+                return Err(EngineError::Invalid(format!(
+                    "secret {:?} references unknown outbound {target:?}",
                     u.name
                 )));
             }
@@ -1731,6 +2270,11 @@ impl ProxyEngine {
         }
 
         self.swap_secrets_locked(&secrets, &all_limits, &all_tags, default_tag, &retiring)?;
+        self.commit_mutation(
+            "secrets.batch",
+            serde_json::json!({ "upserted": upserted_count, "deleted": deleted_count }),
+            true,
+        )?;
         Ok((upserted_count, deleted_count))
     }
 
@@ -1766,6 +2310,15 @@ impl ProxyEngine {
                 ));
             }
         }
+        for (name, lim) in limits {
+            if let Some(ref target) = lim.outbound
+                && !self.outbound_target_exists(target)
+            {
+                return Err(EngineError::Invalid(format!(
+                    "secret {name:?} references unknown outbound {target:?}"
+                )));
+            }
+        }
 
         let _reload_guard = self.reload_mu.lock();
         let prev = self.secrets.load();
@@ -1787,7 +2340,13 @@ impl ProxyEngine {
         }
         drop(prev);
 
-        self.swap_secrets_locked(secrets, limits, ad_tags, default_ad_tag, &kept_retiring)
+        self.swap_secrets_locked(secrets, limits, ad_tags, default_ad_tag, &kept_retiring)?;
+        self.commit_mutation(
+            "secrets.replaced",
+            serde_json::json!({ "count": secrets.len() }),
+            true,
+        )?;
+        Ok(())
     }
 
     /// `POST /secrets` — add or update a single named secret, keeping its retiring keys.
@@ -1803,6 +2362,13 @@ impl ProxyEngine {
         }
         if !secret.is_valid() {
             return Err(EngineError::Invalid("invalid secret".to_owned()));
+        }
+        if let Some(ref target) = limits.outbound
+            && !self.outbound_target_exists(target)
+        {
+            return Err(EngineError::Invalid(format!(
+                "secret {name:?} references unknown outbound {target:?}"
+            )));
         }
         let _reload_guard = self.reload_mu.lock();
         let prev = self.secrets.load();
@@ -1838,10 +2404,14 @@ impl ProxyEngine {
         if limits.is_zero() {
             all_limits.remove(&name);
         } else {
-            all_limits.insert(name, limits);
+            all_limits.insert(name.clone(), limits);
         }
 
-        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, default_tag, &retiring)
+        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, default_tag, &retiring)?;
+        let mut detail = serde_json::Map::with_capacity(1);
+        detail.insert("name".to_owned(), serde_json::Value::String(name));
+        self.commit_mutation("secret.upserted", serde_json::Value::Object(detail), true)?;
+        Ok(())
     }
 
     /// `DELETE /secrets/{name}` — removes one secret (refuses deleting last secret).
@@ -1876,7 +2446,9 @@ impl ProxyEngine {
         }
         drop(prev);
 
-        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, default_tag, &retiring)
+        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, default_tag, &retiring)?;
+        self.commit_mutation("secret.deleted", serde_json::json!({ "name": name }), true)?;
+        Ok(())
     }
 
     /// `PUT /adtag` / `DELETE /adtag` — update global default `ad_tag`.
@@ -1900,7 +2472,13 @@ impl ProxyEngine {
         }
         drop(prev);
 
-        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, tag, &retiring)
+        self.swap_secrets_locked(&secrets, &all_limits, &all_tags, tag, &retiring)?;
+        self.commit_mutation(
+            "adtag.updated",
+            serde_json::json!({ "set": tag.is_some() }),
+            true,
+        )?;
+        Ok(())
     }
 
     fn swap_secrets_locked(
@@ -2031,6 +2609,10 @@ impl ProxyEngine {
             self.addresses.handles_for_units(secret_name, units)
         };
         let closed = self.cancel_handles(&handles);
+        self.emit_event(
+            "client.kicked",
+            serde_json::json!({ "secret": secret_name, "closed": closed }),
+        );
         Ok(closed)
     }
 
@@ -2060,6 +2642,10 @@ impl ProxyEngine {
             addresses = dedup.iter().map(ToString::to_string).collect();
             addresses.sort();
         }
+        self.emit_event(
+            "client.banned",
+            serde_json::json!({ "secret": secret_name, "banned": dedup.len(), "closed": closed }),
+        );
         Ok((dedup.len(), closed, addresses))
     }
 
@@ -2068,7 +2654,14 @@ impl ProxyEngine {
         if !self.secrets.load().contains(secret_name) {
             return Err(EngineError::SecretNotFound(secret_name.to_owned()));
         }
-        Ok(self.bans.remove(secret_name, unit, Utc::now()))
+        let removed = self.bans.remove(secret_name, unit, Utc::now());
+        if removed {
+            self.emit_event(
+                "client.unbanned",
+                serde_json::json!({ "secret": secret_name }),
+            );
+        }
+        Ok(removed)
     }
 
     /// `PUT /secrets/{name}/external-ips` / `DELETE /secrets/{name}/external-ips`.
@@ -2383,6 +2976,139 @@ impl ProxyEngine {
             tok.cancel();
         }
     }
+}
+
+/// Convert declarative `[outbound]` / `[outbound-group]` / `[routing]` config tables into `mtg-net` specs.
+fn config_to_outbound_specs(
+    cfg: &Config,
+) -> Result<(Vec<OutboundSpec>, Vec<OutboundGroupSpec>, RoutingSpec), EngineError> {
+    let mut specs = Vec::with_capacity(cfg.outbounds.len());
+    for ob in &cfg.outbounds {
+        specs.push(OutboundSpec {
+            name: ob.name.trim().to_owned(),
+            url: ob.url.trim().to_owned(),
+            interface: ob
+                .interface
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            bind_ipv4: ob.bind_ipv4,
+            bind_ipv6: ob.bind_ipv6,
+            fwmark: ob.fwmark,
+            weight: ob.weight.unwrap_or(100),
+            max_fails: ob.max_fails.unwrap_or(5),
+            cooldown_secs: ob.cooldown.map_or(30, |d| d.as_secs()),
+        });
+    }
+
+    let mut groups = Vec::with_capacity(cfg.outbound_groups.len());
+    for g in &cfg.outbound_groups {
+        let strategy = match g.strategy.as_deref() {
+            None => OutboundStrategy::EwmaRtt,
+            Some(raw) => raw.parse::<OutboundStrategy>().map_err(|e| {
+                EngineError::Invalid(format!("invalid outbound strategy {raw:?}: {e}"))
+            })?,
+        };
+        groups.push(OutboundGroupSpec {
+            name: g.name.trim().to_owned(),
+            strategy,
+            members: g.members.iter().map(|m| m.trim().to_owned()).collect(),
+        });
+    }
+
+    let mut dc_routes = BTreeMap::new();
+    for (&dc_id, target) in &cfg.routing.dc {
+        dc_routes.insert(dc_id, target.trim().to_owned());
+    }
+    let routing = RoutingSpec {
+        default_outbound: cfg
+            .routing
+            .default_outbound
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        dc_routes,
+    };
+
+    Ok((specs, groups, routing))
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_runtime_snapshot_secrets(
+    snap: &RuntimeStateSnapshot,
+) -> Result<
+    (
+        BTreeMap<String, Secret>,
+        BTreeMap<String, SecretLimits>,
+        BTreeMap<String, [u8; 16]>,
+        Option<[u8; 16]>,
+    ),
+    EngineError,
+> {
+    if snap.secrets.is_empty() {
+        return Err(EngineError::Invalid(
+            "state snapshot must contain at least one secret".to_owned(),
+        ));
+    }
+    let mut secrets = BTreeMap::new();
+    for (name, raw) in &snap.secrets {
+        if name.trim().is_empty() {
+            return Err(EngineError::Invalid(
+                "secret name cannot be empty".to_owned(),
+            ));
+        }
+        let sec = Secret::parse(raw)
+            .map_err(|e| EngineError::Invalid(format!("invalid secret for {name:?}: {e}")))?;
+        secrets.insert(name.clone(), sec);
+    }
+
+    let mut ad_tags = BTreeMap::new();
+    for (name, hex_tag) in &snap.secret_ad_tags {
+        if !secrets.contains_key(name) {
+            continue;
+        }
+        let tag = parse_hex_ad_tag(hex_tag)?;
+        ad_tags.insert(name.clone(), tag);
+    }
+
+    let global_ad_tag = match &snap.global_ad_tag {
+        Some(raw) if !raw.trim().is_empty() => Some(parse_hex_ad_tag(raw)?),
+        _ => None,
+    };
+
+    let mut limits = BTreeMap::new();
+    for (name, lim_snap) in &snap.secret_limits {
+        if !secrets.contains_key(name) {
+            continue;
+        }
+        let lim = SecretLimits::from(lim_snap.clone());
+        if lim.client_fair && !lim.fair_totals().is_active() {
+            return Err(EngineError::Invalid(format!(
+                "secret {name:?}: client_fair requires speed, speed_up, or speed_down"
+            )));
+        }
+        if !lim.is_zero() {
+            limits.insert(name.clone(), lim);
+        }
+    }
+
+    Ok((secrets, limits, ad_tags, global_ad_tag))
+}
+
+fn parse_hex_ad_tag(raw: &str) -> Result<[u8; 16], EngineError> {
+    let bytes = hex::decode(raw.trim())
+        .map_err(|_| EngineError::Invalid(format!("invalid hex ad_tag {raw:?}")))?;
+    if bytes.len() != 16 {
+        return Err(EngineError::Invalid(format!(
+            "ad_tag must be 32 hex chars (16 bytes), got {} bytes",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// Helper to build an [`IpFiltersState`] from validated [`Config`].

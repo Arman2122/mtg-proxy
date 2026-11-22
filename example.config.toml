@@ -31,9 +31,17 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 # (127.0.0.1) unless you set api-token below, since the API can mutate secrets.
 # Endpoints:
 #   GET    /healthz          lightweight liveness/readiness JSON probe (uptime, connections, IP filter status)
+#   GET    /capabilities     multi-core VPN panel discovery (protocols, outbound engines, persistence mode, ETag, features)
+#   GET    /state            complete declarative control-plane snapshot with strong ETag & X-State-Revision
+#   PUT    /state            single-call atomic desired-state convergence (supports If-Match -> 412 optimistic locking)
+#   GET    /events           zero-polling real-time Server-Sent Events (text/event-stream) for control-plane changes
 #   GET    /stats            per-user connection counts, traffic and quota usage
 #   GET    /accounting       enterprise billing & directional accounting ledger (bytes_in, bytes_out, total_connections, quota, cutoffs, speed/ip/conn limits)
 #   POST   /accounting/flush force an immediate crash-safe atomic flush of usage-state-file
+#   POST   /accounting/checkpoint  exact-once per-consumer distributed billing deltas (boot_id + sequence + peek support)
+#   GET    /outbounds        live universal outbound telemetry (dials, failures, EWMA RTT, circuit breakers) & routing rules
+#   PUT    /outbounds        hot-swap [[outbound]], [[outbound-group]] & [routing] live with zero dropped connections
+#   POST   /outbounds/{name}/probe active dial probe against Telegram DC through a named outbound transport
 #   GET    /limits           inspect live server-wide [limits] (concurrency, global speed, global quota, per-IP conn/rate caps, CGNAT-safe conn-speed)
 #   PUT    /limits           replace server-wide [limits] live without restarting
 #   PATCH  /limits           partial atomic update of server-wide [limits] (including add_quota, speed, concurrency, max_connections_per_ip, conn_speed)
@@ -70,6 +78,16 @@ secret = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c6561706973
 # must carry "Authorization: Bearer <token>". When unset (default), the API is
 # unauthenticated and relies on the loopback bind above.
 # api-token = "change-me"
+#
+# Enterprise Management API persistence & optimistic concurrency (`ETag`/`If-Match`):
+# [api]
+# # How live API mutations are persisted across restarts:
+# #   "memory"  (default) - zero disk I/O; ideal when an external VPN panel DB owns desired state (PUT /state)
+# #   "overlay"           - crash-safe atomic 0600 SHA-256 JSON overlay (flock + fsync + rename); keeps config.toml clean!
+# #   "toml"              - lossless toml_edit writeback directly into config.toml (preserves operator comments)
+# persistence = "memory"
+# # Optional overlay path when persistence = "overlay" (defaults to <config-stem>.runtime-state.json)
+# # state-file = "/var/lib/mtg-proxy/runtime-state.json"
 
 # Telegram advertising tag (ad_tag / proxy tag). When set, matching clients are
 # routed through Telegram middle proxies so a sponsored channel appears at the
@@ -209,6 +227,18 @@ bind-to = "0.0.0.0:3128"
 # # fullchain.pem + privkey.pem (RSA, ECDSA, Ed25519).
 # # tls-cert = "/etc/letsencrypt/live/web.example.com/fullchain.pem"
 # # tls-key  = "/etc/letsencrypt/live/web.example.com/privkey.pem"
+#
+# # Multi-carrier WEB transport options (v2.6.0+, full Telegram Desktop + Android + iOS support):
+# #   carrier = "websocket" | "ws-lanes" | "https" | "https-lanes" | "auto"
+# #     - "websocket"   (default) - single RFC 6455 WebSocket carrier (Desktop 7.1+)
+# #     - "ws-lanes"              - up to `lanes` parallel WebSockets sharing one SessionHub
+# #     - "https"                 - iOS WKWebView / strict-proxy sequenced HTTP Conveyor (`POST /up` + `GET /down` with replay ring!)
+# #     - "https-lanes"           - multi-lane HTTP/2 (`h2`) multiplexed Conveyor + full-duplex `POST /stream`
+# #     - "auto"                  - auto-negotiates WS -> HTTPS Conveyor self-healing failover per client UA/network
+# # carrier = "auto"
+# # lanes = 2                     # Parallel lanes (1..=8) for ws-lanes / https-lanes
+# # hosts = ["alt.example.com"]   # Optional secondary virtual hosts (each with independent capability derivation)
+# # base-path = "/api/v1"         # Custom API mount prefix (stealth path obfuscation, e.g. "/cdn/v2")
 #
 # # CDN-aware spoof-proof Geo-Stealth for deployments behind Cloudflare / ArvanCloud /
 # # custom reverse proxies! Peels trusted CDN edge IPs right-to-left and ONLY trusts
@@ -995,3 +1025,52 @@ bind-to = "127.0.0.1:3129"
 http-path = "/"
 # prefix for metrics for prometheus
 metric-prefix = "mtg"
+
+# =============================================================================
+# Universal Plug-In Outbound Traffic Engine (v2.6.0+)
+# =============================================================================
+# Carry outbound Telegram DC & MiddleProxy traffic over ANY protocol with zero
+# overhead on plain direct TCP, hot-reloadable via SIGHUP or PUT /outbounds:
+#   - direct://                               (with optional interface / SO_MARK fwmark / bind-ipv4 / bind-ipv6)
+#   - socks5://[user:pass@]host:port          (or socks5h:// for remote DNS)
+#   - socks4://[user@]host:port               (or socks4a://)
+#   - http://[user:pass@]host:port            (HTTP CONNECT)
+#   - https://[user:pass@]host:port[?sni=...] (TLS 1.3 wrapped HTTP CONNECT)
+#   - ss://<method>:<psk>@host:port           (Hardware-accelerated Shadowsocks AEAD-2022 SIP022 & Classic AEAD)
+#   - unix:///run/sidecar.sock                (Raw Linux Unix socket or abstract unix://@name)
+#   - unix+socks5:///run/xray/socks.sock      (Zero-TCP-overhead Unix SOCKS5 sidecar for Xray/sing-box/VLESS/Hysteria2/Trojan/TUIC/WireGuard!)
+#   - unix+http:///run/singbox/http.sock      (Unix HTTP CONNECT sidecar)
+#
+# [[outbound]]
+# name = "wg-de"
+# url = "direct://"
+# interface = "wg0"        # Linux SO_BINDTODEVICE (WireGuard / Tailscale / sing-box TUN / multi-NIC)
+# fwmark = 0x100           # Linux SO_MARK policy routing mark
+# weight = 100
+#
+# [[outbound]]
+# name = "ss-frankfurt"
+# url = "ss://2022-blake3-aes-256-gcm:<base64-32-byte-psk>@198.51.100.10:8388"
+# weight = 80
+# max-fails = 5
+# cooldown = "30s"
+#
+# [[outbound]]
+# name = "xray-reality"
+# url = "unix+socks5:///run/xray/socks.sock"
+#
+# [[outbound-group]]
+# name = "eu-pool"
+# # Strategies: "ewma-rtt" (P2C default), "failover", "weighted", "round-robin", "hash-dc"
+# strategy = "failover"
+# members = ["wg-de", "ss-frankfurt", "xray-reality", "direct"]
+#
+# [routing]
+# default-outbound = "eu-pool"
+# [routing.dc]
+# 2 = "wg-de"
+# 4 = "ss-frankfurt"
+#
+# Per-secret override in [secret-limits.<name>]:
+#   [secret-limits.vip]
+#   outbound = "xray-reality"

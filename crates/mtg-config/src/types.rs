@@ -44,6 +44,16 @@ pub enum TypeParseError {
     InvalidFragmentMss(String),
     #[error("unknown web CDN preset {0:?} (expected \"cloudflare\" or \"arvancloud\")")]
     InvalidWebCdnPreset(String),
+    #[error(
+        "unknown web carrier mode {0:?} (expected \"auto\", \"websocket\", \"ws-lanes\", \"https\", or \"https-lanes\")"
+    )]
+    InvalidWebCarrierMode(String),
+    #[error("unknown API persistence mode {0:?} (expected \"memory\", \"overlay\", or \"toml\")")]
+    InvalidApiPersistenceMode(String),
+    #[error(
+        "unknown outbound strategy {0:?} (expected \"ewma-rtt\", \"failover\", \"weighted\", \"round-robin\", or \"hash-dc\")"
+    )]
+    InvalidOutboundStrategy(String),
     #[error("incorrect IP or CIDR entry {0:?}")]
     InvalidCidr(String),
     #[error("unknown handshake-budget mode {0:?} (expected \"enforce\", \"observe\", or \"off\")")]
@@ -361,6 +371,100 @@ pub fn parse_server_hello_fragment_mss(s: &str) -> Result<u16, TypeParseError> {
             } else {
                 Err(TypeParseError::InvalidFragmentMss(s.to_owned()))
             }
+        }
+    }
+}
+
+/// Carrier mode advertised and served by `[web]` (`mtg-webrelay`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WebCarrierMode {
+    /// Classic single WebSocket `/api/v1/ws` (default for 100% backwards compatibility).
+    #[default]
+    Websocket,
+    /// Multi-lane parallel WebSockets (`/api/v1/ws?lane=0..N-1`).
+    WsLanes,
+    /// Pure HTTPS fetch Conveyor (`POST /up` + event-driven long-poll `GET /down?cursor=N`,
+    /// works natively on Telegram iOS WKWebView & proxies blocking WebSocket upgrades!).
+    Https,
+    /// Multi-lane HTTP/2 HTTPS Conveyor (parallel lanes over one multiplexed HTTP/2 TLS 1.3 stream!).
+    HttpsLanes,
+    /// Automatic negotiation (`https-lanes` on HTTP/2 & iOS WKWebView, `websocket` on HTTP/1.1
+    /// Desktop/Android with automatic self-healing failover to `https` if WS upgrade is blocked!).
+    Auto,
+}
+
+impl WebCarrierMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Websocket => "websocket",
+            Self::WsLanes => "ws-lanes",
+            Self::Https => "https",
+            Self::HttpsLanes => "https-lanes",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl fmt::Display for WebCarrierMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WebCarrierMode {
+    type Err = TypeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "websocket" | "ws" => Ok(Self::Websocket),
+            "ws-lanes" | "ws_lanes" | "websocket-lanes" => Ok(Self::WsLanes),
+            "https" | "http" | "fetch" | "conveyor" => Ok(Self::Https),
+            "https-lanes" | "https_lanes" | "h2" | "http2" => Ok(Self::HttpsLanes),
+            "auto" => Ok(Self::Auto),
+            _ => Err(TypeParseError::InvalidWebCarrierMode(s.to_owned())),
+        }
+    }
+}
+
+/// Persistence strategy for runtime Management API mutations (`[api] persistence`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApiPersistenceMode {
+    /// In-memory only (default — ideal when an external panel DB owns desired state).
+    #[default]
+    Memory,
+    /// Crash-safe atomic `0600` JSON overlay (`state-file` + `flock` + `fsync` + `rename`)
+    /// keeping `config.toml` clean/immutable while persisting API mutations across reboots!
+    Overlay,
+    /// Lossless `toml_edit` + `flock(2)` atomic writeback directly to `config.toml`
+    /// (preserves operator comments & formatting on standalone single-file servers).
+    Toml,
+}
+
+impl ApiPersistenceMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Overlay => "overlay",
+            Self::Toml => "toml",
+        }
+    }
+}
+
+impl fmt::Display for ApiPersistenceMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ApiPersistenceMode {
+    type Err = TypeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "memory" | "mem" | "none" => Ok(Self::Memory),
+            "overlay" | "state-file" | "state_file" | "json" => Ok(Self::Overlay),
+            "toml" | "config" | "file" => Ok(Self::Toml),
+            _ => Err(TypeParseError::InvalidApiPersistenceMode(s.to_owned())),
         }
     }
 }

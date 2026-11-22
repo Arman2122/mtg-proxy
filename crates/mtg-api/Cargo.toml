@@ -11,11 +11,14 @@ workspace = true
 [dependencies]
 axum.workspace = true
 chrono.workspace = true
+futures-core = "0.3"
 hex.workspace = true
 mtg-config.workspace = true
 mtg-core.workspace = true
+mtg-crypto.workspace = true
 mtg-engine.workspace = true
 mtg-governance.workspace = true
+mtg-net.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true
@@ -24,4 +27,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"
+tempfile = "3"
 tower.workspace = true

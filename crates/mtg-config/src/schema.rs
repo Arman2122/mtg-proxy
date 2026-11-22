@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -22,10 +22,10 @@ use crate::scrub::{
     UNKNOWN_KEY_LINE, reads_as_a_value, scrub_error_against_doc, shown_name, value_free_name,
 };
 use crate::types::{
-    AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction, PreferIp,
-    StatsdTagFormat, UnknownSecretAction, UnknownSniAction, WebCdnPreset, canonical_web_host,
-    format_bytes_go, format_duration_go, parse_ad_tag, parse_bytes_str, parse_duration,
-    parse_server_hello_fragment_mss, redact_proxy_url, validate_ip_or_cidr,
+    AD_TAG_LEN, ApiPersistenceMode, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction,
+    PreferIp, StatsdTagFormat, UnknownSecretAction, UnknownSniAction, WebCarrierMode, WebCdnPreset,
+    canonical_web_host, format_bytes_go, format_duration_go, parse_ad_tag, parse_bytes_str,
+    parse_duration, parse_server_hello_fragment_mss, redact_proxy_url, validate_ip_or_cidr,
 };
 
 /// Reserved `[secrets]` username that is never served (prevents hand-edit
@@ -134,6 +134,7 @@ pub struct ConfigSecretLimit {
     pub conn_speed: Option<i64>,
     pub conn_speed_up: Option<i64>,
     pub conn_speed_down: Option<i64>,
+    pub outbound: Option<String>,
 }
 
 impl ConfigSecretLimit {
@@ -156,6 +157,7 @@ impl ConfigSecretLimit {
             conn_speed_bytes_per_second: self.conn_speed.unwrap_or(0),
             conn_speed_up_bytes_per_second: self.conn_speed_up.unwrap_or(0),
             conn_speed_down_bytes_per_second: self.conn_speed_down.unwrap_or(0),
+            outbound: self.outbound.clone(),
         }
     }
 }
@@ -233,6 +235,14 @@ pub struct ConfigWeb {
     pub tls_cert: Option<String>,
     /// Optional PEM private key path paired with `tls-cert`.
     pub tls_key: Option<String>,
+    /// Carrier mode (`"websocket"` default, `"ws-lanes"`, `"https"`, `"https-lanes"`, or `"auto"`).
+    pub carrier: Option<WebCarrierMode>,
+    /// Parallel lane count for `ws-lanes` / `https-lanes` (`1..=8`, default `4` for HTTPS / `2` for WS).
+    pub lanes: Option<u8>,
+    /// Optional additional canonical virtual hostnames served by this WEB relay (multi-vhost).
+    pub hosts: Option<Vec<String>>,
+    /// Optional custom carrier API prefix (default `"/api/v1"`).
+    pub base_path: Option<String>,
 }
 
 /// `[defense.blocklist]` / `[defense.allowlist]`.
@@ -380,6 +390,60 @@ pub struct StatsConfig {
     pub prometheus: PrometheusConfig,
 }
 
+/// One `[[outbound]]` pluggable outbound transport definition.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConfigOutbound {
+    pub name: String,
+    /// Protocol URL (`direct://`, `socks5://`, `socks5h://`, `socks4://`, `socks4a://`,
+    /// `http://`, `https://`, `ss://`, `unix://`, `unix+socks5://`, `unix+http://`).
+    pub url: String,
+    pub weight: Option<u32>,
+    pub interface: Option<String>,
+    pub bind_ipv4: Option<Ipv4Addr>,
+    pub bind_ipv6: Option<Ipv6Addr>,
+    pub fwmark: Option<u32>,
+    pub max_fails: Option<u32>,
+    pub cooldown: Option<Duration>,
+}
+
+/// One `[[outbound-group]]` load-balancing/failover pool definition.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConfigOutboundGroup {
+    pub name: String,
+    /// `"ewma-rtt"` (default), `"failover"`, `"weighted"`, `"round-robin"`, `"hash-dc"`.
+    pub strategy: Option<String>,
+    pub members: Vec<String>,
+}
+
+/// `[routing]` outbound policy routing table.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConfigRouting {
+    pub default_outbound: Option<String>,
+    /// Per-DC outbound overrides (`[routing.dc]`, e.g. `"2" = "eu-direct"`).
+    pub dc: BTreeMap<i32, String>,
+}
+
+impl ConfigRouting {
+    pub fn is_empty(&self) -> bool {
+        self.default_outbound.is_none() && self.dc.is_empty()
+    }
+}
+
+/// `[api]` enterprise Management API & persistence settings.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ApiConfig {
+    /// Persistence strategy for API mutations: `"memory"` (default), `"overlay"`, or `"toml"`.
+    pub persistence: Option<ApiPersistenceMode>,
+    /// Atomic `0600` JSON runtime-state overlay file path when `persistence = "overlay"`.
+    pub state_file: Option<String>,
+}
+
+impl ApiConfig {
+    pub const fn is_empty(&self) -> bool {
+        self.persistence.is_none() && self.state_file.is_none()
+    }
+}
+
 /// Full parsed `mtg-proxy` configuration.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
@@ -417,6 +481,10 @@ pub struct Config {
     pub defense: DefenseConfig,
     pub network: NetworkConfig,
     pub api_bind_to: Option<HostPort>,
+    pub api: ApiConfig,
+    pub outbounds: Vec<ConfigOutbound>,
+    pub outbound_groups: Vec<ConfigOutboundGroup>,
+    pub routing: ConfigRouting,
     pub limits: GlobalLimitsConfig,
     pub throttle: ThrottleConfig,
     pub stats: StatsConfig,
@@ -885,6 +953,111 @@ impl Config {
             )));
         }
 
+        // Validate `[api]` persistence configuration.
+        if self.api.persistence == Some(ApiPersistenceMode::Overlay)
+            && self
+                .api
+                .state_file
+                .as_deref()
+                .is_none_or(|p| p.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "[api] persistence = \"overlay\" requires a non-empty state-file path".to_owned(),
+            ));
+        }
+
+        // Validate `[[outbound]]`, `[[outbound-group]]`, and `[routing]`.
+        let mut outbound_names = BTreeSet::new();
+        outbound_names.insert("direct".to_owned());
+        for ob in &self.outbounds {
+            let name = ob.name.trim();
+            if name.is_empty() {
+                return Err(ConfigError::Validation(
+                    "[[outbound]] entry must have a non-empty name".to_owned(),
+                ));
+            }
+            if !ob.url.is_empty() {
+                let u = ob.url.trim();
+                let valid_scheme = u == "direct"
+                    || u.starts_with("direct://")
+                    || u.starts_with("socks5://")
+                    || u.starts_with("socks5h://")
+                    || u.starts_with("socks4://")
+                    || u.starts_with("socks4a://")
+                    || u.starts_with("http://")
+                    || u.starts_with("https://")
+                    || u.starts_with("ss://")
+                    || u.starts_with("unix://")
+                    || u.starts_with("unix+socks5://")
+                    || u.starts_with("unix+http://");
+                if !valid_scheme {
+                    return Err(ConfigError::Validation(format!(
+                        "[[outbound]] {name:?} has unsupported URL scheme ({})",
+                        redact_proxy_url(u)
+                    )));
+                }
+            }
+            outbound_names.insert(name.to_owned());
+        }
+        let mut group_names = BTreeSet::new();
+        for g in &self.outbound_groups {
+            let gname = g.name.trim();
+            if gname.is_empty() || g.members.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "[[outbound-group]] {gname:?} must have a non-empty name and members list"
+                )));
+            }
+            if let Some(st) = &g.strategy {
+                match st.trim().to_ascii_lowercase().as_str() {
+                    "ewma-rtt" | "failover" | "weighted" | "round-robin" | "hash-dc" => {}
+                    other => {
+                        return Err(ConfigError::Validation(format!(
+                            "[[outbound-group]] {gname:?} has unknown strategy {other:?}"
+                        )));
+                    }
+                }
+            }
+            for m in &g.members {
+                if !outbound_names.contains(m) {
+                    return Err(ConfigError::Validation(format!(
+                        "[[outbound-group]] {gname:?} references unknown outbound {m:?}"
+                    )));
+                }
+            }
+            group_names.insert(gname.to_owned());
+        }
+        let known_target = |t: &str| outbound_names.contains(t) || group_names.contains(t);
+        if let Some(def) = &self.routing.default_outbound
+            && !known_target(def)
+        {
+            return Err(ConfigError::Validation(format!(
+                "[routing] default-outbound {def:?} does not name any [[outbound]] or [[outbound-group]]"
+            )));
+        }
+        for (&dc, target) in &self.routing.dc {
+            if !known_target(target) {
+                return Err(ConfigError::Validation(format!(
+                    "[routing.dc] {dc} references unknown outbound {target:?}"
+                )));
+            }
+        }
+        for (sname, lim) in &self.secret_limits {
+            if let Some(ob) = &lim.outbound
+                && !known_target(ob)
+            {
+                return Err(ConfigError::Validation(format!(
+                    "[secret-limits.{sname}] outbound {ob:?} does not name any [[outbound]] or [[outbound-group]]"
+                )));
+            }
+        }
+        if let Some(ob) = &self.limits.default_secret.outbound
+            && !known_target(ob)
+        {
+            return Err(ConfigError::Validation(format!(
+                "[limits.default-secret] outbound {ob:?} does not name any [[outbound]] or [[outbound-group]]"
+            )));
+        }
+
         Ok(())
     }
 
@@ -967,6 +1140,33 @@ impl Config {
             if !policy.modes.has(SecretMode::Dd) {
                 return Err(ConfigError::Validation(format!(
                     "[web] backend {backend} does not accept dd secrets, which is the only form a WEB client can hold"
+                )));
+            }
+        }
+
+        if let Some(lanes) = self.web.lanes
+            && !(1..=8).contains(&lanes)
+        {
+            return Err(ConfigError::Validation(format!(
+                "[web] lanes must be in 1..=8 (got {lanes})"
+            )));
+        }
+        if let Some(hosts) = &self.web.hosts {
+            for h in hosts {
+                if let Err(e) = canonical_web_host(h) {
+                    return Err(ConfigError::Validation(format!("[web] hosts entry: {e}")));
+                }
+            }
+        }
+        if let Some(bp) = &self.web.base_path {
+            let trimmed = bp.trim();
+            if !trimmed.starts_with('/')
+                || trimmed == "/"
+                || trimmed.contains('?')
+                || trimmed.contains('#')
+            {
+                return Err(ConfigError::Validation(format!(
+                    "[web] base-path {bp:?} must start with '/' and not be '/'"
                 )));
             }
         }
@@ -2087,6 +2287,24 @@ fn parse_root_table(
                     .ok_or_else(|| ConfigError::FieldParse("[stats] must be a table".to_owned()))?;
                 parse_stats(doc, tbl, &mut cfg.stats, unknown)?;
             }
+            "api" => {
+                let tbl = item
+                    .as_table_like()
+                    .ok_or_else(|| ConfigError::FieldParse("[api] must be a table".to_owned()))?;
+                parse_api_table(doc, tbl, &mut cfg.api, unknown)?;
+            }
+            "outbound" => {
+                parse_outbounds_item(doc, item, &mut cfg.outbounds, unknown)?;
+            }
+            "outbound-group" => {
+                parse_outbound_groups_item(doc, item, &mut cfg.outbound_groups, unknown)?;
+            }
+            "routing" => {
+                let tbl = item.as_table_like().ok_or_else(|| {
+                    ConfigError::FieldParse("[routing] must be a table".to_owned())
+                })?;
+                parse_routing_table(doc, tbl, &mut cfg.routing, unknown)?;
+            }
             _ => record_unknown(doc, unknown, &[], key, item),
         }
     }
@@ -2232,6 +2450,12 @@ fn parse_secret_limit(
                         Some(parse_speed(s).map_err(|e| {
                             ConfigError::FieldParse(format!("conn-speed-down: {e}"))
                         })?);
+                }
+            }
+            "outbound" => {
+                let s = expect_str(v, "outbound")?;
+                if !s.is_empty() {
+                    lim.outbound = Some(s.to_owned());
                 }
             }
             _ => record_unknown(doc, unknown, &["secret-limits", name], k, v),
@@ -2587,6 +2811,31 @@ fn parse_web_table(
                 let s = expect_str(v, "web.tls-key")?;
                 if !s.is_empty() {
                     web.tls_key = Some(s.to_owned());
+                }
+            }
+            "carrier" => {
+                let s = expect_str(v, "web.carrier")?;
+                if !s.is_empty() {
+                    web.carrier = Some(
+                        s.parse()
+                            .map_err(|e| ConfigError::FieldParse(format!("web.carrier: {e}")))?,
+                    );
+                }
+            }
+            "lanes" => {
+                let n = expect_u32(v, "web.lanes")?;
+                let u = u8::try_from(n).map_err(|_| {
+                    ConfigError::FieldParse("web.lanes must be in 1..=8".to_owned())
+                })?;
+                web.lanes = Some(u);
+            }
+            "hosts" => {
+                web.hosts = Some(expect_string_array(v, "web.hosts")?);
+            }
+            "base-path" => {
+                let s = expect_str(v, "web.base-path")?;
+                if !s.is_empty() {
+                    web.base_path = Some(s.trim_end_matches('/').to_owned());
                 }
             }
             _ => record_unknown(doc, unknown, &["web"], k, v),
@@ -3093,6 +3342,170 @@ fn parse_stats(
                 }
             }
             _ => record_unknown(doc, unknown, &["stats"], k, v),
+        }
+    }
+    Ok(())
+}
+
+fn parse_api_table(
+    doc: &[u8],
+    tbl: &dyn TableLike,
+    api: &mut ApiConfig,
+    unknown: &mut BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    for (k, v) in tbl.iter() {
+        match k {
+            "persistence" => {
+                let s = expect_str(v, "api.persistence")?;
+                if !s.is_empty() {
+                    api.persistence =
+                        Some(s.parse().map_err(|e| {
+                            ConfigError::FieldParse(format!("api.persistence: {e}"))
+                        })?);
+                }
+            }
+            "state-file" => {
+                let s = expect_str(v, "api.state-file")?;
+                if !s.is_empty() {
+                    api.state_file = Some(s.to_owned());
+                }
+            }
+            _ => record_unknown(doc, unknown, &["api"], k, v),
+        }
+    }
+    Ok(())
+}
+
+fn parse_outbounds_item(
+    doc: &[u8],
+    item: &Item,
+    out: &mut Vec<ConfigOutbound>,
+    unknown: &mut BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    let tables: Vec<&dyn TableLike> = if let Some(arr) = item.as_array_of_tables() {
+        arr.iter().map(|t| t as &dyn TableLike).collect()
+    } else if let Some(tbl) = item.as_table_like() {
+        vec![tbl]
+    } else {
+        return Err(ConfigError::FieldParse(
+            "outbound must be a [[outbound]] array of tables".to_owned(),
+        ));
+    };
+
+    for tbl in tables {
+        let mut ob = ConfigOutbound::default();
+        for (k, v) in tbl.iter() {
+            match k {
+                "name" => expect_str(v, "outbound.name")?.clone_into(&mut ob.name),
+                "url" => expect_str(v, "outbound.url")?.clone_into(&mut ob.url),
+                "weight" => ob.weight = Some(expect_u32(v, "outbound.weight")?),
+                "interface" => {
+                    let s = expect_str(v, "outbound.interface")?;
+                    if !s.is_empty() {
+                        ob.interface = Some(s.to_owned());
+                    }
+                }
+                "bind-ipv4" => {
+                    let s = expect_str(v, "outbound.bind-ipv4")?;
+                    if !s.is_empty() {
+                        ob.bind_ipv4 = Some(s.parse().map_err(|_| {
+                            ConfigError::FieldParse(format!("invalid outbound.bind-ipv4 {s:?}"))
+                        })?);
+                    }
+                }
+                "bind-ipv6" => {
+                    let s = expect_str(v, "outbound.bind-ipv6")?;
+                    if !s.is_empty() {
+                        ob.bind_ipv6 = Some(s.parse().map_err(|_| {
+                            ConfigError::FieldParse(format!("invalid outbound.bind-ipv6 {s:?}"))
+                        })?);
+                    }
+                }
+                "fwmark" => ob.fwmark = Some(expect_u32(v, "outbound.fwmark")?),
+                "max-fails" => ob.max_fails = Some(expect_u32(v, "outbound.max-fails")?),
+                "cooldown" => {
+                    let s = expect_str(v, "outbound.cooldown")?;
+                    if !s.is_empty() {
+                        ob.cooldown = Some(parse_duration(s).map_err(|e| {
+                            ConfigError::FieldParse(format!("outbound.cooldown: {e}"))
+                        })?);
+                    }
+                }
+                _ => record_unknown(doc, unknown, &["outbound"], k, v),
+            }
+        }
+        out.push(ob);
+    }
+    Ok(())
+}
+
+fn parse_outbound_groups_item(
+    doc: &[u8],
+    item: &Item,
+    out: &mut Vec<ConfigOutboundGroup>,
+    unknown: &mut BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    let tables: Vec<&dyn TableLike> = if let Some(arr) = item.as_array_of_tables() {
+        arr.iter().map(|t| t as &dyn TableLike).collect()
+    } else if let Some(tbl) = item.as_table_like() {
+        vec![tbl]
+    } else {
+        return Err(ConfigError::FieldParse(
+            "outbound-group must be a [[outbound-group]] array of tables".to_owned(),
+        ));
+    };
+
+    for tbl in tables {
+        let mut g = ConfigOutboundGroup::default();
+        for (k, v) in tbl.iter() {
+            match k {
+                "name" => expect_str(v, "outbound-group.name")?.clone_into(&mut g.name),
+                "strategy" => {
+                    let s = expect_str(v, "outbound-group.strategy")?;
+                    if !s.is_empty() {
+                        g.strategy = Some(s.to_owned());
+                    }
+                }
+                "members" => g.members = expect_string_array(v, "outbound-group.members")?,
+                _ => record_unknown(doc, unknown, &["outbound-group"], k, v),
+            }
+        }
+        out.push(g);
+    }
+    Ok(())
+}
+
+fn parse_routing_table(
+    doc: &[u8],
+    tbl: &dyn TableLike,
+    routing: &mut ConfigRouting,
+    unknown: &mut BTreeSet<String>,
+) -> Result<(), ConfigError> {
+    for (k, v) in tbl.iter() {
+        match k {
+            "default-outbound" => {
+                let s = expect_str(v, "routing.default-outbound")?;
+                if !s.is_empty() {
+                    routing.default_outbound = Some(s.to_owned());
+                }
+            }
+            "dc" => {
+                let sub = v.as_table_like().ok_or_else(|| {
+                    ConfigError::FieldParse("[routing.dc] must be a table".to_owned())
+                })?;
+                for (dk, dv) in sub.iter() {
+                    let dc_num: i32 = dk.parse().map_err(|_| {
+                        ConfigError::FieldParse(format!(
+                            "routing.dc key {dk:?} must be a Telegram DC integer"
+                        ))
+                    })?;
+                    let target = expect_str(dv, "routing.dc entry")?;
+                    if !target.is_empty() {
+                        routing.dc.insert(dc_num.abs(), target.to_owned());
+                    }
+                }
+            }
+            _ => record_unknown(doc, unknown, &["routing"], k, v),
         }
     }
     Ok(())

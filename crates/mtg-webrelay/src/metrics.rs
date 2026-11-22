@@ -29,6 +29,13 @@ pub struct RelayCounters {
     session_limit: AtomicI64,
     reloads: AtomicI64,
     reload_failures: AtomicI64,
+    carrier_ws: AtomicI64,
+    carrier_ws_lanes: AtomicI64,
+    carrier_https: AtomicI64,
+    carrier_https_lanes: AtomicI64,
+    carrier_h2_stream: AtomicI64,
+    conveyor_up_batches: AtomicI64,
+    downlink_polls: AtomicI64,
     meta: Mutex<RelayMeta>,
 }
 
@@ -60,8 +67,46 @@ impl RelayCounters {
             session_limit: AtomicI64::new(0),
             reloads: AtomicI64::new(0),
             reload_failures: AtomicI64::new(0),
+            carrier_ws: AtomicI64::new(0),
+            carrier_ws_lanes: AtomicI64::new(0),
+            carrier_https: AtomicI64::new(0),
+            carrier_https_lanes: AtomicI64::new(0),
+            carrier_h2_stream: AtomicI64::new(0),
+            conveyor_up_batches: AtomicI64::new(0),
+            downlink_polls: AtomicI64::new(0),
             meta: Mutex::new(RelayMeta::default()),
         }
+    }
+
+    #[inline]
+    pub fn on_carrier_selected(&self, mode: &str) {
+        match mode {
+            "ws-lanes" => {
+                self.carrier_ws_lanes.fetch_add(1, Ordering::Relaxed);
+            }
+            "https" => {
+                self.carrier_https.fetch_add(1, Ordering::Relaxed);
+            }
+            "https-lanes" => {
+                self.carrier_https_lanes.fetch_add(1, Ordering::Relaxed);
+            }
+            "h2-stream" => {
+                self.carrier_h2_stream.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.carrier_ws.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn on_conveyor_up(&self) {
+        self.conveyor_up_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn on_downlink_poll(&self) {
+        self.downlink_polls.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_profiles(&self, names: Vec<String>) {
@@ -167,6 +212,15 @@ impl RelayCounters {
                 bad_token: self.bad_token.load(Ordering::Relaxed),
                 session_limit: self.session_limit.load(Ordering::Relaxed),
             },
+            carriers: RelayCarrierStats {
+                websocket: self.carrier_ws.load(Ordering::Relaxed),
+                ws_lanes: self.carrier_ws_lanes.load(Ordering::Relaxed),
+                https: self.carrier_https.load(Ordering::Relaxed),
+                https_lanes: self.carrier_https_lanes.load(Ordering::Relaxed),
+                h2_stream: self.carrier_h2_stream.load(Ordering::Relaxed),
+                conveyor_up_batches: self.conveyor_up_batches.load(Ordering::Relaxed),
+                downlink_polls: self.downlink_polls.load(Ordering::Relaxed),
+            },
         }
     }
 }
@@ -184,6 +238,18 @@ pub struct RelayStats {
     pub streams: RelayStreamStats,
     pub bytes: RelayByteStats,
     pub refused: RelayRefusedStats,
+    pub carriers: RelayCarrierStats,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelayCarrierStats {
+    pub websocket: i64,
+    pub ws_lanes: i64,
+    pub https: i64,
+    pub https_lanes: i64,
+    pub h2_stream: i64,
+    pub conveyor_up_batches: i64,
+    pub downlink_polls: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

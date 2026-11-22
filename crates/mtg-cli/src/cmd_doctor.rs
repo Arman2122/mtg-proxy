@@ -6,12 +6,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::Utc;
-use mtg_config::{Config, IpFilterAction, PreferIp};
+use mtg_config::{ApiPersistenceMode, Config, IpFilterAction, PreferIp, WebCarrierMode};
 use mtg_crypto::aes_ctr::detect_aes_backend;
 use mtg_crypto::obfs2::build_outbound_handshake;
 use mtg_governance::LiveIpFilter;
 use mtg_net::{
-    DcRouter, DnsResolver, DriverKind, ProxyPool, SocketConfig, allowed_linux_cpus, probe_uring,
+    DcRouter, DnsResolver, DriverKind, OutboundGroupSpec, OutboundRouter, OutboundSpec,
+    OutboundStrategy, ProxyPool, RoutingSpec, SocketConfig, allowed_linux_cpus, probe_uring,
 };
 use mtg_protocol::dcprobe;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -85,6 +86,24 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
         conf.domain_fronting.unknown_sni_action.unwrap_or_default(),
         conf.ignore_time_skew.unwrap_or(false),
     );
+    let api_persist = conf.api.persistence.unwrap_or(ApiPersistenceMode::Memory);
+    println!(
+        "  ✅ Management API persistence: mode={api_persist}{}",
+        conf.api
+            .state_file
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map_or_else(String::new, |p| format!(" state-file={p}"))
+    );
+    if !conf.outbounds.is_empty() || !conf.outbound_groups.is_empty() || !conf.routing.is_empty() {
+        println!(
+            "  ✅ Universal Outbound Engine: {} outbound(s), {} group(s), default={}, dc-routes={}",
+            conf.outbounds.len(),
+            conf.outbound_groups.len(),
+            conf.routing.default_outbound.as_deref().unwrap_or("direct"),
+            conf.routing.dc.len(),
+        );
+    }
 
     // 2. Linux kernel, CPU affinity & hardware crypto capability probe
     println!("Checking Linux kernel & CPU capabilities...");
@@ -205,8 +224,12 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
                     "standalone"
                 };
                 println!(
-                    "  ✅ [web] schema valid (mode={mode}, host={})",
-                    conf.web.host.as_deref().unwrap_or("")
+                    "  ✅ [web] schema valid (mode={mode}, host={}, extra-hosts={}, carrier={}, lanes={}, base-path={})",
+                    conf.web.host.as_deref().unwrap_or(""),
+                    conf.web.hosts.as_ref().map_or(0, Vec::len),
+                    conf.web.carrier.unwrap_or(WebCarrierMode::Websocket),
+                    conf.web.lanes.unwrap_or(1),
+                    conf.web.base_path.as_deref().unwrap_or("/api/v1"),
                 );
                 if let Err(e) = mtg_webrelay::Signer::load_file(Path::new(&conf.web.token_key)) {
                     println!("  ❌ [web] token-key {}: {e}", conf.web.token_key);
@@ -328,17 +351,73 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
         }
     }
 
-    // 5. Real Telegram DC RPC connectivity (`dcprobe` over obfuscated2!)
+    // 5. Real Telegram DC RPC connectivity (`dcprobe` over obfuscated2 + universal outbounds!)
     if !skip_native_check {
         println!("Checking Telegram DC connectivity (RPC req_pq_multi)...");
-        let router = DcRouter::new(
+        let mut router = DcRouter::new(
             prefer_ip,
             conf.allow_fallback_on_unknown_dc.unwrap_or(true),
             sock_cfg,
             Duration::from_secs(10),
             proxy_pool,
         )
-        .with_dns(dns);
+        .with_dns(std::sync::Arc::clone(&dns));
+
+        if !conf.outbounds.is_empty()
+            || !conf.outbound_groups.is_empty()
+            || !conf.routing.is_empty()
+        {
+            let ob_specs: Vec<OutboundSpec> = conf
+                .outbounds
+                .iter()
+                .map(|ob| OutboundSpec {
+                    name: ob.name.trim().to_owned(),
+                    url: ob.url.trim().to_owned(),
+                    interface: ob.interface.clone(),
+                    bind_ipv4: ob.bind_ipv4,
+                    bind_ipv6: ob.bind_ipv6,
+                    fwmark: ob.fwmark,
+                    weight: ob.weight.unwrap_or(100),
+                    max_fails: ob.max_fails.unwrap_or(5),
+                    cooldown_secs: ob.cooldown.map_or(30, |d| d.as_secs()),
+                })
+                .collect();
+            let ob_groups: Vec<OutboundGroupSpec> = conf
+                .outbound_groups
+                .iter()
+                .map(|g| OutboundGroupSpec {
+                    name: g.name.trim().to_owned(),
+                    strategy: g
+                        .strategy
+                        .as_deref()
+                        .and_then(|s| s.parse::<OutboundStrategy>().ok())
+                        .unwrap_or(OutboundStrategy::EwmaRtt),
+                    members: g.members.clone(),
+                })
+                .collect();
+            let ob_routing = RoutingSpec {
+                default_outbound: conf.routing.default_outbound.clone(),
+                dc_routes: conf.routing.dc.clone(),
+            };
+            let legacy = conf.network.proxies.clone().unwrap_or_default();
+            match OutboundRouter::build(
+                &ob_specs,
+                &ob_groups,
+                ob_routing,
+                &legacy,
+                &dns,
+                sock_cfg,
+                Vec::new(),
+            ) {
+                Ok(ob_router) => {
+                    router = router.with_outbound_router(std::sync::Arc::new(ob_router));
+                }
+                Err(e) => {
+                    println!("  ❌ Universal Outbound Engine build failed: {e}");
+                    all_ok = false;
+                }
+            }
+        }
         let _ = router.refresh_once().await;
 
         let mut any_dc_ok = false;
@@ -447,9 +526,10 @@ async fn check_tcp_reachable(
 
 async fn probe_dc(router: &DcRouter, dc: i32, timeout: Duration) -> Result<Duration> {
     let start = Instant::now();
-    let (mut stream, _, effective_dc) = tokio::time::timeout(timeout, router.dial_direct(dc))
-        .await
-        .map_err(|_| anyhow::anyhow!("dial timeout"))??;
+    let (mut stream, _, effective_dc) =
+        tokio::time::timeout(timeout, router.dial_direct_routed(dc, None))
+            .await
+            .map_err(|_| anyhow::anyhow!("dial timeout"))??;
 
     let (frame, mut ciphers) = build_outbound_handshake(
         effective_dc as i16,

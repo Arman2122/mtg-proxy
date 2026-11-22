@@ -10,12 +10,15 @@
 //! - Instant `DELETE /api/v1/session` teardown via `watch::Sender<bool>`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
+
+use crate::hub::SessionHub;
 
 /// Lifetime of an unspent bootstrap token embedded in one bridge HTML page.
 pub const BOOTSTRAP_TTL: Duration = Duration::from_secs(120);
@@ -54,6 +57,7 @@ struct SessionEntry {
     attached: bool,
     detached_at: Option<Instant>,
     cancel_tx: Option<watch::Sender<bool>>,
+    hub: Option<Arc<SessionHub>>,
 }
 
 #[derive(Debug)]
@@ -205,6 +209,7 @@ impl SessionStore {
                 attached: false,
                 detached_at: Some(now),
                 cancel_tx: None,
+                hub: None,
             },
         );
 
@@ -252,6 +257,42 @@ impl SessionStore {
         }
     }
 
+    /// Return the active [`SessionHub`] for `session_token`, lazily spawning one
+    /// via `spawn_fn` on first `https` / `https-lanes` / `ws-lanes` / `h2-stream`
+    /// carrier request (returns `None` if session is unknown or already bound to
+    /// an exclusive single-carrier WebSocket).
+    pub fn get_or_spawn_hub<F>(
+        &self,
+        session_token: &str,
+        spawn_fn: F,
+    ) -> Option<(usize, Arc<SessionHub>, bool)>
+    where
+        F: FnOnce(watch::Receiver<bool>) -> Arc<SessionHub>,
+    {
+        let now = Instant::now();
+        let mut guard = self.inner.lock();
+        reap(&mut guard, now);
+
+        let entry = guard.sessions.get_mut(session_token)?;
+        if let Some(existing) = &entry.hub {
+            if existing.is_closed() {
+                return None;
+            }
+            return Some((entry.profile, Arc::clone(existing), false));
+        }
+        // Refuse if an exclusive classic single-carrier WebSocket already owns this session.
+        if entry.attached {
+            return None;
+        }
+        let (tx, rx) = watch::channel(false);
+        let hub = spawn_fn(rx);
+        entry.attached = true;
+        entry.detached_at = None;
+        entry.cancel_tx = Some(tx);
+        entry.hub = Some(Arc::clone(&hub));
+        Some((entry.profile, hub, true))
+    }
+
     /// Permanently delete `session_token` and immediately cancel any live carrier.
     pub fn remove(&self, session_token: &str) -> bool {
         self.remove_at(session_token, Instant::now())
@@ -263,6 +304,9 @@ impl SessionStore {
         if let Some(entry) = guard.sessions.remove(session_token) {
             if let Some(tx) = entry.cancel_tx {
                 let _ = tx.send(true);
+            }
+            if let Some(hub) = entry.hub {
+                hub.shutdown();
             }
             true
         } else {
@@ -287,6 +331,9 @@ fn reap(inner: &mut StoreInner, now: Instant) {
     }
 
     inner.sessions.retain(|_, s| {
+        if let Some(hub) = &s.hub {
+            return !hub.is_closed();
+        }
         s.attached
             || s.detached_at
                 .is_none_or(|dt| now.saturating_duration_since(dt) < RECONNECT_GRACE)

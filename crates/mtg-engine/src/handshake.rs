@@ -1059,7 +1059,7 @@ async fn dial_and_prepare_relay(
     let user = engine.metrics.user(&secret_name);
     let dc = obfs_match.dc;
     let doppel = build_doppel_state(engine, is_faketls, doppel_params);
-    let conn_limits = {
+    let (conn_limits, secret_outbound) = {
         let sec_lim = engine
             .secrets
             .load()
@@ -1067,7 +1067,10 @@ async fn dial_and_prepare_relay(
             .cloned()
             .unwrap_or_default();
         let glob_lim = engine.metrics.global_limits.snapshot();
-        ConnSpeedLimiters::effective(&sec_lim, &glob_lim)
+        (
+            ConnSpeedLimiters::effective(&sec_lim, &glob_lim),
+            sec_lim.outbound,
+        )
     };
 
     // 1. Try multiplexed MiddleProxy when `ad_tag` is set!
@@ -1134,30 +1137,43 @@ async fn dial_and_prepare_relay(
         }
     }
 
-    // 2. Direct Telegram DC dial via Happy Eyeballs + outbound obfuscated2 handshake
-    let Ok((mut dc_stream, dc_addr, effective_dc)) = engine.dc_router.dial_direct(dc).await else {
-        debug!(secret = %secret_name, dc, "direct Telegram DC dial failed");
+    // 2. Direct Telegram DC dial via Happy Eyeballs or Universal Plug-In Outbound Engine
+    //    (direct / SO_BINDTODEVICE / fwmark / SOCKS5 / SOCKS4 / HTTP(S) CONNECT /
+    //    Shadowsocks AEAD-2022 / Unix sidecar Xray/sing-box!) + outbound obfuscated2 handshake.
+    let Ok((mut dc_stream, dc_addr, effective_dc)) = engine
+        .dc_router
+        .dial_direct_routed(dc, secret_outbound.as_deref())
+        .await
+    else {
+        debug!(secret = %secret_name, dc, outbound = ?secret_outbound, "direct Telegram DC dial failed");
         return None;
     };
 
     let (out_frame, out_ciphers) =
         build_outbound_handshake(effective_dc as i16, obfs_match.tag, None);
-    // Fast non-blocking write path for 64B outbound obfuscated2 frame!
-    let sent_direct = match dc_stream.try_write(&out_frame) {
-        Ok(w) if w == out_frame.len() => true,
-        Ok(0) => return None,
-        Ok(w) => tokio::time::timeout(
-            engine.settings.tcp_timeout,
-            dc_stream.write_all(&out_frame[w..]),
-        )
-        .await
-        .is_ok_and(|r| r.is_ok()),
-        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-            tokio::time::timeout(engine.settings.tcp_timeout, dc_stream.write_all(&out_frame))
-                .await
-                .is_ok_and(|r| r.is_ok())
+    // Fast non-blocking write path for 64B outbound obfuscated2 frame on concrete TCP;
+    // clean async write_all on encrypted/sidecar tunnels (Shadowsocks / TLS / Unix).
+    let sent_direct = if let Some(tcp) = dc_stream.as_tcp() {
+        match tcp.try_write(&out_frame) {
+            Ok(w) if w == out_frame.len() => true,
+            Ok(0) => return None,
+            Ok(w) => tokio::time::timeout(
+                engine.settings.tcp_timeout,
+                dc_stream.write_all(&out_frame[w..]),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok()),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                tokio::time::timeout(engine.settings.tcp_timeout, dc_stream.write_all(&out_frame))
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+            }
+            Err(_) => return None,
         }
-        Err(_) => return None,
+    } else {
+        tokio::time::timeout(engine.settings.tcp_timeout, dc_stream.write_all(&out_frame))
+            .await
+            .is_ok_and(|r| r.is_ok())
     };
     if !sent_direct {
         return None;

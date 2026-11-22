@@ -7,6 +7,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use mtg_config::WebCarrierMode;
 use thiserror::Error;
 
 use crate::capability::parse_capability_strict;
@@ -14,8 +15,10 @@ use crate::capability::parse_capability_strict;
 /// Embedded cleaned ES5 bridge script.
 pub const BRIDGE_JS: &str = include_str!("bridge.js");
 
-/// Carrier mode announced in `TPROXY_BOOT` and `X-Carrier-Mode`.
+/// Default carrier mode announced in `TPROXY_BOOT` and `X-Carrier-Mode`.
 pub const CARRIER_MODE: &str = "websocket";
+/// Default carrier API base path.
+pub const DEFAULT_BASE_PATH: &str = "/api/v1";
 
 const NONCE_BYTES: usize = 16;
 
@@ -50,12 +53,24 @@ pub struct BridgeDocument {
 #[derive(Debug, Clone)]
 pub struct BridgePage {
     host: String,
+    carrier: WebCarrierMode,
+    base_path: String,
+    lanes: u8,
     csp_prefix: String,
     csp_suffix: String,
 }
 
 impl BridgePage {
     pub fn new(host: &str) -> Result<Self, PageError> {
+        Self::new_with_options(host, WebCarrierMode::Websocket, DEFAULT_BASE_PATH, 1)
+    }
+
+    pub fn new_with_options(
+        host: &str,
+        carrier: WebCarrierMode,
+        base_path: &str,
+        lanes: u8,
+    ) -> Result<Self, PageError> {
         if host.is_empty()
             || host.len() > 253
             || !host.contains('.')
@@ -65,6 +80,14 @@ impl BridgePage {
         {
             return Err(PageError::InvalidHost(host.to_owned()));
         }
+
+        let clean_base = base_path.trim().trim_end_matches('/');
+        let base_path = if clean_base.is_empty() {
+            DEFAULT_BASE_PATH.to_owned()
+        } else {
+            clean_base.to_owned()
+        };
+        let eff_lanes = lanes.clamp(1, 8);
 
         let csp_prefix = format!(
             "default-src 'none'; base-uri 'none'; child-src 'none'; connect-src 'self' wss://{host}; \
@@ -78,6 +101,9 @@ impl BridgePage {
 
         Ok(Self {
             host: host.to_owned(),
+            carrier,
+            base_path,
+            lanes: eff_lanes,
             csp_prefix,
             csp_suffix,
         })
@@ -94,12 +120,26 @@ impl BridgePage {
         getrandom::fill(&mut nonce_raw).map_err(|e| PageError::Rng(e.to_string()))?;
         let nonce = URL_SAFE_NO_PAD.encode(nonce_raw);
 
-        // Both host (lowercase LDH) and token (base64url) contain zero JSON-escapable chars,
-        // and we format as valid JSON object identical to Go `json.Marshal`.
-        let boot_json = format!(
-            r#"{{"host":"{}","mode":"{}","token":"{}"}}"#,
-            self.host, CARRIER_MODE, bootstrap_token
-        );
+        // Preserve exact compact JSON when using default websocket + /api/v1!
+        let boot_json = if self.carrier == WebCarrierMode::Websocket
+            && self.base_path == DEFAULT_BASE_PATH
+        {
+            format!(
+                r#"{{"host":"{}","mode":"{}","token":"{}"}}"#,
+                self.host, CARRIER_MODE, bootstrap_token
+            )
+        } else {
+            let fallback = matches!(self.carrier, WebCarrierMode::Auto);
+            format!(
+                r#"{{"host":"{}","mode":"{}","token":"{}","base":"{}","lanes":{},"fallback":{}}}"#,
+                self.host,
+                self.carrier.as_str(),
+                bootstrap_token,
+                self.base_path,
+                self.lanes,
+                fallback
+            )
+        };
 
         let mut html = Vec::with_capacity(
             PAGE_HEAD.len()

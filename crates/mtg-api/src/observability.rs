@@ -22,7 +22,11 @@ struct PromState {
 }
 
 async fn handle_prometheus(State(state): State<PromState>) -> impl IntoResponse {
-    let body = state.engine.metrics.render_prometheus(&state.prefix);
+    let outbounds = state.engine.outbound_snapshots();
+    let body = state
+        .engine
+        .metrics
+        .render_prometheus_with_outbounds(&state.prefix, &outbounds);
     (
         StatusCode::OK,
         [(

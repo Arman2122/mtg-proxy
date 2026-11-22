@@ -9,8 +9,8 @@
 //! best-effort `TCP_CONGESTION = "bbr"` with once-logged fallback on `ENOENT`.
 
 use std::io;
-use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, RawFd};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::Once;
 use std::time::Duration;
 
@@ -283,6 +283,106 @@ pub fn tune_connected_fd(fd: RawFd, cfg: &SocketConfig) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Optional Linux pre-connect outbound binding & policy-routing options.
+///
+/// Enables routing outbound traffic at 100% kernel line rate over secondary NICs,
+/// WireGuard (`wg0`), Tailscale (`tailscale0`), sing-box/Xray TUN interfaces, or
+/// Linux `ip rule add fwmark ...` policy routing tables!
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OutboundBindOptions {
+    /// Linux network interface name for `SO_BINDTODEVICE` (e.g. `"wg0"`, `"eth1"`).
+    pub interface: Option<String>,
+    /// Local source IPv4 address bound before `connect(2)` (with `IP_BIND_ADDRESS_NO_PORT`).
+    pub bind_ipv4: Option<Ipv4Addr>,
+    /// Local source IPv6 address bound before `connect(2)`.
+    pub bind_ipv6: Option<Ipv6Addr>,
+    /// Linux `SO_MARK` firewall mark for policy routing (`ip rule add fwmark <mark>`).
+    pub fwmark: Option<u32>,
+}
+
+impl OutboundBindOptions {
+    pub const fn is_empty(&self) -> bool {
+        self.interface.is_none()
+            && self.bind_ipv4.is_none()
+            && self.bind_ipv6.is_none()
+            && self.fwmark.is_none()
+    }
+}
+
+/// Apply `SO_BINDTODEVICE`, `SO_MARK`, and source-IP `bind(2)` to a pre-connect
+/// outbound socket.
+pub fn apply_outbound_bind(
+    sock: &Socket,
+    target_is_v6: bool,
+    opts: &OutboundBindOptions,
+) -> io::Result<()> {
+    let fd = sock.as_raw_fd();
+    if let Some(mark) = opts.fwmark {
+        set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_MARK, mark as libc::c_int)?;
+    }
+    if let Some(iface) = &opts.interface {
+        let trimmed = iface.trim();
+        if !trimmed.is_empty() {
+            let mut name_bytes = trimmed.as_bytes().to_vec();
+            if name_bytes.len() >= libc::IFNAMSIZ {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("interface name too long: {trimmed:?}"),
+                ));
+            }
+            name_bytes.push(0);
+            // SAFETY: `name_bytes` is a NUL-terminated Linux interface name < IFNAMSIZ.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    name_bytes.as_ptr().cast::<libc::c_void>(),
+                    name_bytes.len() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    let src_ip: Option<IpAddr> = if target_is_v6 {
+        opts.bind_ipv6.map(IpAddr::V6)
+    } else {
+        opts.bind_ipv4.map(IpAddr::V4)
+    };
+    if let Some(ip) = src_ip {
+        let sa = SockAddr::from(SocketAddr::new(ip, 0));
+        sock.bind(&sa)?;
+    }
+    Ok(())
+}
+
+/// Asynchronously connect a pre-tuned Linux TCP socket to `addr` applying
+/// `SocketConfig` (`TCP_NODELAY`, `BBR`, `TCP_SYNCNT`, `IP_BIND_ADDRESS_NO_PORT`,
+/// `TCP_USER_TIMEOUT`, `TCP_NOTSENT_LOWAT`) AND optional [`OutboundBindOptions`]
+/// (`SO_BINDTODEVICE`, `SO_MARK`, source-IP bind) BEFORE the TCP SYN leaves!
+pub async fn connect_tcp_tuned_bound(
+    addr: SocketAddr,
+    cfg: &SocketConfig,
+    bind: &OutboundBindOptions,
+    timeout: Duration,
+) -> io::Result<tokio::net::TcpStream> {
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let sock = create_outbound_socket(domain, cfg)?;
+    if !bind.is_empty() {
+        apply_outbound_bind(&sock, addr.is_ipv6(), bind)?;
+    }
+    // SAFETY: transfer sole ownership of valid non-blocking Linux TCP socket fd to Tokio.
+    let tokio_sock = unsafe { tokio::net::TcpSocket::from_raw_fd(sock.into_raw_fd()) };
+    tokio::time::timeout(timeout, tokio_sock.connect(addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound TCP connect timed out"))?
 }
 
 /// Apply `tune_connected_fd` to a Tokio `TcpStream` (for control-plane / proxy

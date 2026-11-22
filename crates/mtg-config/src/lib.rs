@@ -13,21 +13,23 @@ pub use rotation::{
     RotationSummary, is_panel_managed_path, rotate_file_atomic,
 };
 pub use schema::{
-    AntiReplayConfig, Config, ConfigError, ConfigListener, ConfigRetiringSecret, ConfigSecretLimit,
-    ConfigWeb, DEFAULT_HANDSHAKES_PER_IP, DefenseConfig, DomainFrontingConfig, DoppelgangerConfig,
-    ENV_AD_TAG, ENV_BIND_TO, ENV_SECRET, ENV_SECRET_HOST, GlobalLimitsConfig,
-    HandshakeBudgetConfig, KeepAliveConfig, ListConfig, ListenerPolicy, MISPLACED_RETIRING_USER,
-    NetworkConfig, PrometheusConfig, StatsConfig, StatsdConfig, ThrottleConfig, TimeoutConfig,
+    AntiReplayConfig, ApiConfig, Config, ConfigError, ConfigListener, ConfigOutbound,
+    ConfigOutboundGroup, ConfigRetiringSecret, ConfigRouting, ConfigSecretLimit, ConfigWeb,
+    DEFAULT_HANDSHAKES_PER_IP, DefenseConfig, DomainFrontingConfig, DoppelgangerConfig, ENV_AD_TAG,
+    ENV_BIND_TO, ENV_SECRET, ENV_SECRET_HOST, GlobalLimitsConfig, HandshakeBudgetConfig,
+    KeepAliveConfig, ListConfig, ListenerPolicy, MISPLACED_RETIRING_USER, NetworkConfig,
+    PrometheusConfig, StatsConfig, StatsdConfig, ThrottleConfig, TimeoutConfig,
 };
 pub use scrub::{
     UNKNOWN_KEY_LINE, VALUE_NOT_SHOWN, holds_a_value, reads_as_a_value, scrub_error_against_doc,
     shown_name, unknown_key_path, value_free_name, value_free_text,
 };
 pub use types::{
-    AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction, PreferIp,
-    StatsdTagFormat, TypeParseError, UnknownSecretAction, UnknownSniAction, WebCdnPreset,
-    canonical_web_host, format_bytes_go, format_duration_go, parse_ad_tag, parse_bytes_str,
-    parse_duration, parse_server_hello_fragment_mss, redact_proxy_url, validate_ip_or_cidr,
+    AD_TAG_LEN, ApiPersistenceMode, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction,
+    PreferIp, StatsdTagFormat, TypeParseError, UnknownSecretAction, UnknownSniAction,
+    WebCarrierMode, WebCdnPreset, canonical_web_host, format_bytes_go, format_duration_go,
+    parse_ad_tag, parse_bytes_str, parse_duration, parse_server_hello_fragment_mss,
+    redact_proxy_url, validate_ip_or_cidr,
 };
 
 #[cfg(test)]
@@ -455,5 +457,86 @@ server-hello-delay-max-ms = 20
 alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
 "#;
         assert!(Config::parse(bad_delay).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn v26_outbounds_routing_persistence_and_web_carriers_parse_and_validate() {
+        let raw = br#"
+bind-to = "0.0.0.0:443"
+
+[api]
+persistence = "overlay"
+state-file = "/var/lib/mtg-proxy/runtime-state.json"
+
+[[outbound]]
+name = "wg-de"
+url = "direct://"
+interface = "wg0"
+fwmark = 256
+weight = 150
+
+[[outbound]]
+name = "xray-unix"
+url = "unix+socks5:///run/xray.sock"
+max-fails = 3
+cooldown = "15s"
+
+[[outbound]]
+name = "ss-eu"
+url = "ss://2022-blake3-aes-256-gcm:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=@198.51.100.10:8388"
+
+[[outbound-group]]
+name = "smart-eu"
+strategy = "failover"
+members = ["wg-de", "xray-unix", "ss-eu"]
+
+[routing]
+default-outbound = "smart-eu"
+[routing.dc]
+2 = "wg-de"
+4 = "xray-unix"
+
+[web]
+enabled = true
+integrated = true
+host = "web.example.com"
+hosts = ["alt.example.com"]
+carrier = "auto"
+lanes = 4
+base-path = "/cdn/v2"
+token-key = "/etc/mtg-proxy/web.key"
+cover-dir = "/srv/site"
+tls-cert = "/etc/ssl/fullchain.pem"
+tls-key = "/etc/ssl/privkey.pem"
+
+[secrets]
+alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+
+[secret-limits.alice]
+outbound = "xray-unix"
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        cfg.validate().unwrap();
+        cfg.validate_web().unwrap();
+        assert!(
+            cfg.unknown_keys.is_empty(),
+            "unknown: {:?}",
+            cfg.unknown_keys
+        );
+        assert_eq!(cfg.api.persistence, Some(ApiPersistenceMode::Overlay));
+        assert_eq!(cfg.outbounds.len(), 3);
+        assert_eq!(cfg.outbound_groups.len(), 1);
+        assert_eq!(cfg.routing.default_outbound.as_deref(), Some("smart-eu"));
+        assert_eq!(
+            cfg.routing.dc.get(&4).map(String::as_str),
+            Some("xray-unix")
+        );
+        assert_eq!(cfg.web.carrier, Some(WebCarrierMode::Auto));
+        assert_eq!(cfg.web.lanes, Some(4));
+        assert_eq!(cfg.web.base_path.as_deref(), Some("/cdn/v2"));
+        assert_eq!(
+            cfg.secret_limits["alice"].outbound.as_deref(),
+            Some("xray-unix")
+        );
     }
 }

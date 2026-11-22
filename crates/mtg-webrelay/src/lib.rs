@@ -11,6 +11,7 @@
 pub mod capability;
 pub mod cover;
 pub mod frame;
+pub mod hub;
 pub mod metrics;
 pub mod origin;
 pub mod page;
@@ -36,15 +37,19 @@ pub use frame::{
     MAX_SESSION_CREATE_BODY, MAX_STREAM_ID, PROTOCOL_VERSION, WELCOME_WIRE, WINDOW_PAYLOAD_SIZE,
     decode_batch, decode_hello,
 };
+pub use hub::{
+    DEFAULT_LONG_POLL_WAIT, H2DownlinkBody, HubError, MAX_CARRIER_LANES, MAX_LONG_POLL_WAIT,
+    SessionHub, WsLaneGuard, encode_h2_stream_chunk, take_h2_stream_chunks,
+};
 pub use metrics::{
-    RelayByteStats, RelayCounters, RelayRefusedStats, RelaySessionStats, RelayStats,
-    RelayStreamStats, handle_stats_request,
+    RelayByteStats, RelayCarrierStats, RelayCounters, RelayRefusedStats, RelaySessionStats,
+    RelayStats, RelayStreamStats, handle_stats_request,
 };
 pub use origin::{
-    BRIDGE_QUERY, CARRIER_PATH, Origin, OriginError, OriginIpFilters, OriginOptions, SESSION_PATH,
-    SUBPROTOCOL_PREFIX,
+    BRIDGE_QUERY, CARRIER_PATH, Origin, OriginBody, OriginError, OriginIpFilters, OriginOptions,
+    SESSION_PATH, SUBPROTOCOL_PREFIX,
 };
-pub use page::{BRIDGE_JS, BridgeDocument, BridgePage, CARRIER_MODE, PageError};
+pub use page::{BRIDGE_JS, BridgeDocument, BridgePage, CARRIER_MODE, DEFAULT_BASE_PATH, PageError};
 pub use server::{
     PrefixedStream, ReloadableTlsAcceptor, SharedGeoFilters, build_ip_filters_from_config,
     build_origin_from_config, build_origin_with_overrides, load_tls_acceptor, reload_web_profiles,
@@ -135,6 +140,10 @@ mod integration_tests {
 
         let origin = Origin::new(OriginOptions {
             host: "relay.example.test".to_owned(),
+            extra_hosts: vec![],
+            carrier: mtg_config::WebCarrierMode::Websocket,
+            lanes: 1,
+            base_path: DEFAULT_BASE_PATH.to_owned(),
             secrets: vec![s_live.clone()],
             retired: vec![s_ret.clone()],
             signer: signer.clone(),
@@ -338,6 +347,10 @@ mod integration_tests {
         let origin = Arc::new(
             Origin::new(OriginOptions {
                 host: "e2e.example.test".to_owned(),
+                extra_hosts: vec![],
+                carrier: mtg_config::WebCarrierMode::Websocket,
+                lanes: 1,
+                base_path: DEFAULT_BASE_PATH.to_owned(),
                 secrets: vec![secret.clone()],
                 retired: vec![],
                 signer,
@@ -551,6 +564,10 @@ mod integration_tests {
 
         let origin = Origin::new(OriginOptions {
             host: "stealth.example.test".to_owned(),
+            extra_hosts: vec![],
+            carrier: mtg_config::WebCarrierMode::Websocket,
+            lanes: 1,
+            base_path: DEFAULT_BASE_PATH.to_owned(),
             secrets: vec![secret.clone()],
             retired: vec![],
             signer,
@@ -649,6 +666,10 @@ mod integration_tests {
 
         let origin = Origin::new(OriginOptions {
             host: "cdn.example.test".to_owned(),
+            extra_hosts: vec![],
+            carrier: mtg_config::WebCarrierMode::Websocket,
+            lanes: 1,
+            base_path: DEFAULT_BASE_PATH.to_owned(),
             secrets: vec![secret.clone()],
             retired: vec![],
             signer,
@@ -750,5 +771,227 @@ mod integration_tests {
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-cover").unwrap(), "yes");
+    }
+
+    #[tokio::test]
+    async fn end_to_end_https_conveyor_cursor_replay_and_multi_vhost() {
+        use http::header;
+        use http_body_util::Full;
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+        use mtg_config::WebCarrierMode;
+        use mtg_protocol::proxyproto::{ProxyParseStatus, ProxyProtoMode, parse_proxy_header};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        // 1. Mock backend verifying PROXY v2 client IP propagation and echoing bytes.
+        let backend_ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_ln.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            let (mut s, _) = backend_ln.accept().await.unwrap();
+            let mut buf = vec![0u8; 256];
+            let mut filled = 0usize;
+            let (client_ip, leftover) = loop {
+                let n = s.read(&mut buf[filled..]).await.unwrap();
+                assert!(n > 0);
+                filled += n;
+                if let ProxyParseStatus::Complete { header, consumed } =
+                    parse_proxy_header(&buf[..filled], ProxyProtoMode::Required).unwrap()
+                {
+                    break (header.source.unwrap().ip(), buf[consumed..filled].to_vec());
+                }
+            };
+            assert_eq!(
+                client_ip,
+                "198.51.100.77".parse::<std::net::IpAddr>().unwrap()
+            );
+            let mut got = leftover;
+            while got.len() < 15 {
+                let mut tmp = [0u8; 64];
+                let n = s.read(&mut tmp).await.unwrap();
+                assert!(n > 0);
+                got.extend_from_slice(&tmp[..n]);
+            }
+            assert_eq!(&got[..15], b"ios-https-hello");
+            s.write_all(b"ios-https-reply").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let secret = Secret::generate_mode(SecretMode::Dd, "").unwrap();
+        let signer = Signer::new(&[0x77; TOKEN_KEY_LEN]).unwrap();
+        let counters = Arc::new(RelayCounters::default());
+
+        let origin = Arc::new(
+            Origin::new(OriginOptions {
+                host: "primary.example.test".to_owned(),
+                extra_hosts: vec!["ios-alt.example.test".to_owned()],
+                carrier: WebCarrierMode::Auto,
+                lanes: 4,
+                base_path: "/cdn/v2".to_owned(),
+                secrets: vec![secret.clone()],
+                retired: vec![],
+                signer,
+                cover: CoverSite::Custom(Arc::new(MarkerCover)),
+                backend: Arc::new(TcpProxyBackend::new(backend_addr, Duration::from_secs(5))),
+                limits: FrameLimits::default(),
+                max_sessions: 16,
+                max_streams: 16,
+                client_ip_source: ClientIpSource::XForwardedFor,
+                counters: Some(Arc::clone(&counters)),
+                ip_filters: OriginIpFilters::default(),
+            })
+            .unwrap(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (origin_addr, origin_srv) =
+            spawn_origin_server(Arc::clone(&origin), "127.0.0.1:0", false, shutdown_rx)
+                .await
+                .unwrap();
+
+        let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+        let alt_cap = derive_capability(&web_secret(&secret), "ios-alt.example.test").unwrap();
+
+        // 2. Fetch bridge page via secondary vhost (`Host: ios-alt.example.test`)!
+        let r_bridge = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://{origin_addr}/?bridge={alt_cap}"))
+            .header(header::HOST, "ios-alt.example.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = client.request(r_bridge).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("\"host\":\"ios-alt.example.test\""));
+        assert!(html.contains("\"base\":\"/cdn/v2\""));
+        assert!(html.contains("\"fallback\":true"));
+
+        // Extract bootstrap token from TPROXY_BOOT JSON.
+        let tok_pos = html.find("\"token\":\"").unwrap() + 9;
+        let tok_rest = &html[tok_pos..];
+        let boot_tok = &tok_rest[..tok_rest.find('"').unwrap()];
+
+        // 3. Create session with iPhone WKWebView User-Agent -> auto-selects `https` carrier!
+        let hello = Bytes::from_static(&[0x10, 0, 0, 0, 0, 0, 0, 1, 1]);
+        let r_sess = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{origin_addr}/cdn/v2/session"))
+            .header(header::AUTHORIZATION, format!("Bearer {boot_tok}"))
+            .header(
+                header::USER_AGENT,
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15",
+            )
+            .header("x-forwarded-for", "198.51.100.77")
+            .body(Full::new(hello))
+            .unwrap();
+        let resp = client.request(r_sess).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-carrier-mode").unwrap(), "https");
+        let sess_tok = resp
+            .headers()
+            .get("x-session-token")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        // 4. Send OUT-OF-ORDER HTTP Conveyor uploads (`X-Up-Seq: 1` DATA before `X-Up-Seq: 0` OPEN)!
+        let mut data_frame = vec![0x02, 0, 0, 7, 0, 0, 0, 15];
+        data_frame.extend_from_slice(b"ios-https-hello");
+        let r_up1 = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{origin_addr}/cdn/v2/up"))
+            .header(header::AUTHORIZATION, format!("Bearer {sess_tok}"))
+            .header("x-up-seq", "1")
+            .header("x-forwarded-for", "198.51.100.77")
+            .body(Full::new(Bytes::from(data_frame)))
+            .unwrap();
+        assert_eq!(
+            client.request(r_up1).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let open_frame = vec![0x01, 0, 0, 7, 0, 0, 0, 0];
+        let r_up0 = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{origin_addr}/cdn/v2/up"))
+            .header(header::AUTHORIZATION, format!("Bearer {sess_tok}"))
+            .header("x-up-seq", "0")
+            .header("x-forwarded-for", "198.51.100.77")
+            .body(Full::new(Bytes::from(open_frame)))
+            .unwrap();
+        assert_eq!(
+            client.request(r_up0).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+
+        // 5. Event-driven downlink long-poll `GET /cdn/v2/down?cursor=0` receives echoed reply!
+        let r_down = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://{origin_addr}/cdn/v2/down?cursor=0"))
+            .header(header::AUTHORIZATION, format!("Bearer {sess_tok}"))
+            .header("x-wait-ms", "3000")
+            .header("x-forwarded-for", "198.51.100.77")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_down = client.request(r_down).await.unwrap();
+        assert_eq!(resp_down.status(), StatusCode::OK);
+        let next_cur = resp_down
+            .headers()
+            .get("x-down-cursor")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(next_cur, "0");
+        let down_bytes = resp_down.into_body().collect().await.unwrap().to_bytes();
+        let frames = decode_batch(
+            &down_bytes,
+            FrameLimits::default(),
+            Direction::RelayToClient,
+        )
+        .unwrap();
+        assert!(frames.iter().any(|f| matches!(
+            f,
+            Frame::Data { stream_id: 7, payload } if &payload[..] == b"ios-https-reply"
+        )));
+
+        // 6. Cellular drop recovery: re-fetching `?cursor=0` replays exact batch from ring!
+        let r_replay = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://{origin_addr}/cdn/v2/down?cursor=0"))
+            .header(header::AUTHORIZATION, format!("Bearer {sess_tok}"))
+            .header("x-wait-ms", "1000")
+            .header("x-forwarded-for", "198.51.100.77")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_replay = client.request(r_replay).await.unwrap();
+        assert_eq!(resp_replay.status(), StatusCode::OK);
+        let replay_bytes = resp_replay.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(replay_bytes, down_bytes);
+
+        // 7. DELETE tears down session & SessionHub cleanly!
+        let r_del = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("http://{origin_addr}/cdn/v2/session"))
+            .header(header::AUTHORIZATION, format!("Bearer {sess_tok}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        assert_eq!(
+            client.request(r_del).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+
+        backend_task.await.unwrap();
+        let _ = shutdown_tx.send(true);
+        let _ = origin_srv.await;
     }
 }

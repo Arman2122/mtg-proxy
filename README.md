@@ -34,7 +34,8 @@ Unlike single-secret proxies, `mtg-proxy` gives every user their own named secre
 - [Production Linux Tuning (`systemd` & `sysctl`)](#production-linux-tuning-systemd--sysctl)
 - [Features](#features)
   - [Multiple Secrets & Hot Reload](#multiple-secrets--hot-reload)
-  - [Management HTTP API & Stats](#management-http-api--stats)
+  - [Management HTTP API, Enterprise Persistence & Multi-Core Panel Integration](#management-http-api--stats)
+  - [Universal Plug-In Outbound Traffic Engine (`[[outbound]]` & `[routing]`)](#universal-plug-in-outbound-traffic-engine)
   - [4-Tier Connection & Speed Governance](#4-tier-connection--speed-governance-global-per-secret-per-ip--cgnat-safe-per-connection)
   - [Per-Address Controls, Fair-Share & Bans](#per-address-controls-fair-share--bans)
   - [Secret Rotation with Overlap](#secret-rotation-with-overlap)
@@ -268,10 +269,57 @@ Configure `api-bind-to` (bind to loopback unless `api-token` is set — verified
 | `GET /ip-filters` | Inspect live `[defense.allowlist]` / `[defense.blocklist]` status (CIDR counts, ETag/304 hits, SHA-256 content hash, last refresh). |
 | `POST /ip-filters/refresh` | Trigger synchronous conditional HTTP (`If-None-Match` / `304`) refresh of allowlist/blocklist feeds. |
 | `GET /adtag` / `PUT /adtag` / `DELETE /adtag` | Read, set (`32` hex chars), or clear the global sponsored-channel `ad_tag`. |
+| `GET /capabilities` | Multi-core VPN panel core discovery (`protocol`, `transports`, `outbound_protocols`, `persistence`, `boot_id`, `state_revision`, `api_capabilities`, `features`). |
+| `GET /state` / `PUT /state` | Export or atomically converge the entire mutable runtime state (secrets, limits, ad-tags, outbounds, groups, routing) in ONE call. |
+| `GET /events` | Zero-polling real-time Server-Sent Events (`text/event-stream`) stream of live control-plane mutations. |
+| `POST /accounting/checkpoint` | Exact-once per-consumer distributed multi-node billing deltas (`boot_id`, `sequence`, `peek`, `counter_reset` detection). |
+| `GET /outbounds` / `PUT /outbounds` | Inspect live outbound RTT/dials/circuit breakers or hot-swap `[[outbound]]`, `[[outbound-group]]` & `[routing]` with zero dropped connections. |
+| `POST /outbounds/{name}/probe` | Actively dial Telegram DC through outbound `{name}` (bypassing open circuit) and return live RTT. |
+
+- **Optimistic Concurrency (`ETag` & `If-Match`):** Every API response includes strong `ETag: "rev-N"` and `X-State-Revision: N`. Passing `If-Match: "rev-N"` on any mutation guarantees safe concurrent panel writes (`412 Precondition Failed` on stale revisions; omit `If-Match` for full Penhoon/legacy compatibility).
+- **3-Mode Runtime Persistence (`[api] persistence`):** Choose `"memory"` (default — zero disk writes for external panel DBs), `"overlay"` (crash-safe atomic `0600` SHA-256 checksummed JSON `state-file` with `flock(2)` + `fsync` + `rename`, keeping `config.toml` clean & GitOps-immutable while surviving reboots), or `"toml"` (lossless `toml_edit` + `flock(2)` writeback directly into `config.toml` preserving operator comments).
 
 > **Privacy default (`track-client-ips = false`):** Client IP addresses (`connected_ips`, `last_ip`, per-address IP listings) are omitted by default and never written to disk; `usage-state-file` persists byte quotas only.
 
-Prometheus (`/metrics`) and StatsD UDP exporters are also built in under `[stats.prometheus]` and `[stats.statsd]`.
+Prometheus (`/metrics`, including `mtg_outbound_dials_total`, `mtg_outbound_rtt_ms`, and `mtg_outbound_circuit_open`) and StatsD UDP exporters are also built in under `[stats.prometheus]` and `[stats.statsd]`.
+
+### Universal Plug-In Outbound Traffic Engine
+
+Route outbound Telegram DC and MiddleProxy (`ad-tag`) traffic through **any protocol** — at zero overhead on direct TCP, with per-node lock-free circuit breakers, EWMA-RTT P2C / Failover / Weighted / Round-Robin / Hash-DC load balancing, per-DC routing, per-secret overrides, and live `PUT /outbounds` hot-swaps:
+
+```toml
+# 1. Kernel line-rate WireGuard / Tailscale / sing-box TUN / multi-NIC routing
+[[outbound]]
+name = "wg-de"
+url = "direct://"
+interface = "wg0"        # Linux SO_BINDTODEVICE
+fwmark = 0x100           # Linux SO_MARK policy routing mark
+
+# 2. Hardware-accelerated Shadowsocks AEAD-2022 (SIP022) & Classic AEAD
+[[outbound]]
+name = "ss-frankfurt"
+url = "ss://2022-blake3-aes-256-gcm:<base64-32-byte-psk>@198.51.100.10:8388"
+
+# 3. Zero-TCP-overhead Linux Unix domain socket sidecar (Xray / sing-box / VLESS+Reality / Hysteria2 / Trojan / TUIC / Tor)
+[[outbound]]
+name = "xray-reality"
+url = "unix+socks5:///run/xray/socks.sock"
+
+# 4. Also supports socks5://, socks5h://, socks4://, socks4a://, http://, https:// (TLS 1.3 CONNECT), unix://, unix+http://
+
+[[outbound-group]]
+name = "eu-egress"
+strategy = "failover"    # "ewma-rtt" | "failover" | "weighted" | "round-robin" | "hash-dc"
+members = ["wg-de", "ss-frankfurt", "xray-reality", "direct"]
+
+[routing]
+default-outbound = "eu-egress"
+[routing.dc]
+2 = "wg-de"
+
+[secret-limits.vip]
+outbound = "xray-reality"
+```
 
 ### 4-Tier Connection & Speed Governance (Global, Per-Secret, Per-IP & CGNAT-Safe Per-Connection)
 
@@ -372,12 +420,18 @@ bind-to-accept = ["ee", "dd"]       # Optional: also accept dd (or plain) on :44
 enabled = true
 integrated = true                   # Runs inside `mtg-proxy run`, auto-binds internal loopback dd backend!
 host = "example.com"
+hosts = ["alt.example.com"]         # Optional multi-vhost secondary domains
+carrier = "auto"                    # "websocket" | "ws-lanes" | "https" | "https-lanes" | "auto" (Desktop + Android + iOS!)
+lanes = 2                           # Parallel lanes for ws-lanes / https-lanes
+base-path = "/api/v1"               # Optional stealth API mount prefix (e.g. "/cdn/v2")
 token-key = "/etc/mtg-proxy/web.key"
 cover-dir = "/srv/site"             # or cover-upstream = "http://127.0.0.1:8080"
-tls-cert = "/etc/letsencrypt/live/example.com/fullchain.pem"  # Hot-reloaded on SIGHUP!
+tls-cert = "/etc/letsencrypt/live/example.com/fullchain.pem"  # Native HTTP/2 (h2) + HTTP/1.1 ALPN, hot-reloaded on SIGHUP!
 tls-key  = "/etc/letsencrypt/live/example.com/privkey.pem"
 stats-bind-to = "127.0.0.1:8100"
 ```
+
+- **Multi-Carrier Support (Desktop, Android & iOS):** Supports classic RFC 6455 `websocket`, parallel `ws-lanes`, iOS WKWebView / strict-CDN-friendly sequenced **`https` Conveyor** (`POST /up` with `X-Up-Seq` out-of-order reassembly + `GET /down` with 64-batch/4 MiB cellular-drop replay ring), native HTTP/2 **`https-lanes`** & full-duplex **`POST /stream`**, and self-healing **`auto`** failover — served over native HTTP/2 (`h2` ALPN / `h2c`) AND lock-free HTTP/1.1 WebSockets!
 
 - **CDN-Aware Spoof-Proof Geo-Stealth (`cdn = "cloudflare" | "arvancloud"`):** When running `[web]` behind Cloudflare, ArvanCloud, or a custom CDN alongside `[defense.allowlist]` (such as `IR-Geo-DB`), CDN edge IPs are foreign and would otherwise conflict with a country allowlist. Setting `cdn = "cloudflare"` (or `cdn = "arvancloud"`, or custom `trusted-proxies` / `trusted-proxy-urls` + `client-ip-header`) automatically fetches and refreshes official CDN edge CIDRs, peels trusted CDN hops right-to-left, and **only** trusts `CF-Connecting-IP` / `Ar-Real-IP` when network routing proves the request arrived from a real CDN CIDR — **100% immune to direct-to-origin header spoofing**!
 - **Standalone Mode:** You can still run `mtg-proxy web-relay /etc/mtg-proxy/config.toml` as a separate process behind Caddy/Nginx (`[[listener]]` + `[web] bind-to` + `[web] backend`). Features a 3-tier anti-oracle origin, per-page 128-bit CSP nonces, strict RFC 6455 WebSocket framing, and automatic 2-second config-file watch + `SIGHUP` secret/TLS reloads. See [contrib/web-relay/README.md](contrib/web-relay/README.md) for Caddy examples.

@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::dns::DnsResolver;
+use crate::outbound::{OutboundRouter, OutboundStream, OutboundTarget};
 use crate::proxy_pool::{ProxyPool, ProxyTarget};
 use crate::sockopts::{SocketConfig, tune_tokio_stream};
 use crate::timer::coarse_now_ns;
@@ -272,6 +273,8 @@ pub struct DcRouter {
     config_v6_url: String,
     first_fetch_done: Arc<tokio::sync::Notify>,
     first_fetch_finished: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional pluggable multi-protocol outbound traffic router (`[[outbound]]` / `[routing]`).
+    outbound_router: ArcSwap<Option<Arc<OutboundRouter>>>,
     /// Monotonically incremented whenever Telegram `proxy_secret` or MiddleProxy
     /// endpoint lists change so [`MiddleProxyPool`] can gracefully rotate carriers!
     middle_generation: AtomicU64,
@@ -299,8 +302,25 @@ impl DcRouter {
             config_v6_url: TELEGRAM_PROXY_CONFIG_V6_URL.to_owned(),
             first_fetch_done: Arc::new(tokio::sync::Notify::new()),
             first_fetch_finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            outbound_router: ArcSwap::from_pointee(None),
             middle_generation: AtomicU64::new(1),
         }
+    }
+
+    /// Attach a hot-reloadable multi-protocol [`OutboundRouter`].
+    pub fn with_outbound_router(self, router: Arc<OutboundRouter>) -> Self {
+        self.outbound_router.store(Arc::new(Some(router)));
+        self
+    }
+
+    /// Atomically swap the active [`OutboundRouter`] (hot reload / `PUT /outbounds`).
+    pub fn set_outbound_router(&self, router: Arc<OutboundRouter>) {
+        self.outbound_router.store(Arc::new(Some(router)));
+    }
+
+    /// Snapshot the active [`OutboundRouter`], if installed.
+    pub fn outbound_router(&self) -> Option<Arc<OutboundRouter>> {
+        self.outbound_router.load().as_ref().clone()
     }
 
     /// Attach a configured [`DnsResolver`] (DoH/DoT/custom DNS + `PreferIp`) so
@@ -577,6 +597,62 @@ impl DcRouter {
 
         let (stream, addr) = self.happy_eyeballs_dial(&addrs).await?;
         Ok((stream, addr, effective_dc))
+    }
+
+    /// Policy-routed direct DC dial supporting ANY configured [`OutboundTransport`]
+    /// (`direct://` + `SO_BINDTODEVICE`/`SO_MARK`, `socks5://`, `socks4://`, `http://`,
+    /// `https://`, Shadowsocks `ss://` AEAD-2022/classic, `unix://` sidecars for
+    /// Xray/sing-box/VLESS/Hysteria2, and per-secret/per-DC routing rules!).
+    ///
+    /// Fast path: when no custom outbound or per-secret route applies, delegates
+    /// straight to Happy Eyeballs direct TCP (`OutboundStream::Tcp`, zero overhead!).
+    pub async fn dial_direct_routed(
+        &self,
+        dc: i32,
+        secret_outbound: Option<&str>,
+    ) -> io::Result<(OutboundStream, SocketAddr, i32)> {
+        let router_guard = self.outbound_router.load();
+        if let Some(router) = router_guard.as_ref()
+            && (secret_outbound.is_some() || !router.is_plain_direct_only())
+        {
+            let (addrs, effective_dc) = self.ranked_direct_addresses_with_dc(dc);
+            if addrs.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!("no addresses configured for DC {dc}"),
+                ));
+            }
+            let route = router.resolve_route(secret_outbound, Some(effective_dc));
+            if route == crate::outbound::DEFAULT_DIRECT_OUTBOUND && router.is_plain_direct_only() {
+                let (stream, addr) = self.happy_eyeballs_dial(&addrs).await?;
+                return Ok((OutboundStream::from_tcp(stream), addr, effective_dc));
+            }
+            let mut last_err = None;
+            for sa in addrs {
+                match router
+                    .dial_named(
+                        route,
+                        &OutboundTarget::Addr(sa),
+                        Some(effective_dc),
+                        self.dial_timeout,
+                    )
+                    .await
+                {
+                    Ok(res) => {
+                        self.record_success(sa, res.rtt_us);
+                        return Ok((res.stream, sa, effective_dc));
+                    }
+                    Err(e) => {
+                        self.record_failure(sa);
+                        last_err = Some(io::Error::other(e.to_string()));
+                    }
+                }
+            }
+            return Err(last_err.unwrap_or_else(|| io::Error::other("routed outbound dial failed")));
+        }
+
+        let (stream, addr, effective_dc) = self.dial_direct(dc).await?;
+        Ok((OutboundStream::from_tcp(stream), addr, effective_dc))
     }
 
     /// Perform an active MTProto `req_pq_multi` -> `resPQ` probe over an

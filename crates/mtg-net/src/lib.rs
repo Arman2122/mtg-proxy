@@ -13,6 +13,7 @@ pub mod driver;
 pub mod epoll;
 pub mod fragmented;
 pub mod middleproxy_pool;
+pub mod outbound;
 pub mod proxy_pool;
 pub mod sockopts;
 pub mod timer;
@@ -38,6 +39,14 @@ pub use middleproxy_pool::{
     DEFAULT_CARRIERS_PER_DC, MAX_CARRIERS_PER_DC, MiddleDownMsg, MiddleProxyPool, MiddleStream,
     MiddleStreamParams,
 };
+pub use outbound::{
+    DEFAULT_DIRECT_OUTBOUND, DialResult, DirectTransport, HttpConnectTransport,
+    HttpsConnectTransport, OutboundError, OutboundGroupSpec, OutboundRouter, OutboundSnapshot,
+    OutboundSpec, OutboundStrategy, OutboundStream, OutboundTarget, OutboundTransport, RoutingSpec,
+    SUPPORTED_OUTBOUND_PROTOCOLS, ShadowsocksStream, ShadowsocksTransport, Socks4Transport,
+    Socks5Transport, SsCipher, TunnelStream, UnixFraming, UnixSidecarTransport, UnixTunnelStream,
+    build_transport_from_url,
+};
 pub use proxy_pool::{
     CircuitBreaker, DEFAULT_CB_HALF_OPEN_TIMEOUT, DEFAULT_CB_OPEN_THRESHOLD,
     DEFAULT_CB_RESET_WINDOW, ProxyDialError, ProxyEndpoint, ProxyPool, ProxyScheme, ProxyTarget,
@@ -45,9 +54,10 @@ pub use proxy_pool::{
 };
 pub use sockopts::{
     DEFAULT_LISTEN_BACKLOG, DEFAULT_NOFILE_TARGET, DEFAULT_TCP_FASTOPEN_QLEN,
-    DEFAULT_TCP_NOTSENT_LOWAT, DEFAULT_TCP_SYNCNT, SocketConfig, allowed_linux_cpus,
-    create_listener_socket, create_outbound_socket, get_tcp_congestion, get_tcp_notsent_lowat,
-    raise_nofile_limit, set_tcp_quickack, tune_connected_fd, tune_tokio_stream,
+    DEFAULT_TCP_NOTSENT_LOWAT, DEFAULT_TCP_SYNCNT, OutboundBindOptions, SocketConfig,
+    allowed_linux_cpus, apply_outbound_bind, connect_tcp_tuned_bound, create_listener_socket,
+    create_outbound_socket, get_tcp_congestion, get_tcp_notsent_lowat, raise_nofile_limit,
+    set_tcp_quickack, tune_connected_fd, tune_tokio_stream,
 };
 pub use timer::{
     TICK_MS, TICK_NS, TimerHandle, TimerWheel, coarse_now_ns, coarse_realtime_ns, coarse_unix_secs,

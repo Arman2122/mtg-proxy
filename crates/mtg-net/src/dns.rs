@@ -94,6 +94,19 @@ impl DnsResolver {
     /// Resolve `host` into ordered IP addresses honoring [`PreferIp`].
     ///
     /// Literal IP strings short-circuit with zero network I/O.
+    /// Resolve `host` and attach `port` to every returned IP address.
+    pub async fn resolve_host(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> io::Result<Vec<std::net::SocketAddr>> {
+        let ips = self.resolve_ips(host).await?;
+        Ok(ips
+            .into_iter()
+            .map(|ip| std::net::SocketAddr::new(ip, port))
+            .collect())
+    }
+
     pub async fn resolve_ips(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![ip]);

@@ -16,7 +16,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "2.5.0"
+version = "2.6.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -74,6 +74,7 @@ slab = "0.4"
 
 # Crypto & hygiene
 aes = "0.8"
+blake3 = { version = "1", default-features = false, features = ["std"] }
 cbc = "0.1"
 cipher = "0.4"
 crc32fast = "1"
@@ -83,6 +84,7 @@ md-5 = "0.10"
 rand = "0.9"
 rand_chacha = "0.9"
 rand_core = "0.9"
+ring = "0.17"
 sha1 = "0.10"
 sha2 = "0.10"
 subtle = "2"

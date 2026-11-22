@@ -8,6 +8,7 @@ pub mod doppel_scout;
 pub mod fronting;
 pub mod handshake;
 pub mod metrics;
+pub mod persistence;
 pub mod relay;
 pub mod state;
 pub mod worker;
@@ -18,6 +19,10 @@ pub use fronting::{FrontingPool, FrontingTarget, front_connection};
 pub use metrics::{
     CoreMetrics, DcEndpointStats, FakeTlsCounters, GlobalLimitsRuntime, ObfsCounters, ProxyMetrics,
     SecretRuntime, UsageRecord, compute_fair_caps,
+};
+pub use persistence::{
+    BillingCheckpointReport, EngineEvent, GlobalLimitsSnapshot, RUNTIME_STATE_SCHEMA_VERSION,
+    RuntimeStateSnapshot, SecretBillingDelta, SecretLimitsSnapshot, if_match_satisfied,
 };
 pub use state::{
     BatchUpsertSecret, DoppelState, EngineError, EngineSettings, FrontingRuntimeConfig,
@@ -1501,5 +1506,173 @@ alice = "{secret_hex}"
             obfs2_fut_size <= 1_920,
             "handle_obfs2_connection future bloated to {obfs2_fut_size} bytes!"
         );
+    }
+
+    /// End-to-end test proving `DirectRelay` (`OutboundStream::Tunnel` non-TCP path!)
+    /// cleanly carries full-duplex FakeTLS (`ee`) MTProto traffic through a Linux
+    /// Unix domain socket SOCKS5 sidecar (`unix+socks5://` — the exact Xray-core /
+    /// sing-box / VLESS+Reality / Hysteria2 carrier path!) to a mock Telegram DC!
+    #[tokio::test]
+    async fn end_to_end_faketls_relay_over_unix_sidecar_tunnel_outbound() {
+        use tokio::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("xray-sidecar.sock");
+
+        // 1. Mock Telegram DC echo server.
+        let mock_dc = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dc_addr = mock_dc.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = mock_dc.accept().await.unwrap();
+            let mut hs = [0u8; 64];
+            s.read_exact(&mut hs).await.unwrap();
+            let mut recv_key = [0u8; 32];
+            let mut recv_iv = [0u8; 16];
+            recv_key.copy_from_slice(&hs[8..40]);
+            recv_iv.copy_from_slice(&hs[40..56]);
+            let mut rev = [0u8; 48];
+            rev.copy_from_slice(&hs[8..56]);
+            rev.reverse();
+            let mut send_key = [0u8; 32];
+            let mut send_iv = [0u8; 16];
+            send_key.copy_from_slice(&rev[..32]);
+            send_iv.copy_from_slice(&rev[32..48]);
+
+            let mut dec = Aes256Ctr::new(&recv_key, &recv_iv);
+            let mut enc = Aes256Ctr::new(&send_key, &send_iv);
+            let mut dummy = [0u8; 64];
+            dec.apply_keystream(&mut dummy);
+
+            let mut buf = [0u8; 256];
+            let n = s.read(&mut buf).await.unwrap();
+            dec.apply_keystream(&mut buf[..n]);
+            enc.apply_keystream(&mut buf[..n]);
+            s.write_all(&buf[..n]).await.unwrap();
+        });
+
+        // 2. Mock Xray/sing-box Unix SOCKS5 sidecar bridging to `dc_addr`.
+        let uln = UnixListener::bind(&sock_path).unwrap();
+        let sidecar_task = tokio::spawn(async move {
+            let (mut u, _) = uln.accept().await.unwrap();
+            let mut hdr = [0u8; 2];
+            u.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[0], 0x05);
+            let mut methods = vec![0u8; usize::from(hdr[1])];
+            u.read_exact(&mut methods).await.unwrap();
+            u.write_all(&[0x05, 0x00]).await.unwrap();
+
+            let mut req = [0u8; 10];
+            u.read_exact(&mut req).await.unwrap();
+            assert_eq!(req[0], 0x05);
+            assert_eq!(req[1], 0x01); // CONNECT
+            assert_eq!(req[3], 0x01); // IPv4
+            let ip = std::net::Ipv4Addr::new(req[4], req[5], req[6], req[7]);
+            let port = u16::from_be_bytes([req[8], req[9]]);
+            let mut upstream = TcpStream::connect((ip, port)).await.unwrap();
+            u.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut u, &mut upstream).await;
+        });
+
+        // 3. Configure ProxyEngine with per-secret `outbound = "xray-eu"`.
+        let proxy_port = {
+            let tmp_ln = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tmp_ln.local_addr().unwrap().port()
+        };
+        let secret_hex =
+            "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d";
+        let secret = Secret::parse(secret_hex).unwrap();
+        let cfg_toml = format!(
+            r#"
+bind-to = "127.0.0.1:{proxy_port}"
+prefer-ip = "only-ipv4"
+
+[[outbound]]
+name = "xray-eu"
+url = "unix+socks5://{}"
+
+[secrets]
+vip = "{secret_hex}"
+
+[secret-limits.vip]
+outbound = "xray-eu"
+"#,
+            sock_path.display()
+        );
+        let cfg = Config::parse(cfg_toml.as_bytes()).unwrap();
+        let engine = ProxyEngine::from_config(&cfg, None, 1, false).unwrap();
+
+        let mut dc_v4 = BTreeMap::new();
+        dc_v4.insert(2, vec![dc_addr]);
+        engine.dc_router.set_directory(DcDirectory {
+            direct_v4: dc_v4,
+            ..DcDirectory::default()
+        });
+
+        let runtime = EngineRuntime::start(Arc::clone(&engine)).await.unwrap();
+
+        // 4. Client dials FakeTLS -> Obfuscated2 -> payload echoed via Unix sidecar!
+        let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+            .await
+            .unwrap();
+        let ch = build_client_hello(secret.key(), secret.host(), Utc::now().timestamp() as u32);
+        client.write_all(&ch).await.unwrap();
+
+        // Read ServerHello + CCS + AppData (exact 3 TLS records).
+        let mut sh_read = Vec::new();
+        let mut sh_tmp = [0u8; 4096];
+        let mut records_seen = 0usize;
+        let mut pos = 0usize;
+        while records_seen < 3 {
+            let n = client.read(&mut sh_tmp).await.unwrap();
+            assert!(n > 0);
+            sh_read.extend_from_slice(&sh_tmp[..n]);
+            while sh_read.len() >= pos + 5 {
+                let rlen = u16::from_be_bytes([sh_read[pos + 3], sh_read[pos + 4]]) as usize;
+                if sh_read.len() < pos + 5 + rlen {
+                    break;
+                }
+                pos += 5 + rlen;
+                records_seen += 1;
+            }
+        }
+        assert_eq!(sh_read[0], 0x16);
+
+        let (obfs_frame, mut client_ciphers) =
+            build_outbound_handshake(2, ConnectionTag::PADDED_INTERMEDIATE, Some(secret.key()));
+        let mut app_msg = b"hello-over-unix-sidecar-tunnel!".to_vec();
+        client_ciphers.send.apply_keystream(&mut app_msg);
+        let mut payload = Vec::with_capacity(obfs_frame.len() + app_msg.len());
+        payload.extend_from_slice(&obfs_frame);
+        payload.extend_from_slice(&app_msg);
+
+        let mut tls_hdr = [0u8; 5];
+        stamp_app_data_header(&mut tls_hdr, payload.len() as u16);
+        client.write_all(&tls_hdr).await.unwrap();
+        client.write_all(&payload).await.unwrap();
+
+        let mut unframer = TlsUnframer::new();
+        let mut raw_reply = [0u8; 512];
+        let mut got_plain = Vec::new();
+        while got_plain.len() < 31 {
+            let n = client.read(&mut raw_reply).await.unwrap();
+            assert!(n > 0);
+            let m = unframer.unframe_in_place(&mut raw_reply[..n]).unwrap();
+            client_ciphers.recv.apply_keystream(&mut raw_reply[..m]);
+            got_plain.extend_from_slice(&raw_reply[..m]);
+        }
+        assert_eq!(&got_plain[..31], b"hello-over-unix-sidecar-tunnel!");
+
+        // Verify live outbound telemetry counted the dial!
+        let snaps = engine.outbound_snapshots();
+        let xray = snaps.iter().find(|s| s.name == "xray-eu").unwrap();
+        assert_eq!(xray.protocol, "unix+socks5");
+        assert!(xray.total_dials >= 1);
+        assert_eq!(xray.failed_dials, 0);
+
+        drop(client);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), sidecar_task).await;
+        runtime.shutdown();
     }
 }

@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use mtg_crypto::aes_ctr::{Aes256Ctr, FusedCtrPair};
 use mtg_governance::{ClientEntry, ConnSpeedLimiters, FairBucket, GcraLimiter};
-use mtg_net::{MiddleDownMsg, MiddleStream, TLS_HEADROOM, coarse_now_ns, coarse_unix_secs};
+use mtg_net::{
+    MiddleDownMsg, MiddleStream, OutboundStream, TLS_HEADROOM, coarse_now_ns, coarse_unix_secs,
+};
 use mtg_protocol::doppel::{DoppelConnState, DoppelParams};
 use mtg_protocol::middleproxy::ClientFraming;
 use mtg_protocol::tls_record::{
@@ -94,7 +96,7 @@ enum StepOutcome {
 /// appear **strictly once** in the async task frame (zero duplicate generator slots!).
 pub struct DirectRelay {
     client: TcpStream,
-    dc: TcpStream,
+    dc: OutboundStream,
     fused_up: FusedCtrPair,
     fused_down: FusedCtrPair,
     tls_unframer: TlsUnframer,
@@ -128,7 +130,7 @@ impl DirectRelay {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: TcpStream,
-        dc: TcpStream,
+        dc: OutboundStream,
         client_recv_initial: Vec<u8>,
         client_ciphers: (Aes256Ctr, Aes256Ctr), // (recv_from_client, send_to_client)
         dc_ciphers: (Aes256Ctr, Aes256Ctr),     // (recv_from_dc, send_to_dc)
@@ -182,6 +184,36 @@ impl DirectRelay {
             *buf = Vec::new();
             *off = 0;
         }
+    }
+
+    #[inline]
+    fn try_drain_buf_outbound(
+        sock: &mut OutboundStream,
+        buf: &mut Vec<u8>,
+        off: &mut usize,
+        cx: &mut Context<'_>,
+    ) -> DrainResult {
+        while *off < buf.len() {
+            match sock.try_write_with_cx(cx, &buf[*off..]) {
+                Ok(0) => return DrainResult::Closed,
+                Ok(w) => *off += w,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if !sock.is_tcp() {
+                        // Non-TCP tunnel already registered `cx.waker()` inside `poll_write`.
+                        return DrainResult::Pending;
+                    }
+                    match sock.poll_write_ready_compat(cx) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(_)) => return DrainResult::Closed,
+                        Poll::Pending => return DrainResult::Pending,
+                    }
+                }
+                Err(_) => return DrainResult::Closed,
+            }
+        }
+        buf.clear();
+        *off = 0;
+        DrainResult::Done
     }
 
     #[inline]
@@ -292,7 +324,12 @@ impl DirectRelay {
         // 1. UPLOAD: client -> DC (with true RFC 793 half-close!)
         // ---------------------------------------------------------------------
         let up_can_read = if self.up_off < self.up_pending.len() {
-            match Self::try_drain_buf(&self.dc, &mut self.up_pending, &mut self.up_off, cx) {
+            match Self::try_drain_buf_outbound(
+                &mut self.dc,
+                &mut self.up_pending,
+                &mut self.up_off,
+                cx,
+            ) {
                 DrainResult::Done => {
                     if self.client_eof && !self.dc_wr_closed {
                         self.dc_wr_closed = true;
@@ -365,7 +402,10 @@ impl DirectRelay {
                                                 }
                                                 if span_count == 1 {
                                                     let (s, e) = spans[0];
-                                                    return match self.dc.try_write(&scratch[s..e]) {
+                                                    return match self
+                                                        .dc
+                                                        .try_write_with_cx(cx, &scratch[s..e])
+                                                    {
                                                         Ok(w) if w == moved => {
                                                             ReadStep::Sent(moved)
                                                         }
@@ -397,10 +437,10 @@ impl DirectRelay {
                                                 {
                                                     iov[idx] = IoSlice::new(&scratch[s..e]);
                                                 }
-                                                return match self
-                                                    .dc
-                                                    .try_write_vectored(&iov[..span_count])
-                                                {
+                                                return match self.dc.try_write_vectored_with_cx(
+                                                    cx,
+                                                    &iov[..span_count],
+                                                ) {
                                                     Ok(w) if w == moved => ReadStep::Sent(moved),
                                                     Ok(0) => ReadStep::Err,
                                                     Ok(w) => {
@@ -453,7 +493,10 @@ impl DirectRelay {
                                                 }
                                                 self.fused_up
                                                     .apply_fused_in_place(&mut scratch[..moved]);
-                                                return match self.dc.try_write(&scratch[..moved]) {
+                                                return match self
+                                                    .dc
+                                                    .try_write_with_cx(cx, &scratch[..moved])
+                                                {
                                                     Ok(w) if w == moved => ReadStep::Sent(moved),
                                                     Ok(0) => ReadStep::Err,
                                                     Ok(w) => {
@@ -491,7 +534,7 @@ impl DirectRelay {
                                         return ReadStep::NeedPace(moved);
                                     }
                                     self.fused_up.apply_fused_in_place(&mut scratch[..moved]);
-                                    match self.dc.try_write(&scratch[..moved]) {
+                                    match self.dc.try_write_with_cx(cx, &scratch[..moved]) {
                                         Ok(w) if w == moved => ReadStep::Sent(moved),
                                         Ok(0) => ReadStep::Err,
                                         Ok(w) => {
@@ -549,8 +592,8 @@ impl DirectRelay {
                                         .fetch_add(1, Ordering::Relaxed);
                                     self.client_eof = true;
                                 }
-                                match Self::try_drain_buf(
-                                    &self.dc,
+                                match Self::try_drain_buf_outbound(
+                                    &mut self.dc,
                                     &mut self.up_pending,
                                     &mut self.up_off,
                                     cx,
@@ -727,7 +770,7 @@ impl DirectRelay {
             }
 
             if !doppel_waiting {
-                match self.dc.poll_read_ready(cx) {
+                match self.dc.poll_read_ready_compat(cx) {
                     Poll::Pending => {
                         Self::maybe_reclaim_buf(&mut self.down_pending, &mut self.down_off);
                     }
@@ -748,7 +791,7 @@ impl DirectRelay {
                         loop {
                             let step = RELAY_SCRATCH.with(|cell| {
                                 let mut scratch = cell.borrow_mut();
-                                match self.dc.try_read(&mut scratch[..max_read]) {
+                                match self.dc.try_read_with_cx(cx, &mut scratch[..max_read]) {
                                     Ok(0) => ReadStep::Eof,
                                     Ok(n) => {
                                         if down_paced {
@@ -920,31 +963,41 @@ impl DirectRelay {
                                         bytes,
                                     });
                                 }
-                                ReadStep::WouldBlock => match self.dc.poll_read_ready(cx) {
-                                    Poll::Pending => {
+                                ReadStep::WouldBlock => {
+                                    if !self.dc.is_tcp() {
+                                        // Non-TCP tunnel already registered `cx.waker()` inside `poll_read`.
                                         Self::maybe_reclaim_buf(
                                             &mut self.down_pending,
                                             &mut self.down_off,
                                         );
                                         break;
                                     }
-                                    Poll::Ready(Err(_)) => {
-                                        let _ = self.account_and_refresh_idle(
-                                            up_moved,
-                                            down_moved,
-                                            idle_sleep.as_mut(),
-                                            cx,
-                                        );
-                                        return Poll::Ready(StepOutcome::Done);
-                                    }
-                                    Poll::Ready(Ok(())) => {
-                                        spurious_wb += 1;
-                                        if spurious_wb >= 4 {
-                                            yield_needed = true;
+                                    match self.dc.poll_read_ready_compat(cx) {
+                                        Poll::Pending => {
+                                            Self::maybe_reclaim_buf(
+                                                &mut self.down_pending,
+                                                &mut self.down_off,
+                                            );
                                             break;
                                         }
+                                        Poll::Ready(Err(_)) => {
+                                            let _ = self.account_and_refresh_idle(
+                                                up_moved,
+                                                down_moved,
+                                                idle_sleep.as_mut(),
+                                                cx,
+                                            );
+                                            return Poll::Ready(StepOutcome::Done);
+                                        }
+                                        Poll::Ready(Ok(())) => {
+                                            spurious_wb += 1;
+                                            if spurious_wb >= 4 {
+                                                yield_needed = true;
+                                                break;
+                                            }
+                                        }
                                     }
-                                },
+                                }
                                 ReadStep::AlertEof | ReadStep::Eof => {
                                     self.dc_eof = true;
                                     if self.down_off >= self.down_pending.len()

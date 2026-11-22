@@ -21,7 +21,7 @@
 //!   `req_pq_multi`) into every `RPC_PROXY_REQ`.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -37,13 +37,14 @@ use mtg_protocol::middleproxy::{
 };
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, warn};
 
 use crate::dc::{DcRouter, happy_eyeballs_connect};
+use crate::outbound::{OutboundStream, OutboundTarget};
 use crate::proxy_pool::{ProxyPool, ProxyTarget};
 use crate::sockopts::{SocketConfig, tune_tokio_stream};
 use crate::timer::coarse_now_ns;
@@ -515,9 +516,15 @@ impl MiddleProxyPool {
             ));
         }
 
+        let custom_router = self
+            .dc_router
+            .outbound_router()
+            .filter(|r| !r.is_plain_direct_only());
+
         // Fast Happy Eyeballs attempt first when connecting directly (handles
         // IPv4-only VPSs with default `prefer-ipv6` in < 1 ms instead of timing out).
-        if self.proxy_pool.as_ref().is_none_or(ProxyPool::is_empty)
+        if custom_router.is_none()
+            && self.proxy_pool.as_ref().is_none_or(ProxyPool::is_empty)
             && addrs.len() > 1
             && let Ok((mut stream, first_addr)) =
                 happy_eyeballs_connect(&addrs, &self.sock_cfg, self.dial_timeout).await
@@ -534,7 +541,7 @@ impl MiddleProxyPool {
                 Ok(Ok((enc, dec, use_crc32c))) => {
                     self.dc_router.record_success(first_addr, 1_000);
                     return Ok(spawn_carrier_tasks(
-                        stream,
+                        OutboundStream::Tcp(stream),
                         enc,
                         dec,
                         local_addr,
@@ -555,27 +562,42 @@ impl MiddleProxyPool {
 
         let mut last_err = io::Error::other("no middle-proxy reached");
         for addr in addrs {
-            let connect_res: io::Result<(TcpStream, Option<SocketAddr>)> = if let Some(pool) =
-                &self.proxy_pool
-                && !pool.is_empty()
-            {
-                pool.dial_with_bound_addr(&ProxyTarget::SocketAddr(addr))
+            let connect_res: io::Result<(OutboundStream, Option<SocketAddr>)> =
+                if let Some(router) = &custom_router {
+                    router
+                        .dial_routed(
+                            &OutboundTarget::Addr(addr),
+                            None,
+                            Some(dc),
+                            self.dial_timeout,
+                        )
+                        .await
+                        .map(|res| (res.stream, res.bound_addr))
+                        .map_err(|e| io::Error::other(e.to_string()))
+                } else if let Some(pool) = &self.proxy_pool
+                    && !pool.is_empty()
+                {
+                    pool.dial_with_bound_addr(&ProxyTarget::SocketAddr(addr))
+                        .await
+                        .map(|(s, b)| (OutboundStream::Tcp(s), b))
+                        .map_err(|e| io::Error::other(e.to_string()))
+                } else {
+                    tokio::time::timeout(self.dial_timeout, async {
+                        let s = TcpStream::connect(addr).await?;
+                        let _ = tune_tokio_stream(&s, &self.sock_cfg);
+                        Ok::<(OutboundStream, Option<SocketAddr>), io::Error>((
+                            OutboundStream::Tcp(s),
+                            None,
+                        ))
+                    })
                     .await
-                    .map_err(|e| io::Error::other(e.to_string()))
-            } else {
-                tokio::time::timeout(self.dial_timeout, async {
-                    let s = TcpStream::connect(addr).await?;
-                    let _ = tune_tokio_stream(&s, &self.sock_cfg);
-                    Ok::<(TcpStream, Option<SocketAddr>), io::Error>((s, None))
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "middle dial timeout",
-                    ))
-                })
-            };
+                    .unwrap_or_else(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "middle dial timeout",
+                        ))
+                    })
+                };
 
             let (mut stream, socks_bound) = match connect_res {
                 Ok(pair) => pair,
@@ -586,12 +608,18 @@ impl MiddleProxyPool {
                 }
             };
 
-            // Use SOCKS5 BND.ADDR:BND.PORT when available so KDF matches the egress socket!
-            let local_addr = socks_bound.unwrap_or(stream.local_addr()?);
+            // Use SOCKS5 BND.ADDR:BND.PORT or bound socket address when available so KDF matches egress!
+            let fallback_local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+            let local_addr = socks_bound
+                .or_else(|| stream.as_tcp().and_then(|s| s.local_addr().ok()))
+                .unwrap_or(fallback_local);
             let remote_addr = if socks_bound.is_some() {
                 addr
             } else {
-                stream.peer_addr().unwrap_or(addr)
+                stream
+                    .as_tcp()
+                    .and_then(|s| s.peer_addr().ok())
+                    .unwrap_or(addr)
             };
             let key_local = compute_key_local(local_addr, public_ipv4, public_ipv6);
 
@@ -643,8 +671,8 @@ fn compute_key_local(
 /// Run the 2-RTT `RPC_NONCE` + `RPC_HANDSHAKE` exchange over `stream`,
 /// negotiating hardware Castagnoli [`RPC_FLAG_USE_CRC32C`] with automatic
 /// fallback to standard IEEE CRC32 if the server does not advertise support.
-async fn perform_rpc_handshake(
-    stream: &mut TcpStream,
+async fn perform_rpc_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     proxy_secret: &[u8],
     key_local: SocketAddr,
     remote_addr: SocketAddr,
@@ -716,7 +744,7 @@ async fn read_next_rpc_body<R: AsyncReadExt + Unpin>(
 }
 
 fn spawn_carrier_tasks(
-    stream: TcpStream,
+    stream: OutboundStream,
     mut enc: Aes256CbcEncryptor,
     mut dec: RpcFrameDecoder,
     local_addr: SocketAddr,
@@ -742,7 +770,19 @@ fn spawn_carrier_tasks(
         active_streams: AtomicUsize::new(0),
     });
 
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr): (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ) = match stream {
+        OutboundStream::Tcp(tcp) => {
+            let (r, w) = tcp.into_split();
+            (Box::new(r), Box::new(w))
+        }
+        OutboundStream::Tunnel(tunnel) => {
+            let (r, w) = tokio::io::split(tunnel);
+            (Box::new(r), Box::new(w))
+        }
+    };
 
     // Writer task: strictly prioritizes control frames (`RPC_PONG`, `RPC_PING`,
     // `RPC_CLOSE_CONN`), coalesces bursty data frames into single CBC + write

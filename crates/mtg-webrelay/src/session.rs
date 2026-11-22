@@ -48,13 +48,13 @@ thread_local! {
 /// Reusable per-session scratch vectors (0 B while idle; eliminates per-batch
 /// and per-poll `Vec`/`BytesMut` heap allocations during active traffic!).
 #[derive(Default)]
-struct SessionScratch {
-    batch_frames: Vec<Frame>,
-    header_scratch: Vec<u8>,
-    header_spans: Vec<(usize, usize)>,
-    stream_ids: Vec<u32>,
-    to_close: Vec<u32>,
-    rr_cursor: usize,
+pub(crate) struct SessionScratch {
+    pub(crate) batch_frames: Vec<Frame>,
+    pub(crate) header_scratch: Vec<u8>,
+    pub(crate) header_spans: Vec<(usize, usize)>,
+    pub(crate) stream_ids: Vec<u32>,
+    pub(crate) to_close: Vec<u32>,
+    pub(crate) rr_cursor: usize,
 }
 
 use crate::frame::{
@@ -204,14 +204,14 @@ impl GlobalBudget {
 /// Bounded FIFO tombstone set remembering closed/refused stream IDs to tolerate
 /// in-flight close races without unbounded memory growth.
 #[derive(Debug, Default)]
-struct Tombstones {
+pub(crate) struct Tombstones {
     set: FxHashSet<u32>,
     order: VecDeque<u32>,
     cap: usize,
 }
 
 impl Tombstones {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             set: FxHashSet::default(),
             order: VecDeque::with_capacity(cap.min(256)),
@@ -220,11 +220,11 @@ impl Tombstones {
     }
 
     #[inline]
-    fn has(&self, id: u32) -> bool {
+    pub(crate) fn has(&self, id: u32) -> bool {
         self.set.contains(&id)
     }
 
-    fn insert(&mut self, id: u32) {
+    pub(crate) fn insert(&mut self, id: u32) {
         if !self.set.insert(id) {
             return;
         }
@@ -239,7 +239,7 @@ impl Tombstones {
 
 /// Outbound downlink queue separating priority control frames (`CLOSE`/`WINDOW`)
 /// from bulk `DATA`, enforcing both per-session and global pending budgets.
-struct Outbox {
+pub(crate) struct Outbox {
     control: VecDeque<Frame>,
     data: VecDeque<Frame>,
     pending_bytes: usize,
@@ -250,7 +250,7 @@ struct Outbox {
 }
 
 impl Outbox {
-    fn new(max_bytes: usize, max_items: usize, global: Arc<GlobalBudget>) -> Self {
+    pub(crate) fn new(max_bytes: usize, max_items: usize, global: Arc<GlobalBudget>) -> Self {
         Self {
             control: VecDeque::new(),
             data: VecDeque::new(),
@@ -263,7 +263,7 @@ impl Outbox {
     }
 
     #[inline]
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.control.is_empty() && self.data.is_empty()
     }
 
@@ -303,7 +303,7 @@ impl Outbox {
     /// Pop a coalesced batch of frames fitting within `batch_budget` bytes into
     /// reusable `out` (zero per-batch heap allocation!), draining control frames
     /// first so `CLOSE`/`WINDOW` are never starved.
-    fn take_batch_into(&mut self, batch_budget: usize, out: &mut Vec<Frame>) {
+    pub(crate) fn take_batch_into(&mut self, batch_budget: usize, out: &mut Vec<Frame>) {
         out.clear();
         let mut used = 0usize;
 
@@ -339,7 +339,7 @@ impl Outbox {
         self.global.release(bytes);
     }
 
-    fn clear_all(&mut self) {
+    pub(crate) fn clear_all(&mut self) {
         while let Some(f) = self.control.pop_front() {
             self.release_one(f.encoded_len());
         }
@@ -360,7 +360,7 @@ enum StreamState {
     Open(BoxedStream),
 }
 
-struct StreamEntry {
+pub(crate) struct StreamEntry {
     state: StreamState,
     uplink_queue: VecDeque<Bytes>,
     uplink_window_credit: u32,
@@ -395,7 +395,7 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
-    fn effective_max_streams(&self) -> usize {
+    pub(crate) fn effective_max_streams(&self) -> usize {
         if self.max_streams == 0 {
             DEFAULT_MAX_STREAMS
         } else {
@@ -403,7 +403,7 @@ impl SessionConfig {
         }
     }
 
-    fn effective_idle_timeout(&self) -> Duration {
+    pub(crate) fn effective_idle_timeout(&self) -> Duration {
         if self.idle_timeout.is_zero() {
             DEFAULT_IDLE_TIMEOUT
         } else {
@@ -423,7 +423,7 @@ pub enum PlanError {
 }
 
 #[derive(Debug)]
-enum PlannedAction {
+pub(crate) enum PlannedAction {
     Ignore,
     Open(u32),
     Refuse(u32),
@@ -642,7 +642,7 @@ where
 /// - `DATA`/`WINDOW`/`CLOSE` on never-opened stream -> fatal `UnknownStream`
 /// - `DATA` exceeding stream's remaining uplink receive credit -> fatal `UplinkWindowExceeded`
 /// - `WINDOW` overflowing 32-bit `downlink_send_window` -> fatal `DownlinkWindowOverflow`
-fn plan_batch(
+pub(crate) fn plan_batch(
     streams: &FxHashMap<u32, StreamEntry>,
     tombstones: &Tombstones,
     max_streams: usize,
@@ -753,7 +753,7 @@ fn get_or_load_sim<'a>(
     }
 }
 
-fn apply_actions(
+pub(crate) fn apply_actions(
     actions: Vec<PlannedAction>,
     streams: &mut FxHashMap<u32, StreamEntry>,
     tombstones: &mut Tombstones,
@@ -815,7 +815,7 @@ fn apply_actions(
 ///    (0 B per idle session!) with burst coalescing up to `batch_budget` ONLY
 ///    when `downlink_send_window > 0` and `outbox.can_accept_data()`!
 #[allow(clippy::too_many_arguments)]
-fn poll_all_streams(
+pub(crate) fn poll_all_streams(
     cx: &mut Context<'_>,
     streams: &mut FxHashMap<u32, StreamEntry>,
     tombstones: &mut Tombstones,

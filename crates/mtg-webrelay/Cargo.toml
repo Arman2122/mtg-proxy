@@ -16,8 +16,9 @@ chrono.workspace = true
 getrandom.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-hyper = { workspace = true, features = ["http1", "server", "client"] }
-hyper-util = { workspace = true, features = ["tokio", "http1", "client-legacy"] }
+hyper = { workspace = true, features = ["http1", "http2", "server", "client"] }
+hyper-util = { workspace = true, features = ["tokio", "http1", "http2", "client-legacy", "server-auto"] }
+futures-core = "0.3"
 idna.workspace = true
 mtg-config.workspace = true
 mtg-core.workspace = true

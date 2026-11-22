@@ -1075,6 +1075,68 @@ impl ProxyMetrics {
         out
     }
 
+    /// Render Prometheus metrics including live per-outbound dial, RTT, and
+    /// circuit-breaker telemetry (`mtg_outbound_*`).
+    pub fn render_prometheus_with_outbounds(
+        &self,
+        prefix: &str,
+        outbounds: &[mtg_net::OutboundSnapshot],
+    ) -> String {
+        let mut out = self.render_prometheus(prefix);
+        if outbounds.is_empty() {
+            return out;
+        }
+        let p = if prefix.is_empty() { "mtg" } else { prefix };
+        let _ = writeln!(
+            out,
+            "# HELP {p}_outbound_dials_total Total outbound dial attempts per transport."
+        );
+        let _ = writeln!(out, "# TYPE {p}_outbound_dials_total counter");
+        for ob in outbounds {
+            let name = escape_prom_label(&ob.name);
+            let proto = escape_prom_label(&ob.protocol);
+            let _ = writeln!(
+                out,
+                "{p}_outbound_dials_total{{outbound=\"{name}\",protocol=\"{proto}\",status=\"ok\"}} {}",
+                ob.total_dials.saturating_sub(ob.failed_dials)
+            );
+            let _ = writeln!(
+                out,
+                "{p}_outbound_dials_total{{outbound=\"{name}\",protocol=\"{proto}\",status=\"failed\"}} {}",
+                ob.failed_dials
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP {p}_outbound_rtt_ms Exponentially weighted moving average dial RTT in milliseconds."
+        );
+        let _ = writeln!(out, "# TYPE {p}_outbound_rtt_ms gauge");
+        for ob in outbounds {
+            let name = escape_prom_label(&ob.name);
+            let proto = escape_prom_label(&ob.protocol);
+            let _ = writeln!(
+                out,
+                "{p}_outbound_rtt_ms{{outbound=\"{name}\",protocol=\"{proto}\"}} {:.3}",
+                ob.ewma_rtt_ms
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP {p}_outbound_circuit_open Whether an outbound circuit breaker is currently open (1 = open, 0 = closed)."
+        );
+        let _ = writeln!(out, "# TYPE {p}_outbound_circuit_open gauge");
+        for ob in outbounds {
+            let name = escape_prom_label(&ob.name);
+            let proto = escape_prom_label(&ob.protocol);
+            let open_val = u8::from(ob.circuit_open);
+            let _ = writeln!(
+                out,
+                "{p}_outbound_circuit_open{{outbound=\"{name}\",protocol=\"{proto}\"}} {open_val}"
+            );
+        }
+        out
+    }
+
     /// Spawn a 1-second batched StatsD UDP exporter (Datadog / InfluxDB / Graphite tag formats).
     pub fn spawn_statsd_flusher(
         self: &Arc<Self>,
@@ -1244,6 +1306,19 @@ pub fn compute_fair_caps(user_conns: &BTreeMap<String, i64>, limit: i64) -> BTre
         }
     }
     caps
+}
+
+fn escape_prom_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

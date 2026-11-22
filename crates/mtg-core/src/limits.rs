@@ -154,6 +154,9 @@ pub struct SecretLimits {
     pub conn_speed_up_bytes_per_second: i64,
     /// Per-TCP-connection download speed cap in bytes/s (`0` = unlimited).
     pub conn_speed_down_bytes_per_second: i64,
+    /// Optional named outbound transport or outbound group override for this secret
+    /// (e.g. `"direct"`, `"eu-xray"`, `"wg-de"`, `"ss-frankfurt"`).
+    pub outbound: Option<String>,
 }
 
 impl SecretLimits {
@@ -176,6 +179,7 @@ impl SecretLimits {
             && self.conn_speed_bytes_per_second == 0
             && self.conn_speed_up_bytes_per_second == 0
             && self.conn_speed_down_bytes_per_second == 0
+            && self.outbound.is_none()
     }
 
     /// True if any per-address control (`client-conns`, `client-speed*`, `client-fair`) is active.
@@ -265,6 +269,7 @@ impl SecretLimits {
             } else {
                 defaults.conn_speed_down_bytes_per_second
             },
+            outbound: self.outbound.clone().or_else(|| defaults.outbound.clone()),
         }
     }
 

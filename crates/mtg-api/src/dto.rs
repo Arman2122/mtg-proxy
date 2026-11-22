@@ -10,6 +10,7 @@ use mtg_core::{
 };
 use mtg_engine::ListenerReport;
 use mtg_governance::BanEntryJson;
+use mtg_net::{OutboundGroupSpec, OutboundSnapshot, OutboundSpec, RoutingSpec};
 use serde::{Deserialize, Serialize};
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -237,6 +238,8 @@ pub struct SecretInfoJson {
     pub conn_speed_limit_up: i64,
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub conn_speed_limit_down: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<String>,
 
     pub mode: String,
     #[serde(skip_serializing_if = "is_false")]
@@ -423,6 +426,8 @@ pub struct LimitFieldsReq {
     pub conn_speed_up: String,
     #[serde(default)]
     pub conn_speed_down: String,
+    #[serde(default)]
+    pub outbound: String,
 }
 
 impl LimitFieldsReq {
@@ -459,6 +464,7 @@ impl LimitFieldsReq {
             parse_speed(&self.conn_speed_up).map_err(|e| format!("conn_speed_up: {e}"))?;
         let conn_speed_down =
             parse_speed(&self.conn_speed_down).map_err(|e| format!("conn_speed_down: {e}"))?;
+        let outbound = (!self.outbound.trim().is_empty()).then(|| self.outbound.trim().to_owned());
 
         let lim = SecretLimits {
             quota_bytes,
@@ -478,6 +484,7 @@ impl LimitFieldsReq {
             conn_speed_bytes_per_second: conn_speed,
             conn_speed_up_bytes_per_second: conn_speed_up,
             conn_speed_down_bytes_per_second: conn_speed_down,
+            outbound,
         };
 
         if lim.client_fair && !lim.fair_totals().is_active() {
@@ -533,6 +540,8 @@ pub struct SecretEntryReq {
     pub conn_speed_up: String,
     #[serde(default)]
     pub conn_speed_down: String,
+    #[serde(default)]
+    pub outbound: String,
 }
 
 impl SecretEntryReq {
@@ -555,6 +564,7 @@ impl SecretEntryReq {
             conn_speed: self.conn_speed.clone(),
             conn_speed_up: self.conn_speed_up.clone(),
             conn_speed_down: self.conn_speed_down.clone(),
+            outbound: self.outbound.clone(),
         }
         .parse_limits()
     }
@@ -614,6 +624,8 @@ pub struct PostSecretReq {
     pub conn_speed_up: String,
     #[serde(default)]
     pub conn_speed_down: String,
+    #[serde(default)]
+    pub outbound: String,
 }
 
 impl PostSecretReq {
@@ -636,6 +648,7 @@ impl PostSecretReq {
             conn_speed: self.conn_speed.clone(),
             conn_speed_up: self.conn_speed_up.clone(),
             conn_speed_down: self.conn_speed_down.clone(),
+            outbound: self.outbound.clone(),
         }
         .parse_limits()
     }
@@ -736,6 +749,8 @@ pub struct PatchSecretReq {
     pub conn_speed: Option<String>,
     pub conn_speed_up: Option<String>,
     pub conn_speed_down: Option<String>,
+    /// Named outbound transport or group override (`""` clears override back to policy routing).
+    pub outbound: Option<String>,
 }
 
 /// `POST /secrets/{name}/disconnect` response.
@@ -871,4 +886,69 @@ pub struct PutGlobalLimitsReq {
     pub conn_speed_up: String,
     #[serde(default)]
     pub conn_speed_down: String,
+}
+
+// ============================================================================
+// Enterprise Panel & Universal Outbound DTOs (v2.6.0+)
+// ============================================================================
+
+/// `GET /capabilities` — multi-core VPN panel discovery response.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilitiesResponse {
+    pub core: &'static str,
+    pub protocol: &'static str,
+    pub version: &'static str,
+    pub boot_id: String,
+    pub state_revision: u64,
+    pub etag: String,
+    pub persistence: &'static str,
+    pub state_file_configured: bool,
+    pub transports: &'static [&'static str],
+    pub outbound_protocols: &'static [&'static str],
+    pub outbound_strategies: &'static [&'static str],
+    pub api_capabilities: &'static [&'static str],
+    pub features: &'static [&'static str],
+    pub listeners: Vec<ListenerReport>,
+}
+
+/// `POST /accounting/checkpoint` request payload.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountingCheckpointReq {
+    pub consumer_id: String,
+    #[serde(default)]
+    pub peek: bool,
+}
+
+/// `GET /outbounds` response payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutboundsReportJson {
+    pub supported_protocols: &'static [&'static str],
+    pub outbounds: Vec<OutboundSnapshot>,
+    pub specs: Vec<OutboundSpec>,
+    pub groups: Vec<OutboundGroupSpec>,
+    pub routing: RoutingSpec,
+}
+
+/// `PUT /outbounds` request payload.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutOutboundsReq {
+    #[serde(default)]
+    pub outbounds: Vec<OutboundSpec>,
+    #[serde(default)]
+    pub outbound_groups: Vec<OutboundGroupSpec>,
+    #[serde(default)]
+    pub routing: RoutingSpec,
+}
+
+/// `POST /outbounds/{name}/probe` response payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutboundProbeResultJson {
+    pub name: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }

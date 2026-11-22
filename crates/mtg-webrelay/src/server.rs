@@ -18,9 +18,9 @@ use bytes::Bytes;
 use chrono::Utc;
 use http::Request;
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use mtg_config::{ClientIpSource, Config, ConfigWeb, IpFilterAction, PreferIp};
 use mtg_core::Secret;
 use mtg_governance::{DEFAULT_IPFILTER_UPDATE_EACH, LiveIpFilter, LiveIpFilterConfig};
@@ -209,6 +209,36 @@ async fn accept_proxy_protocol(
     })?
 }
 
+/// Peek the first 4 bytes of a cleartext connection (without consuming them!)
+/// to distinguish HTTP/2 prior-knowledge (`PRI * HTTP/2.0...`, `h2c`) from
+/// HTTP/1.1 + WebSocket upgrades, avoiding any `Rewind` wrapper so WebSocket
+/// upgrades keep lock-free `TcpStream::into_split()` zero-copy performance!
+async fn detect_h2c_prefix(stream: &mut PrefixedStream) -> io::Result<bool> {
+    if stream.prefix.len() >= 4 {
+        return Ok(stream.prefix.starts_with(b"PRI "));
+    }
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&stream.prefix);
+    let mut tmp = [0u8; 64];
+    tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, async {
+        while buf.len() < 4 {
+            let n = stream.inner.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF before HTTP preface",
+                ));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP preface read timed out"))??;
+    stream.prefix = Bytes::from(buf);
+    Ok(stream.prefix.starts_with(b"PRI "))
+}
+
 /// Build an [`UpgradedIoExtractor`] for [`PrefixedStream`] that enforces ZERO
 /// pipelined trailing bytes before `101 Switching Protocols` and splits the
 /// underlying `TcpStream` into lock-free owned halves!
@@ -314,6 +344,14 @@ pub async fn build_origin_with_overrides(
 
     let origin = Origin::new(OriginOptions {
         host,
+        extra_hosts: conf.web.hosts.clone().unwrap_or_default(),
+        carrier: conf.web.carrier.unwrap_or_default(),
+        lanes: conf.web.lanes.unwrap_or(0),
+        base_path: conf
+            .web
+            .base_path
+            .clone()
+            .unwrap_or_else(|| crate::page::DEFAULT_BASE_PATH.to_owned()),
         secrets,
         retired,
         signer,
@@ -522,7 +560,10 @@ pub fn load_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAccepto
     .with_no_client_auth()
     .with_single_cert(certs, key)
     .map_err(|e| WebRelayError::Config(format!("invalid TLS cert/key pair: {e}")))?;
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // Advertise BOTH HTTP/2 (`h2`) and HTTP/1.1 so modern browsers & iOS WKWebView
+    // use multiplexed HTTP/2 for `https-lanes` / `POST /stream` while WebSocket
+    // upgrades continue seamlessly over HTTP/1.1!
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(cfg)))
 }
 
@@ -637,6 +678,7 @@ pub async fn spawn_tls_origin_server(
                             return;
                         };
 
+                        let is_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
                         let io = TokioIo::new(tls_stream);
                         let svc = service_fn(move |req: Request<Incoming>| {
                             let origin = Arc::clone(&origin);
@@ -648,15 +690,27 @@ pub async fn spawn_tls_origin_server(
                             }
                         });
 
-                        let _ = http1::Builder::new()
-                            .timer(TokioTimer::new())
-                            .keep_alive(true)
-                            .pipeline_flush(true)
-                            .header_read_timeout(Duration::from_secs(10))
-                            .max_buf_size(64 * 1024)
-                            .serve_connection(io, svc)
-                            .with_upgrades()
-                            .await;
+                        if is_h2 {
+                            let mut h2 = http2::Builder::new(TokioExecutor::new());
+                            h2.timer(TokioTimer::new())
+                                .adaptive_window(true)
+                                .initial_stream_window_size(2 * 1024 * 1024)
+                                .initial_connection_window_size(8 * 1024 * 1024)
+                                .max_concurrent_streams(256)
+                                .keep_alive_interval(Duration::from_secs(20))
+                                .keep_alive_timeout(Duration::from_secs(10));
+                            let _ = h2.serve_connection(io, svc).await;
+                        } else {
+                            let _ = http1::Builder::new()
+                                .timer(TokioTimer::new())
+                                .keep_alive(true)
+                                .pipeline_flush(true)
+                                .header_read_timeout(Duration::from_secs(10))
+                                .max_buf_size(64 * 1024)
+                                .serve_connection(io, svc)
+                                .with_upgrades()
+                                .await;
+                        }
                     });
                 }
             }));
@@ -736,7 +790,7 @@ pub async fn spawn_origin_server(
                     let origin = Arc::clone(&origin);
 
                     tokio::spawn(async move {
-                        let (client_peer, io_stream) = if require_proxy_proto {
+                        let (client_peer, mut io_stream) = if require_proxy_proto {
                             match accept_proxy_protocol(stream, raw_peer).await {
                                 Ok(res) => res,
                                 Err(_) => return,
@@ -745,6 +799,9 @@ pub async fn spawn_origin_server(
                             (raw_peer, PrefixedStream::new(stream, Bytes::new()))
                         };
 
+                        let Ok(is_h2c) = detect_h2c_prefix(&mut io_stream).await else {
+                            return;
+                        };
                         let io = TokioIo::new(io_stream);
                         let svc = service_fn(move |req: Request<Incoming>| {
                             let origin = Arc::clone(&origin);
@@ -756,15 +813,27 @@ pub async fn spawn_origin_server(
                             }
                         });
 
-                        let _ = http1::Builder::new()
-                            .timer(TokioTimer::new())
-                            .keep_alive(true)
-                            .pipeline_flush(true)
-                            .header_read_timeout(Duration::from_secs(10))
-                            .max_buf_size(64 * 1024)
-                            .serve_connection(io, svc)
-                            .with_upgrades()
-                            .await;
+                        if is_h2c {
+                            let mut h2 = http2::Builder::new(TokioExecutor::new());
+                            h2.timer(TokioTimer::new())
+                                .adaptive_window(true)
+                                .initial_stream_window_size(2 * 1024 * 1024)
+                                .initial_connection_window_size(8 * 1024 * 1024)
+                                .max_concurrent_streams(256)
+                                .keep_alive_interval(Duration::from_secs(20))
+                                .keep_alive_timeout(Duration::from_secs(10));
+                            let _ = h2.serve_connection(io, svc).await;
+                        } else {
+                            let _ = http1::Builder::new()
+                                .timer(TokioTimer::new())
+                                .keep_alive(true)
+                                .pipeline_flush(true)
+                                .header_read_timeout(Duration::from_secs(10))
+                                .max_buf_size(64 * 1024)
+                                .serve_connection(io, svc)
+                                .with_upgrades()
+                                .await;
+                        }
                     });
                 }
             }));

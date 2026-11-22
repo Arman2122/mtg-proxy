@@ -31,10 +31,28 @@ pub fn build_api_router(engine: Arc<ProxyEngine>, token: &str) -> Router {
     let state = ApiState::new(engine, token);
     Router::new()
         .route("/healthz", get(handlers::handle_healthz))
+        .route("/capabilities", get(handlers::handle_get_capabilities))
+        .route(
+            "/state",
+            get(handlers::handle_get_state).put(handlers::handle_put_state),
+        )
+        .route("/events", get(handlers::handle_events_sse))
         .route("/stats", get(handlers::handle_stats))
         .route("/reload", any(handlers::handle_reload))
         .route("/accounting", get(handlers::handle_get_accounting))
         .route("/accounting/flush", post(handlers::handle_flush_accounting))
+        .route(
+            "/accounting/checkpoint",
+            post(handlers::handle_accounting_checkpoint),
+        )
+        .route(
+            "/outbounds",
+            get(handlers::handle_get_outbounds).put(handlers::handle_put_outbounds),
+        )
+        .route(
+            "/outbounds/{name}/probe",
+            post(handlers::handle_probe_outbound),
+        )
         .route(
             "/limits",
             get(handlers::handle_get_limits)
@@ -93,6 +111,10 @@ pub fn build_api_router(engine: Arc<ProxyEngine>, token: &str) -> Router {
                 .put(handlers::handle_put_adtag)
                 .delete(handlers::handle_delete_adtag),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            handlers::revision_concurrency_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             handlers::bearer_auth_middleware,
@@ -629,5 +651,265 @@ alice = "{ALICE_SECRET}"
         assert_eq!(bob2["client_speed_limit_up"], 125_000);
         assert_eq!(bob2["client_speed_limit_down"], 500_000);
         assert_eq!(bob2["conn_speed_limit_down"], 250_000);
+    }
+
+    #[tokio::test]
+    async fn v26_enterprise_panel_capabilities_etag_state_sse_outbounds_billing_and_overlay_reboot()
+    {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let state_path = tmp.path().join("runtime-state.json");
+        let toml = format!(
+            r#"
+bind-to = "127.0.0.1:3133"
+[api]
+persistence = "overlay"
+state-file = "{}"
+[secrets]
+alice = "{ALICE_SECRET}"
+"#,
+            state_path.display()
+        );
+        std::fs::write(&cfg_path, &toml).unwrap();
+        let cfg = Config::parse(toml.as_bytes()).unwrap();
+        let engine = ProxyEngine::from_config(&cfg, Some(cfg_path.clone()), 1, false).unwrap();
+        let app = build_api_router(Arc::clone(&engine), "panel-token");
+        let auth = Some("Bearer panel-token");
+
+        // 1. GET /capabilities exposes multi-core metadata, protocols, persistence & ETag!
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/capabilities")
+            .header(header::AUTHORIZATION, "Bearer panel-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag1 = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(etag1, "\"rev-1\"");
+        let caps: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(caps["core"], "mtg-proxy");
+        assert_eq!(caps["protocol"], "mtproto");
+        assert_eq!(caps["persistence"], "overlay");
+        assert_eq!(caps["state_file_configured"], true);
+        let protos: Vec<&str> = caps["outbound_protocols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(protos.contains(&"direct"));
+        assert!(protos.contains(&"ss-2022"));
+        assert!(protos.contains(&"ss-aead"));
+        assert!(protos.contains(&"unix+socks5"));
+
+        // 2. Stale If-Match -> 412 Precondition Failed!
+        let stale_req = Request::builder()
+            .method(Method::PUT)
+            .uri("/outbounds")
+            .header(header::AUTHORIZATION, "Bearer panel-token")
+            .header(header::IF_MATCH, "\"rev-999\"")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"outbounds":[]}"#))
+            .unwrap();
+        let stale_resp = app.clone().oneshot(stale_req).await.unwrap();
+        assert_eq!(stale_resp.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale_resp.headers().get(header::ETAG).unwrap(), "\"rev-1\"");
+
+        // 3. Matching If-Match -> PUT /outbounds hot-swaps universal outbounds + groups + routing!
+        let ob_body = json!({
+            "outbounds": [
+                {
+                    "name": "xray-eu",
+                    "url": "unix+socks5:///run/xray/socks.sock",
+                    "weight": 100
+                },
+                {
+                    "name": "ss-de",
+                    "url": "ss://2022-blake3-aes-128-gcm:AAAAAAAAAAAAAAAAAAAAAA==@127.0.0.1:8388",
+                    "weight": 50
+                }
+            ],
+            "outbound_groups": [
+                {
+                    "name": "egress",
+                    "strategy": "failover",
+                    "members": ["xray-eu", "ss-de", "direct"]
+                }
+            ],
+            "routing": {
+                "default_outbound": "egress",
+                "dc_routes": { "2": "xray-eu" }
+            }
+        });
+        let put_ob_req = Request::builder()
+            .method(Method::PUT)
+            .uri("/outbounds")
+            .header(header::AUTHORIZATION, "Bearer panel-token")
+            .header(header::IF_MATCH, &etag1)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&ob_body).unwrap()))
+            .unwrap();
+        let put_ob_resp = app.clone().oneshot(put_ob_req).await.unwrap();
+        assert_eq!(put_ob_resp.status(), StatusCode::OK);
+        let etag2 = put_ob_resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(etag2, "\"rev-2\"");
+
+        // 4. Subscribe to GET /events SSE BEFORE mutating bob!
+        let sse_req = Request::builder()
+            .method(Method::GET)
+            .uri("/events")
+            .header(header::AUTHORIZATION, "Bearer panel-token")
+            .body(Body::empty())
+            .unwrap();
+        let sse_resp = app.clone().oneshot(sse_req).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        assert!(
+            sse_resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream")
+        );
+        let mut sse_body = sse_resp.into_body();
+        let ready_frame = sse_body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let ready_text = String::from_utf8(ready_frame.to_vec()).unwrap();
+        assert!(ready_text.contains("event: ready"), "ready={ready_text}");
+
+        // 5. Add secret `bob` bound to outbound group `"egress"` & verify SSE event fires!
+        let (st, _) = send(
+            &app,
+            Method::POST,
+            "/secrets",
+            auth,
+            Some(json!({
+                "name": "bob",
+                "secret": BOB_SECRET,
+                "quota": "5GB",
+                "outbound": "egress"
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        let ev_frame = sse_body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let ev_text = String::from_utf8(ev_frame.to_vec()).unwrap();
+        assert!(
+            ev_text.contains("event: secret.upserted") && ev_text.contains("\"bob\""),
+            "ev={ev_text}"
+        );
+
+        let (st, bob_info) = send(&app, Method::GET, "/secrets/bob", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(bob_info["outbound"], "egress");
+
+        // Reject unknown outbound on PATCH /secrets/bob!
+        let (st, _) = send(
+            &app,
+            Method::PATCH,
+            "/secrets/bob",
+            auth,
+            Some(json!({ "outbound": "does-not-exist" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // 6. GET /state -> modify -> PUT /state atomic desired-state convergence!
+        let (st, mut state_doc) = send(&app, Method::GET, "/state", auth, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(state_doc["concurrency"], 8192);
+        state_doc["concurrency"] = json!(2048);
+        let (st, converged) = send(&app, Method::PUT, "/state", auth, Some(state_doc)).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(converged["concurrency"], 2048);
+
+        // 7. POST /accounting/checkpoint exact-once multi-consumer deltas!
+        engine
+            .metrics
+            .user("bob")
+            .bytes_in
+            .store(4096, Ordering::Relaxed);
+        engine
+            .metrics
+            .user("bob")
+            .bytes_out
+            .store(8192, Ordering::Relaxed);
+        let (st, cp1) = send(
+            &app,
+            Method::POST,
+            "/accounting/checkpoint",
+            auth,
+            Some(json!({ "consumer_id": "billing-1" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(cp1["sequence"], 1);
+        assert_eq!(cp1["secrets"]["bob"]["delta_total_bytes"], 12288);
+
+        engine
+            .metrics
+            .user("bob")
+            .bytes_out
+            .store(10000, Ordering::Relaxed);
+        let (st, cp2) = send(
+            &app,
+            Method::POST,
+            "/accounting/checkpoint",
+            auth,
+            Some(json!({ "consumer_id": "billing-1" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(cp2["sequence"], 2);
+        assert_eq!(cp2["secrets"]["bob"]["delta_bytes_out"], 1808);
+        assert_eq!(cp2["secrets"]["bob"]["delta_bytes_in"], 0);
+
+        // 8. FULL REBOOT RECOVERY: fresh ProxyEngine boots from unchanged config.toml
+        //    and seamlessly restores overlay (`bob`, `outbound = "egress"`, `concurrency = 2048`,
+        //    `outbounds`, `routing`, `state_revision`)!
+        assert!(state_path.exists());
+        let rebooted = ProxyEngine::from_config(&cfg, Some(cfg_path), 1, false).unwrap();
+        assert_eq!(rebooted.concurrency_limit(), 2048);
+        assert_eq!(rebooted.state_revision(), engine.state_revision());
+        let set = rebooted.secrets.load();
+        assert!(set.contains("alice"));
+        assert!(set.contains("bob"));
+        assert_eq!(
+            set.limits_of("bob").and_then(|l| l.outbound.as_deref()),
+            Some("egress")
+        );
+        let (obs, grps, rt) = rebooted.outbound_config_export();
+        assert_eq!(obs.len(), 2);
+        assert_eq!(grps.len(), 1);
+        assert_eq!(rt.default_outbound.as_deref(), Some("egress"));
     }
 }

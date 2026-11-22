@@ -6,6 +6,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [2.6.0] — 2026-11-22
+
+Enterprise Multi-Carrier WEB Proxy (full Desktop + Android + iOS HTTPS/HTTP2 Conveyor, parallel `ws-lanes` / `https-lanes`, full-duplex HTTP/2 `POST /stream`, `auto` self-healing failover, multi-vhost `hosts`, custom `base-path`), Universal Future-Proof Plug-In Outbound Traffic Engine (`direct` + `SO_BINDTODEVICE`/`SO_MARK`, `socks5`/`5h`, `socks4`/`4a`, `http`/`https` TLS 1.3 CONNECT, hardware-accelerated Shadowsocks AEAD-2022 SIP022 + Classic AEAD, and zero-TCP-overhead Linux Unix domain socket sidecars for Xray/sing-box/VLESS/Hysteria2/Trojan/TUIC), and Enterprise Multi-Core Panel-Ready Control Plane (`[api] persistence = "memory" | "overlay" | "toml"`, strong `ETag`/`If-Match` `412` optimistic locking, `/capabilities`, atomic `GET/PUT /state`, zero-polling `GET /events` SSE, `POST /accounting/checkpoint` distributed billing deltas, and live `/outbounds` hot-swap + probing).
+
+### Added
+- **Pillar 1 — Enterprise Multi-Carrier WEB Proxy (`mtg-webrelay`, `mtg-config`):**
+  - Added single-task multi-carrier **`SessionHub`** (`crates/mtg-webrelay/src/hub.rs`) supporting sequenced **`UplinkConveyor`** (`X-Up-Seq` out-of-order reassembly + idempotent retry deduplication), event-driven **`DownlinkRing`** (monotonic cursor + 64-batch / 4 MiB cellular-drop replay ring + `tokio::sync::Notify`), parallel WebSocket lanes (**`ws-lanes`**), and native full-duplex HTTP/2 **`POST /stream`** (`H2DownlinkBody`).
+  - Added `[web]` configuration knobs: **`carrier = "websocket" | "ws-lanes" | "https" | "https-lanes" | "auto"`**, **`lanes = 1..=8`**, multi-vhost **`hosts = [...]`** (independent per-host capability derivation), and custom stealth **`base-path`** (default `"/api/v1"`).
+  - Upgraded `bridge.js` (strict ES5, 0 CSP violations, 100% Playwright harness compatible) with self-healing `auto` WebSocket → HTTPS Conveyor failover, iOS WKWebView HTTP/HTTPS support, parallel lane scheduling, and configurable `base-path`.
+  - Upgraded both TLS (`ALPN: ["h2", "http/1.1"]`) and cleartext (`h2c` preface detection) listeners to serve native HTTP/2 (2 MiB stream / 8 MiB connection adaptive windows, 256 concurrent streams) alongside lock-free `TcpStream::into_split()` HTTP/1.1 WebSocket upgrades.
+- **Pillar 2 — Universal Future-Proof Plug-In Outbound Traffic Engine (`mtg-net`, `mtg-engine`, `mtg-config`, `mtg-core`, `mtg-cli`):**
+  - Introduced zero-overhead concrete-fast-path **`OutboundStream`** (`24 B`, `Tcp(TcpStream)` fast path + boxed `Tunnel(Box<dyn TunnelStream>)` for encrypted/IPC carriers) wired cleanly into `DirectRelay` (keeping `steady_state_connection_future_size_guard` strictly within `1,536 B` / `1,920 B`), `DcRouter`, `MiddleProxyPool` (`ad-tag` carriers!), and `mtg-proxy doctor`.
+  - Built native, pure-Rust outbound protocols behind the public extensible **`OutboundTransport`** trait:
+    - **`direct://`** with Linux `SO_BINDTODEVICE` (`interface`), `SO_MARK` (`fwmark`), and source IP pinning (`bind-ipv4`, `bind-ipv6`) for kernel line-rate WireGuard/Tailscale/sing-box TUN/multi-NIC routing.
+    - **`socks5://` / `socks5h://`** (with `BND.ADDR` MiddleProxy KDF capture), **`socks4://` / `socks4a://`**, **`http://`** CONNECT, and **`https://`** (TLS 1.3 wrapped CONNECT via `tokio-rustls` + custom `?sni=`).
+    - **`ss://`** hardware-accelerated **Shadowsocks AEAD-2022 SIP022** (`2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-poly1305` + multi-user EIH) and **Classic AEAD** (`aes-128-gcm`, `aes-256-gcm`, `chacha20-poly1305`) via `ring::aead` + `blake3`.
+    - **`unix://` / `unix://@abstract` / `unix+socks5://` / `unix+http://`** (with optional `?proxy_v2=1`) zero-TCP-overhead Linux Unix domain socket sidecars for **Xray-core, sing-box, VLESS+Reality, Hysteria2, Trojan, TUIC, Tor, SSH**, or any future protocol sidecar.
+  - Added declarative **`[[outbound]]`**, **`[[outbound-group]]`** (`ewma-rtt` P2C, `failover`, `weighted`, `round-robin`, `hash-dc` with per-node lock-free circuit breakers & EWMA RTT), **`[routing]`** (`default-outbound` + per-DC `[routing.dc]`), per-secret **`[secret-limits.<name>] outbound`** override, hot-reload & live **`PUT /outbounds`** swap, active **`POST /outbounds/{name}/probe`**, and 3 new Prometheus metrics (`mtg_outbound_dials_total`, `mtg_outbound_rtt_ms`, `mtg_outbound_circuit_open`).
+- **Pillar 3 — Enterprise Panel-Ready Control Plane & 3-Mode Persistence (`mtg-engine`, `mtg-api`, `mtg-config`, `mtg-cli`):**
+  - Added configurable 3-mode **`[api] persistence = "memory" | "overlay" | "toml"`**:
+    - `"memory"` (default): zero disk writes for external panel DBs.
+    - `"overlay"`: crash-safe atomic `0600` JSON runtime-state overlay (`state-file`) with SHA-256 tamper/corruption verification, Linux `flock(2)` serialization, `fsync(2)`, atomic `rename(2)`, and parent dir `fsync(2)` — keeps `config.toml` immutable/GitOps-clean while surviving restarts & reboots.
+    - `"toml"`: lossless `toml_edit` + `flock(2)` atomic writeback directly into `config.toml` preserving operator comments & unrelated sections.
+  - Added monotonic **`state_revision`** + strong HTTP **`ETag` (`"rev-N"`)** + **`X-State-Revision`** on every API response and optional **`If-Match`** optimistic concurrency control (`412 Precondition Failed` on stale writers, 100% backward compatible when omitted).
+  - Added 7 strictly additive enterprise endpoints (preserving all 19 Penhoon routes and exact 20 sorted `SUPPORTED_FEATURES`):
+    - **`GET /capabilities`** — multi-core VPN panel discovery (`core`, `protocol`, `version`, `boot_id`, `transports`, `outbound_protocols`, `outbound_strategies`, `persistence`, `api_capabilities`, `features`).
+    - **`GET /state` & `PUT /state`** — single-call atomic desired-state convergence across secrets, limits, ad-tags, outbounds, groups, and routing.
+    - **`GET /events`** — zero-polling real-time Server-Sent Events (`text/event-stream`) broadcast bus with `ready` handshake, 15s keepalive, and `lagged` resync signaling.
+    - **`POST /accounting/checkpoint`** — exact-once per-consumer distributed billing deltas (`boot_id`, `sequence`, `peek`, `counter_reset` detection).
+    - **`GET /outbounds`**, **`PUT /outbounds`**, **`POST /outbounds/{name}/probe`** — full live outbound observability, hot-swap, and active health probing.
+
+### Quality Gates
+- **`128/128`** Rust workspace tests passing across all 11 crates (including new E2E tests for HTTPS Conveyor out-of-order reassembly & cursor replay, Shadowsocks AEAD-2022 + Classic AEAD roundtrips across all 6 ciphers, FakeTLS over live Unix SOCKS5 sidecar `OutboundStream::Tunnel`, overlay SHA-256 tamper detection, lossless TOML writeback, `ETag`/`If-Match` `412`, SSE `/events`, distributed `/accounting/checkpoint` deltas, and full reboot recovery), **`0`** clippy warnings (`-D warnings`), `aarch64-unknown-linux-gnu` cross-check clean, `panel-config-string.golden` byte-exact, `steady_state_connection_future_size_guard` & `hot_paths_perform_zero_heap_allocations` passing.
+
+---
+
 ## [2.5.0] — 2026-11-22
 
 Post-Quantum `X25519MLKEM768` FakeTLS parity, live cover `ServerHello` wire-profiling, two-speed Linux `MSG_EOR` ServerHello TCP splitting, RFC 793 true TCP half-close & TLS Alert handling, exact FakeTLS anti-replay keying, and carrier-grade MiddleProxy (`ad-tag`) hardware CRC32C + Abridged + RTT/rotation hardening.

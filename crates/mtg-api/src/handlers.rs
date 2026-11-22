@@ -10,36 +10,42 @@ use std::time::Duration;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
+use futures_core::Stream;
 use mtg_config::parse_duration;
 use mtg_core::{
     GlobalLimits, IpUnit, Secret, SecretLimits, parse_expiry, parse_quota_bytes, parse_quota_reset,
     parse_speed,
 };
 use mtg_engine::{
-    BatchUpsertSecret, EngineError, GlobalLimitsPatch, ProxyEngine, SUPPORTED_FEATURES,
-    SecretPatch, is_secret_served,
+    BatchUpsertSecret, EngineError, EngineEvent, GlobalLimitsPatch, ProxyEngine,
+    RuntimeStateSnapshot, SUPPORTED_FEATURES, SecretPatch, is_secret_served,
 };
 use mtg_governance::{
     BanError, DEFAULT_EXTERNAL_ADDRESS_TTL, FairBucket, MAX_EXTERNAL_ADDRESS_TTL,
     MAX_EXTERNAL_ADDRESSES, SecretRecord, parse_ban_request, parse_ban_unit,
 };
+use mtg_net::SUPPORTED_OUTBOUND_PROTOCOLS;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use subtle::ConstantTimeEq as _;
+use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::dto::{
-    AccountLedgerRowJson, AccountingResponse, AccountingTotalsJson, AdTagResponse,
-    AddressReportJson, BanReq, BanResultJson, BansReportJson, BatchSecretsReq,
-    BatchSecretsResultJson, ClientRowJson, ClientUsageJson, ClientsReportJson,
-    DisconnectResultJson, ErrorBody, ExternalIpsReq, FakeTlsJson, FlushResultJson, HealthzResponse,
-    KickReq, KickResultJson, ObfuscatedJson, PatchGlobalLimitsReq, PatchSecretReq, PostSecretReq,
-    PutAdTagReq, PutGlobalLimitsReq, PutSecretsReq, STATUS_OK, SecretInfoJson, SecretsListResponse,
-    StatsResponse, ThrottleJson, UnbanResultJson, UserStatsJson, quota_reset_str,
+    AccountLedgerRowJson, AccountingCheckpointReq, AccountingResponse, AccountingTotalsJson,
+    AdTagResponse, AddressReportJson, BanReq, BanResultJson, BansReportJson, BatchSecretsReq,
+    BatchSecretsResultJson, CapabilitiesResponse, ClientRowJson, ClientUsageJson,
+    ClientsReportJson, DisconnectResultJson, ErrorBody, ExternalIpsReq, FakeTlsJson,
+    FlushResultJson, HealthzResponse, KickReq, KickResultJson, ObfuscatedJson,
+    OutboundProbeResultJson, OutboundsReportJson, PatchGlobalLimitsReq, PatchSecretReq,
+    PostSecretReq, PutAdTagReq, PutGlobalLimitsReq, PutOutboundsReq, PutSecretsReq, STATUS_OK,
+    SecretInfoJson, SecretsListResponse, StatsResponse, ThrottleJson, UnbanResultJson,
+    UserStatsJson, quota_reset_str,
 };
 
 const DEFAULT_CLIENTS_LIMIT: usize = 100;
@@ -94,6 +100,56 @@ pub async fn bearer_auth_middleware(
     next.run(req).await
 }
 
+/// Optimistic-concurrency middleware enforcing optional HTTP `If-Match` on
+/// mutating requests (`412 Precondition Failed` on stale revisions) and
+/// stamping strong `ETag: "rev-N"` + `X-State-Revision: N` on every response.
+pub async fn revision_concurrency_middleware(
+    State(state): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let is_mutation = matches!(
+        *req.method(),
+        Method::PUT | Method::POST | Method::PATCH | Method::DELETE
+    );
+    let path = req.uri().path().to_owned();
+    if is_mutation {
+        let if_match = req
+            .headers()
+            .get(header::IF_MATCH)
+            .and_then(|v| v.to_str().ok());
+        if let Err(current_etag) = state.engine.check_if_match(if_match) {
+            let mut resp = (
+                StatusCode::PRECONDITION_FAILED,
+                Json(serde_json::json!({
+                    "error": "precondition failed: state revision mismatch",
+                    "current_etag": current_etag,
+                    "state_revision": state.engine.state_revision(),
+                })),
+            )
+                .into_response();
+            attach_revision_headers(&state.engine, resp.headers_mut());
+            return resp;
+        }
+    }
+
+    let mut resp = next.run(req).await;
+    if path != "/events" {
+        attach_revision_headers(&state.engine, resp.headers_mut());
+    }
+    resp
+}
+
+fn attach_revision_headers(engine: &ProxyEngine, headers: &mut axum::http::HeaderMap) {
+    let rev = engine.state_revision();
+    if let Ok(etag_val) = HeaderValue::from_str(&format!("\"rev-{rev}\"")) {
+        headers.insert(header::ETAG, etag_val);
+    }
+    if let Ok(rev_val) = HeaderValue::from_str(&rev.to_string()) {
+        headers.insert(HeaderName::from_static("x-state-revision"), rev_val);
+    }
+}
+
 fn json_error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorBody { error: msg.into() })).into_response()
 }
@@ -107,7 +163,7 @@ fn map_engine_error(err: &EngineError) -> Response {
         EngineError::Invalid(_) | EngineError::Ban(BanError::InvalidAddress(_)) => {
             StatusCode::BAD_REQUEST
         }
-        EngineError::Reload(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        EngineError::Reload(_) | EngineError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     json_error(status, err.to_string())
 }
@@ -469,6 +525,7 @@ fn build_secret_info(
         conn_speed_limit: rec.limits.conn_speed_bytes_per_second,
         conn_speed_limit_up: rec.limits.conn_speed_up_bytes_per_second,
         conn_speed_limit_down: rec.limits.conn_speed_down_bytes_per_second,
+        outbound: rec.limits.outbound.clone(),
         mode: rec.secret.mode().as_str().to_owned(),
         unserved: !is_secret_served(&rec.secret, eng.listener_modes),
         connections,
@@ -1238,6 +1295,10 @@ pub async fn handle_patch_secret(
         }
         patch.max_connections = Some(v as u32);
     }
+    if let Some(ob) = req.outbound {
+        let trimmed = ob.trim();
+        patch.outbound = Some((!trimmed.is_empty()).then(|| trimmed.to_owned()));
+    }
 
     match state.engine.patch_secret(&name, patch) {
         Ok(()) => (StatusCode::OK, Json(STATUS_OK)).into_response(),
@@ -1670,4 +1731,261 @@ pub async fn handle_put_limits(State(state): State<ApiState>, body: Bytes) -> Re
 
 pub async fn handle_reset_global_quota(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, Json(state.engine.reset_global_quota())).into_response()
+}
+
+// ============================================================================
+// Enterprise Panel & Universal Outbound Routes (v2.6.0+):
+//   GET  /capabilities
+//   GET  /state, PUT /state
+//   GET  /events (SSE text/event-stream)
+//   POST /accounting/checkpoint
+//   GET  /outbounds, PUT /outbounds, POST /outbounds/{name}/probe
+// ============================================================================
+
+const TRANSPORTS_SUPPORTED: &[&str] = &[
+    "ee",
+    "dd",
+    "plain",
+    "web-ws",
+    "web-ws-lanes",
+    "web-https",
+    "web-https-lanes",
+    "web-h2-stream",
+];
+
+const OUTBOUND_STRATEGIES_SUPPORTED: &[&str] =
+    &["ewma-rtt", "failover", "weighted", "round-robin", "hash-dc"];
+
+const API_CAPABILITIES_SUPPORTED: &[&str] = &[
+    "accounting-checkpoints",
+    "batch-mutations",
+    "desired-state-convergence",
+    "dynamic-outbounds",
+    "etag-optimistic-locking",
+    "geo-stealth-ip-filters",
+    "global-limits",
+    "hot-reload",
+    "per-secret-outbound-routing",
+    "sse-events",
+];
+
+/// `GET /capabilities` — multi-core VPN panel discovery endpoint.
+pub async fn handle_get_capabilities(State(state): State<ApiState>) -> Response {
+    let eng = &state.engine;
+    let resp = CapabilitiesResponse {
+        core: "mtg-proxy",
+        protocol: "mtproto",
+        version: env!("CARGO_PKG_VERSION"),
+        boot_id: eng.boot_id(),
+        state_revision: eng.state_revision(),
+        etag: eng.state_etag(),
+        persistence: eng.persistence_mode.as_str(),
+        state_file_configured: eng.state_file.is_some(),
+        transports: TRANSPORTS_SUPPORTED,
+        outbound_protocols: SUPPORTED_OUTBOUND_PROTOCOLS,
+        outbound_strategies: OUTBOUND_STRATEGIES_SUPPORTED,
+        api_capabilities: API_CAPABILITIES_SUPPORTED,
+        features: SUPPORTED_FEATURES,
+        listeners: eng.listener_reports.clone(),
+    };
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// `GET /state` — complete declarative control-plane snapshot with strong `ETag`.
+pub async fn handle_get_state(State(state): State<ApiState>) -> Response {
+    let snap = state.engine.export_state_snapshot();
+    (StatusCode::OK, Json(snap)).into_response()
+}
+
+/// `PUT /state` — single-call atomic desired-state convergence (supports `If-Match`).
+pub async fn handle_put_state(State(state): State<ApiState>, body: Bytes) -> Response {
+    let desired: RuntimeStateSnapshot = match decode_strict_json(&body) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    match state.engine.apply_state_snapshot(&desired) {
+        Ok(converged) => (StatusCode::OK, Json(converged)).into_response(),
+        Err(e) => map_engine_error(&e),
+    }
+}
+
+/// `POST /accounting/checkpoint` — exact-once per-consumer distributed billing deltas.
+pub async fn handle_accounting_checkpoint(State(state): State<ApiState>, body: Bytes) -> Response {
+    let req: AccountingCheckpointReq = match decode_strict_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match state
+        .engine
+        .take_billing_checkpoint(&req.consumer_id, req.peek)
+    {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => map_engine_error(&e),
+    }
+}
+
+/// `GET /outbounds` — live telemetry + declarative configuration for universal outbounds.
+pub async fn handle_get_outbounds(State(state): State<ApiState>) -> Response {
+    let (specs, groups, routing) = state.engine.outbound_config_export();
+    let resp = OutboundsReportJson {
+        supported_protocols: SUPPORTED_OUTBOUND_PROTOCOLS,
+        outbounds: state.engine.outbound_snapshots(),
+        specs,
+        groups,
+        routing,
+    };
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// `PUT /outbounds` — hot-swap universal plug-in outbounds, groups & routing rules live!
+pub async fn handle_put_outbounds(State(state): State<ApiState>, body: Bytes) -> Response {
+    let req: PutOutboundsReq = match decode_strict_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    match state
+        .engine
+        .replace_outbounds(&req.outbounds, &req.outbound_groups, req.routing)
+    {
+        Ok(outbounds) => {
+            let (specs, groups, routing) = state.engine.outbound_config_export();
+            (
+                StatusCode::OK,
+                Json(OutboundsReportJson {
+                    supported_protocols: SUPPORTED_OUTBOUND_PROTOCOLS,
+                    outbounds,
+                    specs,
+                    groups,
+                    routing,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => map_engine_error(&e),
+    }
+}
+
+/// `POST /outbounds/{name}/probe` — live active dial probe of a named outbound transport.
+pub async fn handle_probe_outbound(
+    Path(name): Path<String>,
+    State(state): State<ApiState>,
+) -> Response {
+    match state.engine.probe_outbound(&name).await {
+        Ok(rtt) => (
+            StatusCode::OK,
+            Json(OutboundProbeResultJson {
+                name,
+                ok: true,
+                rtt_ms: Some(rtt.as_secs_f64() * 1000.0),
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::OK,
+            Json(OutboundProbeResultJson {
+                name,
+                ok: false,
+                rtt_ms: None,
+                error: Some(e.to_string()),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+type SseRecvFut = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = (
+                    Result<EngineEvent, broadcast::error::RecvError>,
+                    broadcast::Receiver<EngineEvent>,
+                ),
+            > + Send,
+    >,
+>;
+
+struct EngineSseStream {
+    initial: Option<SseEvent>,
+    rx: Option<broadcast::Receiver<EngineEvent>>,
+    pending: Option<SseRecvFut>,
+    engine: Arc<ProxyEngine>,
+}
+
+impl Stream for EngineSseStream {
+    type Item = Result<SseEvent, std::convert::Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if let Some(ev) = this.initial.take() {
+            return std::task::Poll::Ready(Some(Ok(ev)));
+        }
+        if this.pending.is_none() {
+            let Some(mut rx) = this.rx.take() else {
+                return std::task::Poll::Ready(None);
+            };
+            this.pending = Some(Box::pin(async move {
+                let res = rx.recv().await;
+                (res, rx)
+            }));
+        }
+        let fut = this.pending.as_mut().expect("pending set");
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready((res, rx)) => {
+                this.pending = None;
+                match res {
+                    Ok(ev) => {
+                        this.rx = Some(rx);
+                        let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
+                        let sse = SseEvent::default()
+                            .id(ev.id.to_string())
+                            .event(ev.event)
+                            .data(data);
+                        std::task::Poll::Ready(Some(Ok(sse)))
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        this.rx = Some(rx);
+                        let data = serde_json::json!({
+                            "skipped": skipped,
+                            "revision": this.engine.state_revision(),
+                            "etag": this.engine.state_etag(),
+                        })
+                        .to_string();
+                        let sse = SseEvent::default().event("lagged").data(data);
+                        std::task::Poll::Ready(Some(Ok(sse)))
+                    }
+                    Err(broadcast::error::RecvError::Closed) => std::task::Poll::Ready(None),
+                }
+            }
+        }
+    }
+}
+
+/// `GET /events` — zero-polling real-time Server-Sent Events (`text/event-stream`).
+pub async fn handle_events_sse(
+    State(state): State<ApiState>,
+) -> Sse<impl Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let rx = state.engine.subscribe_events();
+    let ready_json = serde_json::json!({
+        "boot_id": state.engine.boot_id(),
+        "revision": state.engine.state_revision(),
+        "etag": state.engine.state_etag(),
+    })
+    .to_string();
+    let initial = Some(SseEvent::default().event("ready").data(ready_json));
+    let stream = EngineSseStream {
+        initial,
+        rx: Some(rx),
+        pending: None,
+        engine: Arc::clone(&state.engine),
+    };
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }

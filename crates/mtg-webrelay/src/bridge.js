@@ -1,17 +1,21 @@
-// The bridge: the JavaScript half of the WEB proxy v1 carrier.
+// The bridge: the JavaScript half of the WEB proxy v1 multi-carrier transport.
 //
 // Runs inside the Telegram client's own WebView (Android/iOS/Desktop) or
 // loopback iframe fallback under a strict intersected Content-Security-Policy.
-// Moves opaque Shared-Frame v1 batches between the client and the relay.
-// Written strictly in ES5 syntax for maximum WebView compatibility.
+// Supports all 4 carriers (`websocket`, `ws-lanes`, `https`, `https-lanes`)
+// plus `auto` self-healing failover from WebSocket to HTTPS Conveyor!
+// Written strictly in ES5 syntax with zero forbidden WebView APIs.
 (function () {
   'use strict';
 
   var BOOT = TPROXY_BOOT;
 
+  var BASE_PATH = BOOT.base || '/api/v1';
   var ORIGIN = 'https://' + BOOT.host;
-  var SESSION_URL = ORIGIN + '/api/v1/session';
-  var WS_URL = 'wss://' + BOOT.host + '/api/v1/ws';
+  var SESSION_URL = ORIGIN + BASE_PATH + '/session';
+  var WS_URL = 'wss://' + BOOT.host + BASE_PATH + '/ws';
+  var UP_URL = ORIGIN + BASE_PATH + '/up';
+  var DOWN_URL = ORIGIN + BASE_PATH + '/down';
 
   var HEADER_SIZE = 8;
   var MAX_PAYLOAD = 1048576;
@@ -181,6 +185,17 @@
   }
 
   var socket = null;
+  var laneSockets = [];
+  var laneCursor = 0;
+  var activeMode = 'websocket';
+  var activeLanes = 1;
+  var wsEverOpened = false;
+  var httpsActive = false;
+  var upSeq = 0;
+  var upInFlight = 0;
+  var maxUpInFlight = 1;
+  var downCursor = '0';
+  var downFailures = 0;
   var sessionToken = null;
   var helloBytes = null;
   var uplinkQueue = [];
@@ -210,23 +225,22 @@
 
     setState('failed');
     finished = true;
+    httpsActive = false;
 
     if (boundary) {
       boundary.sendControl({ t: 'close' });
     }
 
     stopTraffic();
-    closeSocket();
+    closeAllSockets();
     releaseSession();
   }
 
-  function closeSocket() {
-    if (!socket) {
+  function closeOneSocket(dying) {
+    if (!dying) {
       return;
     }
 
-    var dying = socket;
-    socket = null;
     dying.onopen = null;
     dying.onmessage = null;
     dying.onerror = null;
@@ -236,6 +250,22 @@
       dying.close();
     } catch (err) {
       // Already closed.
+    }
+  }
+
+  function closeAllSockets() {
+    if (socket) {
+      var primary = socket;
+      socket = null;
+      closeOneSocket(primary);
+    }
+
+    if (laneSockets.length > 0) {
+      var list = laneSockets;
+      laneSockets = [];
+      for (var i = 0; i < list.length; i++) {
+        closeOneSocket(list[i]);
+      }
     }
   }
 
@@ -281,7 +311,26 @@
   }
 
   function bufferedUplink() {
-    return queuedBytes + (socket ? socket.bufferedAmount : 0);
+    var total = queuedBytes + (socket ? socket.bufferedAmount : 0);
+    for (var i = 0; i < laneSockets.length; i++) {
+      if (laneSockets[i]) {
+        total += laneSockets[i].bufferedAmount;
+      }
+    }
+    return total;
+  }
+
+  function pickOpenLane() {
+    var count = laneSockets.length;
+    for (var i = 0; i < count; i++) {
+      var idx = (laneCursor + i) % count;
+      var ws = laneSockets[idx];
+      if (ws && ws.readyState === 1) {
+        laneCursor = (idx + 1) % count;
+        return ws;
+      }
+    }
+    return null;
   }
 
   function enqueueUplink(bytes) {
@@ -297,7 +346,23 @@
       return;
     }
 
-    if (socket && socket.readyState === 1) {
+    if (httpsActive) {
+      uplinkQueue.push(bytes);
+      queuedBytes += bytes.length;
+      pumpHttpsUplink();
+
+      return;
+    }
+
+    if (activeMode === 'ws-lanes') {
+      var lane = pickOpenLane();
+      if (lane) {
+        upBytes += bytes.length;
+        lane.send(copyOut(bytes));
+
+        return;
+      }
+    } else if (socket && socket.readyState === 1) {
       upBytes += bytes.length;
       socket.send(copyOut(bytes));
 
@@ -309,13 +374,25 @@
   }
 
   function flushUplink() {
+    if (httpsActive) {
+      pumpHttpsUplink();
+
+      return;
+    }
+
     var pending = uplinkQueue;
     uplinkQueue = [];
     queuedBytes = 0;
 
     for (var i = 0; i < pending.length; i++) {
+      var target = activeMode === 'ws-lanes' ? pickOpenLane() : socket;
+      if (!target || target.readyState !== 1) {
+        uplinkQueue.push(pending[i]);
+        queuedBytes += pending[i].length;
+        continue;
+      }
       upBytes += pending[i].length;
-      socket.send(copyOut(pending[i]));
+      target.send(copyOut(pending[i]));
     }
   }
 
@@ -366,8 +443,9 @@
 
     if (control && control.t === 'close') {
       finished = true;
+      httpsActive = false;
       stopTraffic();
-      closeSocket();
+      closeAllSockets();
       releaseSession();
     }
   }
@@ -397,6 +475,14 @@
       return;
     }
 
+    var hdrs = {
+      Authorization: 'Bearer ' + BOOT.token,
+      'Content-Type': 'application/octet-stream'
+    };
+    if (BOOT.mode && BOOT.mode !== 'websocket') {
+      hdrs['X-Carrier-Prefer'] = BOOT.mode;
+    }
+
     fetch(SESSION_URL, {
       method: 'POST',
       mode: 'same-origin',
@@ -404,15 +490,15 @@
       cache: 'no-store',
       redirect: 'error',
       referrerPolicy: 'no-referrer',
-      headers: {
-        Authorization: 'Bearer ' + BOOT.token,
-        'Content-Type': 'application/octet-stream'
-      },
+      headers: hdrs,
       body: body
     }).then(function (response) {
       if (response.status === 200) {
         return response.arrayBuffer().then(function (welcome) {
-          onSession(response.headers.get('X-Session-Token'), welcome);
+          var modeHdr = response.headers.get('X-Carrier-Mode') || 'websocket';
+          var cursorHdr = response.headers.get('X-Down-Cursor') || '0';
+          var lanesHdr = parseInt(response.headers.get('X-Carrier-Lanes') || '0', 10);
+          onSession(response.headers.get('X-Session-Token'), welcome, modeHdr, cursorHdr, lanesHdr);
         });
       }
 
@@ -449,7 +535,7 @@
     return null;
   }
 
-  function onSession(token, welcome) {
+  function onSession(token, welcome, modeHdr, cursorHdr, lanesHdr) {
     if (finished) {
       return;
     }
@@ -461,15 +547,213 @@
     }
 
     sessionToken = token;
+    activeMode = modeHdr || 'websocket';
+    downCursor = cursorHdr || '0';
+    activeLanes = lanesHdr > 0 ? lanesHdr : (BOOT.lanes || 1);
+    if (activeLanes > 8) {
+      activeLanes = 8;
+    }
+
     boundary.sendBinary(welcome);
-    openSocket();
+
+    if (activeMode === 'https' || activeMode === 'https-lanes') {
+      startHttpsCarrier(activeMode === 'https-lanes' ? Math.max(2, activeLanes) : 1);
+    } else if (activeMode === 'ws-lanes') {
+      openWsLanes(Math.max(2, activeLanes));
+    } else {
+      openSocket();
+    }
+  }
+
+  // ---- HTTPS / HTTP/2 Conveyor Carrier (works on iOS WKWebView & WS-blocked nets) ----
+
+  function startHttpsCarrier(lanes) {
+    if (finished || httpsActive) {
+      return;
+    }
+
+    closeAllSockets();
+    httpsActive = true;
+    maxUpInFlight = lanes;
+    setState('connected');
+    startTraffic();
+    pumpHttpsUplink();
+    pollHttpsDownlink();
+  }
+
+  function pumpHttpsUplink() {
+    if (!httpsActive || finished || !sessionToken) {
+      return;
+    }
+
+    while (upInFlight < maxUpInFlight && uplinkQueue.length > 0) {
+      // Coalesce queued chunks up to MAX_BATCH per HTTP POST!
+      var batchParts = [];
+      var batchLen = 0;
+
+      while (uplinkQueue.length > 0 && batchLen + uplinkQueue[0].length <= MAX_BATCH) {
+        var nextChunk = uplinkQueue.shift();
+        queuedBytes -= nextChunk.length;
+        batchParts.push(nextChunk);
+        batchLen += nextChunk.length;
+      }
+
+      if (batchParts.length === 0) {
+        break;
+      }
+
+      var merged = new Uint8Array(batchLen);
+      var off = 0;
+      for (var i = 0; i < batchParts.length; i++) {
+        merged.set(batchParts[i], off);
+        off += batchParts[i].length;
+      }
+
+      var seq = upSeq;
+      upSeq += 1;
+      upInFlight += 1;
+      upBytes += batchLen;
+      sendHttpsUplink(merged.buffer, seq, 0);
+    }
+  }
+
+  function sendHttpsUplink(buffer, seq, attempt) {
+    if (!httpsActive || finished || !sessionToken) {
+      upInFlight = Math.max(0, upInFlight - 1);
+      return;
+    }
+
+    fetch(UP_URL, {
+      method: 'POST',
+      mode: 'same-origin',
+      credentials: 'omit',
+      cache: 'no-store',
+      redirect: 'error',
+      referrerPolicy: 'no-referrer',
+      headers: {
+        Authorization: 'Bearer ' + sessionToken,
+        'Content-Type': 'application/octet-stream',
+        'X-Up-Seq': String(seq)
+      },
+      body: buffer
+    }).then(function (response) {
+      if (response.status === 204 || response.status === 200) {
+        upInFlight = Math.max(0, upInFlight - 1);
+        pumpHttpsUplink();
+        return;
+      }
+      if ((response.status === 503 || response.status >= 500) && attempt < 6) {
+        setTimeout(function () {
+          sendHttpsUplink(buffer, seq, attempt + 1);
+        }, backoff(attempt));
+        return;
+      }
+      fail();
+    })['catch'](function () {
+      if (!httpsActive || finished) {
+        return;
+      }
+      if (attempt < 6) {
+        setTimeout(function () {
+          sendHttpsUplink(buffer, seq, attempt + 1);
+        }, backoff(attempt));
+        return;
+      }
+      fail();
+    });
+  }
+
+  function pollHttpsDownlink() {
+    if (!httpsActive || finished || !sessionToken) {
+      return;
+    }
+
+    fetch(DOWN_URL + '?cursor=' + encodeURIComponent(downCursor), {
+      method: 'GET',
+      mode: 'same-origin',
+      credentials: 'omit',
+      cache: 'no-store',
+      redirect: 'error',
+      referrerPolicy: 'no-referrer',
+      headers: {
+        Authorization: 'Bearer ' + sessionToken
+      }
+    }).then(function (response) {
+      if (!httpsActive || finished) {
+        return null;
+      }
+
+      if (response.status === 204) {
+        downFailures = 0;
+        var keptCursor = response.headers.get('X-Down-Cursor');
+        if (keptCursor) {
+          downCursor = keptCursor;
+        }
+        pollHttpsDownlink();
+        return null;
+      }
+
+      if (response.status === 200) {
+        downFailures = 0;
+        var nextCursor = response.headers.get('X-Down-Cursor');
+        return response.arrayBuffer().then(function (buf) {
+          if (!httpsActive || finished) {
+            return;
+          }
+          if (nextCursor) {
+            downCursor = nextCursor;
+          }
+          var bytes = asBytes(buf);
+          if (bytes === null || bytes.length > MAX_BATCH) {
+            fail();
+            return;
+          }
+          if (bytes.length > 0) {
+            deliverDownlink(bytes);
+          }
+          pollHttpsDownlink();
+        });
+      }
+
+      if (response.status === 503 && downFailures < 6) {
+        downFailures += 1;
+        setTimeout(pollHttpsDownlink, backoff(downFailures));
+        return null;
+      }
+
+      fail();
+      return null;
+    })['catch'](function () {
+      if (!httpsActive || finished) {
+        return;
+      }
+      if (downFailures < 6) {
+        downFailures += 1;
+        setTimeout(pollHttpsDownlink, backoff(downFailures));
+        return;
+      }
+      fail();
+    });
+  }
+
+  // ---- Classic Single WebSocket Carrier (with optional auto->https self-heal!) ----
+
+  function handleWsFailure() {
+    if (finished) {
+      return;
+    }
+    if (!wsEverOpened && BOOT.fallback) {
+      startHttpsCarrier(Math.max(1, activeLanes));
+      return;
+    }
+    fail();
   }
 
   function openSocket() {
     try {
       socket = new WebSocket(WS_URL, 'tproxy-v1.' + sessionToken);
     } catch (err) {
-      fail();
+      handleWsFailure();
 
       return;
     }
@@ -477,6 +761,7 @@
     socket.binaryType = 'arraybuffer';
 
     socket.onopen = function () {
+      wsEverOpened = true;
       setState('connected');
       startTraffic();
       flushUplink();
@@ -503,11 +788,68 @@
     };
 
     socket.onerror = function () {
-      fail();
+      handleWsFailure();
     };
 
     socket.onclose = function () {
-      fail();
+      handleWsFailure();
+    };
+  }
+
+  // ---- Multi-Lane Parallel WebSocket Carrier (`ws-lanes`) ----
+
+  function openWsLanes(lanes) {
+    laneSockets = [];
+    for (var i = 0; i < lanes; i++) {
+      openOneWsLane(i);
+    }
+  }
+
+  function openOneWsLane(idx) {
+    var ws;
+    try {
+      ws = new WebSocket(WS_URL + '?lane=' + idx, 'tproxy-v1.' + sessionToken);
+    } catch (err) {
+      handleWsFailure();
+      return;
+    }
+
+    ws.binaryType = 'arraybuffer';
+    laneSockets[idx] = ws;
+
+    ws.onopen = function () {
+      wsEverOpened = true;
+      setState('connected');
+      startTraffic();
+      flushUplink();
+    };
+
+    ws.onmessage = function (event) {
+      if (finished) {
+        return;
+      }
+      var bytes = asBytes(event.data);
+      if (bytes === null || bytes.length > MAX_BATCH) {
+        fail();
+        return;
+      }
+      if (bytes.length > 0) {
+        deliverDownlink(bytes);
+      }
+    };
+
+    ws.onerror = function () {
+      laneSockets[idx] = null;
+      if (!pickOpenLane()) {
+        handleWsFailure();
+      }
+    };
+
+    ws.onclose = function () {
+      laneSockets[idx] = null;
+      if (!pickOpenLane()) {
+        handleWsFailure();
+      }
     };
   }
 
