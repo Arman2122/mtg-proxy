@@ -68,6 +68,23 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
             gl.conn_speed_bytes_per_second,
         );
     }
+    let frag_mss = conf
+        .defense
+        .doppelganger
+        .server_hello_fragment_mss
+        .unwrap_or(0);
+    println!(
+        "  ✅ FakeTLS Anti-DPI profile: pq_mlkem768={} scout_covers={} sh_fragment_mss={} unknown_sni_action={} ignore_time_skew={}",
+        conf.defense.doppelganger.pq_key_share.unwrap_or(true),
+        conf.defense.doppelganger.scout_covers.unwrap_or(false),
+        if frag_mss == 0 {
+            "off".to_string()
+        } else {
+            format!("{frag_mss}B (MSG_EOR)")
+        },
+        conf.domain_fronting.unknown_sni_action.unwrap_or_default(),
+        conf.ignore_time_skew.unwrap_or(false),
+    );
 
     // 2. Linux kernel, CPU affinity & hardware crypto capability probe
     println!("Checking Linux kernel & CPU capabilities...");
@@ -102,7 +119,7 @@ pub async fn execute_doctor(config_path: &Path, skip_native_check: bool) -> Resu
     println!("Checking clock drift (SNTP)...");
     let skew_limit = conf
         .tolerate_time_skewness
-        .unwrap_or(Duration::from_secs(5));
+        .unwrap_or(Duration::from_secs(120));
     match query_sntp_offset("0.pool.ntp.org:123").await {
         Ok(drift) => {
             let abs_ms = drift.unsigned_abs().as_millis();

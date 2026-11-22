@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use mtg_crypto::NoiseParams;
+use mtg_crypto::{
+    NoiseParams, ServerHelloProfile, build_pq_scout_client_hello, parse_raw_server_hello_profile,
+};
 use mtg_net::{
     DnsResolver, ProxyPool, ProxyTarget, SocketConfig, coarse_now_ns, happy_eyeballs_connect,
 };
@@ -153,10 +155,14 @@ pub struct ScoutSample {
     pub cert_flight_bytes: Option<usize>,
     pub gaps_ms: Vec<f64>,
     pub observed_drs: bool,
+    /// Exact live TLS 1.3 `ServerHelloProfile` captured via a raw Post-Quantum
+    /// `X25519MLKEM768` + `X25519` ClientHello probe (cipher, PQ support, extension order).
+    pub server_hello: Option<ServerHelloProfile>,
 }
 
 /// Aggregate raw [`ScoutSample`]s from one or more cover hosts into a validated
-/// [`DoppelParams`] model (preserving configured `shaping` and fallback `drs`).
+/// [`DoppelParams`] model (preserving configured `shaping`, fallback `drs`, and
+/// live cover `ServerHelloProfile`).
 pub fn aggregate_samples(
     samples: &[ScoutSample],
     configured_drs: bool,
@@ -190,19 +196,87 @@ pub fn aggregate_samples(
 
     let mut all_gaps = Vec::new();
     let mut any_drs = configured_drs;
+    let mut observed_sh: Option<ServerHelloProfile> = None;
     for s in samples {
         all_gaps.extend_from_slice(&s.gaps_ms);
         if s.observed_drs {
             any_drs = true;
         }
+        if observed_sh.is_none() && s.server_hello.is_some() {
+            observed_sh = s.server_hello;
+        }
     }
 
-    let fitted = DoppelParams::fit_weibull(&all_gaps, any_drs, shaping, noise).or_default();
+    let mut fitted = DoppelParams::fit_weibull(&all_gaps, any_drs, shaping, noise).or_default();
+    if let Some(mut sh) = observed_sh {
+        if noise.mean > 0 {
+            sh.noise = noise;
+        }
+        fitted.server_hello = sh;
+    } else {
+        fitted.server_hello.noise = noise;
+    }
     Some(fitted)
 }
 
-/// Probe one HTTPS cover target via real TLS 1.3/1.2 handshake + HTTP GET,
-/// returning observed cert-flight bytes, inter-record arrival gaps, and DRS flag.
+/// Send a raw Chrome-like Post-Quantum `X25519MLKEM768` + `X25519` TLS 1.3
+/// `ClientHello` to `target` and parse the cover server's exact raw wire
+/// `ServerHello` (`cipher_suite`, `prefer_pq_mlkem768`, `key_share_first`, and
+/// encrypted handshake flight size).
+pub async fn probe_cover_server_hello_profile(
+    target: &ScoutTarget,
+    dns: &DnsResolver,
+    proxy_pool: Option<&ProxyPool>,
+    sock_cfg: &SocketConfig,
+) -> io::Result<ServerHelloProfile> {
+    let mut tcp = dial_target(target, dns, proxy_pool, sock_cfg).await?;
+    let ch = build_pq_scout_client_hello(&target.host);
+    tokio::time::timeout(SCOUT_TARGET_TIMEOUT, tcp.write_all(&ch))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "pq scout write timeout"))??;
+
+    let mut raw = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+
+    while raw.len() < 16_384 {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let read_wait = if raw.is_empty() {
+            rem
+        } else {
+            rem.min(Duration::from_millis(120))
+        };
+        match tokio::time::timeout(read_wait, tcp.read(&mut tmp)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                raw.extend_from_slice(&tmp[..n]);
+                if parse_raw_server_hello_profile(&raw).is_some_and(|p| p.noise.mean >= 1000) {
+                    break;
+                }
+            }
+            Ok(Err(e)) => {
+                if raw.is_empty() {
+                    return Err(e);
+                }
+                break;
+            }
+        }
+    }
+
+    parse_raw_server_hello_profile(&raw).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cover did not return a TLS 1.3 ServerHello",
+        )
+    })
+}
+
+/// Probe one HTTPS cover target via raw PQ TLS 1.3 ServerHello profiling +
+/// real TLS 1.3/1.2 handshake + HTTP GET, returning observed cert-flight bytes,
+/// inter-record arrival gaps, DRS flag, and live `ServerHelloProfile`.
 pub async fn probe_cover_target(
     target: &ScoutTarget,
     dns: &DnsResolver,
@@ -210,6 +284,11 @@ pub async fn probe_cover_target(
     sock_cfg: &SocketConfig,
     connector: &TlsConnector,
 ) -> io::Result<ScoutSample> {
+    // 1. Capture exact raw wire ServerHello profile (PQ X25519MLKEM768, cipher, extension order)!
+    let server_hello = probe_cover_server_hello_profile(target, dns, proxy_pool, sock_cfg)
+        .await
+        .ok();
+
     let tcp = dial_target(target, dns, proxy_pool, sock_cfg).await?;
     let server_name = ServerName::try_from(target.host.clone())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS SNI"))?;
@@ -251,12 +330,15 @@ pub async fn probe_cover_target(
     let guard = collector
         .lock()
         .map_err(|_| io::Error::other("scout collector poisoned"))?;
-    let cert_flight_bytes = guard.measure_cert_flight_bytes();
+    let cert_flight_bytes = guard
+        .measure_cert_flight_bytes()
+        .or_else(|| server_hello.map(|p| p.noise.mean).filter(|&m| m > 0));
     let (gaps_ms, observed_drs) = guard.extract_gaps_and_drs();
     Ok(ScoutSample {
         cert_flight_bytes,
         gaps_ms,
         observed_drs,
+        server_hello,
     })
 }
 
@@ -387,9 +469,12 @@ pub async fn run_scout_round(
         drs = default.drs,
         noise_mean = default.noise.mean,
         noise_jitter = default.noise.jitter,
+        pq_mlkem768 = default.server_hello.prefer_pq_mlkem768,
+        cipher_suite = ?default.server_hello.cipher_suite.map(|c| format!("0x{c:04x}")),
+        key_share_first = default.server_hello.key_share_first,
         probed = samples.len(),
         per_host_profiles = per_host.len(),
-        "doppelganger traffic profile calibrated from live covers"
+        "doppelganger traffic & ServerHello profile calibrated from live covers"
     );
 
     Some(DoppelCatalog { default, per_host })
@@ -471,11 +556,18 @@ mod tests {
                 cert_flight_bytes: Some(3200),
                 gaps_ms: gaps[..150].to_vec(),
                 observed_drs: false,
+                server_hello: Some(ServerHelloProfile {
+                    cipher_suite: Some(mtg_crypto::TLS13_AES_256_GCM_SHA384),
+                    prefer_pq_mlkem768: true,
+                    key_share_first: true,
+                    noise: NoiseParams::default(),
+                }),
             },
             ScoutSample {
                 cert_flight_bytes: Some(4400),
                 gaps_ms: gaps[150..].to_vec(),
                 observed_drs: true,
+                server_hello: None,
             },
         ];
 
@@ -484,6 +576,13 @@ mod tests {
         assert_eq!(params.shaping, ShapingMode::Burst);
         assert_eq!(params.noise.mean, 3800);
         assert_eq!(params.noise.jitter, 600);
+        assert!(params.server_hello.prefer_pq_mlkem768);
+        assert!(params.server_hello.key_share_first);
+        assert_eq!(
+            params.server_hello.cipher_suite,
+            Some(mtg_crypto::TLS13_AES_256_GCM_SHA384)
+        );
+        assert_eq!(params.server_hello.noise.mean, 3800);
         assert!((params.k - 0.75).abs() < 0.1, "k={}", params.k);
         assert!(
             (params.lambda_ms - 4.0).abs() < 0.8,

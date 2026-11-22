@@ -41,7 +41,7 @@ Unlike single-secret proxies, `mtg-proxy` gives every user their own named secre
   - [Sponsored Channel (`ad-tag`)](#sponsored-channel-ad-tag)
   - [Connection Throttling](#connection-throttling)
   - [Unified Single-Port Multi-Transport & WEB Proxy (`web-relay`)](#unified-single-port-multi-transport--web-proxy-web-relay)
-  - [Doppelganger Cover Scouting & Traffic Mimicry](#doppelganger-cover-scouting--traffic-mimicry)
+  - [Doppelganger Cover Scouting, Post-Quantum `X25519MLKEM768` & Two-Speed Anti-DPI](#doppelganger-cover-scouting-post-quantum-x25519mlkem768--two-speed-anti-dpi)
   - [Geo-Stealth Country Allowlist (`IR-Geo-DB`) & Cover-Only Fronting](#geo-stealth-country-allowlist-ir-geo-db--cover-only-fronting)
   - [Public IP Override & Environment Variables](#public-ip-override--environment-variables)
 - [CLI Command Reference](#cli-command-reference)
@@ -61,8 +61,8 @@ Unlike single-secret proxies, `mtg-proxy` gives every user their own named secre
 | **Thread-per-Core Runtime** | Pinned single-threaded `LocalSet` workers respecting Linux `sched_getaffinity(0)` (Docker/Kubernetes/systemd `AllowedCPUs=` cpusets) with independent per-core `SO_REUSEPORT` listen queues. |
 | **Zero-Syscall Socket Inheritance** | Tunes `TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_KEEP*`, `TCP_USER_TIMEOUT`, `TCP_NOTSENT_LOWAT`, `TCP_FASTOPEN`, and best-effort `TCP_CONGESTION=bbr` once on each listener before `listen(2)` — **0 `setsockopt` syscalls per accepted connection**. |
 | **Single-Poll Full-Duplex `DirectRelay`** | Owns `(client, dc)` directly (no `into_split()` `Arc`s), shares 1 amortized idle timer, uses zero-memmove `TlsUnframer::unframe_spans` + L1/L2-hot 128 KiB thread-local scratch (`0 B` idle I/O buffers), batches up to 8 × 16 KiB FakeTLS records per `writev(2)` (`8 sys/MB`), and locks live task frame size to **`1,776 B`** via CI unit-test guard. |
-| **Multi-Arch Hardware Crypto** | Single-pass in-place fused double-CTR (`x86_64` **VAES+AVX2** 8-block, **AES-NI** 4-block; `aarch64` **ARMv8 AES** 4-block), per-handshake ephemeral X25519 key shares (zero repeated TLS keys), and multi-secret FakeTLS HMAC-SHA256 (**4-way interleaved SHA-NI**, **8-way AVX2**, **ARMv8 SHA-256**) with zero-alloc hot paths. |
-| **Zero-RTT Domain Fronting (`FrontingPool`)** | Pre-warmed standby TCP pool (liveness-checked via `MSG_PEEK \| MSG_DONTWAIT`) with reactive cover pre-warming for 0 ms proxy→cover connect RTT against active DPI probes, SNI-matched multi-cover failover, anti-self-loop IP filtering, and zero-copy Linux `splice(2)` kernel pipe relay. |
+| **Multi-Arch Hardware Crypto** | Single-pass in-place fused double-CTR (`x86_64` **VAES+AVX2** 8-block, **AES-NI** 4-block; `aarch64` **ARMv8 AES** 4-block), **Post-Quantum `X25519MLKEM768` (`0x11EC`)** & ephemeral X25519 FakeTLS handshakes (`0` heap allocs), hardware **SSE4.2 / ARMv8 CRC32C** for MiddleProxy, and multi-secret FakeTLS HMAC-SHA256 (**4-way interleaved SHA-NI**, **8-way AVX2**, **ARMv8 SHA-256**). |
+| **Zero-RTT Domain Fronting (`FrontingPool`)** | Pre-warmed standby TCP pool (liveness-checked via `MSG_PEEK \| MSG_DONTWAIT`) with reactive cover pre-warming for 0 ms proxy→cover connect RTT against active DPI probes, SNI-matched multi-cover failover, Linux `getifaddrs(3)` local-NIC anti-self-loop filtering, authentic nginx `unrecognized_name(112)` rejection option, and zero-copy Linux `splice(2)` kernel pipe relay. |
 | **Geo-Stealth IP Filter (`DIR-24-8`)** | Wait-free O(1) IPv4 DIR-24-8 bitmap (`~4 ns`) + coalesced IPv6 ranges (`~10 ns`), multi-hop GitHub redirect auto-updater (`IR-Geo-DB` / FireHOL / Linux `ipset restore`), per-source LKG retention, atomic `cache-file`, and zero-HMAC byte-0 `splice(2)` cover-only fronting for foreign IPs across both FakeTLS `ee` and `web-relay`. |
 | **High-Throughput WEB Transport (`mtg-webrelay`)** | Lock-free `TcpStream::into_split()`, `0 B` idle per-session scratch, stack-vectored `writev(2)` Shared-Frame v1 batching, fair round-robin stream coalescing, multi-acceptor `SO_REUSEPORT`, Slowloris-hardened HTTP/1.1, 16 MiB cached `StaticCover`, and Happy-Eyeballs keep-alive pooled `UpstreamCover`. |
 | **Lock-Free & Sharded State** | Cache-line-aligned per-worker admission gate & live-connection shards, per-secret sharded `AddressRegistry`, compact 32-byte `CancelToken`, vDSO `CLOCK_REALTIME_COARSE`/`CLOCK_MONOTONIC_COARSE`, and `tikv-jemallocator` (`percpu_arena:percpu`, 1s dirty/muzzy decay). |
@@ -382,18 +382,30 @@ stats-bind-to = "127.0.0.1:8100"
 - **CDN-Aware Spoof-Proof Geo-Stealth (`cdn = "cloudflare" | "arvancloud"`):** When running `[web]` behind Cloudflare, ArvanCloud, or a custom CDN alongside `[defense.allowlist]` (such as `IR-Geo-DB`), CDN edge IPs are foreign and would otherwise conflict with a country allowlist. Setting `cdn = "cloudflare"` (or `cdn = "arvancloud"`, or custom `trusted-proxies` / `trusted-proxy-urls` + `client-ip-header`) automatically fetches and refreshes official CDN edge CIDRs, peels trusted CDN hops right-to-left, and **only** trusts `CF-Connecting-IP` / `Ar-Real-IP` when network routing proves the request arrived from a real CDN CIDR — **100% immune to direct-to-origin header spoofing**!
 - **Standalone Mode:** You can still run `mtg-proxy web-relay /etc/mtg-proxy/config.toml` as a separate process behind Caddy/Nginx (`[[listener]]` + `[web] bind-to` + `[web] backend`). Features a 3-tier anti-oracle origin, per-page 128-bit CSP nonces, strict RFC 6455 WebSocket framing, and automatic 2-second config-file watch + `SIGHUP` secret/TLS reloads. See [contrib/web-relay/README.md](contrib/web-relay/README.md) for Caddy examples.
 
-### Doppelganger Cover Scouting & Traffic Mimicry
+### Doppelganger Cover Scouting, Post-Quantum `X25519MLKEM768` & Two-Speed Anti-DPI
 
-Configure `[defense.doppelganger]` (`shaping = "burst" | "record"`, `drs = true`, `urls = [...]`, `scout-covers = true`) for DPI-resistant TLS mimicry. Recommended high-throughput stealth configuration:
+`mtg-proxy` mirrors real 2026 TLS 1.3 web handshakes down to the exact cipher suite, extension order, Post-Quantum `X25519MLKEM768` (`0x11EC`, `1,210 B`) `ServerHello`, and certificate-flight size — while keeping the bulk data plane at full MTU wire speed (`128 KiB` 8-record `writev(2)`):
 
 ```toml
+tolerate-time-skewness = "120s" # Mobile-friendly default (boot-time <120s also auto-accepted)
+# ignore-time-skew = false      # Optional: accept arbitrary client clock drift (HMAC + anti-replay still enforced)
+
+[domain-fronting]
+unknown-sni-action = "front"    # "front" (default) | "reject-handshake" (nginx alert 112) | "drop"
+
 [defense.doppelganger]
-shaping = "burst"    # Authentic TTFB pacing + Cloudflare/nginx DRS ramp after >1s idle, then full 128 KiB wire speed
-drs = true           # Dynamic Record Sizing (1450 -> 4096 -> 16384 B)
-scout-covers = true  # Concurrent per-SNI live TLS scouting (up to 16 cover domains)
+scout-covers = true                  # Live per-SNI raw PQ ServerHello + cert-flight profiling (0 data-plane latency!)
+pq-key-share = true                  # Mirror 1,210 B Post-Quantum X25519MLKEM768 when offered by iOS/Chrome clients
+server-hello-fragment-mss = "balanced" # Two-speed Linux MSG_EOR splitting on ServerHello ONLY ("off"|"extreme"|"tspu"|"balanced"|88..=1400)
+# shaping = "burst"                  # Optional: TTFB pacing (<=35ms cap) + DRS ramp after >1s idle, then 128 KiB wire speed
+# drs = true                         # Optional: Dynamic Record Sizing (1450 -> 4096 -> 16384 B)
 ```
 
-Live background TLS scouting (`tokio-rustls` + Happy Eyeballs) measures each hosted cover domain's actual certificate-flight size, jitter, Weibull arrival gaps, and DRS behavior independently (`DoppelCatalog`) and publishes calibrated per-SNI profiles atomically via `ArcSwap`.
+Live background TLS scouting probes each hosted cover domain with a real PQ `X25519MLKEM768` `ClientHello` to capture its exact `ServerHelloProfile` (TLS 1.3 cipher suite, PQ vs X25519 selection, extension ordering, and certificate-flight noise size) and publishes calibrated per-SNI profiles atomically via `ArcSwap` — even when `shaping` and `drs` are disabled for zero data-plane latency.
+
+- **Two-Speed `MSG_EOR` ServerHello Fragmentation:** Splits only the `ServerHello` flight across kernel-MSS-aware TCP segments (`TCP_INFO tcpi_snd_mss` minus TCP timestamps) via Linux `send(MSG_EOR | MSG_DONTWAIT | MSG_NOSIGNAL)` to defeat stateless DPI inspection while leaving all bulk chat/media transfers at full MTU.
+- **RFC 793 True Half-Close & TLS Alert Hygiene:** Properly handles client `TLS Alert (0x15)` `close_notify` and TCP `FIN` half-closes (`SHUT_WR`) so in-flight Telegram messages and media chunks finish cleanly without truncation or mobile reconnect loops.
+- **Hardware CRC32C & Abridged MiddleProxy (`ad-tag`):** Automatically negotiates `RPC_FLAG_USE_CRC32C` (`x86_64` SSE4.2 / `aarch64` ARMv8 CRC instructions), supports `Abridged` / `Intermediate` / `PaddedIntermediate` framing, binds SOCKS5 `BND.ADDR` into the KDF, monitors carrier EWMA RTT via `RPC_PING`/`RPC_PONG`, and drains carriers cleanly on Telegram proxy-secret rotations.
 
 ### Geo-Stealth Country Allowlist (`IR-Geo-DB`) & Cover-Only Fronting
 

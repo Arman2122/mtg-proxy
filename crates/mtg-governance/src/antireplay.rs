@@ -59,16 +59,47 @@ impl FakeTlsAntiReplay {
         }
     }
 
-    /// Test and record `session_id`. Returns `true` if `session_id` was
-    /// already seen in the current or previous generation (replay!).
-    ///
-    /// Strictly lock-free (~15 ns, 0 allocations).
+    /// Read-only probe: returns `true` if `key` was already recorded in the
+    /// current or previous generation WITHOUT mutating the filter (used before
+    /// admission so denied connections cannot poison the replay cache!).
     #[inline]
-    pub fn seen_before(&self, session_id: &[u8]) -> bool {
+    pub fn contains(&self, key: &[u8]) -> bool {
         if !self.enabled {
             return false;
         }
-        let (h1, h2) = fast_hash_128(session_id);
+        let (h1, h2) = fast_hash_128(key);
+        let cur_idx = self.active_gen.load(Ordering::Acquire) & 1;
+        let prev_idx = cur_idx ^ 1;
+        let cur = &self.gens[cur_idx];
+        let prev = &self.gens[prev_idx];
+
+        let mut in_prev = true;
+        let mut in_cur = true;
+        for i in 0..4u64 {
+            let bit = h1.wrapping_add(i.wrapping_mul(h2)) & self.bit_mask;
+            let word_idx = (bit >> 6) as usize;
+            let mask = 1u64 << (bit & 63);
+
+            if (prev[word_idx].load(Ordering::Relaxed) & mask) == 0 {
+                in_prev = false;
+            }
+            if (cur[word_idx].load(Ordering::Relaxed) & mask) == 0 {
+                in_cur = false;
+            }
+        }
+        in_cur || in_prev
+    }
+
+    /// Test and record `key`. Returns `true` if `key` was already seen in the
+    /// current or previous generation (replay!).
+    ///
+    /// Strictly lock-free (~15 ns, 0 allocations).
+    #[inline]
+    pub fn seen_before(&self, key: &[u8]) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let (h1, h2) = fast_hash_128(key);
         let cur_idx = self.active_gen.load(Ordering::Acquire) & 1;
         let prev_idx = cur_idx ^ 1;
         let cur = &self.gens[cur_idx];

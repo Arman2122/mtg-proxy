@@ -43,6 +43,11 @@ const MAX_WARM_AGE_NS: u64 = 12_000_000_000;
 /// Maximum distinct origins tracked in [`FrontingPool`] (bounds memory strictly).
 const MAX_TRACKED_ORIGINS: usize = 64;
 
+/// 7-byte nginx-identical TLS 1.2/1.3 fatal `unrecognized_name` alert (`level=2`, `desc=112`),
+/// emitted immediately on unmatched unknown-SNI probes when
+/// `[domain-fronting] unknown-sni-action = "reject-handshake"`.
+pub const NGINX_UNRECOGNIZED_NAME_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70];
+
 /// Parameters for forwarding an unmatched/replayed/denied FakeTLS client
 /// transparently to a cover website.
 #[derive(Debug, Clone)]
@@ -72,12 +77,58 @@ struct OriginHealth {
 /// Minimum cooldown between background pre-warm attempts after a dial failure (`30s`).
 const REFILL_FAIL_COOLDOWN_NS: u64 = 30_000_000_000;
 
+/// Discover all non-loopback IPv4/IPv6 addresses assigned to local Linux
+/// network interfaces via `libc::getifaddrs()` so fronting DNS resolutions
+/// pointing back to any NIC on this host can never create a self-dial loop!
+///
+/// Loopback (`127.0.0.1`, `::1`) is intentionally excluded so local reverse
+/// proxy / cover web servers (`nginx`/`caddy` on `127.0.0.1:<port>`) work cleanly.
+fn discover_local_interface_ips() -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` populates `ifap` with a linked list freed via `freeifaddrs`.
+    if unsafe { libc::getifaddrs(&raw mut ifap) } != 0 || ifap.is_null() {
+        return out;
+    }
+
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a valid node in the list returned by `getifaddrs`.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() {
+            // SAFETY: `ifa_addr` points to a valid `sockaddr` for this interface.
+            let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
+            let maybe_ip = if family == libc::AF_INET {
+                // SAFETY: `sa_family == AF_INET` guarantees `sockaddr_in` layout.
+                let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+                let octets = sin.sin_addr.s_addr.to_ne_bytes();
+                Some(IpAddr::V4(std::net::Ipv4Addr::from(octets)))
+            } else if family == libc::AF_INET6 {
+                // SAFETY: `sa_family == AF_INET6` guarantees `sockaddr_in6` layout.
+                let sin6 = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in6>() };
+                Some(IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
+            } else {
+                None
+            };
+            if let Some(ip) = maybe_ip {
+                let ip = mtg_core::ip::unmap_ip(ip);
+                if !ip.is_loopback() && !ip.is_unspecified() && !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    // SAFETY: `ifap` was returned by `getifaddrs` above.
+    unsafe { libc::freeifaddrs(ifap) };
+    out
+}
+
 /// Zero-RTT warm standby TCP pool + health tracker + anti-self-loop filter for
 /// stealth domain fronting.
 #[derive(Debug)]
 pub struct FrontingPool {
-    self_v4: Option<IpAddr>,
-    self_v6: Option<IpAddr>,
+    self_ips: Vec<IpAddr>,
     warm: Mutex<FxHashMap<(String, u16), VecDeque<WarmSocket>>>,
     refilling: Mutex<FxHashSet<(String, u16)>>,
     health: RwLock<FxHashMap<(String, u16), Arc<OriginHealth>>>,
@@ -92,9 +143,15 @@ impl Default for FrontingPool {
 
 impl FrontingPool {
     pub fn new(self_v4: Option<IpAddr>, self_v6: Option<IpAddr>) -> Self {
+        let mut self_ips = discover_local_interface_ips();
+        for extra in [self_v4, self_v6].into_iter().flatten() {
+            let ip = mtg_core::ip::unmap_ip(extra);
+            if !ip.is_loopback() && !ip.is_unspecified() && !self_ips.contains(&ip) {
+                self_ips.push(ip);
+            }
+        }
         Self {
-            self_v4,
-            self_v6,
+            self_ips,
             warm: Mutex::new(FxHashMap::default()),
             refilling: Mutex::new(FxHashSet::default()),
             health: RwLock::new(FxHashMap::default()),
@@ -226,17 +283,18 @@ impl FrontingPool {
         });
     }
 
-    /// Filter out the server's own public IPv4/IPv6 addresses to prevent
-    /// infinite fronting self-loops when DNS accidentally resolves to self.
+    /// Filter out all of the proxy host's own public AND local NIC IPv4/IPv6
+    /// addresses (discovered via `getifaddrs()` + configured `public-ipv4/6`)
+    /// to prevent infinite fronting self-loops!
     pub fn filter_self_ips(&self, addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
-        if self.self_v4.is_none() && self.self_v6.is_none() {
+        if self.self_ips.is_empty() {
             return addrs;
         }
         addrs
             .into_iter()
             .filter(|sa| {
                 let ip = mtg_core::ip::unmap_ip(sa.ip());
-                self.self_v4.is_none_or(|v4| ip != v4) && self.self_v6.is_none_or(|v6| ip != v6)
+                !self.self_ips.contains(&ip)
             })
             .collect()
     }

@@ -383,6 +383,10 @@ async fn run_proxy(
                     host: tls_addr.ip().to_string(),
                     port: tls_addr.port(),
                     proxy_protocol: require_pp,
+                    unknown_sni_action: conf
+                        .domain_fronting
+                        .unknown_sni_action
+                        .unwrap_or(mtg_config::UnknownSniAction::Front),
                 });
                 info!(
                     %tls_addr,

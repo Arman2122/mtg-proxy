@@ -6,6 +6,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ---
 
+## [2.5.0] — 2026-11-22
+
+Post-Quantum `X25519MLKEM768` FakeTLS parity, live cover `ServerHello` wire-profiling, two-speed Linux `MSG_EOR` ServerHello TCP splitting, RFC 793 true TCP half-close & TLS Alert handling, exact FakeTLS anti-replay keying, and carrier-grade MiddleProxy (`ad-tag`) hardware CRC32C + Abridged + RTT/rotation hardening.
+
+### Added
+- **Post-Quantum `X25519MLKEM768` (`0x11EC`) FakeTLS & Strict TLS 1.3 Parser (`mtg-crypto`, `mtg-engine`, `mtg-config`):**
+  - Full `ClientHello` extension parser detecting hybrid Post-Quantum **`X25519MLKEM768` (`0x11EC`, `1,216 B`)** and classic `X25519` (`0x001D`, `32 B`) key shares, computing compact `ClientHelloFingerprint`, enforcing exact RFC 8701 GREASE filtering, strict TLS 1.3 cipher-suite bitmask selection (never echoing TLS 1.2 ciphers in a TLS 1.3 `ServerHello`), duplicate-SNI rejection (`FakeTlsError::DuplicateSni`), `session_id <= 32` enforcement, zero-extension ClientHello support, and both `0x03 0x01` and `0x03 0x03` record header compatibility.
+  - Zero-allocation **`build_server_hello_with_profile`** (verified `0` heap allocations in `zero_alloc.rs`, stack-staged in `18 KiB` thread-local `HS_SH_BUF`) emitting an authentic **`1,210 B` Post-Quantum `X25519MLKEM768` `ServerHello`** (`1,088 B` CSPRNG ML-KEM-768 ciphertext + `32 B` real ephemeral Curve25519 public key) or classic `122 B` `X25519` `ServerHello` while keeping Telegram iOS-safe 3-record flight geometry (`ServerHello` + `ChangeCipherSpec` + `ApplicationData`).
+  - Added mobile **boot-time/uptime (`ts < 120s`)** timestamp compatibility (`VerifyOptions`, `VerifyMatch::BootTime`), raised default `tolerate-time-skewness` from `5s` → **`120s`**, and added hot-reloadable top-level **`ignore-time-skew`** across scalar, 4-way SHA-NI, and 8-way AVX2 scanners.
+- **Live Cover `ServerHello` Wire-Profiling & Two-Speed `MSG_EOR` TCP Splitting (`mtg-net`, `mtg-engine`, `mtg-protocol`, `mtg-config`):**
+  - Decoupled `scout-covers = true` from data-plane `shaping`/`drs` pacing so operators get live per-SNI cover profiling at **zero data-plane latency overhead**.
+  - Added raw PQ `X25519MLKEM768` cover scouting (`probe_cover_server_hello_profile`) to capture each cover origin's exact `ServerHelloProfile` (negotiated TLS 1.3 cipher suite, PQ `X25519MLKEM768` vs `X25519` preference, `key_share` vs `supported_versions` extension order, and real certificate-flight noise size) and apply it live per SNI via `ArcSwap`.
+  - Added Linux two-speed **`MSG_EOR` ServerHello TCP splitting** (`crates/mtg-net/src/fragmented.rs`, `[defense.doppelganger] server-hello-fragment-mss = "off" | "extreme" | "tspu" | "balanced" | <88..=1400>`) querying kernel `TCP_INFO` `tcpi_snd_mss` (accounting for `TCPI_OPT_TIMESTAMPS` 12 B option overhead) and dispatching ServerHello chunks with `send(MSG_EOR | MSG_DONTWAIT | MSG_NOSIGNAL)` — defeating stateless DPI ServerHello signatures while keeping bulk chat/media traffic at 100% full MTU `128 KiB` `writev(2)` wire speed.
+  - Added optional hot-reloadable `server-hello-delay-min-ms` / `server-hello-delay-max-ms` handshake jitter, `[domain-fronting] unknown-sni-action = "front" | "reject-handshake" | "drop"` (with authentic 7-byte nginx/OpenSSL fatal `unrecognized_name(112)` TLS alert), Linux `getifaddrs(3)` local-NIC anti-self-loop discovery in `FrontingPool`, and 5 new Prometheus metrics (`mtg_faketls_handshakes_total{key_share=...}`, `mtg_faketls_boot_time_accepted_total`, `mtg_faketls_server_hello_fragmented_total`, `mtg_faketls_alert_closes_total`, `mtg_faketls_sni_rejected_total`).
+- **Carrier-Grade MiddleProxy (`ad-tag`) Hardening (`mtg-protocol`, `mtg-net`, `mtg-engine`):**
+  - Hardware-accelerated Castagnoli **CRC32C** (`x86_64` SSE4.2 `_mm_crc32_u64`, `aarch64` ARMv8 `__crc32cd`, and portable `const` table fallback, verified against RFC 3720 `0xE306_9283`) with automatic `RPC_FLAG_USE_CRC32C` (`0x800`) negotiation and transparent CRC32 fallback.
+  - Full **`ClientFraming::Abridged`** (`FLAG_ABRIDGED = 0x4000_0000`) upload & download framing in `relay_middleproxy` alongside `Intermediate` and `PaddedIntermediate`.
+  - Wired SOCKS5 `BND.ADDR:BND.PORT` into the MiddleProxy AES-CBC KDF (`dial_with_bound_addr`), added `RPC_PING` → `RPC_PONG` EWMA RTT tracking + dead-carrier eviction (`> 15s` pong timeout), and graceful carrier draining/rotation via monotonic `middle_generation` when Telegram proxy secrets or middle endpoints refresh.
+
+### Fixed
+- **RFC 793 True TCP Half-Close & TLS Alert (`0x15`) Hygiene (`mtg-protocol`, `mtg-engine`):** Fixed `DirectRelay` and `TlsUnframer` (still `size_of::<TlsUnframer>() == 12`) to return any preceding `ApplicationData` bytes before signalling `TlsRecordError::AlertClose`, propagate clean `SHUT_WR` half-close on both `client -> dc` and `dc -> client` directions (including Alerts pipelined in the handshake TCP segment), and keep draining the opposite direction until both halves close — eliminating truncated replies and mobile reconnect loops.
+- **Exact FakeTLS & Inner Obfuscated2 Anti-Replay Ordering (`mtg-governance`, `mtg-engine`):** Keyed FakeTLS anti-replay on the exact 16-byte client session digest (`&random[..16]`), added read-only `FakeTlsAntiReplay::contains()` pre-check before admission, committed `seen_before()` only after admission succeeds (never poisoning retries on transient limit denials), and enforced `obfs2_replay` on the inner FakeTLS Obfuscated2 frame as well.
+- **Interactive Chat Latency Cap in `ShapingMode::Burst` (`mtg-protocol`):** Capped burst wake-up delay at `35 ms` (`BURST_MAX_WAKEUP_DELAY`) so heavy-tailed Weibull samples never stall interactive Telegram messages.
+
+### Quality Gates
+- **`117/117`** Rust workspace tests passing (including `panel-config-string.golden` byte-exact, all 10 rotation goldens, all 6 FakeTLS goldens, `hot_paths_perform_zero_heap_allocations` with PQ `X25519MLKEM768`, `steady_state_connection_future_size_guard`, and full E2E PQ + `MSG_EOR` + replay + reject-SNI + half-close integration test), **`0`** clippy warnings (`-D warnings`).
+
+---
+
 ## [2.4.0] — 2026-11-22
 
 Carrier-grade 4-tier connection & speed governance engine: server-wide bandwidth shaping & VPS-safe global data quotas (`[limits]`), 64-way sharded global per-IP connection & connect-rate flood shields, Iranian CGNAT-safe per-connection speed caps (`conn-speed*`), directional per-IP ceilings (`client-speed-up`/`down`), `[limits.default-secret]` policy inheritance, hot-reloadable `concurrency`, and live `/limits` Management API.

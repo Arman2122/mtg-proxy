@@ -28,11 +28,12 @@ use std::time::Duration;
 
 use mtg_crypto::Aes256CbcEncryptor;
 use mtg_protocol::middleproxy::{
-    AD_TAG_LEN, FLAG_ENCRYPTED, FLAG_QUICK_ACK, MAX_WIRE_CLIENT_PACKET, NonceRequest, RpcDownEvent,
-    RpcFrameDecoder, SEQ_NO_HANDSHAKE, SEQ_NO_NONCE, append_rpc_frame, build_close_conn_body,
-    build_proxy_req_header, build_rpc_ping_body, build_rpc_pong_body, derive_middleproxy_ciphers,
-    handshake_request_bytes, parse_nonce_response, parse_rpc_down_event,
-    validate_handshake_response,
+    AD_TAG_LEN, ClientFraming, FLAG_ENCRYPTED, FLAG_QUICK_ACK, MAX_WIRE_CLIENT_PACKET,
+    NonceRequest, RPC_FLAG_USE_CRC32C, RpcDownEvent, RpcFrameDecoder, SEQ_NO_HANDSHAKE,
+    SEQ_NO_NONCE, append_rpc_frame, append_rpc_frame_with_crc, build_close_conn_body,
+    build_proxy_req_header_with_framing, build_rpc_ping_body, build_rpc_pong_body,
+    derive_middleproxy_ciphers, handshake_request_bytes_with_flags, parse_nonce_response,
+    parse_rpc_down_event, validate_handshake_response_flags,
 };
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -45,6 +46,7 @@ use tracing::{debug, warn};
 use crate::dc::{DcRouter, happy_eyeballs_connect};
 use crate::proxy_pool::{ProxyPool, ProxyTarget};
 use crate::sockopts::{SocketConfig, tune_tokio_stream};
+use crate::timer::coarse_now_ns;
 
 /// Default baseline number of warm persistent MiddleProxy RPC carriers per DC.
 pub const DEFAULT_CARRIERS_PER_DC: usize = 4;
@@ -63,6 +65,8 @@ const STREAM_RX_CAP: usize = 256;
 const WRITE_COALESCE_BYTES: usize = 64 * 1024;
 /// Proactive `RPC_PING` keepalive cadence for warm idle carriers.
 const CARRIER_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Maximum wait for an `RPC_PONG` reply before evicting a dead/blackholed carrier.
+const CARRIER_PONG_TIMEOUT_NS: u64 = 15_000_000_000;
 
 /// Parameters identifying a client stream carried over MiddleProxy.
 #[derive(Debug, Clone, Copy)]
@@ -72,7 +76,7 @@ pub struct MiddleStreamParams {
     pub public_ipv4: Option<IpAddr>,
     pub public_ipv6: Option<IpAddr>,
     pub advertised_port: u16,
-    pub padded_intermediate: bool,
+    pub framing: ClientFraming,
     pub ad_tag: [u8; AD_TAG_LEN],
 }
 
@@ -157,7 +161,15 @@ impl Drop for MiddleStream {
 struct RpcCarrier {
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
+    generation: u64,
+    use_crc32c: bool,
     alive: AtomicBool,
+    draining: AtomicBool,
+    /// Pending `RPC_PING` ID awaiting `RPC_PONG` (`0` = none in flight).
+    pending_ping_id: AtomicU64,
+    pending_ping_sent_ns: AtomicU64,
+    /// Most recently measured `RPC_PING -> RPC_PONG` RTT in microseconds.
+    ewma_pong_rtt_us: AtomicU64,
     ctrl_tx: mpsc::Sender<Vec<u8>>,
     tx: mpsc::Sender<Vec<u8>>,
     streams: Mutex<FxHashMap<[u8; 8], mpsc::Sender<MiddleDownMsg>>>,
@@ -171,8 +183,53 @@ impl RpcCarrier {
     }
 
     #[inline]
+    fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn mark_draining(&self) {
+        self.draining.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    fn is_accepting_new(&self, current_gen: u64) -> bool {
+        self.is_alive() && !self.is_draining() && self.generation == current_gen
+    }
+
+    #[inline]
     fn load(&self) -> usize {
         self.active_streams.load(Ordering::Relaxed)
+    }
+
+    /// Record a received `RPC_PONG` matching our outstanding keepalive ping and
+    /// update the carrier's EWMA RTT.
+    fn record_pong(&self, ping_id: u64) {
+        let pending = self.pending_ping_id.load(Ordering::Acquire);
+        if pending != 0 && pending == ping_id {
+            let sent_ns = self.pending_ping_sent_ns.load(Ordering::Acquire);
+            self.pending_ping_id.store(0, Ordering::Release);
+            if sent_ns > 0 {
+                let rtt_us = coarse_now_ns().saturating_sub(sent_ns) / 1_000;
+                let prev = self.ewma_pong_rtt_us.load(Ordering::Relaxed);
+                let next = if prev == 0 {
+                    rtt_us.max(1)
+                } else {
+                    (prev.saturating_mul(3).saturating_add(rtt_us.max(1))) >> 2
+                };
+                self.ewma_pong_rtt_us.store(next.max(1), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// True if an outstanding `RPC_PING` has gone unanswered past [`CARRIER_PONG_TIMEOUT_NS`].
+    fn is_pong_timed_out(&self, now_ns: u64) -> bool {
+        let pending = self.pending_ping_id.load(Ordering::Acquire);
+        if pending == 0 {
+            return false;
+        }
+        let sent_ns = self.pending_ping_sent_ns.load(Ordering::Acquire);
+        sent_ns > 0 && now_ns.saturating_sub(sent_ns) > CARRIER_PONG_TIMEOUT_NS
     }
 
     async fn send_rpc_body(&self, body: Vec<u8>) -> io::Result<()> {
@@ -301,12 +358,12 @@ impl MiddleProxyPool {
             SocketAddr::V6(v6) => params.public_ipv6.unwrap_or(IpAddr::V6(*v6.ip())),
         };
         let our_addr = SocketAddr::new(local_ip, params.advertised_port);
-        let header = build_proxy_req_header(
+        let header = build_proxy_req_header_with_framing(
             conn_id,
             params.client_addr,
             our_addr,
             params.ad_tag,
-            params.padded_intermediate,
+            params.framing,
         );
         let base_flags = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
 
@@ -360,11 +417,20 @@ impl MiddleProxyPool {
     }
 
     fn try_select_existing(&self, dc: i32) -> (Option<Arc<RpcCarrier>>, bool) {
+        let current_gen = self.dc_router.middle_generation();
         let mut map = self.carriers.lock();
         let Some(list) = map.get_mut(&dc) else {
             return (None, true);
         };
-        list.retain(|c| c.is_alive());
+        // Gracefully retire carriers from an older Telegram proxy_secret/config
+        // generation: existing streams continue draining cleanly until close,
+        // while new streams dial fresh carriers with the rotated secret!
+        for c in list.iter() {
+            if c.generation != current_gen {
+                c.mark_draining();
+            }
+        }
+        list.retain(|c| c.is_accepting_new(current_gen));
         if list.is_empty() {
             return (None, true);
         }
@@ -430,6 +496,7 @@ impl MiddleProxyPool {
         public_ipv4: Option<IpAddr>,
         public_ipv6: Option<IpAddr>,
     ) -> io::Result<Arc<RpcCarrier>> {
+        let generation = self.dc_router.middle_generation();
         let dir = self.dc_router.directory();
         let Some(secret) = dir.proxy_secret.as_ref().filter(|s| !s.is_empty()) else {
             return Err(io::Error::new(
@@ -464,7 +531,7 @@ impl MiddleProxyPool {
             )
             .await
             {
-                Ok(Ok((enc, dec))) => {
+                Ok(Ok((enc, dec, use_crc32c))) => {
                     self.dc_router.record_success(first_addr, 1_000);
                     return Ok(spawn_carrier_tasks(
                         stream,
@@ -472,6 +539,8 @@ impl MiddleProxyPool {
                         dec,
                         local_addr,
                         remote_addr,
+                        generation,
+                        use_crc32c,
                     ));
                 }
                 Ok(Err(e)) => {
@@ -486,17 +555,18 @@ impl MiddleProxyPool {
 
         let mut last_err = io::Error::other("no middle-proxy reached");
         for addr in addrs {
-            let connect_res = if let Some(pool) = &self.proxy_pool
+            let connect_res: io::Result<(TcpStream, Option<SocketAddr>)> = if let Some(pool) =
+                &self.proxy_pool
                 && !pool.is_empty()
             {
-                pool.dial(&ProxyTarget::SocketAddr(addr))
+                pool.dial_with_bound_addr(&ProxyTarget::SocketAddr(addr))
                     .await
                     .map_err(|e| io::Error::other(e.to_string()))
             } else {
                 tokio::time::timeout(self.dial_timeout, async {
                     let s = TcpStream::connect(addr).await?;
                     let _ = tune_tokio_stream(&s, &self.sock_cfg);
-                    Ok::<TcpStream, io::Error>(s)
+                    Ok::<(TcpStream, Option<SocketAddr>), io::Error>((s, None))
                 })
                 .await
                 .unwrap_or_else(|_| {
@@ -507,8 +577,8 @@ impl MiddleProxyPool {
                 })
             };
 
-            let mut stream = match connect_res {
-                Ok(s) => s,
+            let (mut stream, socks_bound) = match connect_res {
+                Ok(pair) => pair,
                 Err(e) => {
                     self.dc_router.record_failure(addr);
                     last_err = e;
@@ -516,8 +586,13 @@ impl MiddleProxyPool {
                 }
             };
 
-            let local_addr = stream.local_addr()?;
-            let remote_addr = stream.peer_addr().unwrap_or(addr);
+            // Use SOCKS5 BND.ADDR:BND.PORT when available so KDF matches the egress socket!
+            let local_addr = socks_bound.unwrap_or(stream.local_addr()?);
+            let remote_addr = if socks_bound.is_some() {
+                addr
+            } else {
+                stream.peer_addr().unwrap_or(addr)
+            };
             let key_local = compute_key_local(local_addr, public_ipv4, public_ipv6);
 
             match tokio::time::timeout(
@@ -526,7 +601,7 @@ impl MiddleProxyPool {
             )
             .await
             {
-                Ok(Ok((enc, dec))) => {
+                Ok(Ok((enc, dec, use_crc32c))) => {
                     self.dc_router.record_success(addr, 1_000);
                     return Ok(spawn_carrier_tasks(
                         stream,
@@ -534,6 +609,8 @@ impl MiddleProxyPool {
                         dec,
                         local_addr,
                         remote_addr,
+                        generation,
+                        use_crc32c,
                     ));
                 }
                 Ok(Err(e)) => {
@@ -563,14 +640,15 @@ fn compute_key_local(
     SocketAddr::new(key_local_ip, local_addr.port())
 }
 
-/// Run the 2-RTT `RPC_NONCE` + `RPC_HANDSHAKE` exchange over `stream` and return
-/// the initialized AES-256-CBC encryptor and incremental [`RpcFrameDecoder`].
+/// Run the 2-RTT `RPC_NONCE` + `RPC_HANDSHAKE` exchange over `stream`,
+/// negotiating hardware Castagnoli [`RPC_FLAG_USE_CRC32C`] with automatic
+/// fallback to standard IEEE CRC32 if the server does not advertise support.
 async fn perform_rpc_handshake(
     stream: &mut TcpStream,
     proxy_secret: &[u8],
     key_local: SocketAddr,
     remote_addr: SocketAddr,
-) -> io::Result<(Aes256CbcEncryptor, RpcFrameDecoder)> {
+) -> io::Result<(Aes256CbcEncryptor, RpcFrameDecoder, bool)> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -578,7 +656,7 @@ async fn perform_rpc_handshake(
     let req = NonceRequest::generate(proxy_secret, ts)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-    // 1. Send plaintext RPC_NONCE (seq_no = -2)
+    // 1. Send plaintext RPC_NONCE (seq_no = -2, IEEE CRC32)
     let mut seq_no = SEQ_NO_NONCE;
     let mut wire = Vec::with_capacity(64);
     let nonce_body = req.to_bytes();
@@ -595,9 +673,9 @@ async fn perform_rpc_handshake(
     let (mut enc, dec_cipher) =
         derive_middleproxy_ciphers(&req, &server_nonce, key_local, remote_addr, proxy_secret);
 
-    // 4. Send encrypted RPC_HANDSHAKE (seq_no = -1)
+    // 4. Send encrypted RPC_HANDSHAKE (seq_no = -1, requesting USE_CRC32C)
     wire.clear();
-    let hs_body = handshake_request_bytes();
+    let hs_body = handshake_request_bytes_with_flags(RPC_FLAG_USE_CRC32C);
     append_rpc_frame(&mut wire, &mut seq_no, &[&hs_body]);
     enc.encrypt_blocks_in_place(&mut wire)
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -606,10 +684,12 @@ async fn perform_rpc_handshake(
     // 5. Read & validate encrypted RPC_HANDSHAKE response (seq_no = -1)
     let mut enc_dec = RpcFrameDecoder::new(Some(dec_cipher), SEQ_NO_HANDSHAKE);
     let hs_resp = read_next_rpc_body(stream, &mut enc_dec).await?;
-    validate_handshake_response(&hs_resp)
+    let server_flags = validate_handshake_response_flags(&hs_resp)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let use_crc32c = (server_flags & RPC_FLAG_USE_CRC32C) != 0;
+    enc_dec.set_use_crc32c(use_crc32c);
 
-    Ok((enc, enc_dec))
+    Ok((enc, enc_dec, use_crc32c))
 }
 
 async fn read_next_rpc_body<R: AsyncReadExt + Unpin>(
@@ -641,13 +721,21 @@ fn spawn_carrier_tasks(
     mut dec: RpcFrameDecoder,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
+    generation: u64,
+    use_crc32c: bool,
 ) -> Arc<RpcCarrier> {
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Vec<u8>>(CARRIER_CTRL_CAP);
     let (tx, mut rx_out) = mpsc::channel::<Vec<u8>>(CARRIER_TX_CAP);
     let carrier = Arc::new(RpcCarrier {
         remote_addr,
         local_addr,
+        generation,
+        use_crc32c,
         alive: AtomicBool::new(true),
+        draining: AtomicBool::new(false),
+        pending_ping_id: AtomicU64::new(0),
+        pending_ping_sent_ns: AtomicU64::new(0),
+        ewma_pong_rtt_us: AtomicU64::new(0),
         ctrl_tx: ctrl_tx.clone(),
         tx,
         streams: Mutex::new(FxHashMap::default()),
@@ -658,7 +746,8 @@ fn spawn_carrier_tasks(
 
     // Writer task: strictly prioritizes control frames (`RPC_PONG`, `RPC_PING`,
     // `RPC_CLOSE_CONN`), coalesces bursty data frames into single CBC + write
-    // sweeps, and emits proactive 30-second `RPC_PING` keepalives!
+    // sweeps, uses negotiated CRC32C/CRC32, enforces Pong dead-carrier eviction,
+    // and exits cleanly once a rotated carrier finishes draining all streams!
     let wr_carrier = Arc::clone(&carrier);
     tokio::spawn(async move {
         let mut seq_no: i32 = 0;
@@ -667,8 +756,12 @@ fn spawn_carrier_tasks(
         let mut ping_tick = tokio::time::interval(CARRIER_PING_INTERVAL);
         ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping_tick.tick().await; // consume immediate t=0 tick
+        let crc32c = wr_carrier.use_crc32c;
 
         loop {
+            if wr_carrier.is_draining() && wr_carrier.load() == 0 {
+                break;
+            }
             let first = tokio::select! {
                 biased;
                 ctrl = ctrl_rx.recv() => match ctrl {
@@ -683,21 +776,34 @@ fn spawn_carrier_tasks(
                     if !wr_carrier.is_alive() {
                         break;
                     }
+                    if wr_carrier.is_draining() && wr_carrier.load() == 0 {
+                        break;
+                    }
+                    let now_ns = coarse_now_ns();
+                    if wr_carrier.is_pong_timed_out(now_ns) {
+                        warn!(
+                            remote = %wr_carrier.remote_addr,
+                            "evicting unresponsive middleproxy carrier (RPC_PONG timeout > 15s)"
+                        );
+                        break;
+                    }
                     let id = ping_id;
-                    ping_id = ping_id.wrapping_add(1);
+                    ping_id = ping_id.wrapping_add(1).max(1);
+                    wr_carrier.pending_ping_sent_ns.store(now_ns, Ordering::Release);
+                    wr_carrier.pending_ping_id.store(id, Ordering::Release);
                     build_rpc_ping_body(id).to_vec()
                 }
             };
 
             wire.clear();
-            append_rpc_frame(&mut wire, &mut seq_no, &[&first]);
+            append_rpc_frame_with_crc(&mut wire, &mut seq_no, &[&first], crc32c);
 
             // Drain any additional ready control frames first, then coalesce ready data frames.
             while wire.len() < WRITE_COALESCE_BYTES {
                 if let Ok(c) = ctrl_rx.try_recv() {
-                    append_rpc_frame(&mut wire, &mut seq_no, &[&c]);
+                    append_rpc_frame_with_crc(&mut wire, &mut seq_no, &[&c], crc32c);
                 } else if let Ok(d) = rx_out.try_recv() {
-                    append_rpc_frame(&mut wire, &mut seq_no, &[&d]);
+                    append_rpc_frame_with_crc(&mut wire, &mut seq_no, &[&d], crc32c);
                 } else {
                     break;
                 }
@@ -781,7 +887,9 @@ fn spawn_carrier_tasks(
                 Ok(RpcDownEvent::Ping { ping_id }) => {
                     let _ = ctrl_tx.try_send(build_rpc_pong_body(ping_id).to_vec());
                 }
-                Ok(RpcDownEvent::Pong { .. }) => {}
+                Ok(RpcDownEvent::Pong { ping_id }) => {
+                    rd_carrier.record_pong(ping_id);
+                }
                 Err(e) => {
                     warn!(error = %e, "malformed middleproxy RPC response");
                 }
@@ -942,7 +1050,7 @@ mod tests {
             public_ipv4: None,
             public_ipv6: None,
             advertised_port: 443,
-            padded_intermediate: true,
+            framing: ClientFraming::PaddedIntermediate,
             ad_tag: [0x11u8; 16],
         };
 

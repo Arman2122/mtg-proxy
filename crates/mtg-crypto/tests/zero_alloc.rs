@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mtg_core::{ConnectionTag, TagSet};
 use mtg_crypto::{
-    Aes256Ctr, ClientHello, FakeTlsCandidate, FusedCtrPair, NoiseParams, SessionId, X25519KeyRing,
-    build_outbound_handshake, build_server_hello, match_handshake, parse_client_hello_bytes,
-    peek_tag,
+    Aes256Ctr, ClientHello, ClientHelloFingerprint, FakeTlsCandidate, FusedCtrPair, NoiseParams,
+    ServerHelloProfile, SessionId, X25519KeyRing, build_outbound_handshake, build_server_hello,
+    build_server_hello_with_profile, match_handshake, parse_client_hello_bytes, peek_tag,
+    tls13_cipher_bit,
 };
 
 struct CountingAlloc;
@@ -97,8 +98,15 @@ fn hot_paths_perform_zero_heap_allocations() {
         random: parsed.hello.random,
         session_id: SessionId::from_slice(&[0x55; 32]).unwrap(),
         cipher_suite: 0x1303,
+        tls13_ciphers_mask: tls13_cipher_bit(0x1303),
+        first_tls13_cipher: 0x1303,
+        fingerprint: ClientHelloFingerprint {
+            offers_pq_mlkem768: true,
+            offers_x25519: true,
+            ..ClientHelloFingerprint::default()
+        },
     };
-    let mut sh_buf = Vec::with_capacity(17_000);
+    let mut sh_buf = Vec::with_capacity(18_432);
     build_server_hello(&mut sh_buf, &cand, &ch, NoiseParams::default(), &ring);
 
     assert_zero_allocs("ParsedClientHello::verify_at", || {
@@ -106,6 +114,16 @@ fn hot_paths_perform_zero_heap_allocations() {
     });
     assert_zero_allocs("build_server_hello(preallocated)", || {
         build_server_hello(&mut sh_buf, &cand, &ch, NoiseParams::default(), &ring);
+    });
+    assert_zero_allocs("build_server_hello_with_profile(PQ X25519MLKEM768)", || {
+        let pq = build_server_hello_with_profile(
+            &mut sh_buf,
+            &cand,
+            &ch,
+            ServerHelloProfile::default(),
+            &ring,
+        );
+        assert!(pq);
     });
 
     // 3. Obfuscated2 peek_tag & match_handshake

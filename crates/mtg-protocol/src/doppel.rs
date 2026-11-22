@@ -20,7 +20,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use mtg_crypto::{
-    NoiseParams, TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC, TLS_RECORD_HANDSHAKE,
+    NoiseParams, ServerHelloProfile, TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC,
+    TLS_RECORD_HANDSHAKE,
 };
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore as _, SeedableRng as _};
@@ -51,8 +52,13 @@ pub const DRS_MAX_AFTER: u32 = 60;
 pub const DRS_NOISE_BYTES: usize = 100;
 pub const DRS_IDLE_RESET_NS: u64 = 1_000_000_000;
 
-/// Maximum pacing wait drawn from the Weibull distribution (1 second).
+/// Maximum pacing wait drawn from the Weibull distribution (1 second) in [`ShapingMode::Record`].
 pub const MAX_PACING_DELAY: Duration = Duration::from_secs(1);
+
+/// Maximum interactive wake-up pacing delay in [`ShapingMode::Burst`] (35 ms):
+/// preserves randomized TTFB anti-fingerprinting while ensuring interactive
+/// Telegram chat messages never suffer heavy-tail 200ms–1000ms stalls!
+pub const BURST_MAX_WAKEUP_DELAY: Duration = Duration::from_millis(35);
 
 /// Maximum burst write size (headers included) in [`ShapingMode::Burst`].
 pub const BURST_WRITE_MAX: usize = 64 << 10;
@@ -118,6 +124,8 @@ pub struct DoppelParams {
     pub drs: bool,
     pub shaping: ShapingMode,
     pub noise: NoiseParams,
+    /// Live-calibrated cover ServerHello profile (PQ `X25519MLKEM768`, cipher, extension order).
+    pub server_hello: ServerHelloProfile,
 }
 
 impl Default for DoppelParams {
@@ -128,6 +136,7 @@ impl Default for DoppelParams {
             drs: false,
             shaping: ShapingMode::Record,
             noise: NoiseParams::default(),
+            server_hello: ServerHelloProfile::default(),
         }
     }
 }
@@ -161,6 +170,7 @@ impl DoppelParams {
                 drs,
                 shaping,
                 noise,
+                server_hello: ServerHelloProfile::from_noise(noise),
             };
         }
 
@@ -202,6 +212,7 @@ impl DoppelParams {
             drs,
             shaping,
             noise,
+            server_hello: ServerHelloProfile::from_noise(noise),
         }
     }
 
@@ -216,7 +227,7 @@ impl DoppelParams {
     }
 
     /// Return `self` if usable, otherwise the default Moscow `ok.ru` parameters
-    /// keeping `drs`, `shaping`, and `noise`.
+    /// keeping `drs`, `shaping`, `noise`, and `server_hello`.
     pub fn or_default(&self) -> Self {
         if self.is_usable() {
             *self
@@ -227,6 +238,7 @@ impl DoppelParams {
                 drs: self.drs,
                 shaping: self.shaping,
                 noise: self.noise,
+                server_hello: self.server_hello,
             }
         }
     }
@@ -311,7 +323,7 @@ impl DoppelConnState {
             ShapingMode::Record => params.sample_delay(),
             ShapingMode::Burst => {
                 if idle {
-                    params.sample_delay()
+                    params.sample_delay().min(BURST_MAX_WAKEUP_DELAY)
                 } else {
                     Duration::ZERO
                 }

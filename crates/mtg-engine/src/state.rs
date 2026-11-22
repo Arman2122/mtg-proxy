@@ -8,13 +8,14 @@ use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use mtg_config::{
     Config, HandshakeBudgetMode, IpFilterAction, ListConfig, ListenerPolicy, PreferIp,
+    UnknownSniAction,
 };
 use mtg_core::{
     GlobalLimits, IpUnit, ModeSet, QuotaReset, RetiringSecret, RotationClock, Secret, SecretLimits,
@@ -153,6 +154,7 @@ pub struct FrontingRuntimeConfig {
     pub host: String,
     pub port: u16,
     pub proxy_protocol: bool,
+    pub unknown_sni_action: UnknownSniAction,
 }
 
 /// Wait-free snapshot of active IP allowlist / blocklist filters and their policies.
@@ -289,23 +291,39 @@ struct LiveConnSlot {
     retiring: bool,
 }
 
-/// Active Doppelganger runtime profile & shaping settings.
+/// Active Doppelganger runtime profile, ServerHello anti-DPI settings & traffic shaping.
 #[derive(Debug)]
 pub struct DoppelState {
+    /// True when post-handshake TLS record pacing / DRS is enabled on relayed streams.
+    /// Setting `scout-covers = true` alone profiles the cover's `ServerHelloProfile`
+    /// without inserting per-record pacing delays on bulk/chat streams!
     pub enabled: bool,
     pub shaping: ShapingMode,
     pub drs: bool,
     pub scout_covers: bool,
     pub scout_urls: Vec<String>,
+    /// Enable Post-Quantum `X25519MLKEM768` (`0x11EC`, `1,210 B` ServerHello) when offered (hot-reloadable!).
+    pub pq_key_share: AtomicBool,
+    /// Two-speed `MSG_EOR` ServerHello TCP fragmentation target MSS (`0` = disabled, hot-reloadable!).
+    pub server_hello_fragment_mss: AtomicU16,
+    /// Optional minimum randomized ServerHello reply delay in ms (hot-reloadable!).
+    pub server_hello_delay_min_ms: AtomicU32,
+    /// Optional maximum randomized ServerHello reply delay in ms (hot-reloadable!).
+    pub server_hello_delay_max_ms: AtomicU32,
     pub catalog: ArcSwap<crate::doppel_scout::DoppelCatalog>,
 }
 
 impl DoppelState {
     /// Look up the live-calibrated [`DoppelParams`] matching the client's SNI
-    /// cover domain (or the aggregated default profile if not scouted per-host).
+    /// cover domain (or the aggregated default profile if not scouted per-host),
+    /// applying the current hot-reloadable `pq_key_share` policy.
     #[inline]
     pub fn params_for_sni(&self, sni_list: &[String]) -> DoppelParams {
-        self.catalog.load().params_for_sni(sni_list)
+        let mut p = self.catalog.load().params_for_sni(sni_list);
+        if !self.pq_key_share.load(Ordering::Relaxed) {
+            p.server_hello.prefer_pq_mlkem768 = false;
+        }
+        p
     }
 }
 
@@ -363,6 +381,7 @@ pub struct ProxyEngine {
     pub concurrency_live: AtomicU32,
     pub track_client_ips_live: AtomicBool,
     pub tolerate_time_skewness_ms: AtomicU64,
+    pub ignore_time_skew_live: AtomicBool,
     pub dns: Arc<DnsResolver>,
     pub proxy_pool: Option<ProxyPool>,
     pub dc_router: Arc<DcRouter>,
@@ -572,11 +591,20 @@ impl ProxyEngine {
         });
 
         let track_client_ips = cfg.track_client_ips.unwrap_or(false);
-        let tolerate_time_skewness = cfg.tolerate_time_skewness.unwrap_or(Duration::from_secs(5));
+        // Default 120s skewness (plus built-in boot-time <120s compatibility) prevents
+        // mobile/iOS clock-drift reconnect loops out of the box!
+        let tolerate_time_skewness = cfg
+            .tolerate_time_skewness
+            .unwrap_or(Duration::from_secs(120));
+        let ignore_time_skew = cfg.ignore_time_skew.unwrap_or(false);
         let fronting_init = FrontingRuntimeConfig {
             host: cfg.get_domain_fronting_host().to_owned(),
             port: cfg.get_domain_fronting_port(443),
             proxy_protocol: cfg.get_domain_fronting_proxy_protocol(false),
+            unknown_sni_action: cfg
+                .domain_fronting
+                .unknown_sni_action
+                .unwrap_or(UnknownSniAction::Front),
         };
 
         let settings = EngineSettings {
@@ -615,20 +643,42 @@ impl ProxyEngine {
             .defense
             .doppelganger
             .shaping
-            .unwrap_or(ShapingMode::Record);
+            .unwrap_or(ShapingMode::Burst);
         let doppel_drs = cfg.defense.doppelganger.drs.unwrap_or(false);
         let doppel_scout_covers = cfg.defense.doppelganger.scout_covers.unwrap_or(false);
         let doppel_scout_urls = cfg.defense.doppelganger.urls.clone().unwrap_or_default();
+        // Post-handshake pacing/DRS activates ONLY when explicitly requested (`drs`,
+        // `shaping`, or `urls`); `scout-covers = true` alone calibrates live cover
+        // `ServerHelloProfile` (PQ X25519MLKEM768 + cipher + cert flight) at zero latency!
         let doppel_enabled = !doppel_scout_urls.is_empty()
             || doppel_drs
-            || cfg.defense.doppelganger.shaping.is_some()
-            || doppel_scout_covers;
+            || cfg.defense.doppelganger.shaping.is_some();
+        let pq_key_share = cfg.defense.doppelganger.pq_key_share.unwrap_or(true);
+        let sh_frag_mss = cfg
+            .defense
+            .doppelganger
+            .server_hello_fragment_mss
+            .unwrap_or(0);
+        let sh_delay_min = cfg
+            .defense
+            .doppelganger
+            .server_hello_delay_min_ms
+            .unwrap_or(0);
+        let sh_delay_max = cfg
+            .defense
+            .doppelganger
+            .server_hello_delay_max_ms
+            .unwrap_or(sh_delay_min);
         let doppel = DoppelState {
             enabled: doppel_enabled,
             shaping: doppel_shaping,
             drs: doppel_drs,
             scout_covers: doppel_scout_covers,
             scout_urls: doppel_scout_urls,
+            pq_key_share: AtomicBool::new(pq_key_share),
+            server_hello_fragment_mss: AtomicU16::new(sh_frag_mss),
+            server_hello_delay_min_ms: AtomicU32::new(sh_delay_min),
+            server_hello_delay_max_ms: AtomicU32::new(sh_delay_max),
             catalog: ArcSwap::from_pointee(crate::doppel_scout::DoppelCatalog::from_default(
                 DoppelParams {
                     drs: doppel_drs,
@@ -662,6 +712,7 @@ impl ProxyEngine {
             tolerate_time_skewness_ms: AtomicU64::new(
                 tolerate_time_skewness.as_millis().min(u128::from(u64::MAX)) as u64,
             ),
+            ignore_time_skew_live: AtomicBool::new(ignore_time_skew),
             dns,
             proxy_pool,
             dc_router,
@@ -824,6 +875,12 @@ impl ProxyEngine {
     #[inline]
     pub fn tolerate_time_skewness(&self) -> Duration {
         Duration::from_millis(self.tolerate_time_skewness_ms.load(Ordering::Acquire))
+    }
+
+    /// Current hot-reloadable `ignore-time-skew` flag.
+    #[inline]
+    pub fn ignore_time_skew(&self) -> bool {
+        self.ignore_time_skew_live.load(Ordering::Acquire)
     }
 
     /// Snapshot of current hot-reloadable domain-fronting destination config.
@@ -1383,24 +1440,69 @@ impl ProxyEngine {
             .set_throttle_limit(i64::from(cfg.throttle.max_connections.unwrap_or(0)));
         self.track_client_ips_live
             .store(cfg.track_client_ips.unwrap_or(false), Ordering::Release);
-        let skew = cfg.tolerate_time_skewness.unwrap_or(Duration::from_secs(5));
+        let skew = cfg
+            .tolerate_time_skewness
+            .unwrap_or(Duration::from_secs(120));
         self.tolerate_time_skewness_ms.store(
             skew.as_millis().min(u128::from(u64::MAX)) as u64,
             Ordering::Release,
         );
+        self.ignore_time_skew_live
+            .store(cfg.ignore_time_skew.unwrap_or(false), Ordering::Release);
+        self.doppel.pq_key_share.store(
+            cfg.defense.doppelganger.pq_key_share.unwrap_or(true),
+            Ordering::Release,
+        );
+        self.doppel.server_hello_fragment_mss.store(
+            cfg.defense
+                .doppelganger
+                .server_hello_fragment_mss
+                .unwrap_or(0),
+            Ordering::Release,
+        );
+        let d_min = cfg
+            .defense
+            .doppelganger
+            .server_hello_delay_min_ms
+            .unwrap_or(0);
+        let d_max = cfg
+            .defense
+            .doppelganger
+            .server_hello_delay_max_ms
+            .unwrap_or(d_min);
+        self.doppel
+            .server_hello_delay_min_ms
+            .store(d_min, Ordering::Release);
+        self.doppel
+            .server_hello_delay_max_ms
+            .store(d_max, Ordering::Release);
         let new_fronting = FrontingRuntimeConfig {
             host: cfg.get_domain_fronting_host().to_owned(),
             port: cfg.get_domain_fronting_port(443),
             proxy_protocol: cfg.get_domain_fronting_proxy_protocol(false),
+            unknown_sni_action: cfg
+                .domain_fronting
+                .unknown_sni_action
+                .unwrap_or(UnknownSniAction::Front),
         };
-        if !new_fronting.host.is_empty() || self.fronting_cfg.load().host != new_fronting.host {
+        if !new_fronting.host.is_empty()
+            || self.fronting_cfg.load().host != new_fronting.host
+            || self.fronting_cfg.load().unknown_sni_action != new_fronting.unknown_sni_action
+        {
             // Preserve auto-bound integrated TLS cover when config has no explicit host override.
             let prev = self.fronting_cfg.load();
             let preserve_integrated = cfg.get_domain_fronting_host().is_empty()
                 && !prev.host.is_empty()
                 && prev.host == "127.0.0.1"
                 && prev.port != 443;
-            if !preserve_integrated {
+            if preserve_integrated {
+                self.fronting_cfg.store(Arc::new(FrontingRuntimeConfig {
+                    host: prev.host.clone(),
+                    port: prev.port,
+                    proxy_protocol: prev.proxy_protocol,
+                    unknown_sni_action: new_fronting.unknown_sni_action,
+                }));
+            } else {
                 self.fronting_cfg.store(Arc::new(new_fronting));
             }
         }
@@ -2174,8 +2276,9 @@ impl ProxyEngine {
         }
 
         // 6. Live Doppelganger cover-site scouting (probes configured `urls` and/or
-        //    distinct FakeTLS fronting hosts to calibrate ServerHello noise + Weibull + DRS)
-        if self.doppel.enabled && (!self.doppel.scout_urls.is_empty() || self.doppel.scout_covers) {
+        //    distinct FakeTLS fronting hosts to calibrate exact cover ServerHelloProfile
+        //    — PQ X25519MLKEM768, cipher, extension order, cert-flight noise + Weibull + DRS)
+        if !self.doppel.scout_urls.is_empty() || self.doppel.scout_covers {
             let engine = Arc::clone(self);
             let mut sd = shutdown;
             tokio::spawn(async move {

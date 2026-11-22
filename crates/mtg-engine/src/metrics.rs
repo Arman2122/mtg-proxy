@@ -42,7 +42,8 @@ pub struct CoreMetrics {
     pub allowlist_rejected_total: AtomicU64,
 }
 
-/// FakeTLS door handshake counters matching `/stats` `faketls_handshake`.
+/// FakeTLS door handshake counters matching `/stats` `faketls_handshake`, plus
+/// v2.5 anti-DPI & Post-Quantum telemetry exported to Prometheus.
 #[derive(Debug, Default)]
 pub struct FakeTlsCounters {
     pub hinted: AtomicI64,
@@ -52,6 +53,12 @@ pub struct FakeTlsCounters {
     pub denied_global: AtomicI64,
     pub oversized: AtomicI64,
     pub over_budget_matched: AtomicI64,
+    pub pq_handshakes: AtomicU64,
+    pub x25519_handshakes: AtomicU64,
+    pub boot_time_accepted: AtomicU64,
+    pub server_hello_fragmented: AtomicU64,
+    pub alert_closes: AtomicU64,
+    pub sni_rejected: AtomicU64,
 }
 
 impl FakeTlsCounters {
@@ -1004,6 +1011,65 @@ impl ProxyMetrics {
             out,
             "{p}_global_ip_rate_limited_total {}",
             gl.ip_rate_limited_total.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP {p}_faketls_handshakes_total Accepted FakeTLS handshakes by negotiated key_share group."
+        );
+        let _ = writeln!(out, "# TYPE {p}_faketls_handshakes_total counter");
+        let _ = writeln!(
+            out,
+            "{p}_faketls_handshakes_total{{key_share=\"x25519_mlkem768\"}} {}",
+            self.faketls.pq_handshakes.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "{p}_faketls_handshakes_total{{key_share=\"x25519\"}} {}",
+            self.faketls.x25519_handshakes.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP {p}_faketls_boot_time_accepted_total FakeTLS handshakes accepted via boot-time/uptime timestamp compatibility."
+        );
+        let _ = writeln!(out, "# TYPE {p}_faketls_boot_time_accepted_total counter");
+        let _ = writeln!(
+            out,
+            "{p}_faketls_boot_time_accepted_total {}",
+            self.faketls.boot_time_accepted.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP {p}_faketls_server_hello_fragmented_total FakeTLS ServerHello flights sent with two-speed MSG_EOR fragmentation."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE {p}_faketls_server_hello_fragmented_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "{p}_faketls_server_hello_fragmented_total {}",
+            self.faketls.server_hello_fragmented.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP {p}_faketls_alert_closes_total FakeTLS streams closed cleanly after receiving a TLS Alert record."
+        );
+        let _ = writeln!(out, "# TYPE {p}_faketls_alert_closes_total counter");
+        let _ = writeln!(
+            out,
+            "{p}_faketls_alert_closes_total {}",
+            self.faketls.alert_closes.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP {p}_faketls_sni_rejected_total Unmatched FakeTLS probes rejected via unknown-sni-action."
+        );
+        let _ = writeln!(out, "# TYPE {p}_faketls_sni_rejected_total counter");
+        let _ = writeln!(
+            out,
+            "{p}_faketls_sni_rejected_total {}",
+            self.faketls.sni_rejected.load(Ordering::Relaxed)
         );
 
         out

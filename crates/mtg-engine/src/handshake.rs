@@ -33,16 +33,19 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use mtg_config::{ListenerPolicy, UnknownSecretAction};
+use mtg_config::{ListenerPolicy, UnknownSecretAction, UnknownSniAction};
 use mtg_core::{ConnectionTag, TagSet};
 use mtg_crypto::faketls::{
-    FakeTlsCandidate, ParseStatus, ParsedClientHello, build_server_hello,
-    parse_client_hello_incremental,
+    FakeTlsCandidate, ParseStatus, ParsedClientHello, ServerHelloProfile, VerifyMatch,
+    VerifyOptions, build_server_hello_with_profile, parse_client_hello_incremental,
 };
 use mtg_crypto::obfs2::{HANDSHAKE_FRAME_LEN, build_outbound_handshake, match_handshake};
 use mtg_governance::{BudgetVerdict, ConnSpeedLimiters, GlobalIpConnPermit, MAX_HINT_POSITIONS};
-use mtg_net::{MiddleStreamParams, coarse_now_ns, coarse_realtime_ns};
+use mtg_net::{
+    MiddleStreamParams, coarse_now_ns, coarse_realtime_ns, send_fragmented_server_hello,
+};
 use mtg_protocol::doppel::{DoppelConnState, DoppelParams};
+use mtg_protocol::middleproxy::ClientFraming;
 use mtg_protocol::proxyproto::{ProxyParseStatus, ProxyProtoMode, parse_proxy_header};
 use mtg_protocol::tls_record::TlsUnframer;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -50,14 +53,15 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::cancel::CancelToken;
-use crate::fronting::{FrontingTarget, front_connection};
+use crate::fronting::{FrontingTarget, NGINX_UNRECOGNIZED_NAME_ALERT, front_connection};
 use crate::relay::{DirectRelay, RelayContext, relay_middleproxy};
 use crate::state::{IpFilterVerdict, ProxyEngine, peer_ip_of};
 
 thread_local! {
-    /// Per-worker reusable FakeTLS ServerHello + CCS + AppData staging buffer.
-    /// Eliminates the ~16.6 KiB heap allocation on every FakeTLS handshake!
-    static HS_SH_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(16_640));
+    /// Per-worker reusable FakeTLS ServerHello + CCS + AppData staging buffer
+    /// (18 KiB holds full Post-Quantum `X25519MLKEM768` 1,210 B ServerHello + CCS +
+    /// max 16,379 B AppData record with ZERO heap allocations per handshake!).
+    static HS_SH_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(18_432));
 }
 
 /// Handshake result handed from the short-lived boxed handshake phase to the
@@ -364,6 +368,38 @@ async fn faketls_handshake_and_dial(
     // 4. Match secret: Hints -> SNI bucket -> Budgeted hardware SIMD/SHA-NI scan
     let matched = match_faketls_secret(&parsed, client_ip, &engine).await;
     let Some(m) = matched else {
+        // Optional `unknown-sni-action` (`reject-handshake` or `drop`) for unmatched probes
+        // carrying an SNI that does not match any hosted cover or `[domain-fronting].host`.
+        let fcfg = engine.fronting_config();
+        let unknown_sni = !is_known_cover_sni(&parsed.sni_hostnames, &fcfg.host, &engine);
+        let action = fcfg.unknown_sni_action;
+        drop(fcfg);
+        if unknown_sni {
+            match action {
+                UnknownSniAction::RejectHandshake => {
+                    engine
+                        .metrics
+                        .faketls
+                        .sni_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        stream.write_all(&NGINX_UNRECOGNIZED_NAME_ALERT),
+                    )
+                    .await;
+                    return None;
+                }
+                UnknownSniAction::Drop => {
+                    engine
+                        .metrics
+                        .faketls
+                        .sni_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                UnknownSniAction::Front => {}
+            }
+        }
         let hosts = engine.fronting_hosts_for(&parsed.sni_hostnames);
         hello_wire.extend_from_slice(&post_hello_buf);
         do_front(
@@ -379,11 +415,11 @@ async fn faketls_handshake_and_dial(
         return None;
     };
 
-    // 5. Lock-free FakeTLS anti-replay check (replays front cleanly!)
-    if engine
-        .faketls_replay
-        .seen_before(parsed.hello.session_id.as_slice())
-    {
+    // 5. Lock-free FakeTLS anti-replay pre-check keyed on `client_random[..16]`
+    //    (HMAC-authenticated & unique even when a TLS client sends empty/reused session_id!).
+    //    Read-only `contains` runs BEFORE admission so denied connections never poison replay state!
+    let replay_key = *parsed.hello.replay_key();
+    if engine.faketls_replay.contains(&replay_key) {
         core_metrics.replay_attacks.fetch_add(1, Ordering::Relaxed);
         let hosts = engine.fronting_hosts_for(&parsed.sni_hostnames);
         hello_wire.extend_from_slice(&post_hello_buf);
@@ -424,12 +460,6 @@ async fn faketls_handshake_and_dial(
         return None;
     };
 
-    // Earned hint: record ONLY after full admission succeeded!
-    engine.hints.remember(client_ip, Arc::clone(&m.secret_name));
-    // Trigger throttled (<=1 per 2s) Zero-RTT cover pre-warm so reactive DPI
-    // active probes arriving right after a user handshake see 0 ms connect RTT!
-    engine.prewarm_fronting_cover(&parsed.sni_hostnames);
-
     let release_guard = ReleaseConnGuard {
         engine: Arc::clone(&engine),
         secret_name: Arc::clone(&m.secret_name),
@@ -438,16 +468,69 @@ async fn faketls_handshake_and_dial(
         retiring: m.retiring,
     };
 
+    // Commit anti-replay AFTER admission succeeded (also catches any concurrent duplicate race!).
+    if engine.faketls_replay.seen_before(&replay_key) {
+        drop(release_guard);
+        core_metrics.replay_attacks.fetch_add(1, Ordering::Relaxed);
+        let hosts = engine.fronting_hosts_for(&parsed.sni_hostnames);
+        hello_wire.extend_from_slice(&post_hello_buf);
+        do_front(
+            stream,
+            client_addr,
+            dst_addr,
+            &hello_wire,
+            hosts,
+            worker_id,
+            &engine,
+        )
+        .await;
+        return None;
+    }
+
+    // Earned hint: record ONLY after full admission & anti-replay commit succeeded!
+    engine.hints.remember(client_ip, Arc::clone(&m.secret_name));
+    // Trigger throttled (<=1 per 2s) Zero-RTT cover pre-warm so reactive DPI
+    // active probes arriving right after a user handshake see 0 ms connect RTT!
+    engine.prewarm_fronting_cover(&parsed.sni_hostnames);
+
     // 7. Build & send FakeTLS ServerHello + ChangeCipherSpec + AppData noise!
-    // Uses per-SNI calibrated cover cert-flight size + thread-local `HS_SH_BUF`
-    // + non-blocking `try_write` fast path -> ZERO heap allocations per handshake!
+    // Uses live-scouted per-SNI `ServerHelloProfile` (Post-Quantum X25519MLKEM768
+    // 1,210 B ServerHello, cover cipher & extension order, calibrated cert flight),
+    // optional pre-reply jitter delay, and optional two-speed `MSG_EOR` TCP splitting!
+    let delay_min = engine
+        .doppel
+        .server_hello_delay_min_ms
+        .load(Ordering::Relaxed);
+    let delay_max = engine
+        .doppel
+        .server_hello_delay_max_ms
+        .load(Ordering::Relaxed);
+    if delay_max > 0 {
+        let lo = delay_min.min(delay_max);
+        let span = delay_max.saturating_sub(lo);
+        let jitter_ms = if span > 0 {
+            let mix = u64::from_le_bytes(replay_key[..8].try_into().expect("8 bytes"));
+            lo + (mix % u64::from(span + 1)) as u32
+        } else {
+            lo
+        };
+        if jitter_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(u64::from(jitter_ms))).await;
+        }
+    }
+
     let doppel_params = engine.doppel.params_for_sni(&parsed.sni_hostnames);
-    let write_ok = send_server_hello_zero_alloc(
+    let fragment_mss = engine
+        .doppel
+        .server_hello_fragment_mss
+        .load(Ordering::Relaxed);
+    let (write_ok, used_pq) = send_server_hello_zero_alloc(
         &mut stream,
         &m.candidate,
         &parsed.hello,
-        doppel_params.noise,
+        doppel_params.server_hello,
         &engine.x25519_keys,
+        fragment_mss,
         engine.settings.handshake_timeout,
     )
     .await;
@@ -455,6 +538,26 @@ async fn faketls_handshake_and_dial(
     drop(parsed);
     if !write_ok {
         return None;
+    }
+    if used_pq {
+        engine
+            .metrics
+            .faketls
+            .pq_handshakes
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        engine
+            .metrics
+            .faketls
+            .x25519_handshakes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if fragment_mss > 0 {
+        engine
+            .metrics
+            .faketls
+            .server_hello_fragmented
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // 8. Unframe TLS ApplicationData records until we have the 64-byte Obfuscated2 frame
@@ -473,6 +576,13 @@ async fn faketls_handshake_and_dial(
         debug!(secret = %m.secret_name, "inner FakeTLS obfuscated2 handshake failed");
         return None;
     };
+
+    // Enforce anti-replay on the inner obfuscated2 frame as well!
+    if engine.obfs2_replay.seen_before(&obfs_match.replay_key) {
+        core_metrics.replay_attacks.fetch_add(1, Ordering::Relaxed);
+        debug!(secret = %m.secret_name, "inner FakeTLS obfuscated2 replay detected");
+        return None;
+    }
 
     // 9. Dial Telegram DC (multiplexed MiddleProxy when ad_tag present & reframable, else direct DC)
     dial_and_prepare_relay(
@@ -672,44 +782,79 @@ async fn obfs2_handshake_and_dial(
     .await
 }
 
+/// Check whether any SNI in `snis` matches a hosted secret bucket or explicit
+/// `[domain-fronting].host`.
+fn is_known_cover_sni(snis: &[String], explicit_host: &str, engine: &ProxyEngine) -> bool {
+    if snis.is_empty() {
+        return false;
+    }
+    let set = engine.secrets.load();
+    for sni in snis {
+        if set.sni_bucket(sni).is_some() {
+            return true;
+        }
+        if !explicit_host.is_empty() && sni.eq_ignore_ascii_case(explicit_host) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build FakeTLS ServerHello + CCS + AppData inside thread-local `HS_SH_BUF`
-/// and attempt an immediate non-blocking `try_write` (zero heap allocations on
-/// 99.99% of fresh TCP connections!). Only spills the unwritten tail into a
-/// temporary `Vec` if the kernel send buffer is momentarily full.
+/// matching `profile` (Post-Quantum `X25519MLKEM768` or classic `X25519`).
+///
+/// - When `fragment_mss == 0`: attempts an immediate non-blocking `try_write`
+///   (zero heap allocations on 99.99% of fresh TCP connections!).
+/// - When `fragment_mss > 0`: uses two-speed Linux `MSG_EOR` TCP fragmentation
+///   for ONLY this `ServerHello` flight, keeping 100% of post-handshake bulk
+///   data running at full MTU!
 async fn send_server_hello_zero_alloc(
     stream: &mut TcpStream,
     candidate: &FakeTlsCandidate,
     hello: &mtg_crypto::faketls::ClientHello,
-    noise: mtg_crypto::faketls::NoiseParams,
+    profile: ServerHelloProfile,
     x25519_keys: &mtg_crypto::faketls::X25519KeyRing,
+    fragment_mss: u16,
     timeout: Duration,
-) -> bool {
+) -> (bool, bool) {
     enum ShWrite {
         Complete,
         Tail(Vec<u8>),
+        Fragment(Vec<u8>),
         Err,
     }
 
-    let outcome = HS_SH_BUF.with(|cell| {
+    let (outcome, used_pq) = HS_SH_BUF.with(|cell| {
         let mut buf = cell.borrow_mut();
         buf.clear();
-        build_server_hello(&mut buf, candidate, hello, noise, x25519_keys);
-        match stream.try_write(&buf) {
+        let used_pq =
+            build_server_hello_with_profile(&mut buf, candidate, hello, profile, x25519_keys);
+        if fragment_mss > 0 {
+            return (ShWrite::Fragment(buf.clone()), used_pq);
+        }
+        let w = match stream.try_write(&buf) {
             Ok(w) if w == buf.len() => ShWrite::Complete,
             Ok(0) => ShWrite::Err,
             Ok(w) => ShWrite::Tail(buf[w..].to_vec()),
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => ShWrite::Tail(buf.clone()),
             Err(_) => ShWrite::Err,
-        }
+        };
+        (w, used_pq)
     });
 
-    match outcome {
+    let ok = match outcome {
         ShWrite::Complete => true,
         ShWrite::Err => false,
         ShWrite::Tail(tail) => tokio::time::timeout(timeout, stream.write_all(&tail))
             .await
             .is_ok_and(|r| r.is_ok()),
-    }
+        ShWrite::Fragment(full) => {
+            send_fragmented_server_hello(stream, &full, fragment_mss, timeout)
+                .await
+                .is_ok()
+        }
+    };
+    (ok, used_pq)
 }
 
 struct MatchedFakeTls {
@@ -734,9 +879,15 @@ async fn match_faketls_secret(
     let now_unix_ns = coarse_realtime_ns();
     let rot_now = engine.rotation_clock.now();
     let skew_ns = engine.tolerate_time_skewness().as_nanos() as i128;
+    let verify_opts = VerifyOptions {
+        now_unix_ns,
+        skew_ns,
+        ignore_time_skew: engine.ignore_time_skew(),
+        allow_boot_time: true,
+    };
     let blocks = parsed.scan_blocks();
 
-    let accept_pos = |pos: usize| -> Option<MatchedFakeTls> {
+    let accept_pos = |pos: usize, vmatch: VerifyMatch| -> Option<MatchedFakeTls> {
         let meta = &set.faketls_meta[pos];
         if !meta.is_valid_at(rot_now) {
             return None;
@@ -750,6 +901,13 @@ async fn match_faketls_secret(
         } else {
             *rec.secret.key()
         };
+        if vmatch == VerifyMatch::BootTime {
+            engine
+                .metrics
+                .faketls
+                .boot_time_accepted
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Some(MatchedFakeTls {
             secret_name: Arc::clone(&meta.name),
             key_bytes,
@@ -766,8 +924,9 @@ async fn match_faketls_secret(
         if !hinted_names.is_empty() {
             let positions = set.resolve_hint_positions(&hinted_names, MAX_HINT_POSITIONS);
             for pos in positions {
-                if parsed.verify_at(&set.faketls_candidates[pos], now_unix_ns, skew_ns)
-                    && let Some(m) = accept_pos(pos)
+                if let Some(vmatch) =
+                    parsed.verify_with_opts(&set.faketls_candidates[pos], verify_opts)
+                    && let Some(m) = accept_pos(pos, vmatch)
                 {
                     engine
                         .metrics
@@ -841,14 +1000,14 @@ async fn match_faketls_secret(
     // 4. Execute scan using 4-way SHA-NI / 8-way AVX2 / ARMv8 SHA-256!
     let found_pos = if let Some(bucket) = sni_bucket {
         parsed
-            .scan_candidates_at(&bucket.candidates, now_unix_ns, skew_ns)
-            .map(|local_idx| bucket.positions[local_idx])
+            .scan_candidates_with_opts(&bucket.candidates, verify_opts)
+            .map(|(local_idx, vm)| (bucket.positions[local_idx], vm))
     } else {
-        parsed.scan_candidates_at(&set.faketls_candidates, now_unix_ns, skew_ns)
+        parsed.scan_candidates_with_opts(&set.faketls_candidates, verify_opts)
     };
 
-    if let Some(pos) = found_pos
-        && let Some(m) = accept_pos(pos)
+    if let Some((pos, vmatch)) = found_pos
+        && let Some(m) = accept_pos(pos, vmatch)
     {
         if let Some(res) = reservation.as_mut() {
             res.settle(&engine.scan_budget, true);
@@ -912,13 +1071,15 @@ async fn dial_and_prepare_relay(
     };
 
     // 1. Try multiplexed MiddleProxy when `ad_tag` is set!
+    // Supports ALL 3 MTProto client framings: Intermediate, Padded-Intermediate, AND Abridged!
     if let Some(tag_bytes) = ad_tag {
-        let reframable = matches!(
-            obfs_match.tag,
-            ConnectionTag::INTERMEDIATE | ConnectionTag::PADDED_INTERMEDIATE
-        );
-        if reframable {
-            let padded = obfs_match.tag == ConnectionTag::PADDED_INTERMEDIATE;
+        let framing = match obfs_match.tag {
+            ConnectionTag::INTERMEDIATE => Some(ClientFraming::Intermediate),
+            ConnectionTag::PADDED_INTERMEDIATE => Some(ClientFraming::PaddedIntermediate),
+            ConnectionTag::ABRIDGED => Some(ClientFraming::Abridged),
+            _ => None,
+        };
+        if let Some(framing) = framing {
             // Allow short grace wait on startup if first Telegram config fetch is still in flight
             let _ = engine
                 .dc_router
@@ -930,7 +1091,7 @@ async fn dial_and_prepare_relay(
                 public_ipv4: engine.settings.public_ipv4,
                 public_ipv6: engine.settings.public_ipv6,
                 advertised_port: engine.settings.advertised_port,
-                padded_intermediate: padded,
+                framing,
                 ad_tag: tag_bytes,
             };
             match engine.middleproxy.open_stream(params).await {
@@ -948,6 +1109,7 @@ async fn dial_and_prepare_relay(
                         dc_stats,
                         doppel,
                         cancel,
+                        metrics: Arc::clone(&engine.metrics),
                     };
                     let _active = active_guard;
                     let _release = release_guard;
@@ -956,7 +1118,7 @@ async fn dial_and_prepare_relay(
                         middle,
                         leftover_app,
                         (obfs_match.ciphers.recv, obfs_match.ciphers.send),
-                        padded,
+                        framing,
                         ctx,
                     )
                     .await;
@@ -1013,6 +1175,7 @@ async fn dial_and_prepare_relay(
         dc_stats,
         doppel,
         cancel,
+        metrics: Arc::clone(&engine.metrics),
     };
     Some(EstablishedDirectRelay {
         relay: DirectRelay::new(

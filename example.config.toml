@@ -336,10 +336,16 @@ auto-update = false
 # we need to proceed with connection or not.
 #
 # Sometimes time can be skewed so we accept all messages within a
-# time range of this parameter.
+# time range of this parameter. Mobile clients that stamp device uptime
+# (< 120s since boot) are also accepted automatically.
 #
-# Default value is 3s
-tolerate-time-skewness = "5s"
+# Default value is 120s
+tolerate-time-skewness = "120s"
+
+# When true, accepts any FakeTLS ClientHello timestamp regardless of clock drift
+# (relying solely on HMAC-SHA256 + anti-replay protection). Useful for clients
+# on broken-NTP networks. Hot-reloadable via SIGHUP / POST /reload.
+# ignore-time-skew = false
 
 # Telegram has a concept of DC. You can think about DC as a number of a cluster
 # with a certain purpose. Some clusters serve media, some - messages, some rule
@@ -590,6 +596,15 @@ allow-fallback-on-unknown-dc = false
 # proxy protocol.
 # proxy-protocol = false
 
+# What to do when an unauthenticated ClientHello arrives with an SNI that does
+# not match any hosted `ee` secret hostname:
+#   "front"            (default) - transparently domain-front to the cover origin.
+#   "reject-handshake" - send an authentic nginx/OpenSSL TLS 1.3 fatal
+#                        unrecognized_name(112) alert (0x15 0x03 0x03 0x00 0x02 0x02 0x70)
+#                        and close cleanly (prevents cover-cert mismatch probes).
+#   "drop"             - close TCP immediately without sending any bytes.
+# unknown-sni-action = "front"
+
 # network defines different network-related settings
 [network]
 # please be aware that mtg needs to do some external requests. For
@@ -783,6 +798,29 @@ drs = false
 # becomes the default only after it has run on real networks without
 # connections being blocked.
 # shaping = "record"
+
+# Mirror Post-Quantum X25519MLKEM768 (group 0x11EC, 1,210 B ServerHello) whenever
+# a modern Telegram client (iOS 2026 / BoringSSL / Chrome) offers an X25519MLKEM768
+# key_share, matching real Google/Cloudflare TLS 1.3 ServerHello wire geometry.
+# Default is true (hot-reloadable).
+# pq-key-share = true
+
+# Two-speed Linux MSG_EOR TCP fragmentation on the FakeTLS ServerHello flight ONLY
+# (keeps bulk data plane at 100% full MTU / 128 KiB coalesced writev throughput!).
+# Splits the ServerHello across deterministic MSS-aware TCP segments (clamped to
+# kernel TCP_INFO tcpi_snd_mss minus 12 B if TCP timestamps are active) so
+# stateless DPI boxes cannot match ServerHello fingerprints in a single packet:
+#   "off" / "0"   - disabled (default; single writev flight)
+#   "extreme"     - 88 B chunks
+#   "tspu"        - 92 B chunks
+#   "balanced"    - 256 B chunks (recommended on strict mobile/ISP DPI networks)
+#   "<bytes>"     - custom chunk size in 88..=1400
+# server-hello-fragment-mss = "off"
+
+# Optional synthetic handshake RTT jitter before sending ServerHello (milliseconds,
+# hot-reloadable; 0 = disabled for zero latency overhead).
+# server-hello-delay-min-ms = 0
+# server-hello-delay-max-ms = 0
 
 # The ee handshake budget. A client proves it holds a secret with one HMAC, and
 # the proxy does not know which secret that is, so it tries the hosted ee

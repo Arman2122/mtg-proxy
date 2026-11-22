@@ -17,12 +17,15 @@ use mtg_crypto::aes_ctr::{Aes256Ctr, FusedCtrPair};
 use mtg_governance::{ClientEntry, ConnSpeedLimiters, FairBucket, GcraLimiter};
 use mtg_net::{MiddleDownMsg, MiddleStream, TLS_HEADROOM, coarse_now_ns, coarse_unix_secs};
 use mtg_protocol::doppel::{DoppelConnState, DoppelParams};
-use mtg_protocol::tls_record::{MAX_TLS_RECORD_PAYLOAD, TlsUnframer, stamp_app_data_header};
+use mtg_protocol::middleproxy::ClientFraming;
+use mtg_protocol::tls_record::{
+    MAX_TLS_RECORD_PAYLOAD, TlsRecordError, TlsUnframer, stamp_app_data_header,
+};
 use tokio::io::{AsyncWrite as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
 use crate::cancel::CancelToken;
-use crate::metrics::{DcEndpointStats, GlobalLimitsRuntime, SecretRuntime};
+use crate::metrics::{DcEndpointStats, GlobalLimitsRuntime, ProxyMetrics, SecretRuntime};
 
 /// Upload read batch capacity (128 KiB — up to 8 FakeTLS records per read(2) syscall).
 const UPLOAD_SCRATCH_CAP: usize = 128 * 1024;
@@ -56,6 +59,7 @@ pub struct RelayContext {
     pub dc_stats: Arc<DcEndpointStats>,
     pub doppel: Option<Box<(DoppelConnState, DoppelParams)>>,
     pub cancel: CancelToken,
+    pub metrics: Arc<ProxyMetrics>,
 }
 
 /// Optional boxed Doppelganger cadence state (costs only 8 bytes when disabled!).
@@ -95,6 +99,10 @@ pub struct DirectRelay {
     fused_down: FusedCtrPair,
     tls_unframer: TlsUnframer,
     is_faketls: bool,
+    client_eof: bool,
+    dc_eof: bool,
+    dc_wr_closed: bool,
+    client_wr_closed: bool,
     idle_timeout: Duration,
     last_reset_ns: u64,
     user: Arc<SecretRuntime>,
@@ -102,6 +110,7 @@ pub struct DirectRelay {
     global_limits: Arc<GlobalLimitsRuntime>,
     conn_limits: Option<Box<ConnSpeedLimiters>>,
     dc_stats: Arc<DcEndpointStats>,
+    metrics: Arc<ProxyMetrics>,
     cancel: CancelToken,
     doppel: Option<Box<DoppelRelayState>>,
     /// Leftover application bytes already read during handshake (drained & freed immediately).
@@ -145,6 +154,10 @@ impl DirectRelay {
             fused_down,
             tls_unframer: ctx.tls_unframer,
             is_faketls: ctx.is_faketls,
+            client_eof: false,
+            dc_eof: false,
+            dc_wr_closed: false,
+            client_wr_closed: false,
             idle_timeout: ctx.idle_timeout,
             last_reset_ns: coarse_now_ns(),
             user: ctx.user,
@@ -152,6 +165,7 @@ impl DirectRelay {
             global_limits: ctx.global_limits,
             conn_limits: ctx.conn_limits,
             dc_stats: ctx.dc_stats,
+            metrics: ctx.metrics,
             cancel: ctx.cancel,
             doppel,
             initial_app: client_recv_initial,
@@ -275,16 +289,28 @@ impl DirectRelay {
         let mut yield_needed = false;
 
         // ---------------------------------------------------------------------
-        // 1. UPLOAD: client -> DC
+        // 1. UPLOAD: client -> DC (with true RFC 793 half-close!)
         // ---------------------------------------------------------------------
         let up_can_read = if self.up_off < self.up_pending.len() {
             match Self::try_drain_buf(&self.dc, &mut self.up_pending, &mut self.up_off, cx) {
-                DrainResult::Done => true,
+                DrainResult::Done => {
+                    if self.client_eof && !self.dc_wr_closed {
+                        self.dc_wr_closed = true;
+                        let _ = Pin::new(&mut self.dc).poll_shutdown(cx);
+                    }
+                    !self.client_eof
+                }
                 DrainResult::Pending => false,
-                DrainResult::Closed => return Poll::Ready(StepOutcome::Done),
+                DrainResult::Closed => {
+                    self.client_eof = true;
+                    self.dc_wr_closed = true;
+                    self.up_pending.clear();
+                    self.up_off = 0;
+                    false
+                }
             }
         } else {
-            true
+            !self.client_eof
         };
 
         if up_can_read {
@@ -405,11 +431,15 @@ impl DirectRelay {
                                             }
                                             Ok(None) => {
                                                 // Rare: >16 tiny TLS records in one read -> compact fallback.
-                                                let Ok(moved) = self
+                                                let moved = match self
                                                     .tls_unframer
                                                     .unframe_in_place(&mut scratch[..n])
-                                                else {
-                                                    return ReadStep::Err;
+                                                {
+                                                    Ok(m) => m,
+                                                    Err(TlsRecordError::AlertClose) => {
+                                                        return ReadStep::AlertEof;
+                                                    }
+                                                    Err(_) => return ReadStep::Err,
                                                 };
                                                 if moved == 0 {
                                                     return ReadStep::ZeroApp;
@@ -445,6 +475,9 @@ impl DirectRelay {
                                                     }
                                                     Err(_) => ReadStep::Err,
                                                 };
+                                            }
+                                            Err(TlsRecordError::AlertClose) => {
+                                                return ReadStep::AlertEof;
                                             }
                                             Err(_) => return ReadStep::Err,
                                         }
@@ -487,6 +520,18 @@ impl DirectRelay {
                             ReadStep::Sent(moved) => {
                                 spurious_wb = 0;
                                 up_moved += moved;
+                                if self.is_faketls && self.tls_unframer.alert_seen() {
+                                    self.metrics
+                                        .faketls
+                                        .alert_closes
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    self.client_eof = true;
+                                    if !self.dc_wr_closed {
+                                        self.dc_wr_closed = true;
+                                        let _ = Pin::new(&mut self.dc).poll_shutdown(cx);
+                                    }
+                                    break;
+                                }
                                 if up_moved >= POLL_BURST_CAP {
                                     yield_needed = true;
                                     break;
@@ -497,6 +542,13 @@ impl DirectRelay {
                             }
                             ReadStep::Partial(moved) => {
                                 up_moved += moved;
+                                if self.is_faketls && self.tls_unframer.alert_seen() {
+                                    self.metrics
+                                        .faketls
+                                        .alert_closes
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    self.client_eof = true;
+                                }
                                 match Self::try_drain_buf(
                                     &self.dc,
                                     &mut self.up_pending,
@@ -504,6 +556,13 @@ impl DirectRelay {
                                     cx,
                                 ) {
                                     DrainResult::Done => {
+                                        if self.client_eof {
+                                            if !self.dc_wr_closed {
+                                                self.dc_wr_closed = true;
+                                                let _ = Pin::new(&mut self.dc).poll_shutdown(cx);
+                                            }
+                                            break;
+                                        }
                                         if up_moved >= POLL_BURST_CAP {
                                             yield_needed = true;
                                             break;
@@ -557,15 +616,25 @@ impl DirectRelay {
                                     }
                                 }
                             },
+                            ReadStep::AlertEof => {
+                                self.metrics
+                                    .faketls
+                                    .alert_closes
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.client_eof = true;
+                                if self.up_off >= self.up_pending.len() && !self.dc_wr_closed {
+                                    self.dc_wr_closed = true;
+                                    let _ = Pin::new(&mut self.dc).poll_shutdown(cx);
+                                }
+                                break;
+                            }
                             ReadStep::Eof => {
-                                let _ = self.account_and_refresh_idle(
-                                    up_moved,
-                                    0,
-                                    idle_sleep.as_mut(),
-                                    cx,
-                                );
-                                let _ = Pin::new(&mut self.dc).poll_shutdown(cx);
-                                return Poll::Ready(StepOutcome::Done);
+                                self.client_eof = true;
+                                if self.up_off >= self.up_pending.len() && !self.dc_wr_closed {
+                                    self.dc_wr_closed = true;
+                                    let _ = Pin::new(&mut self.dc).poll_shutdown(cx);
+                                }
+                                break;
                             }
                             ReadStep::Err => {
                                 let _ = self.account_and_refresh_idle(
@@ -583,12 +652,18 @@ impl DirectRelay {
         }
 
         // ---------------------------------------------------------------------
-        // 2. DOWNLOAD: DC -> client
+        // 2. DOWNLOAD: DC -> client (with true RFC 793 half-close!)
         // ---------------------------------------------------------------------
         let down_can_read = if self.down_off < self.down_pending.len() {
             match Self::try_drain_buf(&self.client, &mut self.down_pending, &mut self.down_off, cx)
             {
-                DrainResult::Done => true,
+                DrainResult::Done => {
+                    if self.dc_eof && !self.client_wr_closed {
+                        self.client_wr_closed = true;
+                        let _ = Pin::new(&mut self.client).poll_shutdown(cx);
+                    }
+                    !self.dc_eof
+                }
                 DrainResult::Pending => false,
                 DrainResult::Closed => {
                     let _ = self.account_and_refresh_idle(up_moved, 0, idle_sleep.as_mut(), cx);
@@ -596,7 +671,7 @@ impl DirectRelay {
                 }
             }
         } else {
-            true
+            !self.dc_eof
         };
 
         if down_can_read {
@@ -870,15 +945,15 @@ impl DirectRelay {
                                         }
                                     }
                                 },
-                                ReadStep::Eof => {
-                                    let _ = self.account_and_refresh_idle(
-                                        up_moved,
-                                        down_moved,
-                                        idle_sleep.as_mut(),
-                                        cx,
-                                    );
-                                    let _ = Pin::new(&mut self.client).poll_shutdown(cx);
-                                    return Poll::Ready(StepOutcome::Done);
+                                ReadStep::AlertEof | ReadStep::Eof => {
+                                    self.dc_eof = true;
+                                    if self.down_off >= self.down_pending.len()
+                                        && !self.client_wr_closed
+                                    {
+                                        self.client_wr_closed = true;
+                                        let _ = Pin::new(&mut self.client).poll_shutdown(cx);
+                                    }
+                                    break;
                                 }
                                 ReadStep::Err => {
                                     let _ = self.account_and_refresh_idle(
@@ -897,9 +972,18 @@ impl DirectRelay {
         }
 
         // ---------------------------------------------------------------------
-        // 3. Account moved bytes, check quota, reset idle timer at 1s cadence
+        // 3. Account moved bytes, check quota, reset idle timer at 1s cadence,
+        //    and close cleanly once BOTH directions have reached EOF & drained!
         // ---------------------------------------------------------------------
         if self.account_and_refresh_idle(up_moved, down_moved, idle_sleep.as_mut(), cx) {
+            return Poll::Ready(StepOutcome::Done);
+        }
+
+        if self.client_eof
+            && self.dc_eof
+            && self.up_off >= self.up_pending.len()
+            && self.down_off >= self.down_pending.len()
+        {
             return Poll::Ready(StepOutcome::Done);
         }
 
@@ -937,6 +1021,20 @@ impl DirectRelay {
             let initial = std::mem::take(&mut self.initial_app);
             if !Box::pin(flush_initial_app(self, initial)).await {
                 return;
+            }
+        }
+
+        // If a TLS Alert (0x15) arrived pipelined in the same TCP read as the
+        // initial obfs2 frame, propagate half-close (`SHUT_WR`) to the DC immediately!
+        if self.is_faketls && self.tls_unframer.alert_seen() && !self.client_eof {
+            self.metrics
+                .faketls
+                .alert_closes
+                .fetch_add(1, Ordering::Relaxed);
+            self.client_eof = true;
+            if !self.dc_wr_closed {
+                self.dc_wr_closed = true;
+                let _ = self.dc.shutdown().await;
             }
         }
 
@@ -1109,7 +1207,7 @@ pub async fn relay_middleproxy(
     mut middle: MiddleStream,
     mut client_recv_initial: Vec<u8>,
     mut client_ciphers: (Aes256Ctr, Aes256Ctr), // (recv, send)
-    padded_intermediate: bool,
+    framing: ClientFraming,
     ctx: RelayContext,
 ) {
     ctx.dc_stats.active_conns.fetch_add(1, Ordering::Relaxed);
@@ -1132,9 +1230,9 @@ pub async fn relay_middleproxy(
     drop(client_recv_initial);
 
     loop {
-        // Flush any complete intermediate MTProto packets from `plain_in` -> MiddleProxy
+        // Flush any complete MTProto packets (Intermediate / Padded-Intermediate / Abridged) -> MiddleProxy
         let mut up_sent = 0usize;
-        while let Some(pkt_res) = take_intermediate_packet(&mut plain_in, padded_intermediate) {
+        while let Some(pkt_res) = take_client_packet(&mut plain_in, framing) {
             let Ok((pkt, quick_ack)) = pkt_res else {
                 middle.close_graceful().await;
                 return;
@@ -1198,7 +1296,7 @@ pub async fn relay_middleproxy(
             () = idle_sleep.as_mut() => {
                 break;
             }
-            rd_ready = client.readable() => {
+            rd_ready = client.readable(), if !(ctx.is_faketls && tls_unframer.alert_seen()) => {
                 if rd_ready.is_err() {
                     break;
                 }
@@ -1208,9 +1306,22 @@ pub async fn relay_middleproxy(
                         Ok(0) => Ok(None),
                         Ok(n) => {
                             let app_len = if ctx.is_faketls {
-                                tls_unframer
-                                    .unframe_in_place(&mut scratch[..n])
-                                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad FakeTLS frame"))?
+                                match tls_unframer.unframe_in_place(&mut scratch[..n]) {
+                                    Ok(w) => w,
+                                    Err(TlsRecordError::AlertClose) => {
+                                        ctx.metrics
+                                            .faketls
+                                            .alert_closes
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        return Ok(None);
+                                    }
+                                    Err(_) => {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "bad FakeTLS frame",
+                                        ));
+                                    }
+                                }
                             } else {
                                 n
                             };
@@ -1231,15 +1342,13 @@ pub async fn relay_middleproxy(
             }
             down = middle.recv_msg() => {
                 let Ok(Some(msg)) = down else { break; };
-                // Exact MTProto intermediate / padded-intermediate download framing:
-                // - `RPC_PROXY_ANS`: ALWAYS plain 4-byte LE payload length (NEVER OR QUICK_ACK_BIT!).
+                // Exact MTProto download framing matching client's negotiated transport tag:
+                // - `RPC_PROXY_ANS` (Intermediate / Padded): 4-byte LE byte length + payload.
+                // - `RPC_PROXY_ANS` (Abridged): 1-byte (<0x7f) or 4-byte (0x7f + 24b LE) word count + payload.
                 // - `RPC_SIMPLE_ACK`: verbatim 4-byte quick-ack token (no length prefix).
                 let wire_plain = match msg {
                     MiddleDownMsg::Data { payload, .. } => {
-                        let mut framed = Vec::with_capacity(4 + payload.len());
-                        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                        framed.extend_from_slice(&payload);
-                        framed
+                        encode_client_download_packet(&payload, framing)
                     }
                     MiddleDownMsg::SimpleAck(ack) => ack,
                 };
@@ -1347,41 +1456,102 @@ pub async fn relay_middleproxy(
     middle.close_graceful().await;
 }
 
-/// Extract one length-prefixed MTProto intermediate / padded-intermediate packet
-/// from `buf`, returning `(payload, quick_ack)` while rejecting oversized frames
-/// and unaligned plain-intermediate lengths (`len % 4 != 0`).
-fn take_intermediate_packet(
+/// Extract one MTProto client packet (Intermediate, Padded-Intermediate, or
+/// Abridged) from `buf`, returning `(payload, quick_ack)` while rejecting
+/// oversized frames and unaligned non-padded lengths.
+fn take_client_packet(
     buf: &mut Vec<u8>,
-    padded: bool,
+    framing: ClientFraming,
 ) -> Option<Result<(Vec<u8>, bool), ()>> {
-    if buf.len() < 4 {
-        return None;
+    match framing {
+        ClientFraming::Intermediate | ClientFraming::PaddedIntermediate => {
+            let padded = framing == ClientFraming::PaddedIntermediate;
+            if buf.len() < 4 {
+                return None;
+            }
+            let mut declared = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let quick_ack = if declared >= mtg_protocol::middleproxy::QUICK_ACK_BIT {
+                declared -= mtg_protocol::middleproxy::QUICK_ACK_BIT;
+                true
+            } else {
+                false
+            };
+            let len = declared as usize;
+            if len > mtg_protocol::middleproxy::DEFAULT_MAX_CLIENT_PACKET {
+                return Some(Err(()));
+            }
+            if !padded && !len.is_multiple_of(4) {
+                return Some(Err(()));
+            }
+            if buf.len() < 4 + len {
+                return None;
+            }
+            let mut pkt = buf[4..4 + len].to_vec();
+            buf.drain(..4 + len);
+            if padded {
+                // Trim 0..3 random trailing bytes to 4-byte alignment per MTProxy spec.
+                let aligned = pkt.len() & !3;
+                pkt.truncate(aligned);
+            }
+            Some(Ok((pkt, quick_ack)))
+        }
+        ClientFraming::Abridged => {
+            if buf.is_empty() {
+                return None;
+            }
+            let b0 = buf[0];
+            let quick_ack = (b0 & 0x80) != 0;
+            let tag = b0 & 0x7f;
+            let (hdr_len, words) = if tag < 0x7f {
+                (1usize, usize::from(tag))
+            } else {
+                if buf.len() < 4 {
+                    return None;
+                }
+                let w = u32::from_le_bytes([buf[1], buf[2], buf[3], 0]) as usize;
+                (4usize, w)
+            };
+            let len = words.saturating_mul(4);
+            if len > mtg_protocol::middleproxy::DEFAULT_MAX_CLIENT_PACKET {
+                return Some(Err(()));
+            }
+            if buf.len() < hdr_len + len {
+                return None;
+            }
+            let pkt = buf[hdr_len..hdr_len + len].to_vec();
+            buf.drain(..hdr_len + len);
+            Some(Ok((pkt, quick_ack)))
+        }
     }
-    let mut declared = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let quick_ack = if declared >= mtg_protocol::middleproxy::QUICK_ACK_BIT {
-        declared -= mtg_protocol::middleproxy::QUICK_ACK_BIT;
-        true
-    } else {
-        false
-    };
-    let len = declared as usize;
-    if len > mtg_protocol::middleproxy::DEFAULT_MAX_CLIENT_PACKET {
-        return Some(Err(()));
+}
+
+/// Encode one `RPC_PROXY_ANS` download payload into the client's MTProto transport framing.
+fn encode_client_download_packet(payload: &[u8], framing: ClientFraming) -> Vec<u8> {
+    match framing {
+        ClientFraming::Intermediate | ClientFraming::PaddedIntermediate => {
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            framed.extend_from_slice(payload);
+            framed
+        }
+        ClientFraming::Abridged => {
+            let words = payload.len() / 4;
+            if words < 0x7f {
+                let mut framed = Vec::with_capacity(1 + payload.len());
+                framed.push(words as u8);
+                framed.extend_from_slice(payload);
+                framed
+            } else {
+                let mut framed = Vec::with_capacity(4 + payload.len());
+                framed.push(0x7f);
+                framed.push((words & 0xff) as u8);
+                framed.push(((words >> 8) & 0xff) as u8);
+                framed.push(((words >> 16) & 0xff) as u8);
+                framed.extend_from_slice(payload);
+                framed
+            }
+        }
     }
-    if !padded && !len.is_multiple_of(4) {
-        return Some(Err(()));
-    }
-    if buf.len() < 4 + len {
-        return None;
-    }
-    let mut pkt = buf[4..4 + len].to_vec();
-    buf.drain(..4 + len);
-    if padded {
-        // Trim 0..3 random trailing bytes to 4-byte alignment per MTProxy spec.
-        let aligned = pkt.len() & !3;
-        pkt.truncate(aligned);
-    }
-    Some(Ok((pkt, quick_ack)))
 }
 
 enum ReadStep {
@@ -1390,6 +1560,7 @@ enum ReadStep {
     NeedPace(usize),
     ZeroApp,
     WouldBlock,
+    AlertEof,
     Eof,
     Err,
 }

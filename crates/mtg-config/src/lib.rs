@@ -25,9 +25,9 @@ pub use scrub::{
 };
 pub use types::{
     AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction, PreferIp,
-    StatsdTagFormat, TypeParseError, UnknownSecretAction, WebCdnPreset, canonical_web_host,
-    format_bytes_go, format_duration_go, parse_ad_tag, parse_bytes_str, parse_duration,
-    redact_proxy_url, validate_ip_or_cidr,
+    StatsdTagFormat, TypeParseError, UnknownSecretAction, UnknownSniAction, WebCdnPreset,
+    canonical_web_host, format_bytes_go, format_duration_go, parse_ad_tag, parse_bytes_str,
+    parse_duration, parse_server_hello_fragment_mss, redact_proxy_url, validate_ip_or_cidr,
 };
 
 #[cfg(test)]
@@ -411,5 +411,49 @@ conn-speed-down = "15mbit"
         assert_eq!(alice.client_speed_up_bytes_per_second, 125_000);
         assert_eq!(alice.client_speed_down_bytes_per_second, 2_500_000);
         assert_eq!(alice.conn_speed_down_bytes_per_second, 1_875_000);
+    }
+
+    #[test]
+    fn v25_anti_dpi_and_skew_fields_parse_and_validate() {
+        let raw = br#"
+bind-to = "0.0.0.0:443"
+ignore-time-skew = true
+[domain-fronting]
+unknown-sni-action = "reject-handshake"
+[defense.doppelganger]
+scout-covers = true
+pq-key-share = true
+server-hello-fragment-mss = "balanced"
+server-hello-delay-min-ms = 5
+server-hello-delay-max-ms = 25
+[secrets]
+alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+"#;
+        let cfg = Config::parse(raw).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.unknown_keys.is_empty());
+        assert_eq!(cfg.ignore_time_skew, Some(true));
+        assert_eq!(
+            cfg.domain_fronting.unknown_sni_action,
+            Some(UnknownSniAction::RejectHandshake)
+        );
+        assert_eq!(cfg.defense.doppelganger.pq_key_share, Some(true));
+        assert_eq!(
+            cfg.defense.doppelganger.server_hello_fragment_mss,
+            Some(256)
+        );
+        assert_eq!(cfg.defense.doppelganger.server_hello_delay_min_ms, Some(5));
+        assert_eq!(cfg.defense.doppelganger.server_hello_delay_max_ms, Some(25));
+
+        // Invalid range (min > max) MUST fail validation!
+        let bad_delay = br#"
+bind-to = "0.0.0.0:443"
+[defense.doppelganger]
+server-hello-delay-min-ms = 100
+server-hello-delay-max-ms = 20
+[secrets]
+alice = "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d"
+"#;
+        assert!(Config::parse(bad_delay).unwrap().validate().is_err());
     }
 }

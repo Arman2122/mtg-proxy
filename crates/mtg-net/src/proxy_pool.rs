@@ -386,6 +386,16 @@ impl ProxyPool {
     /// Dial `target` through the best healthy upstream proxy using P2C EWMA RTT
     /// selection, failing over cleanly across remaining healthy proxies.
     pub async fn dial(&self, target: &ProxyTarget) -> Result<TcpStream, ProxyDialError> {
+        self.dial_with_bound_addr(target).await.map(|(s, _)| s)
+    }
+
+    /// Dial `target` through the best healthy upstream proxy and also return the
+    /// SOCKS5 server-reported `BND.ADDR:BND.PORT` (when IPv4/IPv6 non-unspecified),
+    /// enabling exact Telegram MiddleProxy KDF derivation through SOCKS5 chains!
+    pub async fn dial_with_bound_addr(
+        &self,
+        target: &ProxyTarget,
+    ) -> Result<(TcpStream, Option<SocketAddr>), ProxyDialError> {
         let n = self.members.len();
         if n == 0 {
             return Err(ProxyDialError::AllFailed(
@@ -422,16 +432,16 @@ impl ProxyPool {
             let started = coarse_now_ns();
             match tokio::time::timeout(
                 self.timeout,
-                dial_via_endpoint(&member.endpoint, target, &self.sock_cfg),
+                dial_via_endpoint_with_bound_addr(&member.endpoint, target, &self.sock_cfg),
             )
             .await
             {
-                Ok(Ok(stream)) => {
+                Ok(Ok((stream, bound_addr))) => {
                     let rtt_us = coarse_now_ns().saturating_sub(started) / 1_000;
                     member.record_rtt_us(rtt_us.max(1));
                     member.breaker.on_success();
-                    debug!(proxy = %member.endpoint.redacted, rtt_us, "dialed via upstream proxy");
-                    return Ok(stream);
+                    debug!(proxy = %member.endpoint.redacted, rtt_us, ?bound_addr, "dialed via upstream proxy");
+                    return Ok((stream, bound_addr));
                 }
                 Ok(Err(e)) => {
                     member.breaker.on_failure();
@@ -457,25 +467,38 @@ pub async fn dial_via_endpoint(
     target: &ProxyTarget,
     sock_cfg: &SocketConfig,
 ) -> Result<TcpStream, ProxyDialError> {
+    dial_via_endpoint_with_bound_addr(ep, target, sock_cfg)
+        .await
+        .map(|(s, _)| s)
+}
+
+/// Dial `target` via a single [`ProxyEndpoint`], also returning the SOCKS5
+/// server-reported `BND.ADDR:BND.PORT` when available.
+pub async fn dial_via_endpoint_with_bound_addr(
+    ep: &ProxyEndpoint,
+    target: &ProxyTarget,
+    sock_cfg: &SocketConfig,
+) -> Result<(TcpStream, Option<SocketAddr>), ProxyDialError> {
     let mut stream = TcpStream::connect(ep.dial_addr()).await?;
     let _ = tune_tokio_stream(&stream, sock_cfg);
 
-    match ep.scheme {
+    let bound = match ep.scheme {
         ProxyScheme::Socks5 | ProxyScheme::Socks5h => {
-            socks5_handshake(&mut stream, ep, target).await?;
+            socks5_handshake(&mut stream, ep, target).await?
         }
         ProxyScheme::Http => {
             http_connect_handshake(&mut stream, ep, target).await?;
+            None
         }
-    }
-    Ok(stream)
+    };
+    Ok((stream, bound))
 }
 
 async fn socks5_handshake(
     stream: &mut TcpStream,
     ep: &ProxyEndpoint,
     target: &ProxyTarget,
-) -> Result<(), ProxyDialError> {
+) -> Result<Option<SocketAddr>, ProxyDialError> {
     // 1. Greeting: VER=5, methods = [NOAUTH] or [NOAUTH, USERPASS]
     let has_auth = ep.username.is_some();
     if has_auth {
@@ -578,29 +601,37 @@ async fn socks5_handshake(
             hdr[1]
         )));
     }
-    // Consume BND.ADDR + BND.PORT
-    match hdr[3] {
+    // Parse BND.ADDR + BND.PORT (used by MiddleProxy KDF when chaining via SOCKS5!).
+    let bound_addr = match hdr[3] {
         0x01 => {
-            let mut skip = [0u8; 6];
-            stream.read_exact(&mut skip).await?;
+            let mut raw = [0u8; 6];
+            stream.read_exact(&mut raw).await?;
+            let ip = std::net::Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]);
+            let port = u16::from_be_bytes([raw[4], raw[5]]);
+            (!ip.is_unspecified() && port != 0).then(|| SocketAddr::new(IpAddr::V4(ip), port))
         }
         0x04 => {
-            let mut skip = [0u8; 18];
-            stream.read_exact(&mut skip).await?;
+            let mut raw = [0u8; 18];
+            stream.read_exact(&mut raw).await?;
+            let ip_bytes: [u8; 16] = raw[..16].try_into().expect("16 bytes");
+            let ip = std::net::Ipv6Addr::from(ip_bytes);
+            let port = u16::from_be_bytes([raw[16], raw[17]]);
+            (!ip.is_unspecified() && port != 0).then(|| SocketAddr::new(IpAddr::V6(ip), port))
         }
         0x03 => {
             let mut len = [0u8; 1];
             stream.read_exact(&mut len).await?;
             let mut skip = vec![0u8; usize::from(len[0]) + 2];
             stream.read_exact(&mut skip).await?;
+            None
         }
         atyp => {
             return Err(ProxyDialError::Socks5(format!(
                 "unknown address type 0x{atyp:02x}"
             )));
         }
-    }
-    Ok(())
+    };
+    Ok(bound_addr)
 }
 
 async fn http_connect_handshake(

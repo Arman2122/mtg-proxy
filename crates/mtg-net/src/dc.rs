@@ -272,6 +272,9 @@ pub struct DcRouter {
     config_v6_url: String,
     first_fetch_done: Arc<tokio::sync::Notify>,
     first_fetch_finished: Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonically incremented whenever Telegram `proxy_secret` or MiddleProxy
+    /// endpoint lists change so [`MiddleProxyPool`] can gracefully rotate carriers!
+    middle_generation: AtomicU64,
 }
 
 impl DcRouter {
@@ -296,6 +299,7 @@ impl DcRouter {
             config_v6_url: TELEGRAM_PROXY_CONFIG_V6_URL.to_owned(),
             first_fetch_done: Arc::new(tokio::sync::Notify::new()),
             first_fetch_finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            middle_generation: AtomicU64::new(1),
         }
     }
 
@@ -321,9 +325,16 @@ impl DcRouter {
         self.dir.load()
     }
 
+    /// Monotonic generation bumped whenever Telegram `proxy_secret` or middle endpoints change.
+    #[inline]
+    pub fn middle_generation(&self) -> u64 {
+        self.middle_generation.load(Ordering::Acquire)
+    }
+
     /// Manually publish a directory snapshot (useful in tests/mock networks).
     pub fn set_directory(&self, dir: DcDirectory) {
         self.dir.store(Arc::new(dir));
+        self.middle_generation.fetch_add(1, Ordering::Release);
         self.first_fetch_finished.store(true, Ordering::Release);
         self.first_fetch_done.notify_waiters();
     }
@@ -408,13 +419,21 @@ impl DcRouter {
         }
 
         if any_ok {
+            let secret_changed = current.proxy_secret.as_deref().map(|z| z.as_slice())
+                != next.proxy_secret.as_deref().map(|z| z.as_slice());
+            let endpoints_changed =
+                current.middle_v4 != next.middle_v4 || current.middle_v6 != next.middle_v6;
             info!(
                 v4_dcs = next.middle_v4.len(),
                 v6_dcs = next.middle_v6.len(),
                 has_secret = next.proxy_secret.is_some(),
+                rotated = secret_changed || endpoints_changed,
                 "Telegram DC & middle-proxy config refreshed"
             );
             self.dir.store(Arc::new(next));
+            if secret_changed || endpoints_changed {
+                self.middle_generation.fetch_add(1, Ordering::Release);
+            }
         }
 
         self.first_fetch_finished.store(true, Ordering::Release);

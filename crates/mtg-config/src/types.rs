@@ -34,6 +34,14 @@ pub enum TypeParseError {
     InvalidUnknownSecretAction(String),
     #[error("unknown ip-filter action {0:?} (expected \"front\" or \"close\")")]
     InvalidIpFilterAction(String),
+    #[error(
+        "unknown unknown-sni-action {0:?} (expected \"front\", \"reject-handshake\", or \"drop\")"
+    )]
+    InvalidUnknownSniAction(String),
+    #[error(
+        "invalid server-hello-fragment-mss {0:?} (expected \"off\", \"extreme\", \"tspu\", \"balanced\", 0, or 88..=1400)"
+    )]
+    InvalidFragmentMss(String),
     #[error("unknown web CDN preset {0:?} (expected \"cloudflare\" or \"arvancloud\")")]
     InvalidWebCdnPreset(String),
     #[error("incorrect IP or CIDR entry {0:?}")]
@@ -287,6 +295,72 @@ impl FromStr for IpFilterAction {
             "front" => Ok(Self::Front),
             "close" => Ok(Self::Close),
             _ => Err(TypeParseError::InvalidIpFilterAction(s.to_owned())),
+        }
+    }
+}
+
+/// Action taken on unmatched FakeTLS ClientHellos whose SNI does not match any
+/// configured secret or `[domain-fronting].host`:
+///
+/// - [`Self::Front`] (default): transparently splice to the configured cover website.
+/// - [`Self::RejectHandshake`]: immediately emit a 7-byte nginx-identical TLS fatal
+///   `unrecognized_name` alert (`[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x70]`) and close
+///   with zero upstream dial!
+/// - [`Self::Drop`]: silently close the connection without writing any bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnknownSniAction {
+    #[default]
+    Front,
+    RejectHandshake,
+    Drop,
+}
+
+impl UnknownSniAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Front => "front",
+            Self::RejectHandshake => "reject-handshake",
+            Self::Drop => "drop",
+        }
+    }
+}
+
+impl fmt::Display for UnknownSniAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for UnknownSniAction {
+    type Err = TypeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "front" => Ok(Self::Front),
+            "reject-handshake" | "reject_handshake" | "reject" => Ok(Self::RejectHandshake),
+            "drop" | "close" => Ok(Self::Drop),
+            _ => Err(TypeParseError::InvalidUnknownSniAction(s.to_owned())),
+        }
+    }
+}
+
+/// Parse `[defense.doppelganger] server-hello-fragment-mss` from a preset name
+/// (`"off"`, `"extreme"` = 88, `"tspu"` = 92, `"balanced"` = 256) or numeric string (`0` or `88..=1400`).
+pub fn parse_server_hello_fragment_mss(s: &str) -> Result<u16, TypeParseError> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "" | "off" | "disabled" | "none" | "0" => Ok(0),
+        "extreme" => Ok(88),
+        "tspu" => Ok(92),
+        "balanced" => Ok(256),
+        other => {
+            let v: u16 = other
+                .parse()
+                .map_err(|_| TypeParseError::InvalidFragmentMss(s.to_owned()))?;
+            if v == 0 || (88..=1400).contains(&v) {
+                Ok(v)
+            } else {
+                Err(TypeParseError::InvalidFragmentMss(s.to_owned()))
+            }
         }
     }
 }

@@ -11,6 +11,7 @@ pub mod dc;
 pub mod dns;
 pub mod driver;
 pub mod epoll;
+pub mod fragmented;
 pub mod middleproxy_pool;
 pub mod proxy_pool;
 pub mod sockopts;
@@ -32,6 +33,7 @@ pub use driver::{
     SplicePipePool, TLS_HEADROOM, signal_wake_fd,
 };
 pub use epoll::EpollDriver;
+pub use fragmented::{effective_fragment_chunk, send_fragmented_server_hello};
 pub use middleproxy_pool::{
     DEFAULT_CARRIERS_PER_DC, MAX_CARRIERS_PER_DC, MiddleDownMsg, MiddleProxyPool, MiddleStream,
     MiddleStreamParams,
@@ -39,7 +41,7 @@ pub use middleproxy_pool::{
 pub use proxy_pool::{
     CircuitBreaker, DEFAULT_CB_HALF_OPEN_TIMEOUT, DEFAULT_CB_OPEN_THRESHOLD,
     DEFAULT_CB_RESET_WINDOW, ProxyDialError, ProxyEndpoint, ProxyPool, ProxyScheme, ProxyTarget,
-    dial_via_endpoint,
+    dial_via_endpoint, dial_via_endpoint_with_bound_addr,
 };
 pub use sockopts::{
     DEFAULT_LISTEN_BACKLOG, DEFAULT_NOFILE_TARGET, DEFAULT_TCP_FASTOPEN_QLEN,

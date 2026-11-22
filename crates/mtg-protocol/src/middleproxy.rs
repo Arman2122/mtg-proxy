@@ -49,6 +49,9 @@ const PROXY_REQ_PROXY_TAG: [u8; 4] = [0xae, 0x26, 0x1e, 0xdb];
 /// 4-byte padding word repeated to align frames to 16-byte CBC block boundaries.
 pub const FRAME_PADDING_WORD: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
 
+/// `RPC_HANDSHAKE` capability flag requesting Castagnoli CRC32C (`RPCF_USE_CRC32C`).
+pub const RPC_FLAG_USE_CRC32C: u32 = 0x0000_0800;
+
 /// `RPC_PROXY_REQ` flag bits.
 pub const FLAG_ENCRYPTED: u32 = 0x2;
 pub const FLAG_HAS_AD_TAG: u32 = 0x8;
@@ -56,7 +59,110 @@ pub const FLAG_MAGIC: u32 = 0x1000;
 pub const FLAG_EXT_MODE2: u32 = 0x20000;
 pub const FLAG_PAD: u32 = 0x0800_0000;
 pub const FLAG_INTERMEDIATE: u32 = 0x2000_0000;
+pub const FLAG_ABRIDGED: u32 = 0x4000_0000;
 pub const FLAG_QUICK_ACK: u32 = 0x8000_0000;
+
+/// Client MTProto framing mode carried over MiddleProxy (`ad-tag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClientFraming {
+    /// Standard Intermediate (`0xeeeeeeee`, 4-byte LE length).
+    Intermediate,
+    /// Padded / Secure Intermediate (`0xdddddddd`, 4-byte LE length + 0..3 random tail bytes).
+    PaddedIntermediate,
+    /// Abridged (`0xefefefef`, 1-byte or 4-byte LE word-count length).
+    Abridged,
+}
+
+/// Hardware-accelerated Castagnoli **CRC32C** (`0x82F6_3B78` reflected polynomial):
+/// - `x86_64` with runtime SSE4.2 (`_mm_crc32_u64` / `_mm_crc32_u8`)
+/// - `aarch64` with runtime CRC32C (`__crc32cd` / `__crc32cb`)
+/// - Portable `const` 256-entry lookup table fallback (zero external deps!)
+#[inline]
+pub fn crc32c(data: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.2") {
+        // SAFETY: runtime feature check confirmed SSE4.2 support.
+        return unsafe { crc32c_sse42(data) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        // SAFETY: runtime feature check confirmed ARMv8 CRC support.
+        return unsafe { crc32c_aarch64(data) };
+    }
+    crc32c_portable(data)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_sse42(data: &[u8]) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+    let mut crc = !0u64;
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let v = u64::from_le_bytes(c.try_into().expect("8 bytes"));
+        crc = _mm_crc32_u64(crc, v);
+    }
+    let mut crc32 = crc as u32;
+    for &b in chunks.remainder() {
+        crc32 = _mm_crc32_u8(crc32, b);
+    }
+    !crc32
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_aarch64(data: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32cb, __crc32cd};
+    let mut crc = !0u32;
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let v = u64::from_le_bytes(c.try_into().expect("8 bytes"));
+        crc = __crc32cd(crc, v);
+    }
+    for &b in chunks.remainder() {
+        crc = __crc32cb(crc, b);
+    }
+    !crc
+}
+
+const CRC32C_TABLE: [u32; 256] = {
+    let mut tbl = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0x82f6_3b78;
+            } else {
+                crc >>= 1;
+            }
+            bit += 1;
+        }
+        tbl[i] = crc;
+        i += 1;
+    }
+    tbl
+};
+
+/// Portable Castagnoli CRC32C reference implementation (RFC 3720).
+pub fn crc32c_portable(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        let idx = ((crc ^ u32::from(b)) & 0xff) as usize;
+        crc = (crc >> 8) ^ CRC32C_TABLE[idx];
+    }
+    !crc
+}
+
+#[inline]
+fn compute_rpc_crc(data: &[u8], use_crc32c: bool) -> u32 {
+    if use_crc32c {
+        crc32c(data)
+    } else {
+        crc32fast::hash(data)
+    }
+}
 
 /// Special sequence numbers during RPC link handshake.
 pub const SEQ_NO_NONCE: i32 = -2;
@@ -164,9 +270,16 @@ pub fn parse_nonce_response(data: &[u8], req: &NonceRequest) -> Result<[u8; 16],
 
 /// Build the 32-byte `RPC_HANDSHAKE` message body sent at `seq_no = -1` (encrypted).
 pub fn handshake_request_bytes() -> [u8; 32] {
+    handshake_request_bytes_with_flags(0)
+}
+
+/// Build the 32-byte `RPC_HANDSHAKE` message body with explicit capability `flags`
+/// (e.g. [`RPC_FLAG_USE_CRC32C`] to negotiate Castagnoli CRC32C).
+pub fn handshake_request_bytes_with_flags(flags: u32) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[0..4].copy_from_slice(&TAG_RPC_HANDSHAKE);
-    out[4..8].copy_from_slice(&HANDSHAKE_FLAGS);
+    let combined = u32::from_le_bytes(HANDSHAKE_FLAGS) | flags;
+    out[4..8].copy_from_slice(&combined.to_le_bytes());
     out[8..20].copy_from_slice(HANDSHAKE_PID);
     out[20..32].copy_from_slice(HANDSHAKE_PID);
     out
@@ -174,6 +287,14 @@ pub fn handshake_request_bytes() -> [u8; 32] {
 
 /// Validate a 32-byte `RPC_HANDSHAKE` response body.
 pub fn validate_handshake_response(data: &[u8]) -> Result<(), MiddleProxyError> {
+    let _ = validate_handshake_response_flags(data)?;
+    Ok(())
+}
+
+/// Validate a 32-byte `RPC_HANDSHAKE` response body and return the negotiated
+/// server capability flags (bit [`RPC_FLAG_USE_CRC32C`] indicates the server
+/// accepted Castagnoli CRC32C for all subsequent frames `seq_no >= 0`).
+pub fn validate_handshake_response_flags(data: &[u8]) -> Result<u32, MiddleProxyError> {
     if data.len() != 32 {
         return Err(MiddleProxyError::InvalidHandshakeLength(data.len()));
     }
@@ -183,7 +304,7 @@ pub fn validate_handshake_response(data: &[u8]) -> Result<(), MiddleProxyError> 
     if &data[20..32] != HANDSHAKE_PID {
         return Err(MiddleProxyError::InvalidPeerPid);
     }
-    Ok(())
+    Ok(u32::from_le_bytes([data[4], data[5], data[6], data[7]]))
 }
 
 /// Derive the exact Telegram MiddleProxy AES-256-CBC encryptor (`CLIENT` purpose,
@@ -316,9 +437,21 @@ fn encode_ip_port(addr: SocketAddr, dst: &mut [u8; 20]) {
     dst[16..20].copy_from_slice(&u32::from(addr.port()).to_le_bytes());
 }
 
-/// Append one plaintext MTProto RPC transport frame to `dst` and increment `write_seq_no`:
+/// Append one plaintext MTProto RPC transport frame to `dst` using standard
+/// IEEE CRC32 and increment `write_seq_no`:
 /// `[ MSGLEN(4 LE) | SEQNO(4 LE) | parts... | CRC32(4 LE) | PADDING(0x04000000 * k) ]`.
 pub fn append_rpc_frame(dst: &mut Vec<u8>, write_seq_no: &mut i32, parts: &[&[u8]]) {
+    append_rpc_frame_with_crc(dst, write_seq_no, parts, false);
+}
+
+/// Append one plaintext MTProto RPC transport frame to `dst` using either
+/// hardware Castagnoli CRC32C (`use_crc32c = true`) or standard IEEE CRC32.
+pub fn append_rpc_frame_with_crc(
+    dst: &mut Vec<u8>,
+    write_seq_no: &mut i32,
+    parts: &[&[u8]],
+    use_crc32c: bool,
+) {
     let body_len: usize = parts.iter().map(|p| p.len()).sum();
     let msg_len = 4 + 4 + body_len + 4;
     let pad_len = (16 - (msg_len % 16)) % 16;
@@ -331,7 +464,7 @@ pub fn append_rpc_frame(dst: &mut Vec<u8>, write_seq_no: &mut i32, parts: &[&[u8
         dst.extend_from_slice(part);
     }
 
-    let crc = crc32fast::hash(&dst[start..]);
+    let crc = compute_rpc_crc(&dst[start..], use_crc32c);
     dst.extend_from_slice(&crc.to_le_bytes());
 
     for _ in 0..(pad_len / 4) {
@@ -341,7 +474,7 @@ pub fn append_rpc_frame(dst: &mut Vec<u8>, write_seq_no: &mut i32, parts: &[&[u8
     *write_seq_no = write_seq_no.wrapping_add(1);
 }
 
-/// Build the 84-byte `RPC_PROXY_REQ` header for a client stream.
+/// Build the 84-byte `RPC_PROXY_REQ` header for an Intermediate or Padded-Intermediate client stream.
 pub fn build_proxy_req_header(
     conn_id: [u8; 8],
     client_addr: SocketAddr,
@@ -349,11 +482,30 @@ pub fn build_proxy_req_header(
     ad_tag: [u8; AD_TAG_LEN],
     padded: bool,
 ) -> [u8; REQ_HEADER_LEN] {
+    let framing = if padded {
+        ClientFraming::PaddedIntermediate
+    } else {
+        ClientFraming::Intermediate
+    };
+    build_proxy_req_header_with_framing(conn_id, client_addr, our_addr, ad_tag, framing)
+}
+
+/// Build the 84-byte `RPC_PROXY_REQ` header for any supported [`ClientFraming`]
+/// (`Intermediate`, `PaddedIntermediate`, or `Abridged`).
+pub fn build_proxy_req_header_with_framing(
+    conn_id: [u8; 8],
+    client_addr: SocketAddr,
+    our_addr: SocketAddr,
+    ad_tag: [u8; AD_TAG_LEN],
+    framing: ClientFraming,
+) -> [u8; REQ_HEADER_LEN] {
     let mut h = [0u8; REQ_HEADER_LEN];
     h[0..4].copy_from_slice(&TAG_RPC_PROXY_REQ);
-    let mut base_flags = FLAG_HAS_AD_TAG | FLAG_MAGIC | FLAG_EXT_MODE2 | FLAG_INTERMEDIATE;
-    if padded {
-        base_flags |= FLAG_PAD;
+    let mut base_flags = FLAG_HAS_AD_TAG | FLAG_MAGIC | FLAG_EXT_MODE2;
+    match framing {
+        ClientFraming::Intermediate => base_flags |= FLAG_INTERMEDIATE,
+        ClientFraming::PaddedIntermediate => base_flags |= FLAG_INTERMEDIATE | FLAG_PAD,
+        ClientFraming::Abridged => base_flags |= FLAG_ABRIDGED,
     }
     h[4..8].copy_from_slice(&base_flags.to_le_bytes());
     h[8..16].copy_from_slice(&conn_id);
@@ -486,6 +638,7 @@ pub fn parse_rpc_down_event(body: &[u8]) -> Result<RpcDownEvent<'_>, MiddleProxy
 pub struct RpcFrameDecoder {
     dec: Option<Aes256CbcDecryptor>,
     read_seq_no: i32,
+    use_crc32c: bool,
     cipher_buf: Vec<u8>,
     plain_buf: Vec<u8>,
     plain_pos: usize,
@@ -498,10 +651,24 @@ impl RpcFrameDecoder {
         Self {
             dec,
             read_seq_no: start_seq_no,
+            use_crc32c: false,
             cipher_buf: Vec::with_capacity(4096),
             plain_buf: Vec::with_capacity(16_384),
             plain_pos: 0,
         }
+    }
+
+    /// Enable or disable Castagnoli CRC32C verification (activated once
+    /// `RPC_HANDSHAKE` negotiates [`RPC_FLAG_USE_CRC32C`]).
+    #[inline]
+    pub const fn set_use_crc32c(&mut self, enabled: bool) {
+        self.use_crc32c = enabled;
+    }
+
+    /// True if Castagnoli CRC32C verification is active on this decoder.
+    #[inline]
+    pub const fn uses_crc32c(&self) -> bool {
+        self.use_crc32c
     }
 
     /// Feed raw wire bytes received from the MiddleProxy socket.
@@ -561,7 +728,7 @@ impl RpcFrameDecoder {
                 frame[msg_len - 2],
                 frame[msg_len - 1],
             ]);
-            let actual_crc = crc32fast::hash(&frame[..msg_len - 4]);
+            let actual_crc = compute_rpc_crc(&frame[..msg_len - 4], self.use_crc32c);
             if actual_crc != expected_crc {
                 return Err(MiddleProxyError::CrcMismatch);
             }
@@ -944,5 +1111,49 @@ mod tests {
         c_dec.decrypt_blocks_in_place(&mut blk).unwrap();
 
         validate_handshake_response(&handshake_request_bytes()).unwrap();
+    }
+
+    #[test]
+    fn hardware_and_portable_crc32c_match_rfc3720_and_rpc_frame_roundtrip() {
+        // RFC 3720 §B.4 iSCSI CRC32C standard test vector!
+        assert_eq!(crc32c_portable(b"123456789"), 0xe306_9283);
+        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+
+        // Verify hardware vs portable equivalence across varied lengths (0..259 bytes).
+        let sample: Vec<u8> = (0..260u16)
+            .map(|i| (i.wrapping_mul(37).wrapping_add(13)) as u8)
+            .collect();
+        for len in [0usize, 1, 3, 7, 8, 9, 15, 16, 31, 64, 127, 259] {
+            assert_eq!(crc32c(&sample[..len]), crc32c_portable(&sample[..len]));
+        }
+
+        // Negotiate USE_CRC32C flag & roundtrip encrypted frame with CRC32C!
+        let hs = handshake_request_bytes_with_flags(RPC_FLAG_USE_CRC32C);
+        let flags = validate_handshake_response_flags(&hs).unwrap();
+        assert_ne!(flags & RPC_FLAG_USE_CRC32C, 0);
+
+        let mut wire = Vec::new();
+        let mut seq = 0i32;
+        append_rpc_frame_with_crc(&mut wire, &mut seq, &[b"hello-crc32c-rpc"], true);
+
+        let mut dec = RpcFrameDecoder::new(None, 0);
+        dec.set_use_crc32c(true);
+        dec.push_wire_bytes(&wire);
+        assert_eq!(
+            dec.next_frame().unwrap().as_deref(),
+            Some(&b"hello-crc32c-rpc"[..])
+        );
+
+        // Abridged header sets FLAG_ABRIDGED (0x4000_0000) instead of FLAG_INTERMEDIATE.
+        let hdr = build_proxy_req_header_with_framing(
+            [9u8; 8],
+            "198.51.100.1:1234".parse().unwrap(),
+            "203.0.113.1:443".parse().unwrap(),
+            [0xaau8; 16],
+            ClientFraming::Abridged,
+        );
+        let hflags = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        assert_ne!(hflags & FLAG_ABRIDGED, 0);
+        assert_eq!(hflags & FLAG_INTERMEDIATE, 0);
     }
 }

@@ -23,9 +23,9 @@ use crate::scrub::{
 };
 use crate::types::{
     AD_TAG_LEN, ClientIpSource, HandshakeBudgetMode, HostPort, IpFilterAction, PreferIp,
-    StatsdTagFormat, UnknownSecretAction, WebCdnPreset, canonical_web_host, format_bytes_go,
-    format_duration_go, parse_ad_tag, parse_bytes_str, parse_duration, redact_proxy_url,
-    validate_ip_or_cidr,
+    StatsdTagFormat, UnknownSecretAction, UnknownSniAction, WebCdnPreset, canonical_web_host,
+    format_bytes_go, format_duration_go, parse_ad_tag, parse_bytes_str, parse_duration,
+    parse_server_hello_fragment_mss, redact_proxy_url, validate_ip_or_cidr,
 };
 
 /// Reserved `[secrets]` username that is never served (prevents hand-edit
@@ -267,6 +267,17 @@ pub struct DoppelgangerConfig {
     pub drs: Option<bool>,
     pub shaping: Option<ShapingMode>,
     pub scout_covers: Option<bool>,
+    /// Enable Post-Quantum `X25519MLKEM768` (`0x11EC`, `1,210 B` ServerHello) when
+    /// offered by the client (default: `true`).
+    pub pq_key_share: Option<bool>,
+    /// Two-speed `MSG_EOR` TCP fragmentation target MSS for the `ServerHello` flight ONLY
+    /// (`0` / `"off"` = disabled, `"extreme"` = 88, `"tspu"` = 92, `"balanced"` = 256, or `88..=1400`).
+    /// Bulk post-handshake traffic ALWAYS runs at 100% full MTU!
+    pub server_hello_fragment_mss: Option<u16>,
+    /// Optional minimum randomized ServerHello reply delay in milliseconds (0..=2000).
+    pub server_hello_delay_min_ms: Option<u32>,
+    /// Optional maximum randomized ServerHello reply delay in milliseconds (0..=2000).
+    pub server_hello_delay_max_ms: Option<u32>,
 }
 
 /// `[defense.handshake-budget]`.
@@ -304,6 +315,8 @@ pub struct DomainFrontingConfig {
     pub ip: Option<IpAddr>,
     pub port: Option<u16>,
     pub proxy_protocol: Option<bool>,
+    /// Action on unmatched FakeTLS ClientHello with unknown SNI (`"front"` | `"reject-handshake"` | `"drop"`).
+    pub unknown_sni_action: Option<UnknownSniAction>,
 }
 
 /// `[network.timeout]`.
@@ -395,6 +408,8 @@ pub struct Config {
     pub domain_fronting_ip: Option<IpAddr>,
     pub domain_fronting_proxy_protocol: Option<bool>,
     pub tolerate_time_skewness: Option<Duration>,
+    /// Skip FakeTLS ClientHello timestamp freshness checks (HMAC is still verified in constant time).
+    pub ignore_time_skew: Option<bool>,
     pub concurrency: Option<u32>,
     pub public_ipv4: Option<IpAddr>,
     pub public_ipv6: Option<IpAddr>,
@@ -841,6 +856,35 @@ impl Config {
             }
         }
 
+        if let Some(mss) = self.defense.doppelganger.server_hello_fragment_mss
+            && mss != 0
+            && !(88..=1400).contains(&mss)
+        {
+            return Err(ConfigError::Validation(format!(
+                "defense.doppelganger.server-hello-fragment-mss must be 0 or in 88..=1400, got {mss}"
+            )));
+        }
+        let d_min = self
+            .defense
+            .doppelganger
+            .server_hello_delay_min_ms
+            .unwrap_or(0);
+        let d_max = self
+            .defense
+            .doppelganger
+            .server_hello_delay_max_ms
+            .unwrap_or(d_min);
+        if d_min > 2_000 || d_max > 2_000 {
+            return Err(ConfigError::Validation(
+                "defense.doppelganger.server-hello-delay-{min,max}-ms must be <= 2000".to_owned(),
+            ));
+        }
+        if d_min > d_max {
+            return Err(ConfigError::Validation(format!(
+                "defense.doppelganger.server-hello-delay-min-ms ({d_min}) must not exceed server-hello-delay-max-ms ({d_max})"
+            )));
+        }
+
         Ok(())
     }
 
@@ -1028,6 +1072,18 @@ impl Config {
                     .map_or_else(String::new, |s| s.as_str().to_owned()),
             ),
         );
+        if let Some(pq) = self.defense.doppelganger.pq_key_share {
+            dop.insert("pqKeyShare".into(), Value::Bool(pq));
+        }
+        if let Some(mss) = self.defense.doppelganger.server_hello_fragment_mss {
+            dop.insert("serverHelloFragmentMss".into(), json!(mss));
+        }
+        if let Some(dmin) = self.defense.doppelganger.server_hello_delay_min_ms {
+            dop.insert("serverHelloDelayMinMs".into(), json!(dmin));
+        }
+        if let Some(dmax) = self.defense.doppelganger.server_hello_delay_max_ms {
+            dop.insert("serverHelloDelayMaxMs".into(), json!(dmax));
+        }
         dop.insert(
             "urls".into(),
             opt_vec_str_to_json(self.defense.doppelganger.urls.as_deref()),
@@ -1078,6 +1134,12 @@ impl Config {
             "proxyProtocol".into(),
             Value::Bool(self.domain_fronting.proxy_protocol.unwrap_or(false)),
         );
+        if let Some(action) = self.domain_fronting.unknown_sni_action {
+            df.insert(
+                "unknownSniAction".into(),
+                Value::String(action.as_str().to_owned()),
+            );
+        }
         root.insert("domainFronting".into(), Value::Object(df));
         root.insert(
             "domainFrontingIp".into(),
@@ -1548,6 +1610,9 @@ impl Config {
                     .map_or_else(String::new, format_duration_go),
             ),
         );
+        if let Some(ignore_skew) = self.ignore_time_skew {
+            root.insert("ignoreTimeSkew".into(), Value::Bool(ignore_skew));
+        }
         root.insert(
             "trackClientIps".into(),
             Value::Bool(self.track_client_ips.unwrap_or(false)),
@@ -1944,6 +2009,9 @@ fn parse_root_table(
                         ConfigError::FieldParse(format!("tolerate-time-skewness: {e}"))
                     })?);
                 }
+            }
+            "ignore-time-skew" => {
+                cfg.ignore_time_skew = Some(expect_bool(item, "ignore-time-skew")?);
             }
             "concurrency" => cfg.concurrency = Some(expect_u32(item, "concurrency")?),
             "public-ipv4" => {
@@ -2553,6 +2621,14 @@ fn parse_domain_fronting(
             "proxy-protocol" => {
                 df.proxy_protocol = Some(expect_bool(v, "domain-fronting.proxy-protocol")?);
             }
+            "unknown-sni-action" => {
+                let s = expect_str(v, "domain-fronting.unknown-sni-action")?;
+                if !s.is_empty() {
+                    df.unknown_sni_action = Some(s.parse().map_err(|e| {
+                        ConfigError::FieldParse(format!("domain-fronting.unknown-sni-action: {e}"))
+                    })?);
+                }
+            }
             _ => record_unknown(doc, unknown, &["domain-fronting"], k, v),
         }
     }
@@ -2708,6 +2784,42 @@ fn parse_defense(
                         "scout-covers" => {
                             def.doppelganger.scout_covers =
                                 Some(expect_bool(dv, "doppelganger.scout-covers")?);
+                        }
+                        "pq-key-share" => {
+                            def.doppelganger.pq_key_share =
+                                Some(expect_bool(dv, "doppelganger.pq-key-share")?);
+                        }
+                        "server-hello-fragment-mss" => {
+                            if let Some(n) = dv.as_integer() {
+                                let v = u16::try_from(n).map_err(|_| {
+                                    ConfigError::FieldParse(
+                                        "doppelganger.server-hello-fragment-mss must be 0 or 88..=1400"
+                                            .to_owned(),
+                                    )
+                                })?;
+                                if v != 0 && !(88..=1400).contains(&v) {
+                                    return Err(ConfigError::FieldParse(format!(
+                                        "doppelganger.server-hello-fragment-mss must be 0 or 88..=1400, got {v}"
+                                    )));
+                                }
+                                def.doppelganger.server_hello_fragment_mss = Some(v);
+                            } else {
+                                let s = expect_str(dv, "doppelganger.server-hello-fragment-mss")?;
+                                def.doppelganger.server_hello_fragment_mss =
+                                    Some(parse_server_hello_fragment_mss(s).map_err(|e| {
+                                        ConfigError::FieldParse(format!(
+                                            "doppelganger.server-hello-fragment-mss: {e}"
+                                        ))
+                                    })?);
+                            }
+                        }
+                        "server-hello-delay-min-ms" => {
+                            def.doppelganger.server_hello_delay_min_ms =
+                                Some(expect_u32(dv, "doppelganger.server-hello-delay-min-ms")?);
+                        }
+                        "server-hello-delay-max-ms" => {
+                            def.doppelganger.server_hello_delay_max_ms =
+                                Some(expect_u32(dv, "doppelganger.server-hello-delay-max-ms")?);
                         }
                         _ => record_unknown(doc, unknown, &["defense", "doppelganger"], dk, dv),
                     }

@@ -6,7 +6,7 @@
 //! buffer, and guards against infinite-spin DoS on empty / non-ApplicationData
 //! record floods.
 
-use mtg_crypto::{TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC};
+use mtg_crypto::{TLS_RECORD_ALERT, TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC};
 use thiserror::Error;
 
 /// TLS record header size (`type(1) + version(2) + length(2) = 5`).
@@ -28,6 +28,8 @@ const MAX_EMPTY_OR_NON_APP_STREAK: u8 = 64;
 pub enum TlsRecordError {
     #[error("invalid TLS record version {0:#x} {1:#x}")]
     InvalidVersion(u8, u8),
+    #[error("peer sent TLS Alert record (clean close)")]
+    AlertClose,
     #[error("too many consecutive empty or non-ApplicationData TLS records")]
     ExcessiveControlRecords,
 }
@@ -43,6 +45,8 @@ pub struct TlsUnframer {
     skip_rem: u16,
     /// Consecutive non-ApplicationData or 0-byte ApplicationData records seen.
     control_streak: u8,
+    /// Set when a TLS Alert (`0x15`) record was observed after earlier AppData in the same read.
+    alert_seen: bool,
 }
 
 impl TlsUnframer {
@@ -54,7 +58,14 @@ impl TlsUnframer {
             app_rem: 0,
             skip_rem: 0,
             control_streak: 0,
+            alert_seen: false,
         }
+    }
+
+    /// True if a TLS Alert (`0x15`) record was seen (peer initiated clean close).
+    #[inline]
+    pub const fn alert_seen(&self) -> bool {
+        self.alert_seen
     }
 
     /// True if currently in the middle of a record header or payload (used to
@@ -78,6 +89,9 @@ impl TlsUnframer {
         buf: &[u8],
         out_spans: &mut [(usize, usize)],
     ) -> Result<Option<usize>, TlsRecordError> {
+        if self.alert_seen {
+            return Err(TlsRecordError::AlertClose);
+        }
         let saved = *self;
         let len = buf.len();
         let mut r = 0usize;
@@ -147,6 +161,12 @@ impl TlsUnframer {
                     self.control_streak = 0;
                     self.app_rem = rec_len;
                 }
+            } else if rec_type == TLS_RECORD_ALERT {
+                self.alert_seen = true;
+                if count == 0 {
+                    return Err(TlsRecordError::AlertClose);
+                }
+                break;
             } else {
                 self.control_streak = self.control_streak.saturating_add(1);
                 if self.control_streak > MAX_EMPTY_OR_NON_APP_STREAK {
@@ -164,8 +184,11 @@ impl TlsUnframer {
     /// returning `written`.
     ///
     /// Non-ApplicationData records (e.g., ChangeCipherSpec `0x14`) are silently
-    /// discarded, matching Go `tls.Conn.openRecord`.
+    /// discarded, while TLS Alert (`0x15`) cleanly signals [`TlsRecordError::AlertClose`].
     pub fn unframe_in_place(&mut self, buf: &mut [u8]) -> Result<usize, TlsRecordError> {
+        if self.alert_seen {
+            return Err(TlsRecordError::AlertClose);
+        }
         let len = buf.len();
         let mut r = 0usize;
         let mut w = 0usize;
@@ -228,8 +251,14 @@ impl TlsUnframer {
                     self.control_streak = 0;
                     self.app_rem = rec_len;
                 }
+            } else if rec_type == TLS_RECORD_ALERT {
+                self.alert_seen = true;
+                if w == 0 {
+                    return Err(TlsRecordError::AlertClose);
+                }
+                break;
             } else {
-                // Skip non-ApplicationData (CCS, Alert, Handshake, etc.), guarded against flood.
+                // Skip non-ApplicationData (CCS, Handshake, etc.), guarded against flood.
                 self.control_streak = self.control_streak.saturating_add(1);
                 if self.control_streak > MAX_EMPTY_OR_NON_APP_STREAK {
                     return Err(TlsRecordError::ExcessiveControlRecords);
@@ -292,6 +321,32 @@ mod tests {
     #[test]
     fn unframer_is_12_bytes_or_less() {
         assert!(std::mem::size_of::<TlsUnframer>() <= 12);
+    }
+
+    #[test]
+    fn alert_record_returns_clean_alert_close_after_preceding_app_data() {
+        let mut wire = Vec::new();
+        append_app_data_records(&mut wire, b"last-bytes");
+        // TLS Alert (0x15), v3.3, len=2, warning(1), close_notify(0)
+        wire.extend_from_slice(&[TLS_RECORD_ALERT, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00]);
+
+        let mut u = TlsUnframer::new();
+        let mut spans = [(0usize, 0usize); 4];
+        let sc = u.unframe_spans(&wire, &mut spans).unwrap().unwrap();
+        assert_eq!(sc, 1);
+        assert_eq!(&wire[spans[0].0..spans[0].1], b"last-bytes");
+        assert!(u.alert_seen());
+        assert_eq!(
+            u.unframe_spans(&[], &mut spans),
+            Err(TlsRecordError::AlertClose)
+        );
+
+        let mut standalone_alert = vec![TLS_RECORD_ALERT, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00];
+        let mut u2 = TlsUnframer::new();
+        assert_eq!(
+            u2.unframe_in_place(&mut standalone_alert),
+            Err(TlsRecordError::AlertClose)
+        );
     }
 
     #[test]
